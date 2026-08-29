@@ -10,6 +10,10 @@
   <img src="public/xiriacanvas-logo.svg" alt="XiriaCanvas AI logo" width="180">
 </p>
 
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 XiriaCanvas AI is a local Stable Diffusion, Illustrious, and native Anima image-generation UI.
 The same source tree supports Windows and Linux. The project does not depend on
 ComfyUI or Stable Diffusion WebUI at runtime.
