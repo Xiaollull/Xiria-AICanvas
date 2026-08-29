@@ -1,8 +1,14 @@
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="public/xiriacanvas-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="public/xiriacanvas-wordmark-light.svg">
+    <img src="public/xiriacanvas-wordmark-light.svg" alt="XiriaCanvas AI" width="680">
+  </picture>
+</h1>
+
 <p align="center">
   <img src="public/xiriacanvas-logo.svg" alt="XiriaCanvas AI logo" width="180">
 </p>
-
-# XiriaCanvas AI
 
 XiriaCanvas AI is a local Stable Diffusion, Illustrious, and native Anima image-generation UI.
 The same source tree supports Windows and Linux. The project does not depend on
