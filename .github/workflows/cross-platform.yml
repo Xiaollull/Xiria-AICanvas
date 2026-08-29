@@ -24,11 +24,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
 
       - run: npm ci
       - run: npm run setup:cli -- --diagnose --source=official --torch=cpu
       - run: npm run test:setup
-      - run: python -m venv .venv
+
+      - name: Create isolated project Python environment
+        run: python -m venv .venv
+
+      - name: Use project virtual environment on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $env:GITHUB_WORKSPACE ".venv\Scripts")
+
+      - name: Use project virtual environment on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install CPU-only backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install --upgrade --upgrade-strategy only-if-needed -r backend/requirements.txt
+          python -m pip check
+          python -c "import torch, torchvision; from PIL import Image; print(f'CPU PyTorch {torch.__version__}; torchvision {torchvision.__version__}')"
+
       - run: node -e "import('./scripts/python.mjs').then(({verifyProjectVenv}) => { const result = verifyProjectVenv(process.cwd()); if (!result.ok) throw new Error(result.error); })"
       - run: node --check vite.config.js
       - run: node --check scripts/setup.mjs
