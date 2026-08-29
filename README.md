@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="public/xiriacanvas-logo.svg" alt="XiriaCanvas AI logo" width="180">
+</p>
+
 # XiriaCanvas AI
 
 XiriaCanvas AI is a local Stable Diffusion, Illustrious, and native Anima image-generation UI.
