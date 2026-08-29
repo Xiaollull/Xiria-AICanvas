@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#080a08" />
+  <link rel="icon" type="image/svg+xml" href="/xiriacanvas-favicon.svg?palette=nebula-violet-v2" />
+  <title>XirAI 环境配置</title>
+  <style>
+    :root { color-scheme:dark; --ink:#e9ebe4; --soft:#a7aca0; --muted:#6e7568; --line:#2a2f28; --panel:#121512; --panel-2:#171b16; --canvas:#080a08; --lime:#8b7cff; --accent-rgb:139 124 255; --accent-contrast:#111112; --lime-dim:#7164dc; --warn:#ffb35d; --error:#ff7d64; --blue:#8fc9ff; font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:var(--canvas); color:var(--ink); }
+    * { box-sizing:border-box; }
+    body { min-width:320px; min-height:100vh; margin:0; background:radial-gradient(circle at 12% -10%,rgb(var(--accent-rgb) / .12),transparent 32%),radial-gradient(circle at 100% 100%,rgb(var(--accent-rgb) / .07),transparent 32%),var(--canvas); }
+    button,select,input { font:inherit; }
+    button { color:inherit; }
+    button:focus-visible,select:focus-visible,input:focus-visible { outline:2px solid var(--lime); outline-offset:2px; }
+    [hidden] { display:none !important; }
+    .shell { width:min(1160px,calc(100vw - 32px)); margin:0 auto; padding:24px 0 42px; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; min-height:46px; margin-bottom:26px; }
+    .brand { display:flex; align-items:center; gap:11px; min-width:0; }.brand-mark { width:42px; height:42px; display:block; object-fit:contain; flex:0 0 auto; }.brand-copy strong { display:block; font-size:15px; letter-spacing:-.03em; }.brand-copy span { display:block; margin-top:2px; color:var(--muted); font:8px/1 ui-monospace,monospace; letter-spacing:.14em; }
+    .stepper { display:flex; align-items:center; gap:8px; color:var(--muted); font:9px ui-monospace,monospace; letter-spacing:.08em; }.stepper span { display:flex; align-items:center; gap:6px; }.stepper b { width:18px; height:18px; display:grid; place-items:center; border:1px solid var(--line); border-radius:50%; font-weight:500; }.stepper .active { color:var(--lime); }.stepper .active b { border-color:var(--lime); background:rgb(var(--accent-rgb) / .08); }.stepper i { width:28px; height:1px; background:var(--line); }
+    .eyebrow { color:var(--lime); font:9px ui-monospace,monospace; letter-spacing:.18em; }
+    .intro { display:grid; grid-template-columns:minmax(0,1fr) 290px; gap:22px; padding:30px; border:1px solid var(--line); background:linear-gradient(115deg,rgb(var(--accent-rgb) / .045),transparent 48%),var(--panel); }.intro h1 { max-width:700px; margin:10px 0 9px; font-size:clamp(26px,4vw,42px); line-height:1.06; letter-spacing:-.055em; }.intro p { max-width:680px; margin:0; color:var(--soft); font-size:13px; line-height:1.7; }.intro-note { align-self:end; padding:15px; border-left:2px solid var(--lime); background:#0d100d; color:#bfc7af; font-size:11px; line-height:1.65; }.intro-note strong { display:block; margin-bottom:5px; color:var(--lime); font:9px ui-monospace,monospace; letter-spacing:.09em; }
+    .notice { display:flex; align-items:flex-start; gap:10px; margin-top:14px; padding:12px 14px; border:1px solid var(--line); color:var(--soft); background:rgba(18,21,18,.88); font-size:12px; line-height:1.55; }.notice i { width:7px; height:7px; flex:0 0 auto; margin-top:6px; border-radius:50%; background:var(--blue); }.notice.error { border-color:rgba(255,125,100,.55); color:#ffc0b0; }.notice.error i { background:var(--error); }.notice.warning { border-color:rgba(255,179,93,.5); color:#f8c98e; }.notice.warning i { background:var(--warn); }
+    .hardware { display:grid; grid-template-columns:1.55fr .8fr .8fr .75fr; gap:1px; margin-top:16px; border:1px solid var(--line); background:var(--line); }.hardware-card { min-width:0; padding:15px 16px; background:var(--panel); }.hardware-card span { display:block; margin-bottom:7px; color:var(--muted); font:8px ui-monospace,monospace; letter-spacing:.1em; }.hardware-card strong { display:block; overflow:hidden; color:#d9ddd2; font:12px ui-monospace,monospace; white-space:nowrap; text-overflow:ellipsis; }.hardware-card.good strong { color:var(--lime); }
+    .section-title { display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin:29px 0 12px; }.section-title h2 { margin:0; font-size:13px; letter-spacing:.04em; }.section-title span { color:var(--muted); font:9px ui-monospace,monospace; }
+    .mode-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }.mode-card { position:relative; min-height:178px; padding:22px; border:1px solid var(--line); color:var(--soft); background:var(--panel); text-align:left; cursor:pointer; transition:border-color .18s,background .18s,transform .18s; }.mode-card:hover:not(:disabled) { border-color:color-mix(in srgb,var(--lime) 34%,#59634d); background:#171b16; transform:translateY(-1px); }.mode-card.active { border-color:var(--lime); color:var(--ink); background:linear-gradient(140deg,rgb(var(--accent-rgb) / .10),transparent 58%),var(--panel-2); box-shadow:inset 0 0 0 1px rgb(var(--accent-rgb) / .12); }.mode-card:disabled { cursor:not-allowed; opacity:.48; }.mode-card h3 { margin:0 0 8px; font-size:17px; letter-spacing:-.02em; }.mode-card p { max-width:470px; margin:0; color:inherit; font-size:11px; line-height:1.65; }.mode-card .tag { position:absolute; top:17px; right:17px; padding:4px 7px; color:var(--accent-contrast); background:var(--lime); font:8px ui-monospace,monospace; letter-spacing:.08em; }.mode-card .mode-foot { position:absolute; right:22px; bottom:17px; left:22px; display:flex; justify-content:space-between; align-items:center; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font:9px ui-monospace,monospace; }.mode-card.active .mode-foot { color:color-mix(in srgb,var(--lime) 55%,#d7d9d2); border-color:rgb(var(--accent-rgb) / .2); }
+    .manual-panel { margin-top:12px; padding:20px; border:1px solid var(--line); background:var(--panel); }.manual-panel-head { display:flex; align-items:baseline; justify-content:space-between; gap:15px; margin-bottom:15px; }.manual-panel h3 { margin:0; font-size:12px; }.manual-panel-head span { color:var(--muted); font:9px ui-monospace,monospace; }.select-grid { display:grid; grid-template-columns:1fr 1.45fr; gap:12px; }.field label { display:block; margin-bottom:7px; color:#aeb4a7; font-size:10px; }.field select { width:100%; height:40px; padding:0 11px; border:1px solid #363d34; color:#dfe3d7; background:#0d100d; font:10px ui-monospace,monospace; }.field select:disabled { opacity:.5; }.field small { display:block; min-height:16px; margin-top:7px; color:var(--muted); font-size:10px; line-height:1.45; }.field small.recommended { color:color-mix(in srgb,var(--lime) 64%,#d8d9d3); }.field small.warning { color:#edbf83; }.unavailable { margin-top:14px; color:#9e8176; font-size:10px; line-height:1.5; }.unavailable b { color:#d6a28f; font-weight:500; }
+    .preferences { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:12px; }.toggle-card { display:flex; align-items:center; gap:12px; min-height:64px; padding:12px 14px; border:1px solid var(--line); background:#101310; cursor:pointer; }.toggle-card:has(input:focus-visible) { outline:2px solid var(--lime); outline-offset:2px; }.toggle-card input { position:absolute; opacity:0; pointer-events:none; }.toggle-track { position:relative; width:34px; height:18px; flex:0 0 auto; border:1px solid #444c3d; border-radius:18px; background:#1a1e19; transition:background .18s,border .18s; }.toggle-track::after { content:""; position:absolute; top:3px; left:3px; width:10px; height:10px; border-radius:50%; background:#72796d; transition:transform .18s,background .18s; }.toggle-card input:checked + .toggle-track { border-color:color-mix(in srgb,var(--lime) 55%,#444c3d); background:rgb(var(--accent-rgb) / .14); }.toggle-card input:checked + .toggle-track::after { transform:translateX(15px); background:var(--lime); }.toggle-copy strong,.toggle-copy span { display:block; }.toggle-copy strong { color:#ccd1c5; font-size:10px; }.toggle-copy span { margin-top:4px; color:var(--muted); font-size:9px; line-height:1.35; }
+    .plan-strip { display:flex; align-items:center; justify-content:space-between; gap:18px; margin-top:12px; padding:14px 16px; border:1px solid color-mix(in srgb,var(--lime) 30%,#36422c); background:rgb(var(--accent-rgb) / .045); }.plan-strip span { display:block; color:color-mix(in srgb,var(--lime) 38%,#98a88a); font:8px ui-monospace,monospace; letter-spacing:.1em; }.plan-strip strong { display:block; margin-top:5px; color:var(--lime); font:12px ui-monospace,monospace; }.plan-strip small { max-width:390px; color:var(--soft); font-size:10px; line-height:1.5; text-align:right; }
+    .actions { display:flex; align-items:center; justify-content:flex-end; gap:9px; margin-top:16px; }.button { min-height:40px; padding:0 15px; border:1px solid #3c4339; color:#c7ccc0; background:#121512; cursor:pointer; font-size:11px; }.button:hover:not(:disabled) { border-color:#68715f; background:#1a1e19; }.button.primary { min-width:184px; color:var(--accent-contrast); border-color:var(--lime); background:var(--lime); font-weight:700; }.button.primary:hover:not(:disabled) { filter:brightness(1.06); }.button.danger { color:#ffc0b0; border-color:#664338; }.button:disabled { cursor:not-allowed; opacity:.42; }
+    .progress-header { display:flex; align-items:end; justify-content:space-between; gap:24px; padding:28px 30px; border:1px solid var(--line); background:linear-gradient(115deg,rgb(var(--accent-rgb) / .045),transparent 52%),var(--panel); }.progress-header h1 { margin:8px 0 0; font-size:clamp(24px,3vw,34px); letter-spacing:-.045em; }.progress-header p { max-width:650px; margin:8px 0 0; color:var(--soft); font-size:12px; line-height:1.55; }.completion { width:145px; flex:0 0 auto; }.completion .readout { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:8px; color:var(--muted); font:9px ui-monospace,monospace; }.completion b { color:var(--lime); font-size:13px; font-weight:500; }.bar { height:4px; overflow:hidden; background:#2a3028; }.bar i { display:block; height:100%; background:var(--lime); box-shadow:0 0 10px rgb(var(--accent-rgb) / .7); transition:width .25s ease; }.bar.indeterminate i { width:32%; transition:none; animation:barSlide 1.4s ease-in-out infinite; }@keyframes barSlide { 0% { transform:translateX(-105%); } 100% { transform:translateX(320%); } }@media (prefers-reduced-motion:reduce) { .bar.indeterminate i { width:100%; opacity:.4; animation:none; } }
+    .progress-grid { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(310px,.85fr); gap:12px; margin-top:12px; }.panel { border:1px solid var(--line); background:var(--panel); }.panel-head { display:flex; align-items:center; justify-content:space-between; gap:15px; min-height:48px; padding:0 16px; border-bottom:1px solid var(--line); }.panel-head h2 { margin:0; font-size:11px; }.panel-head span { color:var(--muted); font:8px ui-monospace,monospace; letter-spacing:.08em; }
+    .tasks { padding:4px 0; }.task { display:grid; grid-template-columns:25px minmax(0,1fr) auto; gap:11px; align-items:center; min-height:54px; padding:8px 16px; }.task + .task { border-top:1px solid #1f241e; }.task-index { color:#545c50; font:9px ui-monospace,monospace; }.task strong,.task small { display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }.task strong { color:#d2d6cd; font-size:11px; }.task small { margin-top:4px; color:var(--muted); font:8px ui-monospace,monospace; }.task-state { color:var(--muted); font:8px ui-monospace,monospace; }.task.running .task-index,.task.running .task-state,.task.complete .task-state { color:var(--lime); }.task.error .task-state { color:var(--error); }.task.skipped { opacity:.58; }
+    .side-stack { display:grid; gap:12px; }.selection-grid { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); }.selection-grid div { min-width:0; padding:13px; background:#111411; }.selection-grid span { display:block; margin-bottom:7px; color:var(--muted); font:8px ui-monospace,monospace; }.selection-grid strong { display:block; overflow:hidden; color:#d4d8d0; font:10px ui-monospace,monospace; white-space:nowrap; text-overflow:ellipsis; }
+    .download { padding:16px; }.download-name { min-height:32px; overflow-wrap:anywhere; color:#d4d8d0; font:11px/1.45 ui-monospace,monospace; }.download-row { display:flex; justify-content:space-between; gap:12px; margin:13px 0 8px; color:var(--muted); font:9px ui-monospace,monospace; }.download-row b { color:var(--lime); font-weight:500; }.download-meta { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:13px; }.metric { min-width:0; padding:10px; border:1px solid #282e27; background:#0d100d; }.metric span { display:block; margin-bottom:5px; color:#626a5f; font:7px ui-monospace,monospace; }.metric strong { display:block; overflow:hidden; color:#c4c9bd; font:9px ui-monospace,monospace; white-space:nowrap; text-overflow:ellipsis; }
+    .log-panel { margin-top:12px; }.terminal { max-height:278px; min-height:184px; overflow:auto; margin:0; padding:14px 16px; color:#99a293; background:#090b09; font:9px/1.65 "Cascadia Mono","DejaVu Sans Mono",monospace; white-space:pre-wrap; scrollbar-width:thin; }.terminal .stderr { color:#e49a86; }.terminal .warning { color:#dfba79; }
+    .repair { margin-top:12px; padding:20px; border:1px solid rgba(255,179,93,.55); background:linear-gradient(105deg,rgba(255,179,93,.09),transparent 55%),var(--panel); }.repair h2 { margin:0; color:#ffd09a; font-size:14px; }.repair p { margin:8px 0 14px; color:#d2b69a; font-size:11px; line-height:1.6; }.repair-plan { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:12px; border:1px solid #59442f; background:#15130d; }.repair-plan span { color:#a78561; font:8px ui-monospace,monospace; }.repair-plan strong { color:var(--lime); font:11px ui-monospace,monospace; }.repair-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:13px; }.repair-scheduled { color:color-mix(in srgb,var(--lime) 58%,#e0e2dc); font-size:10px; }
+    @media (max-width:800px) { .shell { width:min(100% - 20px,680px); padding-top:15px; }.stepper { display:none; }.intro,.progress-header,.progress-grid { grid-template-columns:1fr; }.intro { padding:23px; }.intro-note { margin-top:4px; }.hardware { grid-template-columns:1fr 1fr; }.mode-grid,.select-grid,.preferences { grid-template-columns:1fr; }.mode-card { min-height:160px; }.progress-header { align-items:start; }.completion { width:100%; }.progress-grid { gap:12px; }.actions { flex-wrap:wrap; }.button.primary { flex:1; }.plan-strip { align-items:flex-start; flex-direction:column; }.plan-strip small { text-align:left; }.repair-plan { align-items:flex-start; flex-direction:column; } }
+  </style>
+</head>
+<body>
+  <main class="shell" id="shell">
+    <header class="topbar">
+      <div class="brand"><img class="brand-mark" src="/xiriacanvas-logo.svg" alt=""><div class="brand-copy"><strong>XiriaCanvas AI</strong><span>LOCAL ENVIRONMENT CONFIGURATOR</span></div></div>
+      <nav class="stepper" aria-label="配置步骤"><span class="active" id="stepChoice"><b>1</b>选择方案</span><i></i><span id="stepProgress"><b>2</b>安装验证</span></nav>
+    </header>
+
+    <section id="setupView">
+      <div class="intro">
+        <div><span class="eyebrow">SETUP WIZARD</span><h1 id="setupTitle">准备本地 AI 环境</h1><p id="setupMessage">正在读取硬件和官方 PyTorch wheel 目录。完成前不会创建环境、下载模型或安装软件。</p></div>
+        <aside class="intro-note"><strong>确认后才开始</strong>系统会先验证 GPU 驱动与 Python ABI。你可以自动选择推荐组合，也可以手动锁定 CUDA runtime 与 PyTorch 版本。</aside>
+      </div>
+      <div class="notice" id="setupNotice" hidden><i></i><span></span></div>
+      <section class="hardware" id="hardwareCards" aria-label="机器环境"><div class="hardware-card"><span>GPU</span><strong>正在检测</strong></div><div class="hardware-card"><span>驱动</span><strong>--</strong></div><div class="hardware-card"><span>CUDA 上限</span><strong>--</strong></div><div class="hardware-card"><span>PYTHON ABI</span><strong>--</strong></div></section>
+
+      <div class="section-title"><h2>选择安装方案</h2><span id="catalogLabel">正在查询官方 wheel 目录</span></div>
+      <div class="mode-grid">
+        <button class="mode-card active" id="autoMode" type="button"><span class="tag">推荐</span><h3>自动配置</h3><p>优先选择最新稳定 PyTorch；同版本中使用当前 NVIDIA 驱动可运行的最高内置 CUDA runtime。</p><span class="mode-foot"><span id="autoSummary">查询中</span><span>自动选择</span></span></button>
+        <button class="mode-card" id="manualMode" type="button"><h3>手动配置</h3><p>从当前平台可用的 CUDA 与 PyTorch wheel 中选择。旧版或非首选组合会显示风险说明。</p><span class="mode-foot"><span>自定义组合</span><span>手动选择</span></span></button>
+      </div>
+
+      <section class="manual-panel" id="manualPanel" hidden>
+        <div class="manual-panel-head"><h3>手动组合</h3><span>只显示适用于当前系统与 Python ABI 的稳定 wheel</span></div>
+        <div class="select-grid">
+          <div class="field"><label for="cudaSelect">CUDA Runtime</label><select id="cudaSelect" disabled><option>等待目录查询...</option></select><small id="cudaDescription">请选择 CUDA runtime。</small></div>
+          <div class="field"><label for="torchSelect">PyTorch 版本</label><select id="torchSelect" disabled><option>先选择 CUDA runtime</option></select><small id="torchDescription">推荐组合会优先显示。</small></div>
+        </div>
+        <div class="unavailable" id="unavailableVariants" hidden></div>
+      </section>
+
+      <section class="preferences">
+        <label class="toggle-card"><input type="checkbox" id="xformersToggle" checked><span class="toggle-track"></span><span class="toggle-copy"><strong>安装 xformers</strong><span>可用时启用更高效的注意力实现；不兼容会自动移除。</span></span></label>
+        <label class="toggle-card"><input type="checkbox" id="rtxVsrToggle"><span class="toggle-track"></span><span class="toggle-copy"><strong>安装 NVIDIA RTX VSR</strong><span>NVIDIA 专有可选组件，默认关闭；约下载 468–570 MiB，仅在真实 CUDA 与硬件验证合格后安装。</span></span></label>
+        <label class="toggle-card"><input type="checkbox" id="tritonToggle"><span class="toggle-track"></span><span class="toggle-copy"><strong>安装 Triton 编译器</strong><span>约下载 50 MiB。装好后可在「设置 › 性能」开启 Anima Transformer 编译加速；首次生成需要一次编译，之后每步更快。验证不通过会自动移除。</span></span></label>
+        <label class="toggle-card"><input type="checkbox" id="sageAttentionToggle"><span class="toggle-track"></span><span class="toggle-copy"><strong>安装 SageAttention</strong><span>体积很小，但依赖 Triton，勾选后会一并安装 Triton。装好后可在「设置 › 性能」把注意力内核切到 SageAttention；它把 Q/K 量化到 INT8，速度更快，同种子出图会改变。</span></span></label>
+        <label class="toggle-card"><input type="checkbox" id="autoRepairToggle"><span class="toggle-track"></span><span class="toggle-copy"><strong>CUDA 验证失败时自动修复一次</strong><span>仅在 wheel 已安装但 CUDA 实算失败时，降级到下一套兼容方案。</span></span></label>
+      </section>
+
+      <section class="plan-strip" id="planStrip"><div><span>将要安装</span><strong id="planSelection">正在计算推荐组合</strong></div><small id="planReason">系统还在读取官方稳定 wheel 目录。</small></section>
+      <footer class="actions"><button class="button" id="reloadCatalog" type="button" disabled>重新查询</button><button class="button" id="closeSetup" type="button">关闭</button><button class="button primary" id="startSetup" type="button" disabled>开始配置环境</button></footer>
+    </section>
+
+    <section id="progressView" hidden>
+      <header class="progress-header"><div><span class="eyebrow" id="progressEyebrow">ENVIRONMENT SETUP</span><h1 id="progressTitle">准备开始配置</h1><p id="progressMessage">等待安装任务。</p></div><div class="completion"><div class="readout"><span>完成进度</span><b id="overallText">0%</b></div><div class="bar"><i id="overallBar"></i></div></div></header>
+      <div class="notice" id="progressNotice" hidden><i></i><span></span></div>
+      <section class="repair" id="repairPanel" hidden></section>
+      <div class="progress-grid">
+        <section class="panel"><header class="panel-head"><h2>安装步骤</h2><span id="taskCount">0 / 0</span></header><div class="tasks" id="taskList"></div></section>
+        <aside class="side-stack">
+          <section class="panel"><header class="panel-head"><h2>已选组合</h2><span id="selectionState">WAITING</span></header><div class="selection-grid" id="selectionGrid"></div></section>
+          <section class="panel"><header class="panel-head"><h2>当前下载</h2><span id="downloadPercent">0%</span></header><div class="download"><div class="download-name" id="downloadName">等待下载</div><div class="download-row"><span id="downloadBytes">0 B / --</span><span id="downloadEta"></span><b id="downloadSpeed">--</b></div><div class="bar" id="downloadBarTrack"><i id="downloadBar"></i></div><div class="download-meta"><div class="metric"><span>线路</span><strong id="downloadRoute">等待测速</strong></div><div class="metric"><span>模式</span><strong id="downloadMode">--</strong></div></div></div></section>
+        </aside>
+      </div>
+      <section class="panel log-panel"><header class="panel-head"><h2>配置日志</h2><span id="logStatus">LIVE</span></header><pre class="terminal" id="terminal"></pre></section>
+      <footer class="actions"><button class="button" id="copyLog" type="button">复制日志</button><button class="button" id="backToChoice" type="button" hidden>返回选择</button><button class="button" id="retrySetup" type="button" hidden>从断点继续</button><button class="button" id="closeProgress" type="button" hidden>关闭</button><button class="button primary" id="enterApp" type="button" disabled>重启并进入主页面</button></footer>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const elements = {
+      shell: $("shell"), setupView: $("setupView"), progressView: $("progressView"), stepChoice: $("stepChoice"), stepProgress: $("stepProgress"),
+      setupTitle: $("setupTitle"), setupMessage: $("setupMessage"), setupNotice: $("setupNotice"), hardwareCards: $("hardwareCards"), catalogLabel: $("catalogLabel"),
+      autoMode: $("autoMode"), manualMode: $("manualMode"), autoSummary: $("autoSummary"), manualPanel: $("manualPanel"), cudaSelect: $("cudaSelect"), torchSelect: $("torchSelect"), cudaDescription: $("cudaDescription"), torchDescription: $("torchDescription"), unavailableVariants: $("unavailableVariants"),
+      xformersToggle: $("xformersToggle"), rtxVsrToggle: $("rtxVsrToggle"), tritonToggle: $("tritonToggle"), sageAttentionToggle: $("sageAttentionToggle"), autoRepairToggle: $("autoRepairToggle"), planSelection: $("planSelection"), planReason: $("planReason"), reloadCatalog: $("reloadCatalog"), closeSetup: $("closeSetup"), startSetup: $("startSetup"),
+      progressEyebrow: $("progressEyebrow"), progressTitle: $("progressTitle"), progressMessage: $("progressMessage"), progressNotice: $("progressNotice"), overallText: $("overallText"), overallBar: $("overallBar"), repairPanel: $("repairPanel"), taskList: $("taskList"), taskCount: $("taskCount"), selectionState: $("selectionState"), selectionGrid: $("selectionGrid"),
+      downloadPercent: $("downloadPercent"), downloadName: $("downloadName"), downloadBytes: $("downloadBytes"), downloadEta: $("downloadEta"), downloadSpeed: $("downloadSpeed"), downloadBar: $("downloadBar"), downloadBarTrack: $("downloadBarTrack"), downloadRoute: $("downloadRoute"), downloadMode: $("downloadMode"), terminal: $("terminal"), logStatus: $("logStatus"), copyLog: $("copyLog"), backToChoice: $("backToChoice"), retrySetup: $("retrySetup"), closeProgress: $("closeProgress"), enterApp: $("enterApp"),
+    };
+    const statusLabels = { pending: "等待", running: "进行中", complete: "完成", skipped: "跳过", error: "失败" };
+    let state = null;
+    let catalog = null;
+    let view = "setup";
+    let selectedMode = "auto";
+    let renderedLogCount = 0;
+    let requestBusy = false;
+    let notice = null;
+    let preferencesRestored = false;
+
+    const escapeHtml = (value) => String(value ?? "--").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[character]);
+    const formatBytes = (value) => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(2)} GB` : value >= 1024 ** 2 ? `${(value / 1024 ** 2).toFixed(1)} MB` : value >= 1024 ? `${(value / 1024).toFixed(1)} KB` : `${value || 0} B`;
+    const formatDuration = (seconds) => seconds >= 3600 ? `${Math.round(seconds / 360) / 10} 小时` : seconds >= 60 ? `${Math.round(seconds / 60)} 分钟` : `${Math.max(1, Math.round(seconds))} 秒`;
+    const formatCuda = (variant) => variant ? `CUDA ${variant.slice(2, 4)}.${variant.slice(4) || "0"}` : "--";
+    const selectedCudaOption = () => catalog?.cudaOptions?.find((option) => option.variant === elements.cudaSelect.value) || null;
+    const selectedTorchOption = () => selectedCudaOption()?.versions.find((option) => option.version === elements.torchSelect.value) || null;
+
+    function themeRgb(hex) {
+      return [1, 3, 5].map((index) => parseInt(hex.slice(index, index + 2), 16));
+    }
+
+    function themeLuminance(hex) {
+      const channels = themeRgb(hex).map((value) => {
+        const channel = value / 255;
+        return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+      });
+      return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2];
+    }
+
+    function applyTheme(theme) {
+      const accent = theme?.overall || "#8B7CFF";
+      const logoPalette = [theme?.accent || accent, theme?.ink || "#111112", theme?.disc || "#FFFFFF", theme?.guide || "#C9C5E8"]
+        .map((color) => color.replace("#", "").toLowerCase()).join("-");
+      const root = document.documentElement;
+      root.style.setProperty("--lime", accent);
+      root.style.setProperty("--accent-rgb", themeRgb(accent).join(" "));
+      root.style.setProperty("--accent-contrast", themeLuminance(accent) > .36 ? "#111112" : "#FFFFFF");
+      root.style.setProperty("--lime-dim", `rgb(${themeRgb(accent).join(" ")} / .76)`);
+      document.querySelector('meta[name="theme-color"]')?.setAttribute("content", "#080A08");
+      document.querySelector('link[rel~="icon"]')?.setAttribute("href", `/xiriacanvas-favicon.svg?palette=${logoPalette}`);
+      document.querySelectorAll('img[src^="/xiriacanvas-logo.svg"]').forEach((image) => { image.src = `/xiriacanvas-logo.svg?palette=${logoPalette}`; });
+    }
+
+    async function loadTheme() {
+      try {
+        const payload = await fetchJson("/api/theme");
+        applyTheme(payload.theme);
+      } catch {
+        applyTheme(null);
+      }
+    }
+
+    function setView(nextView) {
+      view = nextView;
+      elements.setupView.hidden = nextView !== "setup";
+      elements.progressView.hidden = nextView !== "progress";
+      elements.stepChoice.classList.toggle("active", nextView === "setup");
+      elements.stepProgress.classList.toggle("active", nextView === "progress");
+    }
+
+    function setNotice(message, type = "warning") {
+      notice = message ? { message, type } : null;
+      if (view === "setup") renderSetup(); else renderProgress();
+    }
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, { cache: "no-store", ...options });
+      let payload = {};
+      try { payload = await response.json(); } catch {}
+      if (!response.ok) throw new Error(payload.error || payload.message || `请求失败 (${response.status})`);
+      return payload;
+    }
+
+    function machine() {
+      const candidate = catalog?.hardware || state?.machine || {};
+      return {
+        available: candidate.available ?? candidate.nvidia ?? false,
+        name: candidate.name || candidate.gpu || null,
+        driver: candidate.driverVersion || candidate.driver || null,
+        cuda: typeof candidate.cuda === "object" ? candidate.cuda?.text : candidate.cuda,
+      };
+    }
+
+    function configureManualSelects() {
+      const compatible = catalog?.cudaOptions?.filter((option) => option.compatible) || [];
+      const previous = elements.cudaSelect.value;
+      elements.cudaSelect.innerHTML = compatible.map((option) => `<option value="${escapeHtml(option.variant)}">CUDA ${escapeHtml(option.cudaRuntime)} · ${escapeHtml(option.variant)}${option.recommended ? " · 推荐" : ""}</option>`).join("") || '<option value="">没有兼容的 CUDA wheel</option>';
+      elements.cudaSelect.disabled = compatible.length === 0;
+      elements.cudaSelect.value = compatible.some((option) => option.variant === previous) ? previous : (catalog?.recommended?.variant || compatible[0]?.variant || "");
+      refreshTorchSelect();
+      elements.cudaSelect.onchange = refreshTorchSelect;
+      elements.torchSelect.onchange = renderSetup;
+    }
+
+    function refreshTorchSelect() {
+      const option = selectedCudaOption();
+      const previous = elements.torchSelect.value;
+      const versions = option?.versions || [];
+      elements.torchSelect.innerHTML = versions.map((version) => `<option value="${escapeHtml(version.version)}">${escapeHtml(version.version)}${version.recommended ? " · 推荐" : " · 非推荐"}</option>`).join("") || '<option value="">没有可用版本</option>';
+      elements.torchSelect.disabled = versions.length === 0;
+      elements.torchSelect.value = versions.some((version) => version.version === previous) ? previous : (versions.find((version) => version.recommended)?.version || versions[0]?.version || "");
+      renderSetup();
+    }
+
+    function renderHardware() {
+      const current = machine();
+      const cards = [
+        ["GPU", current.available ? current.name || "NVIDIA GPU" : "未检测到 NVIDIA GPU", current.available],
+        ["驱动", current.driver || "--", false],
+        ["CUDA 上限", current.cuda ? `CUDA ${current.cuda}` : current.available ? "确认中" : "不可用", Boolean(current.cuda)],
+        ["PYTHON ABI", catalog?.pythonTag || "检测中", Boolean(catalog?.pythonTag)],
+      ];
+      elements.hardwareCards.innerHTML = cards.map(([label, value, good]) => `<div class="hardware-card ${good ? "good" : ""}"><span>${label}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong></div>`).join("");
+    }
+
+    function renderSetup() {
+      if (!state) return;
+      const current = machine();
+      elements.setupTitle.textContent = state.catalogStatus === "loading" ? "正在查询兼容版本" : state.catalogStatus === "error" ? "无法读取版本目录" : "准备本地 AI 环境";
+      elements.setupMessage.textContent = state.message || "配置器不会在确认前安装或修改环境。";
+      elements.catalogLabel.textContent = state.catalogStatus === "ready" ? "官方稳定 wheel 已就绪" : state.catalogStatus === "error" ? "目录查询失败" : "正在查询官方 wheel 目录";
+      renderHardware();
+
+      if (notice) {
+        elements.setupNotice.hidden = false;
+        elements.setupNotice.className = `notice ${notice.type}`;
+        elements.setupNotice.querySelector("span").textContent = notice.message;
+      } else {
+        elements.setupNotice.hidden = true;
+      }
+
+      const ready = state.catalogStatus === "ready" && Boolean(catalog);
+      const autoAvailable = ready && Boolean(catalog.recommended) && current.available;
+      elements.autoMode.disabled = !autoAvailable;
+      elements.manualMode.disabled = !ready || !catalog.cudaOptions.some((option) => option.compatible);
+      elements.autoMode.classList.toggle("active", selectedMode === "auto");
+      elements.manualMode.classList.toggle("active", selectedMode === "manual");
+      elements.manualPanel.hidden = selectedMode !== "manual";
+      elements.autoSummary.textContent = catalog?.recommended ? `${catalog.recommended.version} · ${catalog.recommended.variant}` : ready ? "无兼容组合" : "查询中";
+
+      if (ready && !elements.cudaSelect.dataset.ready) {
+        elements.cudaSelect.dataset.ready = "true";
+        configureManualSelects();
+      }
+      const cuda = selectedCudaOption();
+      const torch = selectedTorchOption();
+      if (cuda) {
+        elements.cudaDescription.textContent = cuda.recommended ? "此 CUDA runtime 是当前驱动的首选项。" : "该 CUDA runtime 可用，但不是当前首选 runtime。";
+        elements.cudaDescription.className = cuda.recommended ? "recommended" : "warning";
+      }
+      if (torch) {
+        elements.torchDescription.textContent = torch.recommended ? "最新稳定且完整兼容，推荐使用。" : torch.reason || "该组合可安装，但不是推荐方案。";
+        elements.torchDescription.className = torch.recommended ? "recommended" : "warning";
+      }
+      const unavailable = catalog?.cudaOptions?.filter((option) => !option.compatible) || [];
+      elements.unavailableVariants.hidden = unavailable.length === 0 || selectedMode !== "manual";
+      elements.unavailableVariants.innerHTML = unavailable.length ? `<b>不可用：</b>${unavailable.map((option) => ` ${escapeHtml(option.variant)} (${escapeHtml(option.reason)})`).join("；")}` : "";
+
+      const plan = selectedMode === "auto" ? catalog?.recommended : torch && cuda ? { version: torch.version, variant: cuda.variant, recommended: torch.recommended } : null;
+      elements.planSelection.textContent = plan ? `PyTorch ${plan.version} · ${plan.variant}` : "等待选择兼容组合";
+      elements.planReason.textContent = plan ? `${plan.recommended ? "推荐：最新稳定 PyTorch 与当前驱动可运行的最高 CUDA runtime。" : "手动方案可安装，但并非当前推荐组合。"}${elements.rtxVsrToggle.checked ? " 将在 CUDA 实算合格后尝试安装专有 RTX VSR。" : " RTX VSR 保持关闭。"}` : "无法在当前环境中选择可安装的 CUDA PyTorch wheel。";
+      elements.reloadCatalog.disabled = state.catalogStatus === "loading" || requestBusy;
+      elements.closeSetup.textContent = state.returnToApp ? "返回主页面" : "关闭";
+      elements.startSetup.disabled = requestBusy || !plan || (selectedMode === "auto" && !autoAvailable);
+      elements.startSetup.textContent = requestBusy ? "正在提交..." : selectedMode === "auto" ? "按推荐方案开始配置" : "按手动方案开始配置";
+    }
+
+    function renderProgress() {
+      if (!state) return;
+      const completed = (state.tasks || []).filter((task) => ["complete", "skipped"].includes(task.status)).length;
+      const total = state.tasks?.length || 0;
+      const percentage = total ? Math.round(completed / total * 100) : state.status === "complete" ? 100 : 0;
+      elements.shell.className = `shell ${state.status || ""}`;
+      elements.progressEyebrow.textContent = state.status === "complete" ? "SETUP COMPLETE" : state.status === "error" ? "SETUP NEEDS ATTENTION" : "ENVIRONMENT SETUP";
+      elements.progressTitle.textContent = state.phase || "正在配置环境";
+      elements.progressMessage.textContent = state.message || "正在处理安装任务。";
+      if (notice) {
+        elements.progressNotice.hidden = false;
+        elements.progressNotice.className = `notice ${notice.type}`;
+        elements.progressNotice.querySelector("span").textContent = notice.message;
+      } else {
+        elements.progressNotice.hidden = true;
+      }
+      elements.overallText.textContent = `${percentage}%`;
+      elements.overallBar.style.width = `${percentage}%`;
+      elements.taskCount.textContent = `${completed} / ${total}`;
+      elements.tasks = state.tasks || [];
+      elements.taskList.innerHTML = elements.tasks.map((task, index) => `<div class="task ${escapeHtml(task.status)}"><span class="task-index">${String(index + 1).padStart(2, "0")}</span><div><strong>${escapeHtml(task.label)}</strong><small>${escapeHtml(task.detail || "等待处理")}</small></div><span class="task-state">${statusLabels[task.status] || task.status}</span></div>`).join("") || '<div class="task"><span class="task-index">--</span><div><strong>等待安装任务</strong><small>选择方案后才开始下载和安装。</small></div><span class="task-state">等待</span></div>';
+
+      const selection = state.selection || {};
+      const current = machine();
+      const selectionItems = [
+        ["GPU", selection.gpu || current.name || "检测中"],
+        ["驱动 CUDA", selection.driverCuda || current.cuda || "--"],
+        ["PYTORCH", selection.torch || "待选择"],
+        ["CUDA RUNTIME", selection.variant || "待选择"],
+      ];
+      elements.selectionGrid.innerHTML = selectionItems.map(([label, value]) => `<div><span>${label}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong></div>`).join("");
+      elements.selectionState.textContent = selection.torch ? (selection.resumed ? "RESUMED" : "SELECTED") : "WAITING";
+
+      const download = state.currentDownload || {};
+      // uv, npm and the model-config prefetch never state a total for the phase. Showing 0% for
+      // twenty minutes reads as a hang, so those phases get a moving bar and a live byte counter
+      // instead of a percentage nobody can compute.
+      const indeterminate = !download.totalBytes && (download.indeterminate === true || download.currentBytes > 0);
+      const downloadPercent = download.totalBytes ? Math.min(100, Math.round(download.currentBytes / download.totalBytes * 100)) : 0;
+      elements.downloadName.textContent = download.name || "等待下载";
+      elements.downloadBytes.textContent = indeterminate
+        ? `已处理 ${formatBytes(download.currentBytes)}${download.packages ? ` · ${download.packages} 个包` : ""}`
+        : `${formatBytes(download.currentBytes)} / ${download.totalBytes ? formatBytes(download.totalBytes) : "--"}`;
+      elements.downloadPercent.textContent = indeterminate ? "进行中" : `${downloadPercent}%`;
+      elements.downloadEta.textContent = download.etaSeconds > 0 && !indeterminate ? `剩余 ${formatDuration(download.etaSeconds)}` : "";
+      elements.downloadSpeed.textContent = download.speedBps ? `${formatBytes(download.speedBps)}/s` : "--";
+      elements.downloadBarTrack.className = indeterminate ? "bar indeterminate" : "bar";
+      elements.downloadBar.style.width = indeterminate ? "" : `${downloadPercent}%`;
+      const sources = Array.isArray(download.sources) ? download.sources.filter((source) => source && source.label) : [];
+      elements.downloadRoute.textContent = sources.length > 1
+        ? sources.map((source) => source.label).join(" + ")
+        : download.route || "等待测速";
+      elements.downloadMode.textContent = download.mode || (download.connections > 1 ? `并发 ×${download.connections}` : "--");
+      elements.downloadRoute.title = sources.length > 1
+        ? sources.map((source) => `${source.label} ${formatBytes(source.speedBps || 0)}/s`).join("\n")
+        : elements.downloadRoute.textContent;
+
+      const logs = state.logs || [];
+      if (logs.length !== renderedLogCount) {
+        elements.terminal.innerHTML = logs.map((entry) => `<span class="${escapeHtml(entry.stream)}">${escapeHtml(entry.text)}</span>\n`).join("");
+        elements.terminal.scrollTop = elements.terminal.scrollHeight;
+        renderedLogCount = logs.length;
+      }
+      elements.logStatus.textContent = state.status === "error" ? "ERROR" : state.status === "complete" ? "COMPLETE" : "LIVE";
+
+      const repair = state.repair;
+      elements.repairPanel.hidden = !repair;
+      if (repair) {
+        const scheduled = state.autoRepairScheduled ? '<p class="repair-scheduled">已启用自动修复：当前失败进程退出后，会自动尝试该组合一次。</p>' : "";
+        elements.repairPanel.innerHTML = `<h2>建议使用兼容回退方案</h2><p>当前组合已安装，但 CUDA 实算验证失败。修复会改用较低、仍兼容当前驱动的 runtime，并默认关闭 xformers。</p><div class="repair-plan"><span>建议组合</span><strong>PyTorch ${escapeHtml(repair.version)} · ${escapeHtml(repair.variant)}</strong></div>${scheduled}<div class="repair-actions"><button class="button" id="backFromRepair" type="button">重新选择</button><button class="button primary" id="repairNow" type="button" ${requestBusy || state.autoRepairScheduled ? "disabled" : ""}>按建议方案修复</button></div>`;
+        $("repairNow")?.addEventListener("click", runRepair);
+        $("backFromRepair")?.addEventListener("click", () => setView("setup"));
+      }
+      const error = state.status === "error";
+      elements.retrySetup.hidden = !error || Boolean(repair);
+      elements.backToChoice.hidden = !error;
+      elements.closeProgress.hidden = !["complete", "error"].includes(state.status);
+      elements.closeProgress.textContent = state.returnToApp ? "返回主页面" : "关闭";
+      elements.enterApp.disabled = state.status !== "complete" || !state.configured || requestBusy;
+      elements.enterApp.textContent = state.restarting ? "正在重启服务..." : "重启并进入主页面";
+    }
+
+    async function loadCatalog(force = false) {
+      if (requestBusy) return;
+      if (force) {
+        catalog = null;
+        elements.cudaSelect.dataset.ready = "";
+        requestBusy = true;
+        try { await fetchJson("/api/options/retry", { method: "POST" }); } catch (error) { setNotice(error.message, "error"); }
+        requestBusy = false;
+      }
+      if (state?.catalogStatus !== "ready" || catalog) return;
+      try {
+        const options = await fetchJson("/api/options");
+        if (options.status !== "ready" || !Array.isArray(options.cudaOptions)) return;
+        catalog = options;
+        elements.cudaSelect.dataset.ready = "";
+        setNotice(null);
+      } catch (error) {
+        setNotice(error.message, "error");
+      }
+    }
+
+    async function startConfiguration() {
+      const cuda = selectedCudaOption();
+      const torch = selectedTorchOption();
+      const accelerators = {
+        installXformers: elements.xformersToggle.checked,
+        installRtxVsr: elements.rtxVsrToggle.checked,
+        // Sage cannot run without Triton, so choosing it chooses Triton.
+        installTriton: elements.tritonToggle.checked || elements.sageAttentionToggle.checked,
+        installSageAttention: elements.sageAttentionToggle.checked,
+        autoRepair: elements.autoRepairToggle.checked,
+      };
+      const config = selectedMode === "auto"
+        ? { mode: "auto", ...accelerators }
+        : { mode: "manual", cudaVariant: cuda?.variant, torchVersion: torch?.version, ...accelerators };
+      requestBusy = true;
+      renderSetup();
+      try {
+        await fetchJson("/api/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) });
+        renderedLogCount = 0;
+        setNotice(null);
+        setView("progress");
+      } catch (error) {
+        setNotice(error.message, "error");
+      } finally {
+        requestBusy = false;
+        renderSetup();
+      }
+    }
+
+    async function runRepair() {
+      requestBusy = true;
+      renderProgress();
+      try { await fetchJson("/api/repair", { method: "POST" }); } catch (error) { setNotice(error.message, "error"); } finally { requestBusy = false; }
+    }
+
+    async function retrySetup() {
+      requestBusy = true;
+      renderProgress();
+      try { await fetchJson("/api/retry", { method: "POST" }); } catch (error) { setNotice(error.message, "error"); } finally { requestBusy = false; }
+    }
+
+    async function closeConfigurator() {
+      try {
+        const result = await fetchJson("/api/close", { method: "POST" });
+        if (result.status === "restarting") {
+          for (;;) {
+            await new Promise((resolve) => setTimeout(resolve, 700));
+            try { if ((await fetch("/api/inference/health", { cache: "no-store" })).ok) { window.location.replace("/"); return; } } catch {}
+          }
+        }
+      } catch {}
+      window.close();
+    }
+
+    async function enterApplication() {
+      requestBusy = true;
+      renderProgress();
+      try {
+        await fetchJson("/api/restart", { method: "POST" });
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 700));
+          try { if ((await fetch("/api/inference/health", { cache: "no-store" })).ok) { window.location.replace("/"); return; } } catch {}
+        }
+      } catch (error) {
+        requestBusy = false;
+        setNotice(error.message, "error");
+      }
+    }
+
+    elements.autoMode.addEventListener("click", () => { selectedMode = "auto"; renderSetup(); });
+    elements.manualMode.addEventListener("click", () => { selectedMode = "manual"; renderSetup(); });
+    elements.rtxVsrToggle.addEventListener("change", renderSetup);
+    // Sage implies Triton, so show that rather than silently adding it later.
+    elements.sageAttentionToggle.addEventListener("change", () => {
+      if (elements.sageAttentionToggle.checked) elements.tritonToggle.checked = true;
+      renderSetup();
+    });
+    elements.tritonToggle.addEventListener("change", () => {
+      if (!elements.tritonToggle.checked) elements.sageAttentionToggle.checked = false;
+      renderSetup();
+    });
+    elements.reloadCatalog.addEventListener("click", () => loadCatalog(true));
+    elements.startSetup.addEventListener("click", startConfiguration);
+    elements.closeSetup.addEventListener("click", closeConfigurator);
+    elements.closeProgress.addEventListener("click", closeConfigurator);
+    elements.retrySetup.addEventListener("click", retrySetup);
+    elements.backToChoice.addEventListener("click", () => setView("setup"));
+    elements.copyLog.addEventListener("click", async () => { try { await navigator.clipboard.writeText((state?.logs || []).map((entry) => entry.text).join("\n")); elements.copyLog.textContent = "已复制"; setTimeout(() => { elements.copyLog.textContent = "复制日志"; }, 1200); } catch { setNotice("浏览器未授权复制日志。", "warning"); } });
+    elements.enterApp.addEventListener("click", enterApplication);
+
+    async function poll() {
+      try {
+        state = await fetchJson("/api/state");
+        if (!preferencesRestored && state.configuration) {
+          elements.rtxVsrToggle.checked = state.configuration.installRtxVsr === true;
+          elements.tritonToggle.checked = state.configuration.installTriton === true;
+          elements.sageAttentionToggle.checked = state.configuration.installSageAttention === true;
+          preferencesRestored = true;
+        }
+        if (view === "setup" && ["running", "complete", "error"].includes(state.status)) setView("progress");
+        await loadCatalog();
+        if (view === "setup") renderSetup(); else renderProgress();
+      } catch (error) {
+        if (view === "setup") setNotice(`无法连接配置器：${error.message}`, "error");
+      }
+      setTimeout(poll, 400);
+    }
+    void loadTheme().finally(poll);
+  </script>
+</body>
+</html>

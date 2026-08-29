@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "repository": "Bingsu/adetailer",
+  "revision": "53cc19de382014514d9d4038601d261a7faa9b7b",
+  "models": [
+    {
+      "name": "face_yolov8n.pt",
+      "label": "Face YOLOv8n",
+      "description": "Fast face detector"
+    },
+    {
+      "name": "face_yolov8s.pt",
+      "label": "Face YOLOv8s",
+      "description": "Higher-accuracy face detector"
+    },
+    {
+      "name": "hand_yolov8n.pt",
+      "label": "Hand YOLOv8n",
+      "description": "Hand detector"
+    },
+    {
+      "name": "person_yolov8n-seg.pt",
+      "label": "Person YOLOv8n-seg",
+      "description": "Fast person segmentation"
+    },
+    {
+      "name": "person_yolov8s-seg.pt",
+      "label": "Person YOLOv8s-seg",
+      "description": "Higher-accuracy person segmentation"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+node_modules/
+dist/
+outputs/
+logs/*
+!logs/.gitkeep
+**/__pycache__/
+*.py[cod]
+.venv/
+.venv.backup-*/
+.cache/
+state-cache/
+.env
+.env.local
+.env.*.local
+.XAIG.7z
+Thumbs.db
+.DS_Store
+.finesse/
+
+# Installed plugin folders are user-owned. Keeping them untracked also keeps them out of
+# `npm pack`, which falls back to .gitignore when no .npmignore exists. Only the root placeholder
+# ships with the application.
+plugins/*
+!plugins/README.md
+
+# Local model weights are large and must not be committed.
+models/**/*.safetensors
+models/**/*.ckpt
+models/**/*.pt
+models/**/*.pth
+models/**/*.bin
+models/**/*.onnx
+models/**/*.gguf
+models/**/*.civitai.info
+models/**/*.preview.*

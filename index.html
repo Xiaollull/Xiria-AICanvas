@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0b0c" />
+    <link rel="icon" type="image/svg+xml" href="/xiriacanvas-favicon.svg?palette=nebula-violet-v2" />
+    <title>XiriaCanvas AI</title>
+    <script>
+      try {
+        const savedMotion = localStorage.getItem("xirai_motion_enabled");
+        document.documentElement.dataset.motion = savedMotion === "false" || savedMotion === null && matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on";
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

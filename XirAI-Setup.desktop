@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Configure XiriaCanvas AI
+Comment=GPU detection, PyTorch/CUDA version selection, download, installation and build
+Exec=node -e "const { spawn } = require('node:child_process'); const { join, dirname } = require('node:path'); const { fileURLToPath } = require('node:url'); const value = process.argv[1]; const root = dirname(value.startsWith('file:') ? fileURLToPath(value, { windows: false }) : value); const child = spawn('sh', [join(root, 'Setup-XirAI.sh')], { stdio: 'inherit' }); child.on('error', () => process.exit(1)); child.on('exit', (code) => process.exit(code ?? 1));" %k
+Icon=applications-graphics
+Terminal=true
+Categories=Graphics;Development;

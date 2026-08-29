@@ -1,0 +1,22 @@
+{
+  "checkpoints": {
+    "sd": "models/checkpoints/sd",
+    "illustrious": "models/checkpoints/illustrious"
+  },
+  "loras": {
+    "sd": "models/loras/sd",
+    "illustrious": "models/loras/illustrious",
+    "anima": "models/loras/anima",
+    "flux": "models/loras/flux",
+    "flux2": "models/loras/flux2",
+    "krea2": "models/loras/krea2"
+  },
+  "vae": "models/vae",
+  "diffusion_models": "models/diffusion_models",
+  "text_encoders": "models/text_encoders",
+  "embeddings": "models/embeddings",
+  "upscalers": "models/upscalers",
+  "configs": "models/configs",
+  "yolo": "models/yolo",
+  "background_removal": "models/background-removal"
+}

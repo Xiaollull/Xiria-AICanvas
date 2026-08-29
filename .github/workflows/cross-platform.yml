@@ -1,0 +1,47 @@
+name: Cross-platform verification
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: npm ci
+      - run: npm run setup:cli -- --diagnose --source=official --torch=cpu
+      - run: npm run test:setup
+      - run: python -m venv .venv
+      - run: node -e "import('./scripts/python.mjs').then(({verifyProjectVenv}) => { const result = verifyProjectVenv(process.cwd()); if (!result.ok) throw new Error(result.error); })"
+      - run: node --check vite.config.js
+      - run: node --check scripts/setup.mjs
+      - run: node --check scripts/python.mjs
+      - run: node --check scripts/run-inference.mjs
+      - run: node --check scripts/node-tools.mjs
+      - run: node --check scripts/nvidia.mjs
+      - run: node --check scripts/setup-options.mjs
+      - run: node --check scripts/setup-gui.mjs
+      - run: node --check scripts/setup-state.mjs
+      - run: node --check scripts/start.mjs
+      - run: node --check scripts/torch.mjs
+      - run: python -m py_compile backend/inference_server.py
+      - run: python -m py_compile backend/memory_policy.py
+      - run: npm run test:backend
+      - run: npm run build

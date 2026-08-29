@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Start XiriaCanvas AI
+Comment=Start the configured XiriaCanvas AI WebUI and inference service
+Exec=node -e "const { spawn } = require('node:child_process'); const { join, dirname } = require('node:path'); const { fileURLToPath } = require('node:url'); const value = process.argv[1]; const root = dirname(value.startsWith('file:') ? fileURLToPath(value, { windows: false }) : value); const child = spawn('sh', [join(root, 'Start-XirAI.sh')], { stdio: 'inherit' }); child.on('error', () => process.exit(1)); child.on('exit', (code) => process.exit(code ?? 1));" %k
+Icon=applications-graphics
+Terminal=true
+Categories=Graphics;Development;

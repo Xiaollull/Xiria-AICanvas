@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">XiriaCanvas AI favicon</title>
+  <desc id="description">A symmetric black and nebula-violet folded mark with a central X, broken orbital rings, and a restrained notched-disc backdrop.</desc>
+  <defs>
+    <path id="backplate-notch" d="M 478 40 H 546 V 94 L 512 122 L 478 94 Z"/>
+    <mask id="backplate-mask">
+      <rect width="1024" height="1024" fill="#000000"/>
+      <circle cx="512" cy="512" r="456" fill="#ffffff"/>
+      <g fill="#000000">
+        <use href="#backplate-notch"/>
+        <use href="#backplate-notch" transform="rotate(90 512 512)"/>
+        <use href="#backplate-notch" transform="rotate(180 512 512)"/>
+        <use href="#backplate-notch" transform="rotate(270 512 512)"/>
+      </g>
+    </mask>
+    <path id="fold" d="M 342 286 H 444 L 494 336 V 410 L 464 380 H 398 V 438 L 424 464 L 394 494 H 336 L 286 444 V 342 Z"/>
+  </defs>
+  <circle cx="512" cy="512" r="456" fill="#8b7cff" mask="url(#backplate-mask)"/>
+  <circle cx="512" cy="512" r="434" fill="#ffffff" mask="url(#backplate-mask)"/>
+  <circle cx="512" cy="512" r="414" fill="none" stroke="#c9c5e8" stroke-width="3"/>
+  <g fill="none" stroke="#111112" stroke-width="5">
+    <path d="M 524 132 A 380 380 0 0 1 892 500"/>
+    <path d="M 892 524 A 380 380 0 0 1 524 892"/>
+    <path d="M 500 892 A 380 380 0 0 1 132 524"/>
+    <path d="M 132 500 A 380 380 0 0 1 500 132"/>
+  </g>
+  <g fill="none" stroke="#111112" stroke-width="9">
+    <path id="orbit-tick" d="M 207 207 L 223 223"/>
+    <use href="#orbit-tick" transform="rotate(90 512 512)"/>
+    <use href="#orbit-tick" transform="rotate(180 512 512)"/>
+    <use href="#orbit-tick" transform="rotate(270 512 512)"/>
+  </g>
+  <g fill="none" stroke="#8b7cff" stroke-width="5">
+    <path d="M 395 232 A 303 303 0 0 1 629 232"/>
+    <path d="M 792 395 A 303 303 0 0 1 792 629"/>
+    <path d="M 629 792 A 303 303 0 0 1 395 792"/>
+    <path d="M 232 629 A 303 303 0 0 1 232 395"/>
+  </g>
+  <use href="#fold" fill="#8b7cff" stroke="#111112" stroke-width="5"/>
+  <use href="#fold" fill="#111112" stroke="#8b7cff" stroke-width="5" transform="rotate(90 512 512)"/>
+  <use href="#fold" fill="#8b7cff" stroke="#111112" stroke-width="5" transform="rotate(180 512 512)"/>
+  <use href="#fold" fill="#111112" stroke="#8b7cff" stroke-width="5" transform="rotate(270 512 512)"/>
+  <path fill="#111112" stroke="#8b7cff" stroke-width="5" d="M 432 432 H 461 L 512 483 L 563 432 H 592 V 461 L 541 512 L 592 563 V 592 H 563 L 512 541 L 461 592 H 432 V 563 L 483 512 L 432 461 Z"/>
+</svg>

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "../.Structure/AI_WORKFLOW.md"
+  ],
+  "skills": {
+    "paths": [
+      ".opencode/skills"
+    ]
+  },
+  "references": {
+    "xiriacanvas-structure": {
+      "path": "../.Structure",
+      "description": "Authoritative XiriaCanvas AI architecture, page-block, API, persistence, tooling, test, and reverse task-location index. Read this before searching the project source."
+    }
+  },
+  "permission": {
+    "external_directory": {
+      "D:\\.XAIG\\.Structure\\**": "allow"
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "schema": 3,
+  "models": [
+    {
+      "id": "birefnet-lite-fp16",
+      "repository": "onnx-community/BiRefNet_lite-ONNX",
+      "revision": "de15b22ba131738a16dff04aab8bdf8dc32e3ac1",
+      "license": "MIT",
+      "filename": "birefnet-lite-fp16.onnx",
+      "source_path": "onnx/model_fp16.onnx",
+      "label": "BiRefNet Lite 复杂场景精细抠图",
+      "description": "1024px 高精度前景分割，适合复杂背景、毛发和细线边缘",
+      "size": 114538221,
+      "sha256": "d39b897ceb16ae654c1731f3dba0cf9b368d9cae74b5a57459b455cc8bfec402",
+      "input_size": 1024,
+      "output": "logits",
+      "priority": 300
+    },
+    {
+      "id": "bria-rmbg-2-int8",
+      "repository": "briaai/RMBG-2.0",
+      "revision": "5df4c9c76d8170882c34f6986e848ee07fd0ba43",
+      "modelscope_repository": "briaai/RMBG-2.0",
+      "modelscope_revision": "master",
+      "license": "CC BY-NC 4.0",
+      "filename": "bria-rmbg-2-int8.onnx",
+      "source_path": "onnx/model_int8.onnx",
+      "label": "BRIA RMBG-2.0 INT8 均衡抠图",
+      "description": "366 MB CPU 量化高精度模型，兼顾复杂场景质量、内存占用与速度；仅限非商业自托管使用",
+      "size": 366087445,
+      "sha256": "f8ee7690d8c5e7fc45d7b4938ac2fe4eab63fdeddd537673cda2d4c6e74809af",
+      "input_size": 1024,
+      "output": "probability",
+      "priority": 200
+    },
+    {
+      "id": "bria-rmbg-2-fp16",
+      "repository": "briaai/RMBG-2.0",
+      "revision": "5df4c9c76d8170882c34f6986e848ee07fd0ba43",
+      "modelscope_repository": "briaai/RMBG-2.0",
+      "modelscope_revision": "master",
+      "license": "CC BY-NC 4.0",
+      "filename": "bria-rmbg-2-fp16.onnx",
+      "source_path": "onnx/model_fp16.onnx",
+      "label": "BRIA RMBG-2.0 高精度抠图",
+      "description": "514 MB BiRefNet 高精度模型，适合商品、人像、复杂背景和细发丝；仅限非商业自托管使用",
+      "size": 513576499,
+      "sha256": "9dc47db40d113090ba5d7a13d8fcfd9ee4eda510ce92613219b2fe19da4746f6",
+      "input_size": 1024,
+      "output": "probability",
+      "priority": 100
+    },
+    {
+      "id": "u2netp-onnx",
+      "repository": "BritishWerewolf/U-2-Netp",
+      "revision": "7112208dbac3a3642496c8d54e2f0f9bb3dc1dc8",
+      "license": "Apache-2.0",
+      "filename": "u2netp.onnx",
+      "source_path": "onnx/model.onnx",
+      "label": "U-2-Netp 轻量抠图",
+      "description": "4.36 MB CPU 前景分割，精细模型缺失时自动回退",
+      "size": 4574861,
+      "sha256": "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8",
+      "input_size": 320,
+      "output": "minmax",
+      "selectable": false,
+      "priority": 10
+    }
+  ]
+}
