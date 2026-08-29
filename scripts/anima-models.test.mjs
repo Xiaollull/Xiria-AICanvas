@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  ANIMA_RUNTIME_ARTIFACTS,
   animaRuntimeArtifactStatuses,
   bundledAnimaTokenizerDirectory,
   classifyAnimaSafetensorsHeader,
@@ -181,16 +182,30 @@ test("Anima tokenizers are bundled program resources and not recommended downloa
   }
 
   const expected = {
-    qwen_tokenizer: ["anima-qwen3-tokenizer.json", 7334926, "47ec9be242d3ef39b9c97ac0a3f06c1752f061b234e295bc0a2842067a3fe4f9"],
-    qwen_tokenizer_config: ["anima-qwen3-tokenizer-config.json", 9916, "7992a7924330571ac9b97d58e39d4a4993ccdb865335034cec29cf2c482fd460"],
-    t5_tokenizer: ["anima-t5-tokenizer.json", 1389353, "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"],
+    qwen_tokenizer: {
+      canonical: ["anima-qwen3-tokenizer.json", 7031645, "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"],
+      alternates: [[7334926, "47ec9be242d3ef39b9c97ac0a3f06c1752f061b234e295bc0a2842067a3fe4f9"]],
+    },
+    qwen_tokenizer_config: {
+      canonical: ["anima-qwen3-tokenizer-config.json", 9678, "3c04ed3ca964ea2f6b2b5faf0dc4d31aec1cb1e8b4bcf63f402d295046b422b5"],
+      alternates: [[9916, "7992a7924330571ac9b97d58e39d4a4993ccdb865335034cec29cf2c482fd460"]],
+    },
+    t5_tokenizer: {
+      canonical: ["anima-t5-tokenizer.json", 1389353, "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"],
+      alternates: [],
+    },
   };
   const statuses = await requireBundledAnimaTokenizers(root);
   assert.equal(path.normalize(bundledAnimaTokenizerDirectory(root)), path.normalize(path.join(root, "backend", "resources", "anima-tokenizers")));
-  for (const [name, [filename, size, sha256]] of Object.entries(expected)) {
+  for (const [name, { canonical: [filename, size, sha256], alternates }] of Object.entries(expected)) {
+    const artifact = ANIMA_RUNTIME_ARTIFACTS[name];
+    assert.deepEqual([artifact.filename, artifact.size, artifact.sha256], [filename, size, sha256], `${name} canonical`);
+    assert.deepEqual((artifact.alternates || []).map((variant) => [variant.size, variant.sha256]), alternates, `${name} alternates`);
     const bytes = await readFile(path.join(bundledAnimaTokenizerDirectory(root), filename));
-    assert.equal(bytes.length, size, name);
-    assert.equal(createHash("sha256").update(bytes).digest("hex"), sha256, name);
+    const canonicalBytes = Buffer.from(bytes.toString("utf8").replace(/\r\n/g, "\n"), "utf8");
+    assert.deepEqual([canonicalBytes.length, createHash("sha256").update(canonicalBytes).digest("hex")], [size, sha256], `${name} canonical bytes`);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    assert.ok([[size, sha256], ...alternates].some(([variantSize, variantDigest]) => bytes.length === variantSize && digest === variantDigest), name);
     assert.equal(statuses[name].installed, true, name);
   }
 

@@ -7,13 +7,19 @@ export const MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024;
 export const ANIMA_RUNTIME_ARTIFACTS = Object.freeze({
   qwen_tokenizer: Object.freeze({
     filename: "anima-qwen3-tokenizer.json",
-    size: 7334926,
-    sha256: "47ec9be242d3ef39b9c97ac0a3f06c1752f061b234e295bc0a2842067a3fe4f9",
+    size: 7031645,
+    sha256: "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+    alternates: Object.freeze([
+      Object.freeze({ size: 7334926, sha256: "47ec9be242d3ef39b9c97ac0a3f06c1752f061b234e295bc0a2842067a3fe4f9" }),
+    ]),
   }),
   qwen_tokenizer_config: Object.freeze({
     filename: "anima-qwen3-tokenizer-config.json",
-    size: 9916,
-    sha256: "7992a7924330571ac9b97d58e39d4a4993ccdb865335034cec29cf2c482fd460",
+    size: 9678,
+    sha256: "3c04ed3ca964ea2f6b2b5faf0dc4d31aec1cb1e8b4bcf63f402d295046b422b5",
+    alternates: Object.freeze([
+      Object.freeze({ size: 9916, sha256: "7992a7924330571ac9b97d58e39d4a4993ccdb865335034cec29cf2c482fd460" }),
+    ]),
   }),
   t5_tokenizer: Object.freeze({
     filename: "anima-t5-tokenizer.json",
@@ -35,7 +41,9 @@ export async function animaRuntimeArtifactStatuses(directory, hashFile = hashRun
     const filePath = path.join(directory, artifact.filename);
     try {
       const fileStat = await stat(filePath);
-      if (!fileStat.isFile() || fileStat.size !== artifact.size) {
+      const variants = [artifact, ...(artifact.alternates || [])];
+      const sizeMatches = variants.filter((variant) => variant.size === fileStat.size);
+      if (!fileStat.isFile() || !sizeMatches.length) {
         return [name, { path: filePath, installed: false, reason: "file size mismatch" }];
       }
       const sha256 = await hashFile({
@@ -44,7 +52,7 @@ export async function animaRuntimeArtifactStatuses(directory, hashFile = hashRun
         mtimeMs: fileStat.mtimeMs,
         ctimeMs: fileStat.ctimeMs,
       });
-      return sha256 === artifact.sha256
+      return sizeMatches.some((variant) => sha256 === variant.sha256)
         ? [name, { path: filePath, installed: true, reason: null }]
         : [name, { path: filePath, installed: false, reason: "SHA-256 mismatch" }];
     } catch (error) {
