@@ -204,6 +204,19 @@ export function createInstallerRunner({
           // uv names a file and its size but never its progress. The filesystem meter supplies that,
           // counted from here so the reading belongs to this file rather than to the whole phase.
           fileBaselineBytes = observedBytes;
+        } else if (event.kind === "file-complete") {
+          // uv names a file when it starts and again when it finishes, and says nothing whatsoever
+          // in between or about the files it is fetching concurrently. Without releasing the name
+          // here the panel holds the last finished package at 100% for the whole remainder of the
+          // phase — twenty-three minutes of it, when this was measured against the CUDA runtime
+          // set — which is the frozen bar this module exists to remove. Falling back to the
+          // filesystem meter reports the phase honestly instead.
+          if (event.name === currentName) {
+            currentName = label;
+            currentTotal = 0;
+            currentBytes = 0;
+            fileBaselineBytes = observedBytes;
+          }
         } else if (event.kind === "bytes") {
           currentName = event.name;
           currentTotal = event.totalBytes;

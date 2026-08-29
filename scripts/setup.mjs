@@ -725,8 +725,12 @@ if (!basePython) {
 }
 
 if (!diagnoseOnly && !existsSync(venvPythonPath)) {
-  const result = runPython(basePython, ["-I", "-m", "venv", venvRoot], { cwd: projectRoot, env: isolatedPythonEnv(process.env) });
-  if (result.status !== 0) fail("无法创建项目独立 Python 环境；Linux 请确认已安装 python3-venv");
+  // A non-zero exit is not fatal by itself. Debian and Ubuntu ship ensurepip in a separate
+  // python3-venv package, so on a stock image this command lays down the directory and the
+  // interpreter symlink and *then* exits non-zero — which is precisely the case the uv repair
+  // below was written to handle. Stopping here would send the user off to `apt install
+  // python3-venv` for something the bundled uv fixes without any system package at all.
+  runPython(basePython, ["-I", "-m", "venv", venvRoot], { cwd: projectRoot, env: isolatedPythonEnv(process.env) });
 }
 // A venv without pip is the shape `python -m venv` leaves behind when ensurepip is missing — the
 // Debian and Ubuntu split of python3-venv is the usual cause. It creates the directory layout and
@@ -735,8 +739,11 @@ if (!diagnoseOnly && !existsSync(venvPythonPath)) {
 // uv can seed a complete environment without any system package, so repair it rather than sending
 // the user away to install one.
 if (!diagnoseOnly) {
-  const seededPython = findPython(projectRoot);
-  if (!seededPython || !pythonCheck(seededPython, "import ensurepip,pip", isolatedPythonEnv(process.env))) {
+  // Only a `.venv` interpreter counts as seeded: when the creation above left nothing behind,
+  // `findPython` would otherwise answer with the system interpreter, and a system pip would then
+  // pass the check and leave the project with no environment at all.
+  const seededPython = existsSync(venvPythonPath) ? findPython(projectRoot) : null;
+  if (!seededPython || seededPython.source !== ".venv" || !pythonCheck(seededPython, "import ensurepip,pip", isolatedPythonEnv(process.env))) {
     emit("warning", { message: "项目 Python 环境缺少 pip（Linux 上通常是未安装 python3-venv），正在使用项目内 uv 重建完整环境" });
     if (existsSync(venvRoot)) {
       const backupPath = path.join(projectRoot, `.venv.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`);
@@ -1050,7 +1057,13 @@ function checkForTorchvision(plan) {
   return [
     "import torch,torchvision",
     `assert torch.__version__==${JSON.stringify(plan.version)}`,
-    `assert str(torchvision.version.cuda)==${JSON.stringify(cudaRuntime)}, f'torchvision built for CUDA {torchvision.version.cuda}, torch for {torch.version.cuda}'`,
+    // torchvision reports its CUDA build as a packed integer from 0.28 onward — 12060 for 12.6 —
+    // where it used to be a dotted string and where torch still is one. Compared raw, a correctly
+    // matched pair reads as a mismatch: torchvision 0.28.0+cu126 beside torch 2.13.0+cu126 failed
+    // this assert on every mirror in turn and ended the whole run with "no matching torchvision",
+    // having in fact installed the right wheel. Both forms are normalised to major.minor first.
+    "_cuda=lambda v:(lambda t: f'{int(t)//1000}.{(int(t)%1000)//10}' if t.isdigit() and len(t)>=4 else t)(str(v))",
+    `assert _cuda(torchvision.version.cuda)==_cuda(${JSON.stringify(cudaRuntime)}), f'torchvision built for CUDA {torchvision.version.cuda}, torch for {torch.version.cuda}'`,
     "from torchvision.ops import nms",
     "assert nms(torch.tensor([[0.,0.,1.,1.],[0.,0.,1.,1.]]),torch.tensor([0.9,0.5]),0.5).numel()==1",
   ].join(";");
@@ -1193,7 +1206,7 @@ if (installedTorchvision.status === 0 && installedTorchvision.stdout.trim()) {
 startTask("backend");
 const pipelineConfigsScript = path.join(projectRoot, "backend", "pipeline_configs.py");
 const backendFingerprint = digest(`${pythonVersion}:${torchPlan.version}:${backendPackages.join("\n")}:${readFileSync(pipelineConfigsScript, "utf8")}`);
-const backendCheck = "import accelerate,diffusers,fastapi,huggingface_hub,numpy,onnxruntime,peft,PIL,psutil,pydantic,safetensors,scipy,spandrel,spandrel_extra_arches,transformers,ultralytics,uvicorn;from diffusers import AutoencoderKLQwenImage,CosmosTransformer3DModel;from diffusers.loaders.single_file_utils import convert_cosmos_transformer_checkpoint_to_diffusers,convert_wan_vae_to_diffusers;from transformers import Qwen3Config,Qwen3Model,T5TokenizerFast";
+const backendCheck = "import accelerate,diffusers,fastapi,huggingface_hub,numpy,onnxruntime,peft,PIL,psutil,pydantic,safetensors,scipy,spandrel,spandrel_extra_arches,transformers,ultralytics,uvicorn;from diffusers import AutoencoderKLQwenImage,AutoencoderKLWan,CosmosTransformer3DModel;from diffusers.loaders.single_file_utils import convert_cosmos_transformer_checkpoint_to_diffusers,convert_wan_vae_to_diffusers;from transformers import Qwen3Config,Qwen3Model,Qwen3VLTextModel,T5TokenizerFast";
 const backendDependenciesReady = pythonCheck(venvPython, backendCheck, installEnvironment);
 const checkPipelineConfigs = (scope = []) => runPython(venvPython, [pipelineConfigsScript, "--check", ...scope, "--installed", projectRoot], {
   cwd: projectRoot,
@@ -1549,7 +1562,7 @@ try {
   fail(error.message);
 }
 const verification = [
-   "import torch,torchvision,fastapi,diffusers,transformers,psutil,numpy,onnxruntime,scipy,ultralytics;from diffusers import AutoencoderKLQwenImage,CosmosTransformer3DModel;from transformers import Qwen3Config,Qwen3Model,T5TokenizerFast",
+   "import torch,torchvision,fastapi,diffusers,transformers,psutil,numpy,onnxruntime,scipy,ultralytics;from diffusers import AutoencoderKLQwenImage,AutoencoderKLWan,CosmosTransformer3DModel;from transformers import Qwen3Config,Qwen3Model,Qwen3VLTextModel,T5TokenizerFast",
   "from torchvision.ops import nms",
   "assert nms(torch.tensor([[0.,0.,1.,1.],[0.,0.,1.,1.]]),torch.tensor([0.9,0.5]),0.5).numel()==1",
   "print('Python environment ready')",

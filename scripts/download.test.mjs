@@ -386,7 +386,7 @@ test("a segment leaves a mirror that turns out slow in flight, while the move ca
   assert.equal(segment.switches, 1);
   assert.equal(pool.shouldLeave(a, { ...segment, switches: 0 }), false, "the fastest mirror is never abandoned");
 
-  // A tail that is nearly finished is not worth another handshake, however slow the link is.
+  // A tail this mirror can still finish in a couple of seconds is not worth another handshake.
   assert.equal(pool.shouldLeave(b, { start: 0, end: 1024 ** 2, downloaded: 0, switches: 0 }), false);
 
   // Two mirrors that measure alternately faster must not trade a segment back and forth instead of
@@ -397,6 +397,43 @@ test("a segment leaves a mirror that turns out slow in flight, while the move ca
   // turn a slow download into no download.
   const alone = downloadInternals.createRoutePool([b], 2, { now: () => clock });
   assert.equal(alone.shouldLeave(b, { ...segment, switches: 0 }), false);
+});
+
+test("the last megabyte still moves off a mirror that has collapsed", () => {
+  // Observed configuring a fresh cloud host: of three mirrors serving the uv archive, two had
+  // finished their segments and sat idle at zero connections while the tail of the file arrived at
+  // 9 KB/s on the third. The remainder had fallen under the splitting floor, so the segment could
+  // neither be split nor moved, and the download spent nearly two minutes on its last megabyte with
+  // the ETA climbing. Size was the wrong question to ask; the wait was the whole problem.
+  let clock = 0;
+  const fast = { id: "fast", label: "fast", url: "https://fast.test/uv", speedBps: 2 * 1024 ** 2 };
+  const collapsed = { id: "collapsed", label: "collapsed", url: "https://collapsed.test/uv", speedBps: 2 * 1024 ** 2 };
+  const pool = downloadInternals.createRoutePool([fast, collapsed], 3, { now: () => clock });
+  pool.acquire(fast);
+  pool.acquire(collapsed);
+  pool.record(fast, 0);
+  pool.record(collapsed, 0);
+  clock = 10_000;
+  pool.record(fast, 870 * 1024);       // 87 KB/s
+  pool.record(collapsed, 93 * 1024);   // 9.3 KB/s, from an identical benchmark
+
+  // Just under a megabyte left: 104 seconds of staying against 11 seconds of transfer plus a
+  // handshake somewhere else.
+  const tail = { start: 0, end: 991_957, downloaded: 0, switches: 0 };
+  assert.equal(pool.shouldLeave(collapsed, tail), true);
+  assert.equal(tail.switches, 1);
+
+  // The same small remainder stays put when the mirror it is on can actually finish it, so the
+  // handshake is only ever spent on a wait that justifies it.
+  const healthy = downloadInternals.createRoutePool([fast, collapsed], 3, { now: () => clock });
+  healthy.acquire(fast);
+  healthy.acquire(collapsed);
+  healthy.record(fast, 0);
+  healthy.record(collapsed, 0);
+  clock = 20_000;
+  healthy.record(fast, 10 * 1024 ** 2);
+  healthy.record(collapsed, 2 * 1024 ** 2);
+  assert.equal(healthy.shouldLeave(collapsed, { start: 0, end: 991_957, downloaded: 0, switches: 0 }), false);
 });
 
 test("a mirror an order of magnitude slower is not given an equal share of the segments", () => {

@@ -281,6 +281,40 @@ test("a phase with nothing to report still reports the bytes it is writing", asy
   await pending;
 });
 
+test("a finished package releases the panel instead of holding it at 100%", async (t) => {
+  // Measured installing the CUDA runtime set: uv named one package, finished it, and then said
+  // nothing for twenty-three minutes while it fetched the rest concurrently. The panel held that
+  // one completed package at 100% the entire time — a frozen bar again, only at the other end.
+  let bytes = 0;
+  const { runInstaller, child, events } = runnerHarness(t, { meterBytes: () => bytes });
+  const pending = runInstaller({ command: "uv", args: [], label: "PyTorch", meterDirectories: ["/cache"] });
+  await settle(15);
+  child.stdout.emit("data", "Downloading nvidia-cusolver-cu12 (150.9MiB)\n");
+  bytes = 150 * 1024 ** 2;
+  await settle();
+  assert.equal(events.filter((event) => event.type === "download").at(-1).name, "nvidia-cusolver-cu12");
+
+  child.stdout.emit("data", "Downloaded nvidia-cusolver-cu12\n");
+  bytes = 900 * 1024 ** 2;
+  await settle();
+  const released = events.filter((event) => event.type === "download").at(-1);
+  assert.equal(released.name, "PyTorch");
+  assert.equal(released.indeterminate, true, "the finished package still owns the panel");
+  assert.equal(released.totalBytes, 0);
+  assert.ok(released.currentBytes > 150 * 1024 ** 2, "the meter should carry the phase once the name is released");
+
+  // A completion notice for some *other* package must not steal the panel from the one still running.
+  child.stdout.emit("data", "Downloading nvidia-cublas-cu12 (400MiB)\n");
+  await settle();
+  child.stdout.emit("data", "Downloaded nvidia-cudnn-cu12\n");
+  await settle();
+  const stillRunning = events.filter((event) => event.type === "download").at(-1);
+  assert.equal(stillRunning.name, "nvidia-cublas-cu12");
+  assert.equal(stillRunning.indeterminate, false);
+  child.emit("close", 0);
+  await pending;
+});
+
 test("a mirror that goes silent is ended once and reported as stalled", async (t) => {
   let now = 0;
   const { runInstaller, child, events } = runnerHarness(t, { clock: () => now });

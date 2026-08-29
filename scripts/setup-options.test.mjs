@@ -369,6 +369,29 @@ test("an explicitly configured torch index outranks the one a plan was resolved 
   assert.match(setup, /function checkForTorchvision\(plan\)/);
   assert.match(setup, /from torchvision\.ops import nms/);
   assert.match(setup, /torchvision==\$\{installedTorchvision\.stdout\.trim\(\)\}/);
+  // torchvision 0.28 reports `version.cuda` as the packed integer 12060 where torch reports the
+  // string "12.6". Compared raw, torchvision 0.28.0+cu126 beside torch 2.13.0+cu126 read as a
+  // mismatch and ended a completed install with "no matching torchvision", so the comparison
+  // normalises both spellings instead of stringifying one of them.
+  assert.doesNotMatch(setup, /assert str\(torchvision\.version\.cuda\)==/);
+  assert.match(setup, /_cuda=lambda v:/);
+  assert.match(setup, /assert _cuda\(torchvision\.version\.cuda\)==_cuda\(/);
+});
+
+test("the environment check proves the symbols Krea 2 loads through, not just the packages", async () => {
+  const setup = await readFile(new URL("./setup.mjs", import.meta.url), "utf8");
+  // `requirements.txt` floors transformers at 4.51 and diffusers at 0.38, but Krea 2 mounts a
+  // Qwen3-VL encoder and a Wan autoencoder that arrived later than the transformers floor. Both
+  // verification passes imported `Qwen3Config` and `Qwen3Model` and neither of these, so a
+  // resolver that landed an older transformers would report a fully configured environment and
+  // then fail at load time — with Krea 2 shipping as a ready engine.
+  for (const symbol of ["AutoencoderKLWan", "Qwen3VLTextModel", "convert_wan_vae_to_diffusers"]) {
+    const occurrences = setup.split(symbol).length - 1;
+    assert.ok(occurrences >= 1, `the configurator never verifies ${symbol}, which Krea 2 imports`);
+  }
+  // Both passes, not only the first: the second is what the "verify" task reports green on.
+  assert.equal(setup.split("AutoencoderKLWan").length - 1, 2);
+  assert.equal(setup.split("Qwen3VLTextModel").length - 1, 2);
 });
 
 test("setup keeps Triton when PyTorch requires it rather than failing pip check", async () => {

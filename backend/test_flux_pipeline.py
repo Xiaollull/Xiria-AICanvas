@@ -133,6 +133,48 @@ class ScaledFp8Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dequantize_scaled_fp8({"scaled_fp8": torch.zeros(()), "ghost.scale_weight": torch.tensor(1.0)}, torch.float32)
 
+    def test_the_other_spelling_of_the_same_scale_is_recognised(self):
+        # Comfy-Org's Krea 2 fp8 checkpoint writes `<layer>.weight_scale` where ComfyUI writes
+        # `<layer>.scale_weight`, and carries no `scaled_fp8` marker. Read as unscaled, all 256 of
+        # its scales fell out as unclaimed tensors and the transformer ran at the wrong scale —
+        # which loads and samples perfectly happily, and produces a wrong image.
+        self.assertTrue(checkpoint_is_scaled_fp8({"img_in.weight_scale": torch.ones(())}))
+
+    def test_the_other_spelling_is_folded_in_the_same_way(self):
+        state = {
+            "img_in.weight": torch.tensor([[2.0, 4.0]]),
+            "img_in.weight_scale": torch.tensor(0.5),
+            "img_in.bias": torch.tensor([1.0]),
+        }
+        resolved = dequantize_scaled_fp8(state, torch.float32)
+        self.assertEqual(sorted(resolved), ["img_in.bias", "img_in.weight"])
+        self.assertTrue(torch.equal(resolved["img_in.weight"], torch.tensor([[1.0, 2.0]])))
+
+    def test_a_folded_weight_is_narrowed_as_it_is_produced(self):
+        # Holding every dequantised layer in float32 until a final pass costs four bytes per
+        # parameter for the whole model at once. Krea 2's 12.2 GB fp8 transformer needs about 49 GB
+        # that way, and the load was OOM-killed at 64.9 GB RSS on a 62 GB machine.
+        state = {
+            "img_in.weight": torch.tensor([[2.0, 4.0]]),
+            "img_in.weight_scale": torch.tensor(0.5),
+        }
+        resolved = dequantize_scaled_fp8(state, torch.bfloat16)
+        self.assertEqual(resolved["img_in.weight"].dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(resolved["img_in.weight"], torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)))
+
+    def test_a_plain_norm_scale_is_left_alone(self):
+        # This format also carries ordinary bf16 norm parameters named `.scale`, such as
+        # `last.norm.scale`. Treating those as quantisation state would strip real weights out of
+        # the checkpoint and fail the strict load.
+        state = {
+            "img_in.weight": torch.tensor([[2.0]]),
+            "img_in.weight_scale": torch.tensor(0.5),
+            "last.norm.scale": torch.tensor([3.0]),
+        }
+        resolved = dequantize_scaled_fp8(state, torch.float32)
+        self.assertEqual(sorted(resolved), ["img_in.weight", "last.norm.scale"])
+        self.assertTrue(torch.equal(resolved["last.norm.scale"], torch.tensor([3.0])))
+
 
 def comfy_quant_marker(quant_format, **extra):
     """The `comfy_quant` tensor ComfyUI writes: the layer's JSON configuration, stored as bytes."""

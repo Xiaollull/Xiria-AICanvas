@@ -101,6 +101,9 @@ FLUX_DISTILLED_T5_SEQUENCE_LENGTH = 256
 # linear. The stored weight is float8_e4m3fn and the real weight is `stored * scale`.
 FLUX_SCALED_FP8_MARKER = "scaled_fp8"
 FLUX_SCALE_WEIGHT_SUFFIX = ".scale_weight"
+# The same per-tensor fp8 scale, under the two names publishers give it. ComfyUI's own repackages
+# use the first; Comfy-Org's Krea 2 fp8 checkpoint uses the second.
+FLUX_SCALE_WEIGHT_SUFFIXES = (FLUX_SCALE_WEIGHT_SUFFIX, ".weight_scale")
 FLUX_INPUT_SCALE_SUFFIX = ".scale_input"
 
 # ComfyUI's newer mixed-precision checkpoints describe every quantised linear individually: a
@@ -261,9 +264,32 @@ def normalize_flux_checkpoint_keys(state_dict: Mapping[str, torch.Tensor]) -> di
     return normalized
 
 
+def _scale_weight_layer(key: str) -> str | None:
+    """The layer a per-tensor fp8 scale belongs to, or None if this key is not one.
+
+    ComfyUI writes `<layer>.scale_weight`. The Krea 2 repackage writes the same scalar as
+    `<layer>.weight_scale`, and reading only the first spelling meant its scales were never folded
+    in: the weights loaded as raw fp8 cast to bf16, the scales fell out as unclaimed tensors, and
+    the model ran — quietly, at the wrong scale. Both spellings mean the same thing.
+
+    `.scale` on its own is deliberately not accepted: this format uses it for ordinary bf16 norm
+    parameters such as `last.norm.scale`, which must not be mistaken for quantisation state.
+    """
+    for suffix in FLUX_SCALE_WEIGHT_SUFFIXES:
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return None
+
+
 def checkpoint_is_scaled_fp8(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    if checkpoint_is_mixed_precision(state_dict):
+        # `.weight_scale` is also how the per-layer mixed-precision layout spells its scale, and
+        # that layout is identified by its `comfy_quant` markers and has its own dequantiser. The
+        # two predicates stay mutually exclusive, so a marker always wins. What Krea 2 has is the
+        # mixed-precision *spelling* with no markers at all: uniformly scaled fp8, and this one.
+        return False
     return FLUX_SCALED_FP8_MARKER in state_dict or any(
-        key.endswith(FLUX_SCALE_WEIGHT_SUFFIX) for key in state_dict
+        _scale_weight_layer(key) is not None for key in state_dict
     )
 
 
@@ -274,14 +300,14 @@ def dequantize_scaled_fp8(state_dict: Mapping[str, torch.Tensor], dtype: torch.d
     modules have no such op, so the scale has to be applied once here instead — dropping it would
     not fail, it would quietly produce a differently-scaled model.
     """
-    scales = {
-        key[: -len(FLUX_SCALE_WEIGHT_SUFFIX)]: value
-        for key, value in state_dict.items()
-        if key.endswith(FLUX_SCALE_WEIGHT_SUFFIX)
-    }
+    scales = {}
+    for key, value in state_dict.items():
+        layer = _scale_weight_layer(key)
+        if layer is not None:
+            scales[layer] = value
     resolved = {}
     for key, value in state_dict.items():
-        if key == FLUX_SCALED_FP8_MARKER or key.endswith(FLUX_SCALE_WEIGHT_SUFFIX):
+        if key == FLUX_SCALED_FP8_MARKER or _scale_weight_layer(key) is not None:
             continue
         if key.endswith(FLUX_INPUT_SCALE_SUFFIX):
             # An activation scale only matters to an fp8 matmul kernel. Full-precision weights make
@@ -291,7 +317,13 @@ def dequantize_scaled_fp8(state_dict: Mapping[str, torch.Tensor], dtype: torch.d
             layer = key[: -len(".weight")]
             scale = scales.get(layer)
             if scale is not None:
-                resolved[key] = value.to(dtype=torch.float32) * scale.to(dtype=torch.float32).reshape(())
+                # Narrowed here rather than in one pass at the end. The product has to be taken in
+                # float32 to keep the scale's precision, but holding every layer in float32 until
+                # the final cast means a peak of four bytes per parameter for the whole model:
+                # Krea 2's 12.2 GB fp8 transformer needs about 49 GB that way, and the load was
+                # OOM-killed at 64.9 GB on a 62 GB machine. Casting each tensor as it is produced
+                # keeps exactly one float32 copy alive and gives identical numbers.
+                resolved[key] = (value.to(dtype=torch.float32) * scale.to(dtype=torch.float32).reshape(())).to(dtype)
                 continue
         resolved[key] = value
     unused = set(scales) - {key[: -len(".weight")] for key in state_dict if key.endswith(".weight")}

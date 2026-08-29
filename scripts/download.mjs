@@ -172,9 +172,15 @@ const TOTAL_ATTEMPT_LIMIT = 64;
 // Hard failures a route may accumulate across the whole download before it is dropped. Without this
 // a single dead mirror would be re-leased by every segment in turn.
 const ROUTE_FAILURE_LIMIT = 3;
-// A segment smaller than this is not worth splitting or moving: the new request's handshake would
-// cost more than the transfer it saves.
+// A segment smaller than this is not worth splitting: the second request's handshake would cost
+// more than the halved transfer saves. Moving a segment is judged on time rather than size — see
+// `shouldLeave` — because the last megabyte of a file on a mirror that has collapsed to a few KB/s
+// is exactly the case where a fresh request pays for itself many times over.
 const MINIMUM_SPLIT_BYTES = 4 * 1024 ** 2;
+// What a move costs before it transfers anything: DNS, connect, TLS and the first byte. Measured
+// TTFB against the configured mirrors sits well under a second; this leaves room for the worst of
+// them without ever making a genuinely useful move look unprofitable.
+const ROUTE_SWITCH_HANDSHAKE_SECONDS = 1.5;
 // How often an in-flight segment re-examines whether its mirror is still the right one.
 const ROUTE_REVIEW_INTERVAL_MS = 4000;
 // How many times one segment may move to a different mirror, so a pair of routes that measure
@@ -259,10 +265,17 @@ function createRoutePool(routes, connections, { now = () => performance.now() } 
       const mine = laneSpeed(entry);
       if (!mine) return false;
       const remaining = segment.end - segment.start - segment.downloaded + 1;
-      if (remaining < MINIMUM_SPLIT_BYTES) return false;
-      if (remaining / mine < SLOW_ROUTE_MINIMUM_SECONDS) return false;
+      // Deliberately not gated on `MINIMUM_SPLIT_BYTES`. The last segment of a download is the one
+      // that decides when the file is finished, and when its mirror has collapsed the remainder is
+      // small but the wait is not: a megabyte at 9 KB/s is nearly two minutes while every other
+      // route sits idle. Size is the wrong question; the two tests below ask the right one.
+      const stayingSeconds = remaining / mine;
+      if (stayingSeconds < SLOW_ROUTE_MINIMUM_SECONDS) return false;
       const bestAlternative = Math.max(...alternatives.map(laneSpeed));
       if (bestAlternative < mine * SLOW_ROUTE_RATIO) return false;
+      // Charge the move its handshake, so a switch is only taken when finishing somewhere else is
+      // still faster than staying even after paying to get there.
+      if (ROUTE_SWITCH_HANDSHAKE_SECONDS + remaining / bestAlternative >= stayingSeconds) return false;
       segment.switches += 1;
       return true;
     },
