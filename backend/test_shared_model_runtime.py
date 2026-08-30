@@ -83,6 +83,8 @@ class SharedModelRuntimeTests(unittest.TestCase):
         self.assertEqual(inference_server.public_model_reference(reference), reference)
         self.assertEqual(inference_server.public_model_reference("sd/base.safetensors"), "sd/base.safetensors")
         self.assertEqual(inference_server.public_model_reference("C:\\absolute\\base.safetensors"), "base.safetensors")
+        self.assertEqual(inference_server.public_model_reference("/absolute/base.safetensors"), "base.safetensors")
+        self.assertEqual(inference_server.public_model_reference("..\\escape.safetensors"), "escape.safetensors")
 
 
 if __name__ == "__main__":

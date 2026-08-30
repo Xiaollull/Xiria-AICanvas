@@ -1210,6 +1210,7 @@ class AnimaRuntimeContractTests(unittest.TestCase):
         )
         real_torch_device = torch.device
         with (
+            patch.object(torch.cuda, "is_available", return_value=True),
             patch.object(torch, "device", side_effect=lambda value: real_torch_device("cpu") if value == "cuda" else real_torch_device(value)),
             patch("backend.anima_pipeline._empty_cuda_cache"),
         ):
@@ -1239,6 +1240,7 @@ class AnimaRuntimeContractTests(unittest.TestCase):
         )
         real_torch_device = torch.device
         with (
+            patch.object(torch.cuda, "is_available", return_value=True),
             patch.object(
                 torch,
                 "device",
@@ -1276,6 +1278,7 @@ class AnimaRuntimeContractTests(unittest.TestCase):
         )
         real_torch_device = torch.device
         with (
+            patch.object(torch.cuda, "is_available", return_value=True),
             patch.object(
                 torch,
                 "device",
@@ -1489,9 +1492,11 @@ class AnimaRuntimeContractTests(unittest.TestCase):
             self.assertEqual(len(derived), 1)
             self.assertEqual(derived[0].initial_seed(), seed)
             self.assertEqual(torch.device(derived[0].device).type, "cuda")
+        else:
+            with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+                anima_pipeline._derive_cuda_generators([base])
         with self.assertRaises(ValueError):
-            anima_pipeline._derive_cuda_generators([torch.Generator(device="cuda").manual_seed(seed)]
-                                                   if torch.cuda.is_available() else ["not-a-generator"])
+            anima_pipeline._derive_cuda_generators(["not-a-generator"])
 
     def test_lora_family_plans_selects_only_the_requested_family(self):
         runtime = AnimaRuntime.__new__(AnimaRuntime)
@@ -2225,7 +2230,10 @@ class AnimaRuntimeContractTests(unittest.TestCase):
         sigmas = prepare_anima_refinement_sigmas(2, 1.0, "normal")
         image = Image.new("RGB", (32, 32))
         final_states = []
-        with patch.object(torch.cuda, "is_available", return_value=True):
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "is_bf16_supported", return_value=True),
+        ):
             for _ in range(4):
                 generator = torch.Generator(device="cpu").manual_seed(9)
                 runtime.refine_batch(
@@ -2248,7 +2256,10 @@ class AnimaRuntimeContractTests(unittest.TestCase):
         generator = torch.Generator(device="cpu")
         bad_conditioning = PreparedAnimaConditioning("other", "negative", 1.0, "none", torch.ones((1, 2, 3), dtype=torch.bfloat16))
         valid_conditioning = PreparedAnimaConditioning("prompt", "negative", 1.0, "none", torch.ones((1, 2, 3), dtype=torch.bfloat16))
-        with patch.object(torch.cuda, "is_available", return_value=True):
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "is_bf16_supported", return_value=True),
+        ):
             with self.assertRaisesRegex(ValueError, "does not match"):
                 runtime.refine_batch(
                     [image], "prompt", "negative", 2, 1.0, 1.0, "euler", "normal", [generator], "none",
@@ -2401,6 +2412,18 @@ class AnimaAccelerationTests(unittest.TestCase):
         transformer.transformer_blocks = torch.nn.ModuleList(self._Block() for _ in range(count))
         runtime.transformer = transformer
         return runtime
+
+    @contextmanager
+    def _cuda_pinned_memory_path(self):
+        """Model the CUDA host-pinning contract without requiring a CI GPU."""
+        def pin_memory(tensor):
+            return tensor.contiguous().clone()
+
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.Tensor, "pin_memory", new=pin_memory),
+        ):
+            yield
 
     def test_compilation_leaves_every_parameter_path_addressable(self):
         runtime = self._runtime_with_blocks()
@@ -2622,7 +2645,8 @@ class AnimaAccelerationTests(unittest.TestCase):
         runtime = self._runtime_with_blocks(count=2)
         runtime.dtype = torch.float32
         runtime.keep_transformer_resident = False
-        runtime._pin_transformer()
+        with self._cuda_pinned_memory_path():
+            runtime._pin_transformer()
 
         mirror = runtime._transformer_host_buffers
         self.assertTrue(runtime._transformer_pinned)
@@ -2662,7 +2686,8 @@ class AnimaAccelerationTests(unittest.TestCase):
     def test_a_mirror_that_stops_describing_the_weights_is_rebuilt_not_copied_into(self):
         runtime = self._runtime_with_blocks(count=2)
         runtime.dtype = torch.float32
-        runtime._pin_transformer()
+        with self._cuda_pinned_memory_path():
+            runtime._pin_transformer()
         for _name, parameter in runtime.transformer.named_parameters():
             parameter.data = parameter.data.clone().to(torch.float16)
         runtime._park_transformer_on_cpu()
@@ -2672,7 +2697,8 @@ class AnimaAccelerationTests(unittest.TestCase):
     def test_group_offload_releases_the_mirror_it_can_no_longer_describe(self):
         runtime = self._runtime_with_blocks()
         runtime.dtype = torch.float32
-        runtime._pin_transformer()
+        with self._cuda_pinned_memory_path():
+            runtime._pin_transformer()
         self.assertIsNotNone(runtime._transformer_host_buffers)
         runtime.transformer.enable_group_offload = lambda **_kwargs: None
         runtime.enable_transformer_group_offload(1)
@@ -2685,10 +2711,21 @@ class AnimaAccelerationTests(unittest.TestCase):
         runtime.text_encoder = runtime.llm_adapter = runtime.vae = None
         runtime.qwen_tokenizer = runtime.t5_tokenizer = None
         runtime.components = {}
-        runtime._pin_transformer()
+        with self._cuda_pinned_memory_path():
+            runtime._pin_transformer()
         runtime.close()
         self.assertIsNone(runtime._transformer_host_buffers)
         self.assertFalse(runtime._transformer_pinned)
+
+    def test_cpu_only_runtime_never_attempts_to_pin_transformer_memory(self):
+        runtime = self._runtime_with_blocks(count=2)
+        with (
+            patch.object(torch.cuda, "is_available", return_value=False),
+            patch.object(torch.Tensor, "pin_memory", side_effect=AssertionError("pinning must be skipped on CPU-only installs")),
+        ):
+            runtime._pin_transformer()
+        self.assertIsNone(getattr(runtime, "_transformer_host_buffers", None))
+        self.assertFalse(getattr(runtime, "_transformer_pinned", False))
 
     def test_sage_callable_is_reported_honestly(self):
         from backend.anima_pipeline import sage_attention_callable

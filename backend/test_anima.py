@@ -1,5 +1,6 @@
 import json
 import copy
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -260,6 +261,31 @@ class AnimaPathAndHealthTests(unittest.TestCase):
             {inference_server.ANIMA_TOKENIZER_DIRECTORY},
         )
 
+    def test_anima_tokenizer_integrity_accepts_only_declared_line_ending_variants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            filename = "tokenizer.json"
+            lf = b'{"line":"one"}\n'
+            crlf = lf.replace(b"\n", b"\r\n")
+            variants = {
+                "qwen": (
+                    (filename, len(lf), hashlib.sha256(lf).hexdigest()),
+                    (filename, len(crlf), hashlib.sha256(crlf).hexdigest()),
+                ),
+            }
+            artifacts = {"qwen": variants["qwen"][0]}
+            with patch.object(inference_server, "ANIMA_TOKENIZER_ARTIFACTS", artifacts), patch.object(
+                inference_server, "ANIMA_TOKENIZER_ARTIFACT_VARIANTS", variants
+            ):
+                (root / filename).write_bytes(lf)
+                self.assertTrue(inference_server.anima_tokenizer_status(root, force_hash=True)["qwen"]["installed"])
+                (root / filename).write_bytes(crlf)
+                self.assertTrue(inference_server.anima_tokenizer_status(root, force_hash=True)["qwen"]["installed"])
+                (root / filename).write_bytes(b'{"line":"two"}\n')
+                status = inference_server.anima_tokenizer_status(root, force_hash=True)["qwen"]
+                self.assertFalse(status["installed"])
+                self.assertIn("SHA-256", status["reason"])
+
     def test_health_exposes_anima_and_guidance_capabilities(self):
         anima = inference_server.anima_health_fields()
         self.assertEqual(anima["samplers"], list(ANIMA_SAMPLERS))
@@ -327,51 +353,53 @@ class AnimaCacheAndMetadataTests(unittest.TestCase):
 
     def test_model_cache_uses_anima_diffusion_identity_to_release_composite(self):
         runtime = SimpleNamespace(close=Mock())
-        root = Path("C:/configured/diffusion")
-        original = (
-            inference_server.loaded_pipeline,
-            inference_server.loaded_checkpoint,
-            inference_server.loaded_family,
-            inference_server.loaded_engine,
-            inference_server.loaded_model_assets,
-            inference_server.loaded_model_revisions,
-        )
-        inference_server.loaded_pipeline = runtime
-        inference_server.loaded_checkpoint = str(root / "anima.safetensors")
-        inference_server.loaded_family = "anima"
-        inference_server.loaded_engine = "Anima"
-        inference_server.loaded_model_assets = {
-            "diffusion_model": str(root / "anima.safetensors"),
-            "text_encoder": "C:/configured/text/qwen.safetensors",
-            "vae": "C:/configured/vae/qwen.safetensors",
-        }
-        inference_server.loaded_model_revisions = {}
-        try:
-            with patch.object(
-                inference_server,
-                "anima_model_roots",
-                return_value={
-                    "diffusion_model": root,
-                    "text_encoder": Path("C:/configured/text"),
-                    "vae": Path("C:/configured/vae"),
-                    "configs": Path("C:/configured/configs"),
-                },
-            ):
-                retained = inference_server.unload_model_cache("Anima", "other.safetensors")
-                released = inference_server.unload_model_cache("Anima", "anima.safetensors")
-            self.assertEqual(retained["status"], "retained")
-            self.assertEqual(retained["loaded_checkpoint"], "anima.safetensors")
-            self.assertEqual(released, {"status": "released", "model_cached": False})
-            runtime.close.assert_called_once_with()
-        finally:
-            (
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "diffusion"
+            root.mkdir()
+            original = (
                 inference_server.loaded_pipeline,
                 inference_server.loaded_checkpoint,
                 inference_server.loaded_family,
                 inference_server.loaded_engine,
                 inference_server.loaded_model_assets,
                 inference_server.loaded_model_revisions,
-            ) = original
+            )
+            inference_server.loaded_pipeline = runtime
+            inference_server.loaded_checkpoint = str(root / "anima.safetensors")
+            inference_server.loaded_family = "anima"
+            inference_server.loaded_engine = "Anima"
+            inference_server.loaded_model_assets = {
+                "diffusion_model": str(root / "anima.safetensors"),
+                "text_encoder": str(root.parent / "text" / "qwen.safetensors"),
+                "vae": str(root.parent / "vae" / "qwen.safetensors"),
+            }
+            inference_server.loaded_model_revisions = {}
+            try:
+                with patch.object(
+                    inference_server,
+                    "anima_model_roots",
+                    return_value={
+                        "diffusion_model": root,
+                        "text_encoder": root.parent / "text",
+                        "vae": root.parent / "vae",
+                        "configs": root.parent / "configs",
+                    },
+                ):
+                    retained = inference_server.unload_model_cache("Anima", "other.safetensors")
+                    released = inference_server.unload_model_cache("Anima", "anima.safetensors")
+                self.assertEqual(retained["status"], "retained")
+                self.assertEqual(retained["loaded_checkpoint"], "anima.safetensors")
+                self.assertEqual(released, {"status": "released", "model_cached": False})
+                runtime.close.assert_called_once_with()
+            finally:
+                (
+                    inference_server.loaded_pipeline,
+                    inference_server.loaded_checkpoint,
+                    inference_server.loaded_family,
+                    inference_server.loaded_engine,
+                    inference_server.loaded_model_assets,
+                    inference_server.loaded_model_revisions,
+                ) = original
 
     def test_model_cache_can_clear_the_authoritative_current_runtime_without_identity(self):
         runtime = SimpleNamespace(close=Mock())
@@ -1475,7 +1503,7 @@ class AnimaAccelerationGateTests(unittest.TestCase):
         with patch.dict(
             inference_server.os.environ,
             {"XIRAI_ANIMA_COMPILE": "1", "XIRAI_ANIMA_SAGE_ATTENTION": "1", "XIRAI_ANIMA_COMPILE_MODE": "max-autotune"},
-        ):
+        ), patch.object(inference_server, "find_spec", return_value=object()):
             record = inference_server.configure_anima_acceleration(runtime)
         self.assertTrue(record["compile_active"])
         self.assertEqual(record["compile_mode"], "max-autotune")
@@ -1506,7 +1534,9 @@ class AnimaAccelerationGateTests(unittest.TestCase):
             raise RuntimeError("inductor unavailable")
 
         runtime, _state = self._runtime(configure_transformer_compilation=explode)
-        with patch.dict(inference_server.os.environ, {"XIRAI_ANIMA_COMPILE": "1"}):
+        with patch.dict(inference_server.os.environ, {"XIRAI_ANIMA_COMPILE": "1"}), patch.object(
+            inference_server, "find_spec", return_value=object()
+        ):
             record = inference_server.configure_anima_acceleration(runtime)
         self.assertFalse(record["compile_active"])
         # The message matters, not just the type: the first real failure here was

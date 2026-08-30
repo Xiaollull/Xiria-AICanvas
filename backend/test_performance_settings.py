@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,8 +9,9 @@ from unittest.mock import patch
 
 import torch
 
-from backend import inference_server
+from backend import inference_server, memory_policy
 
+from backend.memory_policy import MIB, default_reserved_vram_bytes, vram_limit_bounds
 from backend.performance_settings import (
     DEFAULT_PERFORMANCE_SETTINGS,
     file_sha256,
@@ -85,11 +87,46 @@ class PerformanceSettingsTests(unittest.TestCase):
             inference_server.performance_settings.clear()
             inference_server.performance_settings.update(original)
 
+        physical = 8 * 1024**3
+        minimum, maximum, reserve = vram_limit_bounds(physical, allow_shared_memory=True)
         wall = payload["capabilities"]["vram_limit"]
-        self.assertEqual(wall["minimum_bytes"], 2 * 1024**3)
-        self.assertEqual(wall["maximum_bytes"], 8 * 1024**3 - 600 * 1024**2)
-        self.assertEqual(wall["effective_bytes"], 8 * 1024**3)
+        self.assertEqual(wall["minimum_bytes"], minimum)
+        self.assertEqual(wall["maximum_bytes"], maximum)
+        self.assertEqual(wall["platform_reserve_bytes"], reserve)
+        self.assertEqual(wall["effective_bytes"], physical)
         self.assertTrue(wall["automatic"])
+        # The reserve is not a constant: the documented policy keeps 600 MiB headroom
+        # on Windows (`os.name == "nt"`) and 400 MiB on every other OS, and the payload
+        # must expose exactly the running platform's wall.
+        self.assertEqual(reserve, default_reserved_vram_bytes(physical))
+        self.assertEqual(reserve, 600 * MIB if os.name == "nt" else 400 * MIB)
+        self.assertEqual(maximum, physical - reserve)
+
+    def test_performance_payload_reserves_the_platform_specific_vram_wall(self):
+        # `performance_payload` derives its wall from the running platform's reserve via
+        # `os.name`. Patch it so CI exercises both documented branches regardless of the
+        # OS the runner happens to use.
+        properties = SimpleNamespace(total_memory=8 * 1024**3)
+        original = inference_server.performance_settings.copy()
+        try:
+            inference_server.performance_settings.update({"vram_limit_gb": 0.0, "allow_shared_memory": True})
+            for platform_name, expected_reserve in (("nt", 600 * MIB), ("posix", 400 * MIB)):
+                with (
+                    patch.object(memory_policy, "os", SimpleNamespace(name=platform_name)),
+                    patch.object(inference_server.torch.cuda, "is_available", return_value=True),
+                    patch.object(inference_server.torch.cuda, "get_device_capability", return_value=(8, 9)),
+                    patch.object(inference_server.torch.cuda, "get_device_properties", return_value=properties),
+                    patch.object(inference_server.torch.cuda, "get_device_name", return_value="RTX test"),
+                    patch.object(inference_server.torch.cuda, "is_bf16_supported", return_value=True),
+                ):
+                    payload = inference_server.performance_payload()
+                wall = payload["capabilities"]["vram_limit"]
+                self.assertEqual(wall["platform_reserve_bytes"], expected_reserve)
+                self.assertEqual(wall["maximum_bytes"], 8 * 1024**3 - expected_reserve)
+                self.assertEqual(wall["effective_bytes"], 8 * 1024**3)
+        finally:
+            inference_server.performance_settings.clear()
+            inference_server.performance_settings.update(original)
 
     def test_ultra_low_mode_locks_peak_memory_options(self):
         settings = normalize_performance_settings({

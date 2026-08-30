@@ -1434,6 +1434,17 @@ def _empty_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
+def _cuda_bf16_supported() -> bool:
+    """Return CUDA BF16 capability without probing a CPU-only build."""
+    if not torch.cuda.is_available() or not hasattr(torch.cuda, "is_bf16_supported"):
+        return False
+    try:
+        return bool(torch.cuda.is_bf16_supported())
+    except (AssertionError, RuntimeError):
+        # Some CPU-only builds expose the symbol but reject its invocation.
+        return False
+
+
 def _discard_module_storage(module: torch.nn.Module) -> None:
     """Release a module's tensor storage without copying any of it anywhere.
 
@@ -1577,20 +1588,30 @@ class AnimaRuntime:
         host allocation for the life of the runtime, and both directions really
         are asynchronous.
         """
-        if getattr(self, "_transformer_pinned", False) or self.transformer is None:
+        if (
+            getattr(self, "_transformer_pinned", False)
+            or self.transformer is None
+            or not torch.cuda.is_available()
+        ):
             return
         try:
             named = list(self.transformer.named_parameters())
         except (TypeError, AttributeError, ValueError):
             return
         mirror = {}
+        try:
+            for name, parameter in named:
+                data = parameter.data
+                if data.device.type != "cpu":
+                    continue
+                mirror[name] = data if data.is_pinned() and data.is_contiguous() else data.contiguous().pin_memory()
+        except RuntimeError:
+            # CUDA may become unavailable after the initial capability check.
+            # Do not leave a partial mirror or turn an optimization into a load failure.
+            return
         for name, parameter in named:
-            data = parameter.data
-            if data.device.type != "cpu":
-                continue
-            pinned = data if data.is_pinned() and data.is_contiguous() else data.contiguous().pin_memory()
-            parameter.data = pinned
-            mirror[name] = pinned
+            if name in mirror:
+                parameter.data = mirror[name]
         self._transformer_host_buffers = mirror
         self._transformer_pinned = True
 
@@ -2726,7 +2747,7 @@ class AnimaRuntime:
         )
         if not torch.cuda.is_available():
             raise RuntimeError("Native Anima generation requires CUDA")
-        if self.dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        if self.dtype == torch.bfloat16 and not _cuda_bf16_supported():
             raise RuntimeError("Native Anima BF16 execution requires a BF16-capable CUDA device")
         if sampling_batch_size is None:
             sampling_batch_size = len(generators)
@@ -3000,7 +3021,7 @@ class AnimaRuntime:
 
         if not torch.cuda.is_available():
             raise RuntimeError("Native Anima refinement requires CUDA")
-        if self.dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        if self.dtype == torch.bfloat16 and not _cuda_bf16_supported():
             raise RuntimeError("Native Anima BF16 execution requires a BF16-capable CUDA device")
 
         conditioning_reused = prepared_conditioning is not None
@@ -3207,9 +3228,7 @@ def load_anima_runtime(
 ) -> AnimaRuntime:
     if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
         raise ValueError("Anima dtype must be torch.float16, torch.bfloat16, or torch.float32")
-    if dtype == torch.bfloat16 and (
-        not torch.cuda.is_available() or not hasattr(torch.cuda, "is_bf16_supported") or not torch.cuda.is_bf16_supported()
-    ):
+    if dtype == torch.bfloat16 and not _cuda_bf16_supported():
         raise RuntimeError("torch.bfloat16 Anima loading requires a BF16-capable CUDA device")
 
     diffusion_path = _require_safetensors(diffusion_path, "Anima diffusion")

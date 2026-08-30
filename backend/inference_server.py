@@ -26,7 +26,7 @@ from importlib.util import find_spec
 from math import ceil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 try:
     from .benchmark_lease import HIRES_ARTIFACT_PURPOSE, validate_lease
@@ -836,19 +836,33 @@ MAX_POSTPROCESS_SOURCE_PIXELS = rtx_vsr.MAX_OUTPUT_PIXELS
 ANIMA_TOKENIZER_ARTIFACTS = {
     "qwen": (
         "anima-qwen3-tokenizer.json",
-        7_334_926,
-        "47ec9be242d3ef39b9c97ac0a3f06c1752f061b234e295bc0a2842067a3fe4f9",
+        7_031_645,
+        "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
     ),
     "qwen_config": (
         "anima-qwen3-tokenizer-config.json",
-        9_916,
-        "7992a7924330571ac9b97d58e39d4a4993ccdb865335034cec29cf2c482fd460",
+        9_678,
+        "3c04ed3ca964ea2f6b2b5faf0dc4d31aec1cb1e8b4bcf63f402d295046b422b5",
     ),
     "t5": (
         "anima-t5-tokenizer.json",
         1_389_353,
         "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066",
     ),
+}
+# Git's text conversion can produce either of these byte-exact JSON resources.
+# Keep each pair pinned: accepting a matching size alone would make corruption
+# indistinguishable from an expected LF/CRLF checkout conversion.
+ANIMA_TOKENIZER_ARTIFACT_VARIANTS = {
+    "qwen": (
+        ANIMA_TOKENIZER_ARTIFACTS["qwen"],
+        ("anima-qwen3-tokenizer.json", 7_334_926, "47ec9be242d3ef39b9c97ac0a3f06c1752f061b234e295bc0a2842067a3fe4f9"),
+    ),
+    "qwen_config": (
+        ANIMA_TOKENIZER_ARTIFACTS["qwen_config"],
+        ("anima-qwen3-tokenizer-config.json", 9_916, "7992a7924330571ac9b97d58e39d4a4993ccdb865335034cec29cf2c482fd460"),
+    ),
+    "t5": (ANIMA_TOKENIZER_ARTIFACTS["t5"],),
 }
 
 
@@ -1762,10 +1776,19 @@ def public_model_reference(value):
     shared = shared_model_reference(value)
     if shared:
         return shared
-    path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
-        return path.name
-    return path.as_posix()
+    # References can originate on another OS (for example from a remote client
+    # or a persisted job).  pathlib.Path only recognises the host's syntax, so
+    # inspect both grammars before deciding whether a path may leave the server.
+    windows_path = PureWindowsPath(value)
+    posix_path = PurePosixPath(value)
+    if (
+        windows_path.is_absolute()
+        or posix_path.is_absolute()
+        or ".." in windows_path.parts
+        or ".." in posix_path.parts
+    ):
+        return windows_path.name if windows_path.is_absolute() or ".." in windows_path.parts else posix_path.name
+    return posix_path.as_posix()
 
 
 @lru_cache(maxsize=16)
@@ -1782,17 +1805,23 @@ def anima_tokenizer_status(directory=None, force_hash=False):
         "qwen_config": "Anima Qwen3 tokenizer config",
         "t5": "Anima T5 tokenizer",
     }
-    for name, (filename, expected_size, expected_sha256) in ANIMA_TOKENIZER_ARTIFACTS.items():
+    for name, (filename, _expected_size, _expected_sha256) in ANIMA_TOKENIZER_ARTIFACTS.items():
         try:
             path = validate_child_path(filename, directory, labels[name])
             file_stat = path.stat()
-            if file_stat.st_size != expected_size:
-                raise ValueError(f"expected {expected_size} bytes, found {file_stat.st_size}")
+            variants = ANIMA_TOKENIZER_ARTIFACT_VARIANTS[name]
+            size_matches = [variant for variant in variants if variant[1] == file_stat.st_size]
+            if not size_matches:
+                expected_sizes = ", ".join(str(variant[1]) for variant in variants)
+                raise ValueError(f"expected one of {expected_sizes} bytes, found {file_stat.st_size}")
             actual_sha256 = file_sha256(path) if force_hash else anima_tokenizer_sha256(
                 str(path), file_stat.st_size, file_stat.st_mtime_ns, file_stat.st_ctime_ns
             )
-            if actual_sha256 != expected_sha256:
-                raise ValueError("SHA-256 does not match the pinned Anima runtime artifact")
+            if actual_sha256 not in {variant[2] for variant in size_matches}:
+                raise ValueError(
+                    "SHA-256 does not match a pinned Anima runtime artifact for "
+                    f"the {file_stat.st_size}-byte variant"
+                )
             statuses[name] = {"path": path, "installed": True, "reason": None}
         except FileNotFoundError:
             statuses[name] = {
