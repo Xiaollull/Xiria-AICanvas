@@ -5,6 +5,7 @@ import { downloadFile } from "./download.mjs";
 import { assertEnvironmentBackup, assertOfflineUpdateTemp, createOfflineUpdateTemp, OFFLINE_UPDATE_OWNER_FILE, removeEnvironmentBackup, removeEnvironmentOwnershipMarker, removeOfflineUpdateTemp, restoreEnvironmentBackup } from "./offline-update-temp.mjs";
 import { assertOfflineUpdateLock } from "./offline-update-lock.mjs";
 import { getSetupMarkerPath, readSetupMarker, writeSetupMarker } from "./setup-state.mjs";
+import { RELEASE_MANAGED_DIRECTORIES, RELEASE_MANAGED_FILES, RELEASE_MANIFEST_FILE, validateReleasePackageDirectory } from "./release-package.mjs";
 
 const SEVEN_ZIP_URL = "https://github.com/ip7z/7zip/releases/download/26.02/7zr.exe";
 const SEVEN_ZIP_SHA256 = "56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72";
@@ -51,30 +52,11 @@ const ARCHIVE_EXTENSIONS = [
   ".zip",
 ];
 
-const MANAGED_DIRECTORIES = ["src", "backend", "scripts", "public", ".github"];
-const MANAGED_FILES = [
-  "index.html",
-  "vite.config.js",
-  "package.json",
-  "package-lock.json",
-  "README.md",
-  "README.zh-CN.md",
-  "Start-XirAI.bat",
-  "Start-XirAI.sh",
-  "Setup-XirAI.bat",
-  "Setup-XirAI.sh",
-  "XirAI-Setup.desktop",
-  "XirAI-Start.desktop",
-  ".env.example",
-  ".gitattributes",
-  ".gitignore",
-  "models/recommended-models.json",
-  "models/yolo-models.json",
-  "models/background-removal-models.json",
-  "models/README.md",
-];
+const MANAGED_DIRECTORIES = RELEASE_MANAGED_DIRECTORIES;
+const MANAGED_FILES = RELEASE_MANAGED_FILES;
 const MANAGED_MODEL_MANIFESTS = new Set([
   "models/recommended-models.json",
+  "models/model-paths.json",
   "models/yolo-models.json",
   "models/background-removal-models.json",
   "models/README.md",
@@ -233,6 +215,22 @@ function validateArchiveMembers(members) {
     if (seen.has(identity)) throw new ArchiveSecurityError(`更新归档包含重复路径：${member}`);
     seen.add(identity);
   }
+}
+
+function releaseWrapperFromMembers(members) {
+  const markerMembers = members.filter((member) => {
+    const normalized = member.replace(/\\/g, "/").replace(/\/$/, "");
+    return normalized === RELEASE_MANIFEST_FILE || normalized.endsWith(`/${RELEASE_MANIFEST_FILE}`);
+  });
+  if (!markerMembers.length) return null;
+  if (markerMembers.length !== 1) throw new ArchiveSecurityError("Release 归档包含多个 manifest");
+  const normalized = markerMembers[0].replace(/\\/g, "/").replace(/\/$/, "");
+  const [wrapper, ...rest] = normalized.split("/");
+  if (!wrapper || rest.join("/") !== RELEASE_MANIFEST_FILE || members.some((member) => {
+    const candidate = member.replace(/\\/g, "/").replace(/\/$/, "");
+    return candidate && candidate !== wrapper && !candidate.startsWith(`${wrapper}/`);
+  })) throw new ArchiveSecurityError("Release 归档必须恰有一层 wrapper");
+  return wrapper;
 }
 
 function commandError(command, args, code, stderr) {
@@ -766,6 +764,7 @@ export async function prepareUpdate({ projectRoot, archivePath, report } = {}) {
   emit(report, { phase: "inspect", progress: 0, message: "正在检查更新归档" });
   try {
     const selected = await selectArchiveTool(root, canonicalArchive, kind, report);
+    const releaseWrapper = releaseWrapperFromMembers(selected.members);
     if (!sameFileIdentity(initialArchiveIdentity, await fileIdentity(canonicalArchive))) {
       throw new ArchiveSecurityError("更新归档在安全检查期间发生变化，请重新选择文件");
     }
@@ -791,6 +790,7 @@ export async function prepareUpdate({ projectRoot, archivePath, report } = {}) {
     emit(report, { phase: "validate", progress: 55, message: "正在校验解压结果" });
     await inspectExtractedTree(extractionDirectory);
     const packageRoot = await identifyProjectRoot(extractionDirectory);
+    const releaseManifest = releaseWrapper ? await validateReleasePackageDirectory({ packageRoot }) : null;
 
     emit(report, { phase: "dependencies", progress: 72, message: "正在比较新旧环境依赖" });
     const environmentRepairRequired = await dependencyChangesRequired(root, packageRoot);
@@ -807,6 +807,7 @@ export async function prepareUpdate({ projectRoot, archivePath, report } = {}) {
       packageRoot,
       archiveTool: { kind: selected.tool.kind, command: selected.tool.command },
       environmentRepairRequired,
+      releaseManifest,
       plan,
     };
     emit(report, {
@@ -891,6 +892,7 @@ async function validatePrepared(root, prepared) {
 
   await inspectExtractedTree(packageRoot);
   if (!await validProjectRoot(packageRoot)) throw new Error("更新暂存项目根已失效");
+  if (prepared.releaseManifest) await validateReleasePackageDirectory({ packageRoot });
   const environmentRepairRequired = await dependencyChangesRequired(root, packageRoot);
   return {
     stagingDirectory,
@@ -1220,6 +1222,7 @@ export async function recoverInterruptedUpdate({ projectRoot, transactionPath, r
 export const archiveUpdateInternals = {
   FORBIDDEN_TOP_LEVEL_ITEMS,
   MANAGED_FILES,
+  MANAGED_DIRECTORIES,
   createUpdatePlan,
   dependencyChangesRequired,
   dependencyEnvironmentEqual,

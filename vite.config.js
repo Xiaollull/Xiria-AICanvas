@@ -12,12 +12,15 @@ import { appVersion } from "./scripts/app-version.mjs";
 import { downloadFile } from "./scripts/download.mjs";
 import {
   checksumRoutes,
+  hasCustomReleaseFeed,
   parseChecksumFile,
   parseRelease,
   releaseDownloadRoutes,
   missingReleaseMeaning,
   releaseFeedUrl,
-  releaseRepository,
+  releaseRepositoryUrl,
+  trustedGithubUrl,
+  updateAuthorizationHeaders,
   updateAvailable,
 } from "./scripts/release-feed.mjs";
 import { getLogsDirectory, writeDiagnosticLog } from "./scripts/diagnostics.mjs";
@@ -971,14 +974,130 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   }
 }
 
-async function fetchDownload(url, options = {}) {
+async function fetchDownload(url, options = {}, {
+  fetcher = undiciFetch,
+  environment = process.env,
+} = {}) {
   try {
-    return await undiciFetch(url, { ...options, dispatcher: getProxyDispatcher() });
+    const headers = new Headers(options.headers || {});
+    const carriesUpdateToken = headers.has("authorization");
+    if (carriesUpdateToken && !trustedGithubUrl(url, environment)) {
+      throw new Error("拒绝向非受信任地址发送更新令牌");
+    }
+    let currentUrl = url;
+    for (let redirects = 0; redirects <= 5; redirects += 1) {
+      const response = await fetcher(currentUrl, {
+        ...options,
+        headers,
+        redirect: "manual",
+        ...(fetcher === undiciFetch ? { dispatcher: getProxyDispatcher() } : {}),
+      });
+      const location = response.headers.get("location");
+      if (!location || !new Set([301, 302, 303, 307, 308]).has(response.status)) return response;
+      if (redirects === 5) throw new Error("更新包下载重定向次数过多");
+      const nextUrl = new URL(location, currentUrl).href;
+      const parsedNextUrl = new URL(nextUrl);
+      if (parsedNextUrl.protocol !== "https:" || parsedNextUrl.username || parsedNextUrl.password) {
+        throw new Error("更新包下载拒绝不安全的重定向地址");
+      }
+      // GitHub's API redirects private assets to a short-lived object URL. That URL needs no PAT;
+      // stripping here is explicit rather than relying on a fetch implementation's redirect rules.
+      if (headers.has("authorization") && !trustedGithubUrl(nextUrl, environment)) headers.delete("authorization");
+      void response.body?.cancel().catch(() => {});
+      currentUrl = nextUrl;
+    }
+    throw new Error("更新包下载重定向次数过多");
   } catch (error) {
     const cause = error.cause?.message;
     throw new Error(cause ? `${error.message}: ${cause}` : error.message);
   }
 }
+
+const maximumReleaseFeedBytes = 1024 ** 2;
+const maximumReleaseSidecarBytes = 16 * 1024;
+
+/** Fetch and consume a small update resource under one deadline.
+ *
+ * `fetchWithTimeout` is intentionally header-oriented for several unrelated metadata callers. The
+ * release feed and checksum are security inputs, so their deadline remains armed while every body
+ * chunk is read and a declared or actual oversized body is rejected before it reaches JSON/hash
+ * parsing. Redirects are manual so an Authorization header cannot follow GitHub to object storage.
+ */
+async function fetchBoundedUpdateBody(url, {
+  headers = {},
+  timeoutMs,
+  maximumBytes,
+  fetcher = undiciFetch,
+  environment = process.env,
+  label,
+} = {}) {
+  const controller = new AbortController();
+  let rejectDeadline;
+  const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+  const timer = setTimeout(() => {
+    controller.abort();
+    rejectDeadline(new Error(`${label}响应超时`));
+  }, timeoutMs);
+  const requestHeaders = new Headers(headers);
+  let currentUrl = url;
+  let response;
+  let reader;
+  try {
+    if (requestHeaders.has("authorization") && !trustedGithubUrl(currentUrl, environment)) {
+      throw new Error("拒绝向非受信任地址发送更新令牌");
+    }
+    for (let redirects = 0; redirects <= 5; redirects += 1) {
+      response = await Promise.race([
+        fetcher(currentUrl, {
+          headers: requestHeaders,
+          redirect: "manual",
+          signal: controller.signal,
+          ...(fetcher === undiciFetch ? { dispatcher: getProxyDispatcher() } : {}),
+        }),
+        deadline,
+      ]);
+      const location = response.headers.get("location");
+      if (!location || !new Set([301, 302, 303, 307, 308]).has(response.status)) break;
+      if (redirects === 5) throw new Error(`${label}重定向次数过多`);
+      const nextUrl = new URL(location, currentUrl);
+      if (nextUrl.protocol !== "https:" || nextUrl.username || nextUrl.password) {
+        throw new Error(`${label}拒绝不安全的重定向地址`);
+      }
+      if (requestHeaders.has("authorization") && !trustedGithubUrl(nextUrl, environment)) {
+        requestHeaders.delete("authorization");
+      }
+      void Promise.resolve(response.body?.cancel()).catch(() => {});
+      currentUrl = nextUrl.href;
+    }
+    if (!response) throw new Error(`${label}没有返回响应`);
+    const declared = response.headers.get("content-length");
+    if (declared != null && (!/^\d+$/.test(declared) || BigInt(declared) > BigInt(maximumBytes))) {
+      throw new Error(`${label}内容超过 ${maximumBytes} 字节限制`);
+    }
+    if (!response.body) return { response, body: Buffer.alloc(0), finalUrl: currentUrl };
+    reader = response.body.getReader();
+    const chunks = [];
+    let bytes = 0;
+    while (true) {
+      const { done, value } = await Promise.race([reader.read(), deadline]);
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maximumBytes) throw new Error(`${label}内容超过 ${maximumBytes} 字节限制`);
+      chunks.push(Buffer.from(value));
+    }
+    return { response, body: Buffer.concat(chunks, bytes), finalUrl: currentUrl };
+  } catch (error) {
+    if (controller.signal.aborted && !/超时/.test(error.message || "")) throw new Error(`${label}响应超时`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (reader) void reader.cancel().catch(() => {});
+    else void response?.body?.cancel().catch(() => {});
+  }
+}
+
+// Exported for deterministic network-boundary tests; production callers use updateApiPlugin.
+export const onlineUpdateNetworkInternals = { fetchBoundedUpdateBody, fetchDownload };
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -4080,7 +4199,17 @@ function modelApiPlugin() {
   };
 }
 
-export function updateApiPlugin() {
+export function updateApiPlugin({
+  fetcher: updateFetcher = undiciFetch,
+  environment: updateEnvironment = process.env,
+  releaseTimeoutMs = 15000,
+  sidecarTimeoutMs = 15000,
+  repositoryTimeoutMs = 10000,
+} = {}) {
+  // The feed provenance and PAT allow-list must not change between check and download. Snapshot the
+  // update settings once for this server instance instead of re-reading a mutable process.env after
+  // a release has already crossed the check boundary.
+  const releaseEnvironment = Object.freeze({ ...updateEnvironment });
   let preparedUpdate;
   let activeTask;
   let uploadDirectory;
@@ -4090,6 +4219,7 @@ export function updateApiPlugin() {
   // "update available" that outlived the release it named would offer a download that 404s.
   let onlineRelease = null;
   let onlineCheckedAt = null;
+  let onlineCheckGeneration = 0;
   let updateState = {
     status: "idle",
     phase: "idle",
@@ -4220,8 +4350,9 @@ export function updateApiPlugin() {
     notes: onlineRelease.notes.slice(0, 4000),
     asset_name: onlineRelease.asset.name,
     asset_bytes: onlineRelease.asset.bytes,
-    // Whether the archive can be verified decides whether accelerated mirrors are used at all.
-    verified: Boolean(onlineRelease.asset.sha256 || onlineRelease.asset.checksumUrl),
+    // Advertised metadata is not verification. This is true only after the required sidecar has
+    // been fetched, bounded, parsed for this exact filename, and reconciled with any API digest.
+    verified: Boolean(onlineRelease.resolvedChecksum),
     update_available: updateAvailable(onlineRelease.version, appVersion),
   } : null);
   const publicState = () => ({
@@ -4246,46 +4377,114 @@ export function updateApiPlugin() {
    */
   const releaseSourceExists = async () => {
     try {
-      const probe = await fetchWithTimeout(
-        `https://api.github.com/repos/${releaseRepository(process.env)}`,
-        { headers: { Accept: "application/vnd.github+json", "User-Agent": "XiriaCanvas-AI" } },
-        10000,
-      );
+      const repositoryUrl = releaseRepositoryUrl(releaseEnvironment);
+      const { response: probe } = await fetchBoundedUpdateBody(repositoryUrl, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "XiriaCanvas-AI",
+          ...updateAuthorizationHeaders(repositoryUrl, { environment: releaseEnvironment }),
+        },
+        timeoutMs: repositoryTimeoutMs,
+        maximumBytes: maximumReleaseFeedBytes,
+        fetcher: updateFetcher,
+        environment: releaseEnvironment,
+        label: "发布仓库探测",
+      });
       return probe.ok;
     } catch {
       return false;
     }
   };
 
+  /** Resolve the required checksum sidecar before a release can enter the download trust set. */
+  const fetchReleaseChecksum = async (release) => {
+    const customFeed = hasCustomReleaseFeed(releaseEnvironment);
+    const [route] = checksumRoutes(release, {
+      environment: releaseEnvironment,
+      allowToken: !customFeed,
+    });
+    if (!route) throw Object.assign(new Error("发布信息缺少必需的 SHA-256 校验和文件"), { statusCode: 502 });
+    let result;
+    try {
+      result = await fetchBoundedUpdateBody(route.url, {
+        headers: { "User-Agent": "XiriaCanvas-AI", ...route.headers },
+        timeoutMs: sidecarTimeoutMs,
+        maximumBytes: maximumReleaseSidecarBytes,
+        fetcher: updateFetcher,
+        environment: releaseEnvironment,
+        label: "校验和文件",
+      });
+    } catch (error) {
+      throw Object.assign(new Error(`无法获取发布校验和：${error.message}`), { statusCode: 502 });
+    }
+    if (!result.response.ok) {
+      throw Object.assign(new Error(`无法获取发布校验和：服务器返回 HTTP ${result.response.status}`), { statusCode: 502 });
+    }
+    const checksum = parseChecksumFile(result.body.toString("utf8"), release.asset.name);
+    if (!checksum) {
+      throw Object.assign(new Error("发布校验和文件格式无效或文件名不匹配"), { statusCode: 502 });
+    }
+    if (release.asset.advertisedSha256 && release.asset.advertisedSha256 !== checksum) {
+      throw Object.assign(new Error("发布资产摘要与校验和文件不一致"), { statusCode: 502 });
+    }
+    return checksum;
+  };
+
   /** Reads the release feed and remembers what it offers. */
   const checkForRelease = async () => {
-    const feedUrl = releaseFeedUrl(process.env);
-    const token = String(process.env.XIRAI_UPDATE_TOKEN || "").trim();
-    let feedResponse;
+    const generation = ++onlineCheckGeneration;
+    // A failed refresh must revoke the prior release immediately. Otherwise /download would still
+    // install the last successful answer after the current source had become malformed or hostile.
+    onlineRelease = null;
+    onlineCheckedAt = null;
+    let feedUrl;
+    let customFeed;
     try {
-      feedResponse = await fetchWithTimeout(feedUrl, {
+      feedUrl = releaseFeedUrl(releaseEnvironment);
+      customFeed = hasCustomReleaseFeed(releaseEnvironment);
+    } catch (error) {
+      throw Object.assign(error, { statusCode: error.statusCode || 500 });
+    }
+    let feedResult;
+    let authenticatedFeed = false;
+    try {
+      const authorizationHeaders = updateAuthorizationHeaders(feedUrl, {
+        environment: releaseEnvironment,
+        allowToken: !customFeed,
+      });
+      authenticatedFeed = Object.keys(authorizationHeaders)
+        .some((name) => name.toLowerCase() === "authorization");
+      feedResult = await fetchBoundedUpdateBody(feedUrl, {
         headers: {
           Accept: "application/vnd.github+json",
           "User-Agent": "XiriaCanvas-AI",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          // A custom feed is untrusted data even when its hostname happens to be github.com.
+          ...authorizationHeaders,
         },
-      }, 15000);
+        timeoutMs: releaseTimeoutMs,
+        maximumBytes: maximumReleaseFeedBytes,
+        fetcher: updateFetcher,
+        environment: releaseEnvironment,
+        label: "发布信息",
+      });
     } catch (error) {
       throw Object.assign(new Error(`无法连接更新服务器：${error.message}`), { statusCode: 502 });
     }
+    const feedResponse = feedResult.response;
     if (feedResponse.status === 404) {
       // A repository that exists but has published nothing answers 404 exactly as a private or
       // misspelled one does. That is not a failure to report: it means there is no newer version,
       // which is the ordinary state of a project between releases. Only when the repository itself
       // cannot be read is the configuration actually wrong.
-      const customFeed = Boolean(String(process.env.XIRAI_UPDATE_FEED || "").trim());
       const meaning = missingReleaseMeaning({
         customFeed,
         repositoryReachable: customFeed ? false : await releaseSourceExists(),
       });
       if (meaning === "no-release") {
-        onlineRelease = null;
-        onlineCheckedAt = new Date().toISOString();
+        if (generation === onlineCheckGeneration) {
+          onlineRelease = null;
+          onlineCheckedAt = new Date().toISOString();
+        }
         return;
       }
       throw Object.assign(new Error("未找到发布源，请确认仓库地址与 Release 是否公开"), { statusCode: 502 });
@@ -4298,30 +4497,28 @@ export function updateApiPlugin() {
     }
     let payload;
     try {
-      payload = await feedResponse.json();
+      payload = JSON.parse(feedResult.body.toString("utf8"));
     } catch {
       throw Object.assign(new Error("更新服务器返回的内容不是有效的发布信息"), { statusCode: 502 });
     }
-    onlineRelease = parseRelease(payload);
-    onlineCheckedAt = new Date().toISOString();
-  };
-
-  /** The checksum, from a route a mirror cannot rewrite.
-   *
-   * The API's own digest is preferred because it arrives over TLS from the API host. A checksum
-   * asset is the fallback, and it is fetched from GitHub directly rather than through any
-   * accelerated route, since a mirror that could rewrite the archive could rewrite its hash too.
-   */
-  const fetchReleaseChecksum = async (release) => {
-    if (release.asset.sha256) return release.asset.sha256;
-    const [route] = checksumRoutes(release);
-    if (!route) return null;
+    let release;
     try {
-      const checksumResponse = await fetchWithTimeout(route.url, { headers: { "User-Agent": "XiriaCanvas-AI" } }, 15000);
-      if (!checksumResponse.ok) return null;
-      return parseChecksumFile(await checksumResponse.text(), release.asset.name);
-    } catch {
-      return null;
+      release = parseRelease(payload);
+    } catch (error) {
+      throw Object.assign(new Error(`发布信息不可用于在线更新：${error.message}`), { statusCode: 502 });
+    }
+    const resolvedChecksum = await fetchReleaseChecksum(release);
+    // Concurrent check requests may finish out of order. Only the newest initiated check may name
+    // what /download is allowed to fetch; an older success cannot overwrite a newer failure/result.
+    if (generation === onlineCheckGeneration) {
+      onlineRelease = {
+        ...release,
+        resolvedChecksum,
+        allowToken: !customFeed,
+        // This is derived from the request that actually authenticated, not token presence alone.
+        privateContext: authenticatedFeed,
+      };
+      onlineCheckedAt = new Date().toISOString();
     }
   };
   const validationReport = (event) => report({
@@ -4498,9 +4695,14 @@ export function updateApiPlugin() {
             repair_available: false,
           });
           activeTask = (async () => {
-            const checksum = await fetchReleaseChecksum(release);
-            const routes = releaseDownloadRoutes(release, { checksum, environment: process.env });
-            if (!routes.length) throw new Error("发布信息中没有可下载的更新包");
+            const checksum = release.resolvedChecksum;
+            const routes = releaseDownloadRoutes(release, {
+              checksum,
+              environment: releaseEnvironment,
+              allowToken: release.allowToken === true,
+              privateContext: release.privateContext === true,
+            });
+            if (!routes.length) throw new Error("发布信息中没有已验证、可下载的更新包");
             await downloadFile({
               routes,
               destination: archivePath,
@@ -4508,9 +4710,12 @@ export function updateApiPlugin() {
               maximumBytes: maximumUpdateArchiveBytes,
               sizeHint: release.asset.bytes,
               connections: 8,
-              fetcher: fetchDownload,
-              // Without a verifiable hash there is exactly one route, so ranking would only cost a
-              // probe request against the host the download has to use anyway.
+              fetcher: (downloadUrl, options) => fetchDownload(downloadUrl, options, {
+                fetcher: updateFetcher,
+                environment: releaseEnvironment,
+              }),
+              // Every admitted release is checksum-pinned; ranking may therefore compare mirrors
+              // without allowing any sampled bytes to bypass the final digest check.
               rankRoutes: Boolean(checksum),
               existingFilePolicy: "replace",
               onRoute: (route) => setState({ message: `正在通过 ${route.label} 下载 ${release.version} 更新包` }),

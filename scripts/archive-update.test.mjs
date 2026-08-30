@@ -15,6 +15,7 @@ import {
 } from "./archive-update.mjs";
 import { createEnvironmentBackupOwnership, createOfflineUpdateTemp, writeEnvironmentBackupOwnership } from "./offline-update-temp.mjs";
 import { acquireOfflineUpdateLock } from "./offline-update-lock.mjs";
+import { stageReleasePackage } from "./release-package.mjs";
 
 const {
   FORBIDDEN_TOP_LEVEL_ITEMS,
@@ -316,6 +317,7 @@ test("update plan preserves user model paths and weights while refreshing catalo
 
     const plan = await createUpdatePlan(projectRoot, packageRoot);
     assert.deepEqual(plan.map((item) => item.relativePath), [
+      "models/model-paths.json",
       "models/recommended-models.json",
       "models/yolo-models.json",
       "models/background-removal-models.json",
@@ -934,4 +936,66 @@ test("both README translations are replaced by an update, not just the English o
     const exempt = relativePath.startsWith("models/");
     assert.equal(FORBIDDEN_TOP_LEVEL_ITEMS.has(topLevel) && !exempt, false, relativePath);
   }
+});
+
+test("release archives require one wrapper and reject unknown/test package members", async (context) => {
+  try { await run("tar", ["--version"]); } catch { context.skip("system tar is unavailable"); return; }
+  const workspace = await temporaryDirectory("xirai-release-archive-");
+  const current = path.join(workspace, "current");
+  const source = path.join(workspace, "source");
+  const staging = path.join(workspace, "staging");
+  const archivePath = path.join(workspace, "release.tar");
+  const directArchivePath = path.join(workspace, "release-direct.tar");
+  try {
+    await Promise.all([createProjectRoot(current), createProjectRoot(source), mkdir(path.join(source, "models"), { recursive: true })]);
+    await mkdir(path.join(source, "assistant", "personas"), { recursive: true });
+    await Promise.all([
+      writeFile(path.join(source, "index.html"), "<main></main>"),
+      writeFile(path.join(source, "src", "App.jsx"), "export default null;"),
+      writeFile(path.join(source, "scripts", "start.mjs"), "export {};"),
+      writeFile(path.join(source, "assistant", "personas", "built-in.json"), "{}"),
+      writeFile(path.join(source, "models", "model-paths.json"), "{}"),
+      writeFile(path.join(source, "models", "recommended-models.json"), "{}"),
+      writeFile(path.join(source, "models", "yolo-models.json"), "{}"),
+      writeFile(path.join(source, "models", "background-removal-models.json"), "{}"),
+      writeFile(path.join(source, "models", "README.md"), "# models"),
+    ]);
+    const staged = await stageReleasePackage({ projectRoot: source, stagingDirectory: staging, wrapperName: "release" });
+    await run("tar", ["-cf", "../release-direct.tar", "-C", "release", ".xirai-release-manifest.json", ...staged.manifest.files], { cwd: staging });
+    await assert.rejects(prepareUpdate({ projectRoot: current, archivePath: directArchivePath }), /恰有一层 wrapper/);
+    await writeFile(path.join(staged.packageRoot, "src", "injected.test.jsx"), "bad");
+    await createTar(archivePath, staging, "release");
+    await assert.rejects(prepareUpdate({ projectRoot: current, archivePath }), /未知或禁止/);
+  } finally { await rm(workspace, { recursive: true, force: true }); }
+});
+
+test("assistant assets replace as a managed directory while user personas and model weights remain", async (context) => {
+  try { await run("tar", ["--version"]); } catch { context.skip("system tar is unavailable"); return; }
+  const workspace = await temporaryDirectory("xirai-assistant-update-");
+  const current = path.join(workspace, "current");
+  const packageParent = path.join(workspace, "package");
+  const packageRoot = path.join(packageParent, "release");
+  const archivePath = path.join(workspace, "update.tar");
+  try {
+    await Promise.all([createProjectRoot(current), createProjectRoot(packageRoot)]);
+    await Promise.all([
+      mkdir(path.join(current, "assistant", "personas"), { recursive: true }),
+      mkdir(path.join(current, "state-cache", "assistant-personas"), { recursive: true }),
+      mkdir(path.join(current, "models", "checkpoints"), { recursive: true }),
+      mkdir(path.join(packageRoot, "assistant", "personas"), { recursive: true }),
+    ]);
+    await Promise.all([
+      writeFile(path.join(current, "assistant", "personas", "obsolete.json"), "old"),
+      writeFile(path.join(current, "state-cache", "assistant-personas", "user.json"), "user"),
+      writeFile(path.join(current, "models", "checkpoints", "user.safetensors"), "weight"),
+      writeFile(path.join(packageRoot, "assistant", "personas", "new.json"), "new"),
+    ]);
+    await createTar(archivePath, packageParent, "release");
+    const prepared = await prepareUpdate({ projectRoot: current, archivePath });
+    await applyPreparedUpdate({ projectRoot: current, prepared });
+    assert.equal(await readFile(path.join(current, "assistant", "personas", "new.json"), "utf8"), "new");
+    await assert.rejects(access(path.join(current, "assistant", "personas", "obsolete.json")));
+    assert.equal(await readFile(path.join(current, "state-cache", "assistant-personas", "user.json"), "utf8"), "user");
+    assert.equal(await readFile(path.join(current, "models", "checkpoints", "user.safetensors"), "utf8"), "weight");
+  } finally { await rm(workspace, { recursive: true, force: true }); }
 });

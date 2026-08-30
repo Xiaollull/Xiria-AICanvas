@@ -3,233 +3,319 @@ import test from "node:test";
 import {
   checksumRoutes,
   compareVersions,
+  hasCustomReleaseFeed,
   missingReleaseMeaning,
   parseChecksumFile,
   parseRelease,
   parseVersion,
+  releaseApiBaseUrl,
   releaseDownloadRoutes,
   releaseFeedUrl,
   releaseRepository,
+  releaseRepositoryUrl,
   selectReleaseAsset,
+  trustedGithubUrl,
+  updateAuthorizationHeaders,
   updateAvailable,
 } from "./release-feed.mjs";
 
-function release(overrides = {}) {
+const sha = "a".repeat(64);
+
+function uploadedAsset(name, {
+  size = 1024,
+  digest = null,
+  state = "uploaded",
+  browserHost = "github.com",
+  apiHost = "api.github.com",
+} = {}) {
   return {
-    tag_name: "v1.1.0",
+    name,
+    state,
+    size,
+    digest,
+    browser_download_url: `https://${browserHost}/owner/repo/releases/download/v1.2.3/${name}`,
+    url: `https://${apiHost}/repos/owner/repo/releases/assets/${encodeURIComponent(name)}`,
+  };
+}
+
+function release(overrides = {}) {
+  const version = overrides.version || "1.2.3";
+  const archiveName = `XirAI-${version}.7z`;
+  return {
+    tag_name: `v${version}`,
+    draft: false,
+    prerelease: false,
     published_at: "2026-09-01T10:00:00Z",
     body: "  修复若干问题  ",
     assets: [
-      { name: "XirAI-1.1.0.7z", browser_download_url: "https://github.com/o/r/releases/download/v1.1.0/XirAI-1.1.0.7z", size: 734003200, digest: "sha256:" + "a".repeat(64) },
+      uploadedAsset(archiveName, { size: 734003200, digest: `sha256:${sha}` }),
+      uploadedAsset(`${archiveName}.sha256`, { size: 89 }),
     ],
     ...overrides,
   };
 }
 
-test("versions parse with and without a leading v, and reject anything else", () => {
-  assert.equal(parseVersion("1.0.0").text, "1.0.0");
+test("stable versions are exact MAJOR.MINOR.PATCH values with precision-safe numeric components", () => {
+  assert.equal(parseVersion("1.2.3").text, "1.2.3");
   assert.equal(parseVersion("v1.2.3").text, "1.2.3");
-  assert.deepEqual(parseVersion("1.2.3-beta.1").prerelease, ["beta", "1"]);
-  for (const rejected of ["", null, undefined, "latest", "1.0", "1.0.0.0", "nightly-2026-09-01"]) {
+  const huge = "900719925474099312345678901234567890.2.3";
+  assert.equal(parseVersion(huge).major, huge.split(".")[0]);
+
+  for (const rejected of [
+    "", null, undefined, "V1.2.3", " 1.2.3", "1.2.3 ", "01.2.3", "1.02.3", "1.2.03",
+    "1.2", "1.2.3.4", "1.2.3-", "1.2.3-beta", "1.2.3+build", "latest",
+  ]) {
     assert.equal(parseVersion(rejected), null, String(rejected));
   }
 });
 
-test("version ordering follows semver, including pre-release ranking", () => {
+test("version ordering does not lose precision and unstable values never become newer", () => {
   assert.ok(compareVersions("1.0.1", "1.0.0") > 0);
-  assert.ok(compareVersions("1.1.0", "1.0.9") > 0);
-  assert.ok(compareVersions("2.0.0", "1.99.99") > 0);
-  assert.equal(compareVersions("1.0.0", "v1.0.0"), 0);
-  // A pre-release sorts below the release it leads to, and numerically among its own kind.
-  assert.ok(compareVersions("1.0.0-beta.1", "1.0.0") < 0);
-  assert.ok(compareVersions("1.0.0-beta.2", "1.0.0-beta.10") < 0);
-  assert.ok(compareVersions("1.0.0-alpha", "1.0.0-beta") < 0);
+  assert.ok(compareVersions("1.1.0", "1.0.999999999999999999999999999999") > 0);
+  assert.ok(compareVersions("900719925474099312345678901234567891.0.0", "900719925474099312345678901234567890.999.999") > 0);
+  assert.equal(compareVersions("v1.2.3", "1.2.3"), 0);
+  assert.equal(compareVersions("1.2.3-beta.1", "1.2.3"), 0);
+  assert.equal(updateAvailable("1.2.4", "1.2.3"), true);
+  assert.equal(updateAvailable("1.2.3", "1.2.3"), false);
+  assert.equal(updateAvailable("1.2.3", "1.2.4"), false);
+  assert.equal(updateAvailable("1.2.4-beta", "1.2.3"), false);
+  assert.equal(updateAvailable("1.2.4", "dev"), false);
 });
 
-test("an update is offered only for a strictly newer, parsable version", () => {
-  assert.equal(updateAvailable("1.0.1", "1.0.0"), true);
-  assert.equal(updateAvailable("1.0.0", "1.0.0"), false);
-  // A local build ahead of the channel is left alone rather than rolled backwards.
-  assert.equal(updateAvailable("1.0.0", "1.1.0"), false);
-  // Neither side may be a tag that is not a version.
-  assert.equal(updateAvailable("nightly", "1.0.0"), false);
-  assert.equal(updateAvailable("1.0.1", "dev"), false);
-});
-
-test("the release feed defaults to the project repository and honours an override", () => {
+test("repository configuration defaults only when unset and rejects every invalid nonempty value", () => {
   assert.equal(releaseRepository({}), "Xiaollull/Xiria-AICanvas");
-  assert.equal(releaseRepository({ XIRAI_UPDATE_REPO: "someone/fork" }), "someone/fork");
-  // A malformed override falls back rather than building a nonsense URL.
-  assert.equal(releaseRepository({ XIRAI_UPDATE_REPO: "not a repo" }), "Xiaollull/Xiria-AICanvas");
+  assert.equal(releaseRepository({ XIRAI_UPDATE_REPO: "" }), "Xiaollull/Xiria-AICanvas");
+  assert.equal(releaseRepository({ XIRAI_UPDATE_REPO: "someone/fork.name" }), "someone/fork.name");
+  for (const invalid of [" ", "not a repo", "owner", "/repo", "owner/", "owner/repo/extra", "-owner/repo", "owner/.repo", "owner/repo "]) {
+    assert.throws(() => releaseRepository({ XIRAI_UPDATE_REPO: invalid }), /XIRAI_UPDATE_REPO 格式无效/, invalid);
+  }
   assert.equal(releaseFeedUrl({}), "https://api.github.com/repos/Xiaollull/Xiria-AICanvas/releases/latest");
-  assert.equal(releaseFeedUrl({ XIRAI_UPDATE_FEED: "https://mirror.example/latest.json" }), "https://mirror.example/latest.json");
+  assert.equal(releaseRepositoryUrl({ XIRAI_UPDATE_REPO: "o/r" }), "https://api.github.com/repos/o/r");
 });
 
-test("the archive named for the release wins, and its digest is read from the API", () => {
-  const asset = selectReleaseAsset([
-    { name: "notes.txt", browser_download_url: "https://x/notes.txt", size: 10 },
-    { name: "XirAI-full-1.1.0.7z", browser_download_url: "https://x/full.7z", size: 9_000_000_000 },
-    { name: "XirAI-1.1.0.7z", browser_download_url: "https://x/program.7z", size: 700_000_000, digest: `sha256:${"b".repeat(64)}` },
-  ]);
-  assert.equal(asset.name, "XirAI-1.1.0.7z");
+test("custom feeds and GitHub Enterprise API bases must be credential-free HTTPS URLs", () => {
+  assert.equal(releaseFeedUrl({ XIRAI_UPDATE_FEED: "https://updates.example/latest.json" }), "https://updates.example/latest.json");
+  assert.equal(hasCustomReleaseFeed({ XIRAI_UPDATE_FEED: "https://updates.example/latest.json" }), true);
+  assert.equal(hasCustomReleaseFeed({}), false);
+  for (const invalid of ["http://updates.example/latest", "https://u:p@updates.example/latest", "ftp://updates.example/latest", " https://updates.example/latest"] ) {
+    assert.throws(() => releaseFeedUrl({ XIRAI_UPDATE_FEED: invalid }), /HTTPS/, invalid);
+  }
+  const ghe = { XIRAI_UPDATE_GITHUB_API_BASE: "https://git.example/api/v3/", XIRAI_UPDATE_REPO: "o/r" };
+  assert.equal(releaseApiBaseUrl(ghe), "https://git.example/api/v3");
+  assert.equal(releaseFeedUrl(ghe), "https://git.example/api/v3/repos/o/r/releases/latest");
+  for (const invalid of ["http://git.example/api/v3", "https://u:p@git.example/api/v3", "https://git.example/api/v3?q=1"]) {
+    assert.throws(() => releaseApiBaseUrl({ XIRAI_UPDATE_GITHUB_API_BASE: invalid }), /HTTPS/);
+  }
+});
+
+test("only the exact uploaded archive and exact uploaded sidecar are selected", () => {
+  const payload = release({
+    assets: [
+      uploadedAsset("source.tar.gz", { size: 1 }),
+      uploadedAsset("XirAI-full-1.2.3.7z", { size: 2 }),
+      uploadedAsset("evil-XirAI-1.2.3.7z", { size: 3 }),
+      uploadedAsset("XirAI-1.2.3.7z", { size: 700_000_000, digest: `sha256:${"b".repeat(64)}` }),
+      uploadedAsset("XirAI-1.2.3.7z.sha256", { size: 89 }),
+    ],
+  });
+  const asset = selectReleaseAsset(payload.assets, "1.2.3");
+  assert.equal(asset.name, "XirAI-1.2.3.7z");
   assert.equal(asset.bytes, 700_000_000);
-  assert.equal(asset.sha256, "b".repeat(64));
-  assert.equal(selectReleaseAsset([{ name: "readme.md", browser_download_url: "https://x/r.md" }]), null);
+  assert.equal(asset.advertisedSha256, "b".repeat(64));
+  assert.ok(asset.checksumUrl.endsWith("XirAI-1.2.3.7z.sha256"));
 });
 
-test("a checksum sidecar asset is found beside the archive it covers", () => {
-  const asset = selectReleaseAsset([
-    { name: "XirAI-1.1.0.7z", browser_download_url: "https://x/a.7z", size: 5 },
-    { name: "XirAI-1.1.0.7z.sha256", browser_download_url: "https://x/a.7z.sha256", size: 65 },
-  ]);
-  assert.equal(asset.checksumUrl, "https://x/a.7z.sha256");
-  assert.deepEqual(checksumRoutes({ asset }), [
-    { id: "release-checksum", label: "校验和 · GitHub", url: "https://x/a.7z.sha256" },
-  ]);
-  assert.deepEqual(checksumRoutes({ asset: { ...asset, checksumUrl: null } }), []);
+test("asset selection rejects fallback, ambiguity, non-uploaded state, and unsafe metadata", () => {
+  const exactArchive = uploadedAsset("XirAI-1.2.3.7z");
+  const exactSidecar = uploadedAsset("XirAI-1.2.3.7z.sha256", { size: 89 });
+  const select = (assets) => selectReleaseAsset(assets, "1.2.3");
+
+  assert.throws(() => select([uploadedAsset("XirAI-full-1.2.3.7z"), exactSidecar]), /缺少精确命名的更新包/);
+  assert.throws(() => select([uploadedAsset("XirAI-1.2.3.7z.exe"), exactSidecar]), /缺少精确命名的更新包/);
+  assert.throws(() => select([exactArchive]), /缺少精确命名的校验和文件/);
+  assert.throws(() => select([exactArchive, exactArchive, exactSidecar]), /多个同名更新包/);
+  assert.throws(() => select([exactArchive, exactSidecar, exactSidecar]), /多个同名校验和文件/);
+  assert.throws(() => select([{ ...exactArchive, state: "starter" }, exactSidecar]), /尚未完成上传/);
+  assert.throws(() => select([exactArchive, { ...exactSidecar, state: "new" }]), /尚未完成上传/);
+  assert.throws(() => select([{ ...exactArchive, browser_download_url: "http://github.com/file" }, exactSidecar]), /HTTPS/);
+  assert.throws(() => select([{ ...exactArchive, browser_download_url: "https://u:p@github.com/file" }, exactSidecar]), /HTTPS/);
+  assert.throws(() => select([{ ...exactArchive, size: 0 }, exactSidecar]), /大小无效/);
+  assert.throws(() => select([{ ...exactArchive, size: "1024" }, exactSidecar]), /大小无效/);
+  assert.throws(() => select([exactArchive, { ...exactSidecar, size: "89" }]), /大小无效/);
+  assert.throws(() => select([exactArchive, { ...exactSidecar, size: 16 * 1024 + 1 }]), /16 KiB/);
+  assert.throws(() => select([{ ...exactArchive, digest: `sha256:${sha}tail` }, exactSidecar]), /摘要格式无效/);
 });
 
-test("a checksum file is read in both bare-hash and SHA256SUMS form", () => {
-  const hash = "c".repeat(64);
-  assert.equal(parseChecksumFile(`${hash}\n`, "XirAI-1.1.0.7z"), hash);
-  assert.equal(parseChecksumFile(`${hash}  XirAI-1.1.0.7z\n`, "XirAI-1.1.0.7z"), hash);
-  assert.equal(parseChecksumFile([
-    `${"d".repeat(64)}  OtherPackage.7z`,
-    `${hash}  XirAI-1.1.0.7z`,
-  ].join("\n"), "XirAI-1.1.0.7z"), hash);
-  assert.equal(parseChecksumFile("no hash here", "XirAI-1.1.0.7z"), null);
-  assert.equal(parseChecksumFile("", "XirAI-1.1.0.7z"), null);
-});
-
-test("a release is reduced to the fields the update flow acts on", () => {
+test("release parsing exposes invalid releases instead of treating them as latest", () => {
   const parsed = parseRelease(release());
-  assert.equal(parsed.version, "1.1.0");
+  assert.equal(parsed.version, "1.2.3");
   assert.equal(parsed.prerelease, false);
-  assert.equal(parsed.publishedAt, "2026-09-01T10:00:00Z");
   assert.equal(parsed.notes, "修复若干问题");
-  assert.equal(parsed.asset.name, "XirAI-1.1.0.7z");
-  assert.equal(parsed.asset.sha256, "a".repeat(64));
+  assert.equal(parsed.asset.advertisedSha256, sha);
+
+  assert.throws(() => parseRelease(null), /格式无效/);
+  assert.throws(() => parseRelease(release({ draft: true })), /草稿/);
+  assert.throws(() => parseRelease(release({ prerelease: true })), /预发布/);
+  assert.throws(() => parseRelease(release({ tag_name: "v1.2.3-beta.1" })), /稳定/);
+  assert.throws(() => parseRelease(release({ tag_name: "v01.2.3" })), /稳定/);
+  assert.throws(() => parseRelease(release({ tag_name: "nightly" })), /稳定/);
+  assert.throws(() => parseRelease(release({ assets: [uploadedAsset("../XirAI-1.2.3.7z"), uploadedAsset("../XirAI-1.2.3.7z.sha256", { size: 89 })] })), /缺少精确命名/);
 });
 
-test("a release with nothing installable in it is not an update", () => {
-  assert.equal(parseRelease(null), null);
-  assert.equal(parseRelease({}), null);
-  // A draft is not published, whatever it carries.
-  assert.equal(parseRelease(release({ draft: true })), null);
-  // A tag that is not a version cannot be compared against the running build.
-  assert.equal(parseRelease(release({ tag_name: "nightly" })), null);
-  // A release with notes but no archive offers nothing to install.
-  assert.equal(parseRelease(release({ assets: [{ name: "notes.txt", browser_download_url: "https://x/n.txt" }] })), null);
-  // An asset entry without a download URL is equally useless.
-  assert.equal(parseRelease(release({ assets: [{ name: "XirAI.7z", browser_download_url: "" }] })), null);
+test("sha256sum sidecars require one exact complete filename", () => {
+  assert.equal(parseChecksumFile(`${sha}  XirAI-1.2.3.7z\n`, "XirAI-1.2.3.7z"), sha);
+  assert.equal(parseChecksumFile(`${sha} *XirAI-1.2.3.7z\r\n`, "XirAI-1.2.3.7z"), sha);
+  for (const malicious of [
+    `${sha}\n`,
+    `${sha} XirAI-1.2.3.7z\n`,
+    `${sha}  prefix-XirAI-1.2.3.7z\n`,
+    `${sha}  ./XirAI-1.2.3.7z\n`,
+    `${sha}  XirAI-1.2.3.7z.exe\n`,
+    `${sha}  XirAI-1.2.3.7z\n${"b".repeat(64)}  other\n`,
+    `${sha}  XirAI-1.2.3.7z\n\n`,
+    `xx${sha}  XirAI-1.2.3.7z\n`,
+    `${sha.toUpperCase()}  XirAI-1.2.3.7z extra\n`,
+  ]) {
+    assert.equal(parseChecksumFile(malicious, "XirAI-1.2.3.7z"), null, malicious);
+  }
 });
 
-test("a pre-release tag is reported as such so it can be kept off a stable channel", () => {
-  assert.equal(parseRelease(release({ tag_name: "v1.2.0-beta.1" })).prerelease, true);
-  assert.equal(parseRelease(release({ prerelease: true })).prerelease, true);
-});
-
-test("accelerated routes are offered only when the archive's checksum is known", () => {
+test("public download routes fail closed without a resolved SHA-256 and retain built-in acceleration", () => {
   const parsed = parseRelease(release());
-  const verified = releaseDownloadRoutes(parsed, { checksum: parsed.asset.sha256, environment: {} });
-  assert.deepEqual(verified.map((route) => route.id), ["release-ghfast", "release-ghproxy-net", "release-github"]);
-  assert.ok(verified[0].url.endsWith(parsed.asset.url));
-
-  // Without a checksum a mirror could serve anything at all, and the bytes become program files.
-  const unverified = releaseDownloadRoutes(parsed, { checksum: null, environment: {} });
-  assert.deepEqual(unverified.map((route) => route.id), ["release-github"]);
-  assert.equal(unverified[0].url, parsed.asset.url);
-});
-
-test("a configured mirror replaces the built-in accelerated hosts", () => {
-  const parsed = parseRelease(release());
-  const routes = releaseDownloadRoutes(parsed, {
-    checksum: parsed.asset.sha256,
+  assert.deepEqual(releaseDownloadRoutes(parsed, { checksum: null, environment: {} }), []);
+  assert.deepEqual(releaseDownloadRoutes(parsed, { checksum: "short", environment: {} }), []);
+  const routes = releaseDownloadRoutes(parsed, { checksum: sha, environment: {} });
+  assert.deepEqual(routes.map((route) => route.id), ["release-ghfast", "release-ghproxy-net", "release-github"]);
+  assert.ok(routes.slice(0, 2).every((route) => !new Headers(route.headers).has("authorization")));
+  const custom = releaseDownloadRoutes(parsed, {
+    checksum: sha,
     environment: { XIRAI_UPDATE_MIRROR: "https://mirror.example/gh/" },
+  });
+  assert.deepEqual(custom.map((route) => route.id), ["release-mirror", "release-github"]);
+  assert.equal(custom[0].url, `https://mirror.example/gh/${parsed.asset.url}`);
+  assert.equal(new Headers(custom[0].headers).has("authorization"), false);
+});
+
+test("PAT headers are limited to HTTPS GitHub or the explicit GHE host", () => {
+  const environment = { XIRAI_UPDATE_TOKEN: " secret ", XIRAI_UPDATE_GITHUB_API_BASE: "https://git.example/api/v3" };
+  assert.deepEqual(updateAuthorizationHeaders("https://api.github.com/repos/o/r", { environment }), { Authorization: "Bearer secret" });
+  assert.deepEqual(updateAuthorizationHeaders("https://github.com/o/r/file", { environment }), { Authorization: "Bearer secret" });
+  assert.deepEqual(updateAuthorizationHeaders("https://git.example/api/v3/repos/o/r", { environment }), { Authorization: "Bearer secret" });
+  assert.deepEqual(updateAuthorizationHeaders("http://api.github.com/repos/o/r", { environment }), {});
+  assert.deepEqual(updateAuthorizationHeaders("https://evil.example/file", { environment }), {});
+  assert.deepEqual(updateAuthorizationHeaders("https://api.github.com.evil.example/file", { environment }), {});
+  assert.deepEqual(updateAuthorizationHeaders("https://api.github.com:444/file", { environment }), {});
+  assert.deepEqual(updateAuthorizationHeaders("https://u:p@api.github.com/file", { environment }), {});
+  assert.deepEqual(updateAuthorizationHeaders("https://api.github.com/file", { environment, allowToken: false }), {});
+  assert.equal(trustedGithubUrl("https://git.example/file", environment), true);
+  assert.equal(trustedGithubUrl("http://git.example/file", environment), false);
+});
+
+test("private GitHub assets use only the authenticated official API route by default", () => {
+  const parsed = parseRelease(release());
+  const environment = { XIRAI_UPDATE_TOKEN: "secret" };
+  const [checksum] = checksumRoutes(parsed, { environment });
+  assert.equal(checksum.url, parsed.asset.checksumApiUrl);
+  assert.equal(checksum.headers.Authorization, "Bearer secret");
+  assert.equal(checksum.headers.Accept, "application/octet-stream");
+  const routes = releaseDownloadRoutes(parsed, { checksum: sha, environment });
+  assert.deepEqual(routes.map((route) => route.id), ["release-github"]);
+  const [official] = routes;
+  assert.equal(official.url, parsed.asset.apiUrl);
+  assert.equal(official.headers.Authorization, "Bearer secret");
+  assert.ok(routes.every((route) => !/ghfast\.top|ghproxy\.net/.test(route.url)));
+
+  const customChecksum = checksumRoutes(parsed, { environment, allowToken: false })[0];
+  assert.equal(customChecksum.url, parsed.asset.checksumUrl);
+  assert.equal(customChecksum.headers.Authorization, undefined);
+  const publicRoutes = releaseDownloadRoutes(parsed, { checksum: sha, environment, allowToken: false });
+  assert.deepEqual(publicRoutes.map((route) => route.id), ["release-ghfast", "release-ghproxy-net", "release-github"]);
+  const customOfficial = publicRoutes.at(-1);
+  assert.equal(customOfficial.url, parsed.asset.url);
+  assert.equal(customOfficial.headers.Authorization, undefined);
+});
+
+test("an explicit mirror is isolated from private official credentials", () => {
+  const parsed = parseRelease(release());
+  const token = "private-token-that-must-not-leak";
+  const routes = releaseDownloadRoutes(parsed, {
+    checksum: sha,
+    environment: {
+      XIRAI_UPDATE_TOKEN: token,
+      XIRAI_UPDATE_MIRROR: "https://mirror.example/gh/",
+    },
   });
   assert.deepEqual(routes.map((route) => route.id), ["release-mirror", "release-github"]);
   assert.equal(routes[0].url, `https://mirror.example/gh/${parsed.asset.url}`);
-  assert.deepEqual(releaseDownloadRoutes(null, { checksum: "x" }), []);
+  assert.equal(routes[0].url.includes(token), false);
+  assert.equal(new Headers(routes[0].headers).has("authorization"), false);
+  assert.equal(routes[1].url, parsed.asset.apiUrl);
+  assert.equal(routes[1].headers.Authorization, `Bearer ${token}`);
 });
 
-test("a 404 from the feed is read as 'nothing published yet' only when the repository is there", () => {
-  // The state this project is in between releases: the repository is public and readable, and the
-  // latest-release endpoint still answers 404. Reporting that as a broken configuration told the
-  // user to check whether their repository was public when it already was.
+test("explicit private context suppresses public proxies without relying on token presence", () => {
+  const parsed = parseRelease(release());
+  const routes = releaseDownloadRoutes(parsed, {
+    checksum: sha,
+    environment: {},
+    privateContext: true,
+  });
+  assert.deepEqual(routes.map((route) => route.id), ["release-github"]);
+  assert.equal(routes[0].url, parsed.asset.url);
+  assert.equal(routes[0].headers.Authorization, undefined);
+});
+
+test("an API-shaped official URL is conservative even without a token or explicit private flag", () => {
+  const parsed = parseRelease(release());
+  const apiOnly = {
+    ...parsed,
+    asset: {
+      ...parsed.asset,
+      url: parsed.asset.apiUrl,
+      apiUrl: null,
+    },
+  };
+  const routes = releaseDownloadRoutes(apiOnly, { checksum: sha, environment: {} });
+  assert.deepEqual(routes.map((route) => route.id), ["release-github"]);
+  assert.equal(routes[0].url, parsed.asset.apiUrl);
+});
+
+test("mirror configuration is credential-free HTTPS and signed source URLs are never disclosed", () => {
+  const parsed = parseRelease(release());
+  for (const mirror of [
+    "http://mirror.example/gh",
+    "https://user:password@mirror.example/gh",
+    "https://mirror.example/gh?token=secret",
+    "https://mirror.example/gh#fragment",
+    " https://mirror.example/gh",
+    "not a URL",
+  ]) {
+    assert.throws(
+      () => releaseDownloadRoutes(parsed, { checksum: sha, environment: { XIRAI_UPDATE_MIRROR: mirror } }),
+      /XIRAI_UPDATE_MIRROR/,
+      mirror,
+    );
+  }
+
+  const signed = {
+    ...parsed,
+    asset: { ...parsed.asset, url: `${parsed.asset.url}?token=release-secret` },
+  };
+  const routes = releaseDownloadRoutes(signed, {
+    checksum: sha,
+    environment: { XIRAI_UPDATE_MIRROR: "https://mirror.example/gh" },
+  });
+  assert.deepEqual(routes.map((route) => route.id), ["release-github"]);
+  assert.ok(routes.every((route) => !route.url.startsWith("https://mirror.example/")));
+  assert.deepEqual(
+    releaseDownloadRoutes(signed, { checksum: sha, environment: {} }).map((route) => route.id),
+    ["release-github"],
+  );
+});
+
+test("404 meaning remains explicit for custom feeds and reachable repositories", () => {
   assert.equal(missingReleaseMeaning({ customFeed: false, repositoryReachable: true }), "no-release");
-  // A repository that cannot be read is a genuine configuration problem worth surfacing.
   assert.equal(missingReleaseMeaning({ customFeed: false, repositoryReachable: false }), "source-missing");
-  // A custom feed is one URL; its 404 says nothing about any repository, so it is never guessed at.
   assert.equal(missingReleaseMeaning({ customFeed: true, repositoryReachable: true }), "source-missing");
   assert.equal(missingReleaseMeaning(), "source-missing");
-});
-
-test("a release in GitHub's real response shape parses end to end", () => {
-  // Captured from api.github.com rather than invented: the field names, the `sha256:` digest
-  // prefix and the presence of sidecar `.sha256` assets are what the live API actually returns.
-  const parsed = parseRelease({
-    tag_name: "1.0.0",
-    name: "1.0.0",
-    draft: false,
-    prerelease: false,
-    published_at: "2026-09-01T12:00:00Z",
-    body: "首个正式版本",
-    assets: [
-      {
-        name: "XirAI-1.0.0.7z",
-        browser_download_url: "https://github.com/Xiaollull/Xiria-AICanvas/releases/download/1.0.0/XirAI-1.0.0.7z",
-        size: 18284455,
-        digest: "sha256:1611d0f4be72b0a354ad9a6ae954093dd4c91e93e36b8b490326a05a039ffe14",
-        content_type: "application/x-7z-compressed",
-        state: "uploaded",
-        download_count: 0,
-      },
-      {
-        name: "XirAI-1.0.0.7z.sha256",
-        browser_download_url: "https://github.com/Xiaollull/Xiria-AICanvas/releases/download/1.0.0/XirAI-1.0.0.7z.sha256",
-        size: 89,
-        digest: null,
-      },
-    ],
-  });
-  assert.equal(parsed.version, "1.0.0");
-  assert.equal(parsed.asset.name, "XirAI-1.0.0.7z");
-  assert.equal(parsed.asset.bytes, 18284455);
-  assert.equal(parsed.asset.sha256, "1611d0f4be72b0a354ad9a6ae954093dd4c91e93e36b8b490326a05a039ffe14");
-  assert.equal(parsed.asset.checksumUrl.endsWith(".7z.sha256"), true);
-  // A tag without the leading v is as valid as one with it, and both must compare cleanly.
-  assert.equal(updateAvailable(parsed.version, "0.9.0"), true);
-  assert.equal(updateAvailable(parsed.version, "1.0.0"), false);
-});
-
-test("an asset digest GitHub did not compute does not become a checksum", () => {
-  // `digest` is null on assets GitHub has not hashed. Treating that as a hash would hand
-  // downloadFile an expected checksum of "null" and fail every verified download.
-  const parsed = parseRelease({
-    tag_name: "1.0.1",
-    assets: [{ name: "XirAI-1.0.1.7z", browser_download_url: "https://x/a.7z", size: 10, digest: null }],
-  });
-  assert.equal(parsed.asset.sha256, null);
-  // With no checksum from anywhere, the download must stay on the official route.
-  assert.deepEqual(releaseDownloadRoutes(parsed, { checksum: null, environment: {} }).map((r) => r.id), ["release-github"]);
-});
-
-test("the archive built for the release wins over anything else attached to it", () => {
-  // Observed against a real release: a project that also publishes a source tarball has an asset
-  // smaller than its program package, and picking by size alone would install the source.
-  const assets = [
-    { name: "source.tar.gz", browser_download_url: "https://x/source.tar.gz", size: 8_000_000 },
-    { name: "XirAI-1.0.1.7z", browser_download_url: "https://x/XirAI-1.0.1.7z", size: 700_000_000 },
-  ];
-  assert.equal(selectReleaseAsset(assets, "1.0.1").name, "XirAI-1.0.1.7z");
-  // Two packages that both name the version: the smaller one is the program-only archive.
-  assert.equal(selectReleaseAsset([
-    { name: "XirAI-full-1.0.1.7z", browser_download_url: "https://x/full", size: 9_000_000_000 },
-    { name: "XirAI-1.0.1.7z", browser_download_url: "https://x/program", size: 700_000_000 },
-  ], "1.0.1").name, "XirAI-1.0.1.7z");
-  // Nothing carries the version: size decides, as before.
-  assert.equal(selectReleaseAsset(assets, "9.9.9").name, "source.tar.gz");
-  assert.equal(selectReleaseAsset(assets).name, "source.tar.gz");
-  // And the whole rule runs through parseRelease, which knows the version from the tag.
-  assert.equal(parseRelease({ tag_name: "v1.0.1", assets }).asset.name, "XirAI-1.0.1.7z");
 });

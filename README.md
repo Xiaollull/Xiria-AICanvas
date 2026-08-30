@@ -136,18 +136,22 @@ update starts only after you confirm it. The archive is then verified and
 applied by the updater described below, with the same rollback, so the online
 and offline routes differ only in how the archive reaches the machine.
 
-Accelerated mirrors are used only when the release publishes a SHA-256 — either
-an asset digest from the API or a `<archive>.sha256` asset. Without one the
-download is pinned to GitHub itself, because bytes that become program files
-are not worth taking from an unverifiable proxy. The feed, repository, mirror
-and an optional token are configurable in `.env`; see `.env.example`.
+Accelerated mirrors are used only after the release publishes both the exact
+`XirAI-<version>.7z` archive and its exact uploaded
+`XirAI-<version>.7z.sha256` sidecar. The sidecar is fetched and strictly
+validated before any archive route is enabled, and an API digest is
+cross-checked when present. Missing, malformed, ambiguous, draft, prerelease,
+or incorrectly named releases fail closed instead of being presented as an
+available update. The feed, repository, mirror and optional token are
+configurable in `.env`; see `.env.example`.
 
-Publishing a release: tag it with a version (`v1.0.1` or `1.0.1`; drafts and
-non-version tags are ignored) and attach one program archive whose filename
-contains that version, such as `XirAI-1.0.1.7z`. When several archives are
-attached, the one naming the version wins and size only breaks a remaining tie.
-A repository with no release yet reads as "already up to date" rather than as
-an error.
+Publishing a release is intentionally strict: push a tag matching
+`vMAJOR.MINOR.PATCH` and the exact `package.json` and lockfile version. The
+Release workflow creates `XirAI-<version>.7z` and its matching `.sha256` asset,
+validates the allowlisted package, and tests the update against the previous
+stable release when one exists. The initial `v1.0.0` release uses an isolated
+first-release validation. A repository with no published release yet reads as
+"already up to date" rather than as an error.
 
 The **Settings → About → Manual program update** page accepts trusted clean
 XiriaCanvas AI project archives such as ZIP, 7Z, RAR, TAR, TAR.GZ, and TAR.XZ.

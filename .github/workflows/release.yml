@@ -2,29 +2,88 @@ name: Release
 
 on:
   push:
+    # Ref filters are globs, not regular expressions. This narrows the event set; the first job
+    # then applies the exact stable-version regex before any install, build, or packaging work.
     tags:
-      - "v*"
+      - "v*.*.*"
+  # A dispatch deliberately runs static validation only. It can never reach the publish job.
+  workflow_dispatch:
 
-# Creating a release and uploading its assets both write to the repository.
 permissions:
-  contents: write
+  contents: read
 
-# A retagged release must not race the run it replaces.
+# A second delivery attempt for the same immutable tag must wait for the first one to finish.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Publish ${{ github.ref_name }}
+  static-validation:
+    name: Static release validation
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v5
         with:
-          # The project requires >= 22.21.0 and the verification workflow pins this exact build.
+          node-version: 22.21.0
+
+      - name: Parse the workflow and check release scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -e 'require "yaml"; YAML.safe_load(File.read(".github/workflows/release.yml"), aliases: true)'
+          node --check scripts/release-package.mjs
+          node --check scripts/archive-update.mjs
+          node --test scripts/release-package.test.mjs
+
+      - name: Check release metadata consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises";
+          const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+          const pkg = JSON.parse(await readFile("package.json", "utf8"));
+          const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
+          const versions = [pkg.version, lock.version, lock.packages?.[""]?.version];
+          if (versions.some((value) => typeof value !== "string" || !stable.test(value))) {
+            throw new Error(`Release metadata must use strict stable versions: ${versions.join(", ")}`);
+          }
+          if (new Set(versions).size !== 1) {
+            throw new Error(`Release metadata versions disagree: ${versions.join(", ")}`);
+          }
+          console.log(`Static release metadata check passed for ${pkg.version}`);
+          NODE
+
+  verify-and-package:
+    name: Verify and package ${{ github.ref_name }}
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      archive: ${{ steps.version.outputs.archive }}
+      artifact: ${{ steps.version.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # origin/main and the tag commit must both be available for the ancestry proof.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
           node-version: 22.21.0
           cache: npm
 
@@ -32,131 +91,725 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The version the running program reports comes from package.json, and the update check
-      # compares the release tag against it. If they disagree, a user who installs this release
-      # ends up running a build that reports the older number, so the check offers the same
-      # update again on every click, forever. Refusing to publish is the only safe answer.
-      - name: Verify the tag matches the version the build will report
+      - name: Verify strict tag and all package versions
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$version" != "$tag" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}. Bump package.json, or retag."
+          node --input-type=module <<'NODE'
+          import { appendFile, readFile } from "node:fs/promises";
+
+          const tag = process.env.GITHUB_REF_NAME;
+          const stableTag = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+          const match = stableTag.exec(tag);
+          if (!match || process.env.GITHUB_REF !== `refs/tags/${tag}`) {
+            throw new Error(`Release tags must be exactly vMAJOR.MINOR.PATCH without leading zeroes, prerelease, or build metadata; received ${tag}`);
+          }
+
+          const version = match.slice(1).join(".");
+          const pkg = JSON.parse(await readFile("package.json", "utf8"));
+          const lock = JSON.parse(await readFile("package-lock.json", "utf8"));
+          const metadata = {
+            "package.json": pkg.version,
+            "package-lock.json root": lock.version,
+            "package-lock.json packages['']": lock.packages?.[""]?.version,
+          };
+          for (const [source, value] of Object.entries(metadata)) {
+            if (value !== version) throw new Error(`${source} version ${String(value)} does not match tag ${tag}`);
+          }
+
+          const archive = `XirAI-${version}.7z`;
+          await appendFile(process.env.GITHUB_OUTPUT, [
+            `version=${version}`,
+            `tag=${tag}`,
+            `archive=${archive}`,
+            `artifact=xirai-release-${version}`,
+            "",
+          ].join("\n"));
+          console.log(`Verified strict stable release ${tag}`);
+          NODE
+
+      - name: Prove the tag commit belongs to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error::release verification requires the complete Git history"
             exit 1
           fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "archive=XirAI-${version}.7z" >> "$GITHUB_OUTPUT"
-          echo "Publishing version ${version} from tag ${GITHUB_REF_NAME}"
+          git rev-parse --verify refs/remotes/origin/main^{commit} >/dev/null
+          test "$(git rev-parse HEAD^{commit})" = "$GITHUB_SHA"
+          test "$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")" = "$GITHUB_SHA"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::tag commit ${GITHUB_SHA} is not contained in origin/main"
+            exit 1
+          fi
+          echo "Tag commit ${GITHUB_SHA} is an ancestor of or equal to origin/main."
 
       - run: npm ci
 
-      # A release must at least build and pass its own fast checks. Browser fixtures need a
-      # runner-installed browser and are skipped here exactly as they are in verification.
       - name: Run fast Node checks
         env:
           XIRAI_SKIP_BROWSER_FIXTURES: "1"
         run: npm run test:setup
 
-      - run: npm run build
-
-      - name: Install 7-Zip
+      - name: Build without creating a distributable dist directory
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v 7z >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y p7zip-full
-          fi
-          7z i > /dev/null
+          test ! -e dist
+          build_directory="${RUNNER_TEMP}/xirai-vite-build"
+          rm -rf "$build_directory"
+          npm run build -- --outDir "$build_directory" --emptyOutDir
+          test -f "$build_directory/index.html"
+          test ! -e dist
+          rm -rf "$build_directory"
 
-      # The package is the program, and only the program. `git archive` takes exactly the tracked
-      # files at this tag, which is what keeps .venv, node_modules, models, outputs, logs,
-      # state-cache, .cache and .env out of it — a user's environment and creations must survive
-      # the update that replaces the code around them. `dist/` is deliberately absent too: it is
-      # gitignored, the running app serves the dev server rather than a bundle, and the updater
-      # rebuilds the frontend itself while validating the replacement.
-      - name: Package the program archive
-        id: package
+      - name: Check 7-Zip availability
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          archive="${{ steps.version.outputs.archive }}"
-          staging="$(mktemp -d)/XiriaCanvas-AI-${version}"
-          mkdir -p "$staging" release
-          # HEAD is the tag commit by definition here, and needs no tag ref to exist locally.
-          git archive --format=tar HEAD | tar -x -C "$staging"
+          command -v 7z >/dev/null
+          7z i >/dev/null
 
-          # One wrapper directory is what the updater accepts besides a bare project root, and it
-          # is friendlier for anyone extracting the archive by hand.
-          ( cd "$(dirname "$staging")" && 7z a -t7z -mx=9 -bd -bso0 -bsp0 "${GITHUB_WORKSPACE}/release/${archive}" "$(basename "$staging")" )
-
-          for forbidden in .venv node_modules outputs state-cache .cache .env; do
-            if [ -e "${staging}/${forbidden}" ]; then
-              echo "::error::the package contains ${forbidden}, which an update must never replace"
-              exit 1
-            fi
-          done
-          ls -l "release/${archive}"
-
-      # Named for the archive so the checksum survives being downloaded on its own, and in the
-      # `sha256sum` format the updater already reads.
-      - name: Generate the checksum
+      - name: Create and manifest-validate the release archive
         shell: bash
-        run: |
-          set -euo pipefail
-          cd release
-          sha256sum "${{ steps.version.outputs.archive }}" > "${{ steps.version.outputs.archive }}.sha256"
-          cat "${{ steps.version.outputs.archive }}.sha256"
-
-      # The last gate, and the one that matters most: the archive is handed to the updater that
-      # will install it, against this very checkout as the project being updated. A release that
-      # the updater would refuse is caught here rather than on a user's machine.
-      - name: Verify the updater accepts this archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --input-type=module -e '
-            import { prepareUpdate } from "./scripts/archive-update.mjs";
-            import { rm } from "node:fs/promises";
-            const archivePath = process.env.RELEASE_ARCHIVE;
-            const prepared = await prepareUpdate({ projectRoot: process.cwd(), archivePath });
-            if (!prepared.plan.length) throw new Error("the update plan is empty; the archive replaces nothing");
-            console.log(`updater accepted the archive: ${prepared.plan.length} managed items, tool ${prepared.archiveTool.kind}`);
-            await rm(prepared.stagingDirectory, { recursive: true, force: true });
-          '
         env:
-          RELEASE_ARCHIVE: ${{ github.workspace }}/release/${{ steps.version.outputs.archive }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        run: |
+          set -euo pipefail
+          staging="${RUNNER_TEMP}/xirai-release-stage"
+          wrapper="XiriaCanvas-AI-${VERSION}"
+          package_root="${staging}/${wrapper}"
+          archive_path="${GITHUB_WORKSPACE}/release/${ARCHIVE}"
+          rm -rf "$staging" "${GITHUB_WORKSPACE}/release"
+          mkdir -p "${GITHUB_WORKSPACE}/release"
 
-      - name: Publish the release
-        uses: softprops/action-gh-release@v2
+          # This allowlisted staging command writes the manifest and validates the staged tree.
+          node scripts/release-package.mjs "$GITHUB_WORKSPACE" "$staging" "$wrapper"
+          PACKAGE_ROOT="$package_root" node --input-type=module <<'NODE'
+          import { validateReleasePackageDirectory } from "./scripts/release-package.mjs";
+          const manifest = await validateReleasePackageDirectory({ packageRoot: process.env.PACKAGE_ROOT });
+          if (!manifest.files.length) throw new Error("Release manifest is empty");
+          console.log(`Validated ${manifest.files.length} allowlisted release files before archiving.`);
+          NODE
+
+          # Run from the staging parent so the 7z contains exactly one wrapper directory.
+          (
+            cd "$staging"
+            7z a -t7z -mx=9 -mmt=on -bd -bso0 -bsp0 "$archive_path" "$wrapper"
+          )
+          test -s "$archive_path"
+          7z t -bd -bso0 -bsp0 "$archive_path"
+
+          (
+            cd "${GITHUB_WORKSPACE}/release"
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+            sha256sum --check "${ARCHIVE}.sha256"
+          )
+
+      - name: Find and authenticate the previous stable release archive
+        id: previous
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          PREVIOUS_DIRECTORY: ${{ runner.temp }}/xirai-previous-release
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { createWriteStream } from "node:fs";
+          import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
+          import path from "node:path";
+          import { pipeline } from "node:stream/promises";
+
+          const headers = {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${process.env.GH_TOKEN}`,
+            "User-Agent": "xirai-release-workflow",
+            "X-GitHub-Api-Version": "2022-11-28",
+          };
+          const stable = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+          const currentTag = `v${process.env.VERSION}`;
+          const current = process.env.VERSION.split(".").map(BigInt);
+          const compare = (left, right) => {
+            for (let index = 0; index < 3; index += 1) {
+              if (left[index] !== right[index]) return left[index] < right[index] ? -1 : 1;
+            }
+            return 0;
+          };
+          const request = async (url, accept = headers.Accept) => {
+            const response = await fetch(url, { headers: { ...headers, Accept: accept }, redirect: "follow" });
+            if (!response.ok) throw new Error(`GitHub API ${response.status} for ${url}`);
+            return response;
+          };
+
+          const releases = [];
+          for (let page = 1; page <= 10; page += 1) {
+            const response = await request(`https://api.github.com/repos/${process.env.REPOSITORY}/releases?per_page=100&page=${page}`);
+            const batch = await response.json();
+            if (!Array.isArray(batch)) throw new Error("GitHub Releases API returned an invalid response");
+            releases.push(...batch);
+            if (batch.length < 100) break;
+            if (page === 10) throw new Error("More than 1000 releases exist; refusing an incomplete previous-release search");
+          }
+
+          const sameTagReleases = releases.filter((release) => release.tag_name === currentTag);
+          if (sameTagReleases.some((release) => !release.draft)) {
+            throw new Error(`Published release ${currentTag} already exists; refusing to update its notes or assets`);
+          }
+          if (sameTagReleases.length > 0) {
+            if (sameTagReleases.length !== 1) {
+              throw new Error(`Found ${sameTagReleases.length} draft releases for ${currentTag}; refusing an ambiguous recovery`);
+            }
+            const [draft] = sameTagReleases;
+            const marker = `<!-- xirai-release-workflow-owned:v2 repository=${process.env.REPOSITORY} workflow_ref=${process.env.WORKFLOW_REF} tag=${currentTag} sha=${process.env.TARGET_SHA} -->`;
+            const expectedName = `XiriaCanvas AI ${process.env.VERSION}`;
+            const expectedAssets = new Set([
+              `XirAI-${process.env.VERSION}.7z`,
+              `XirAI-${process.env.VERSION}.7z.sha256`,
+            ]);
+            if (
+              draft.prerelease ||
+              draft.target_commitish !== process.env.TARGET_SHA ||
+              draft.name !== expectedName ||
+              draft.body !== marker ||
+              !Array.isArray(draft.assets) ||
+              draft.assets.some((asset) => !expectedAssets.has(asset.name))
+            ) {
+              throw new Error(`Draft release ${currentTag} is not the exact workflow-owned draft for this repository, workflow, tag, and commit; refusing to modify it`);
+            }
+            console.log(`Recognized workflow-owned draft ${draft.id}; publish may safely resume after verification.`);
+          }
+          const stableReleases = releases.flatMap((release) => {
+            const match = !release.draft && !release.prerelease && stable.exec(release.tag_name || "");
+            return match ? [{ release, version: match.slice(1).map(BigInt) }] : [];
+          });
+          if (stableReleases.some(({ version }) => compare(version, current) > 0)) {
+            throw new Error(`A stable release newer than ${currentTag} already exists`);
+          }
+          const previous = stableReleases
+            .filter(({ version }) => compare(version, current) < 0)
+            .sort((left, right) => compare(right.version, left.version))[0];
+
+          await rm(process.env.PREVIOUS_DIRECTORY, { recursive: true, force: true });
+          await mkdir(process.env.PREVIOUS_DIRECTORY, { recursive: true });
+          if (!previous) {
+            if (process.env.VERSION !== "1.0.0") {
+              throw new Error(`No previous stable release exists; only the initial 1.0.0 release may omit an update baseline`);
+            }
+            await appendFile(process.env.GITHUB_OUTPUT, "found=false\n");
+            console.log("No previous stable release exists; 1.0.0 will use a current-package structural/apply check.");
+            process.exit(0);
+          }
+
+          const previousVersion = previous.version.join(".");
+          const archiveName = `XirAI-${previousVersion}.7z`;
+          const checksumName = `${archiveName}.sha256`;
+          const exactAsset = (name) => previous.release.assets.filter((asset) => asset.name === name && asset.state === "uploaded");
+          const archiveAssets = exactAsset(archiveName);
+          const checksumAssets = exactAsset(checksumName);
+          if (archiveAssets.length !== 1 || checksumAssets.length !== 1) {
+            throw new Error(`Previous release ${previous.release.tag_name} must have exactly ${archiveName} and ${checksumName}`);
+          }
+
+          const download = async (asset, destination) => {
+            const response = await request(asset.url, "application/octet-stream");
+            if (!response.body) throw new Error(`Empty response while downloading ${asset.name}`);
+            await pipeline(response.body, createWriteStream(destination, { flags: "wx" }));
+          };
+          const archivePath = path.join(process.env.PREVIOUS_DIRECTORY, archiveName);
+          const checksumPath = path.join(process.env.PREVIOUS_DIRECTORY, checksumName);
+          await download(archiveAssets[0], archivePath);
+          await download(checksumAssets[0], checksumPath);
+
+          const checksumText = await readFile(checksumPath, "utf8");
+          const escapedName = archiveName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const checksumMatch = new RegExp(`^([0-9a-fA-F]{64}) [ *]${escapedName}\\r?\\n?$`).exec(checksumText);
+          if (!checksumMatch) throw new Error(`Previous release checksum sidecar has an invalid or non-exact filename`);
+          const hash = createHash("sha256");
+          for await (const chunk of (await import("node:fs")).createReadStream(archivePath)) hash.update(chunk);
+          const actual = hash.digest("hex");
+          if (actual !== checksumMatch[1].toLowerCase()) throw new Error(`Previous release archive checksum mismatch`);
+
+          await appendFile(process.env.GITHUB_OUTPUT, [
+            "found=true",
+            `version=${previousVersion}`,
+            `archive=${archivePath}`,
+            "",
+          ].join("\n"));
+          console.log(`Authenticated previous stable archive ${archiveName} from ${previous.release.tag_name}.`);
+          NODE
+
+      - name: Exercise the real updater against the release archive
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NEW_ARCHIVE: ${{ github.workspace }}/release/${{ steps.version.outputs.archive }}
+          CURRENT_PACKAGE_ROOT: ${{ runner.temp }}/xirai-release-stage/XiriaCanvas-AI-${{ steps.version.outputs.version }}
+          PREVIOUS_FOUND: ${{ steps.previous.outputs.found }}
+          PREVIOUS_ARCHIVE: ${{ steps.previous.outputs.archive }}
+          CANDIDATE_ARCHIVE: ${{ runner.temp }}/xirai-update-candidate.7z
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { constants } from "node:fs";
+          import { copyFile, readFile, rm } from "node:fs/promises";
+          import path from "node:path";
+          import { applyPreparedUpdate, prepareUpdate } from "./scripts/archive-update.mjs";
+          import { createReleaseManifest } from "./scripts/release-package.mjs";
+          import { removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
+
+          const cleanupPrepared = async (prepared) => {
+            if (!prepared?.stagingOwnership) return;
+            await removeOfflineUpdateTemp({
+              projectRoot: prepared.projectRoot,
+              record: prepared.stagingOwnership,
+              prefix: "xirai-update-stage-",
+              kind: "stage",
+            });
+          };
+          const assertUpdatedTree = async (projectRoot, expectedRoot, expectedManifest) => {
+            const actualManifest = await createReleaseManifest({ projectRoot });
+            if (JSON.stringify(actualManifest.files) !== JSON.stringify(expectedManifest.files)) {
+              throw new Error("Applied tree does not have the exact new release manifest file set");
+            }
+            for (const relative of expectedManifest.files) {
+              const segments = relative.split("/");
+              const [actual, expected] = await Promise.all([
+                readFile(path.join(projectRoot, ...segments)),
+                readFile(path.join(expectedRoot, ...segments)),
+              ]);
+              if (!actual.equals(expected)) throw new Error(`Applied release file differs: ${relative}`);
+            }
+            const pkg = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
+            const lock = JSON.parse(await readFile(path.join(projectRoot, "package-lock.json"), "utf8"));
+            if ([pkg.version, lock.version, lock.packages?.[""]?.version].some((value) => value !== process.env.VERSION)) {
+              throw new Error("Applied project version metadata does not match the release version");
+            }
+          };
+
+          let previousPrepared;
+          let candidatePrepared;
+          try {
+            await rm(process.env.CANDIDATE_ARCHIVE, { force: true });
+            await copyFile(process.env.NEW_ARCHIVE, process.env.CANDIDATE_ARCHIVE, constants.COPYFILE_EXCL);
+
+            let updateRoot = process.env.CURRENT_PACKAGE_ROOT;
+            if (process.env.PREVIOUS_FOUND === "true") {
+              // prepareUpdate performs the security-aware extraction of the authenticated old archive.
+              previousPrepared = await prepareUpdate({
+                projectRoot: process.env.CURRENT_PACKAGE_ROOT,
+                archivePath: process.env.PREVIOUS_ARCHIVE,
+              });
+              if (!previousPrepared.plan.length) throw new Error("Previous release extraction produced an empty update plan");
+              if (previousPrepared.environmentRepairRequired) {
+                throw new Error("Requirements differ from the previous release; this workflow has no release environment to verify repair, so publishing is blocked");
+              }
+              updateRoot = previousPrepared.packageRoot;
+            } else if (process.env.VERSION !== "1.0.0") {
+              throw new Error("Only first release 1.0.0 may be validated without a previous stable archive");
+            }
+
+            // A byte-identical copy is used because applyPreparedUpdate securely removes its input
+            // after success; the actual release asset must remain available for artifact upload.
+            candidatePrepared = await prepareUpdate({
+              projectRoot: updateRoot,
+              archivePath: process.env.CANDIDATE_ARCHIVE,
+            });
+            if (!candidatePrepared.releaseManifest) throw new Error("New release archive did not pass manifest validation");
+            if (!candidatePrepared.plan.length) throw new Error("New release archive produced an empty update plan");
+            if (candidatePrepared.environmentRepairRequired) {
+              throw new Error("Requirements changed and cannot be validated without environment repair; publishing is blocked");
+            }
+
+            const expectedRoot = candidatePrepared.packageRoot;
+            const expectedManifest = candidatePrepared.releaseManifest;
+            await applyPreparedUpdate({
+              projectRoot: updateRoot,
+              prepared: candidatePrepared,
+              validate: async ({ projectRoot, environmentRepairRequired }) => {
+                if (environmentRepairRequired) throw new Error("Unexpected environment repair request during release validation");
+                await assertUpdatedTree(projectRoot, expectedRoot, expectedManifest);
+                return { verified: true };
+              },
+            });
+            candidatePrepared = undefined;
+            console.log(process.env.PREVIOUS_FOUND === "true"
+              ? "The real updater prepared, applied, and byte-validated the new archive over the previous stable package."
+              : "The real updater prepared, applied, and byte-validated the initial archive over an isolated current package.");
+          } finally {
+            await cleanupPrepared(candidatePrepared).catch(() => {});
+            await cleanupPrepared(previousPrepared).catch(() => {});
+            await rm(process.env.CANDIDATE_ARCHIVE, { force: true });
+          }
+          NODE
+
+      - name: Upload verified release assets for the publish job
+        uses: actions/upload-artifact@v4
         with:
-          name: XiriaCanvas AI ${{ steps.version.outputs.version }}
-          draft: false
-          # A pre-release is invisible to the update check: GitHub's latest-release endpoint, which
-          # the check reads, never returns one. Publishing a release users cannot see would look
-          # exactly like a broken updater.
-          prerelease: false
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
+          name: ${{ steps.version.outputs.artifact }}
+          path: |
             release/${{ steps.version.outputs.archive }}
             release/${{ steps.version.outputs.archive }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
-      - name: Summarize
+      - name: Summarize verification
         if: always()
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+          PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
         run: |
           {
-            echo "## Release ${{ github.ref_name }}"
+            echo "## Verified release ${GITHUB_REF_NAME}"
             echo
-            echo "- Version: ${{ steps.version.outputs.version }}"
-            echo "- Archive: ${{ steps.version.outputs.archive }}"
-            if [ -f "release/${{ steps.version.outputs.archive }}" ]; then
-              echo "- Size: $(du -h "release/${{ steps.version.outputs.archive }}" | cut -f1)"
-              echo "- SHA-256: \`$(cut -d' ' -f1 "release/${{ steps.version.outputs.archive }}.sha256")\`"
+            echo "- Version: ${VERSION:-not validated}"
+            echo "- Archive: ${ARCHIVE:-not created}"
+            if [ -n "${ARCHIVE:-}" ] && [ -f "release/${ARCHIVE}" ]; then
+              echo "- Size: $(du -h "release/${ARCHIVE}" | cut -f1)"
+              echo "- SHA-256: \`$(cut -d' ' -f1 "release/${ARCHIVE}.sha256")\`"
             fi
+            echo "- Update baseline: ${PREVIOUS_VERSION:-initial 1.0.0 structural/apply validation}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish ${{ needs.verify-and-package.outputs.tag }}
+    if: github.event_name == 'push'
+    needs: verify-and-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This short, isolated job is the only place a contents:write token exists.
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download only the verified release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.verify-and-package.outputs.artifact }}
+          path: release
+
+      - name: Recheck exact artifact names and checksum
+        shell: bash
+        env:
+          ARCHIVE: ${{ needs.verify-and-package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          test "$(find release -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+          test -f "release/${ARCHIVE}"
+          test ! -L "release/${ARCHIVE}"
+          test -f "release/${ARCHIVE}.sha256"
+          test ! -L "release/${ARCHIVE}.sha256"
+          (
+            cd release
+            test "$(wc -l < "${ARCHIVE}.sha256")" -eq 1
+            grep -Eq "^[0-9a-f]{64}  ${ARCHIVE//./\\.}$" "${ARCHIVE}.sha256"
+            sha256sum --check "${ARCHIVE}.sha256"
+          )
+
+      - name: Create or recover the exact workflow-owned draft
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.verify-and-package.outputs.tag }}
+          VERSION: ${{ needs.verify-and-package.outputs.version }}
+          ARCHIVE: ${{ needs.verify-and-package.outputs.archive }}
+          TARGET_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFile } from "node:fs/promises";
+
+          const apiRoot = `https://api.github.com/repos/${process.env.REPOSITORY}`;
+          const marker = `<!-- xirai-release-workflow-owned:v2 repository=${process.env.REPOSITORY} workflow_ref=${process.env.WORKFLOW_REF} tag=${process.env.TAG} sha=${process.env.TARGET_SHA} -->`;
+          const releaseName = `XiriaCanvas AI ${process.env.VERSION}`;
+          const expectedAssets = new Set([process.env.ARCHIVE, `${process.env.ARCHIVE}.sha256`]);
+          const headers = {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${process.env.GH_TOKEN}`,
+            "Content-Type": "application/json",
+            "User-Agent": "xirai-release-workflow",
+            "X-GitHub-Api-Version": "2022-11-28",
+          };
+
+          const request = async (path, { method = "GET", body } = {}) => {
+            const response = await fetch(`${apiRoot}${path}`, {
+              method,
+              headers,
+              body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            const text = await response.text();
+            let data;
+            try {
+              data = text ? JSON.parse(text) : undefined;
+            } catch {
+              throw new Error(`GitHub API returned non-JSON data for ${method} ${path}`);
+            }
+            if (!response.ok) {
+              throw new Error(`GitHub API ${response.status} for ${method} ${path}: ${data?.message || text}`);
+            }
+            return data;
+          };
+          const listAll = async (path) => {
+            const values = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const separator = path.includes("?") ? "&" : "?";
+              const batch = await request(`${path}${separator}per_page=100&page=${page}`);
+              if (!Array.isArray(batch)) throw new Error(`GitHub API returned an invalid list for ${path}`);
+              values.push(...batch);
+              if (batch.length < 100) return values;
+            }
+            throw new Error(`More than 1000 results exist for ${path}; refusing an incomplete safety check`);
+          };
+          const assertOwnedDraft = (release) => {
+            if (!release?.draft) {
+              throw new Error(`Published release ${process.env.TAG} already exists; refusing to update its notes or assets`);
+            }
+            if (
+              release.tag_name !== process.env.TAG ||
+              release.prerelease ||
+              release.target_commitish !== process.env.TARGET_SHA ||
+              release.name !== releaseName ||
+              release.body !== marker
+            ) {
+              throw new Error(`Draft release ${process.env.TAG} is not the exact workflow-owned draft for this repository, workflow, tag, and commit; refusing to modify it`);
+            }
+          };
+          const findExactDraft = async () => {
+            const releases = await listAll("/releases");
+            const matches = releases.filter((release) => release.tag_name === process.env.TAG);
+            if (matches.some((release) => !release.draft)) {
+              throw new Error(`Published release ${process.env.TAG} already exists; refusing to update its notes or assets`);
+            }
+            if (matches.length > 1) {
+              throw new Error(`Found ${matches.length} draft releases for ${process.env.TAG}; refusing an ambiguous recovery`);
+            }
+            return matches[0];
+          };
+
+          let release = await findExactDraft();
+          if (release) {
+            assertOwnedDraft(release);
+            console.log(`Recovering workflow-owned draft ${release.id} for ${process.env.TAG}.`);
+          } else {
+            release = await request("/releases", {
+              method: "POST",
+              body: {
+                tag_name: process.env.TAG,
+                target_commitish: process.env.TARGET_SHA,
+                name: releaseName,
+                body: marker,
+                draft: true,
+                prerelease: false,
+              },
+            });
+            assertOwnedDraft(release);
+
+            // A lost create response is recoverable on rerun. After a successful response, also
+            // reject any same-tag race rather than guessing which draft is safe to modify.
+            const discovered = await findExactDraft();
+            if (!discovered || discovered.id !== release.id) {
+              throw new Error(`Created draft ${release.id} is not the unique discoverable draft for ${process.env.TAG}`);
+            }
+            release = discovered;
+            console.log(`Created workflow-owned draft ${release.id} for ${process.env.TAG}.`);
+          }
+
+          // Only a fully authenticated workflow draft reaches this mutation. Removing expected
+          // assets makes retries recover from interrupted or half-finished previous uploads.
+          const assets = await listAll(`/releases/${release.id}/assets`);
+          const unexpected = assets.filter((asset) => !expectedAssets.has(asset.name));
+          if (unexpected.length > 0) {
+            throw new Error(`Workflow-owned draft ${release.id} has unexpected assets (${unexpected.map((asset) => asset.name).join(", ")}); refusing to overwrite them`);
+          }
+          for (const asset of assets) {
+            await request(`/releases/assets/${asset.id}`, { method: "DELETE" });
+            console.log(`Removed retry residue ${asset.name} from draft ${release.id}.`);
+          }
+
+          await appendFile(process.env.GITHUB_OUTPUT, `release_id=${release.id}\n`);
+          NODE
+
+      - name: Upload assets while keeping the owned release as a draft
+        id: upload
+        # softprops/action-gh-release v2.6.2, audited at the v2 commit on 2026-08-30.
+        # Draft creation and authentication happen above; this pinned action only uploads files,
+        # and the next step requires its release ID and exact uploaded-asset IDs to match.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: ${{ needs.verify-and-package.outputs.tag }}
+          draft: true
+          preserve_order: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: |
+            release/${{ needs.verify-and-package.outputs.archive }}
+            release/${{ needs.verify-and-package.outputs.archive }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Verify assets, generate notes, and publish the owned draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.verify-and-package.outputs.tag }}
+          VERSION: ${{ needs.verify-and-package.outputs.version }}
+          ARCHIVE: ${{ needs.verify-and-package.outputs.archive }}
+          TARGET_SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release_id }}
+          UPLOADED_RELEASE_ID: ${{ steps.upload.outputs.id }}
+          UPLOADED_ASSETS: ${{ steps.upload.outputs.assets }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { stat } from "node:fs/promises";
+
+          const apiRoot = `https://api.github.com/repos/${process.env.REPOSITORY}`;
+          const marker = `<!-- xirai-release-workflow-owned:v2 repository=${process.env.REPOSITORY} workflow_ref=${process.env.WORKFLOW_REF} tag=${process.env.TAG} sha=${process.env.TARGET_SHA} -->`;
+          const releaseName = `XiriaCanvas AI ${process.env.VERSION}`;
+          const expectedAssets = new Map(await Promise.all([
+            process.env.ARCHIVE,
+            `${process.env.ARCHIVE}.sha256`,
+          ].map(async (name) => [name, (await stat(`release/${name}`)).size])));
+          const headers = {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${process.env.GH_TOKEN}`,
+            "Content-Type": "application/json",
+            "User-Agent": "xirai-release-workflow",
+            "X-GitHub-Api-Version": "2022-11-28",
+          };
+
+          const request = async (path, { method = "GET", body, extraHeaders = {} } = {}) => {
+            const response = await fetch(`${apiRoot}${path}`, {
+              method,
+              headers: { ...headers, ...extraHeaders },
+              body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            const text = await response.text();
+            let data;
+            try {
+              data = text ? JSON.parse(text) : undefined;
+            } catch {
+              throw new Error(`GitHub API returned non-JSON data for ${method} ${path}`);
+            }
+            if (!response.ok) {
+              throw new Error(`GitHub API ${response.status} for ${method} ${path}: ${data?.message || text}`);
+            }
+            return { data, etag: response.headers.get("etag") };
+          };
+          const listAll = async (path) => {
+            const values = [];
+            for (let page = 1; page <= 10; page += 1) {
+              const separator = path.includes("?") ? "&" : "?";
+              const { data: batch } = await request(`${path}${separator}per_page=100&page=${page}`);
+              if (!Array.isArray(batch)) throw new Error(`GitHub API returned an invalid list for ${path}`);
+              values.push(...batch);
+              if (batch.length < 100) return values;
+            }
+            throw new Error(`More than 1000 results exist for ${path}; refusing an incomplete safety check`);
+          };
+          const assertOwnedDraft = (release) => {
+            if (
+              !release?.draft ||
+              release.tag_name !== process.env.TAG ||
+              release.prerelease ||
+              release.target_commitish !== process.env.TARGET_SHA ||
+              release.name !== releaseName ||
+              release.body !== marker
+            ) {
+              throw new Error(`Release ${process.env.EXPECTED_RELEASE_ID} no longer exactly matches the workflow-owned draft marker and target; refusing to publish it`);
+            }
+          };
+
+          if (!/^\d+$/.test(process.env.EXPECTED_RELEASE_ID || "")) {
+            throw new Error("The draft preparation step did not return a valid release ID");
+          }
+          if (process.env.UPLOADED_RELEASE_ID !== process.env.EXPECTED_RELEASE_ID) {
+            throw new Error(`The pinned upload action used release ${process.env.UPLOADED_RELEASE_ID}, not authenticated draft ${process.env.EXPECTED_RELEASE_ID}; refusing to publish`);
+          }
+          let uploadedAssets;
+          try {
+            uploadedAssets = JSON.parse(process.env.UPLOADED_ASSETS || "[]");
+          } catch {
+            throw new Error("The pinned upload action returned invalid asset metadata");
+          }
+          if (!Array.isArray(uploadedAssets) || uploadedAssets.length !== expectedAssets.size) {
+            throw new Error(`The pinned upload action did not report exactly ${expectedAssets.size} newly uploaded assets`);
+          }
+          const uploadedAssetIds = new Set(uploadedAssets.map((asset) => String(asset.id)));
+          if (uploadedAssetIds.size !== expectedAssets.size || uploadedAssetIds.has("undefined")) {
+            throw new Error("The pinned upload action returned duplicate or invalid asset IDs");
+          }
+
+          const releasePath = `/releases/${process.env.EXPECTED_RELEASE_ID}`;
+          const { data: draft, etag } = await request(releasePath);
+          assertOwnedDraft(draft);
+
+          const sameTag = (await listAll("/releases")).filter((release) => release.tag_name === process.env.TAG);
+          if (sameTag.length !== 1 || String(sameTag[0].id) !== process.env.EXPECTED_RELEASE_ID) {
+            throw new Error(`Draft ${process.env.EXPECTED_RELEASE_ID} is not the unique release for ${process.env.TAG}; refusing to publish`);
+          }
+
+          const assets = await listAll(`${releasePath}/assets`);
+          if (assets.length !== expectedAssets.size) {
+            throw new Error(`Draft ${draft.id} has ${assets.length} assets; expected exactly ${expectedAssets.size}`);
+          }
+          for (const asset of assets) {
+            const expectedSize = expectedAssets.get(asset.name);
+            if (
+              expectedSize === undefined ||
+              asset.state !== "uploaded" ||
+              asset.size !== expectedSize ||
+              !uploadedAssetIds.has(String(asset.id))
+            ) {
+              throw new Error(`Draft ${draft.id} has an unexpected or incomplete asset ${asset.name}`);
+            }
+            expectedAssets.delete(asset.name);
+          }
+          if (expectedAssets.size !== 0) {
+            throw new Error(`Draft ${draft.id} is missing expected assets: ${[...expectedAssets.keys()].join(", ")}`);
+          }
+
+          const { data: notes } = await request("/releases/generate-notes", {
+            method: "POST",
+            body: {
+              tag_name: process.env.TAG,
+              target_commitish: process.env.TARGET_SHA,
+            },
+          });
+          if (typeof notes?.body !== "string") throw new Error("GitHub did not return generated release notes");
+
+          // Keep the marker until every fallible preparation and upload operation succeeds. This
+          // final mutation atomically replaces it with generated notes and publishes the draft.
+          const { data: published } = await request(releasePath, {
+            method: "PATCH",
+            extraHeaders: etag ? { "If-Match": etag } : {},
+            body: {
+              tag_name: process.env.TAG,
+              target_commitish: process.env.TARGET_SHA,
+              name: releaseName,
+              body: notes.body,
+              draft: false,
+              prerelease: false,
+              make_latest: "true",
+            },
+          });
+          if (published.draft || published.tag_name !== process.env.TAG || published.body !== notes.body) {
+            throw new Error(`GitHub did not confirm publication of release ${draft.id}`);
+          }
+          console.log(`Published ${process.env.TAG} from authenticated workflow draft ${draft.id}.`);
+          NODE
