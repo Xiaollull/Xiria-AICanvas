@@ -58,6 +58,7 @@ const MANAGED_FILES = [
   "package.json",
   "package-lock.json",
   "README.md",
+  "README.zh-CN.md",
   "Start-XirAI.bat",
   "Start-XirAI.sh",
   "Setup-XirAI.bat",
@@ -1218,6 +1219,7 @@ export async function recoverInterruptedUpdate({ projectRoot, transactionPath, r
 
 export const archiveUpdateInternals = {
   FORBIDDEN_TOP_LEVEL_ITEMS,
+  MANAGED_FILES,
   createUpdatePlan,
   dependencyChangesRequired,
   dependencyEnvironmentEqual,

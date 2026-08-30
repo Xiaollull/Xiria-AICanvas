@@ -920,3 +920,18 @@ test("real Windows bootstrap prepares a 7z update with the verified portable too
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+test("both README translations are replaced by an update, not just the English one", () => {
+  // The English README was managed and the Chinese one was not, so every documentation change
+  // reached English readers through an update and never reached Chinese readers at all — the
+  // shipped README.zh-CN.md stayed at whatever version was first installed.
+  const { MANAGED_FILES } = archiveUpdateInternals;
+  assert.ok(MANAGED_FILES.includes("README.md"));
+  assert.ok(MANAGED_FILES.includes("README.zh-CN.md"));
+  // A managed file must never be one an update is forbidden to touch, or the plan throws.
+  for (const relativePath of MANAGED_FILES) {
+    const topLevel = relativePath.split("/")[0];
+    const exempt = relativePath.startsWith("models/");
+    assert.equal(FORBIDDEN_TOP_LEVEL_ITEMS.has(topLevel) && !exempt, false, relativePath);
+  }
+});

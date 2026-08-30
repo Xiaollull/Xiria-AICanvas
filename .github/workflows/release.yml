@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Creating a release and uploading its assets both write to the repository.
+permissions:
+  contents: write
+
+# A retagged release must not race the run it replaces.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          # The project requires >= 22.21.0 and the verification workflow pins this exact build.
+          node-version: 22.21.0
+          cache: npm
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # The version the running program reports comes from package.json, and the update check
+      # compares the release tag against it. If they disagree, a user who installs this release
+      # ends up running a build that reports the older number, so the check offers the same
+      # update again on every click, forever. Refusing to publish is the only safe answer.
+      - name: Verify the tag matches the version the build will report
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}. Bump package.json, or retag."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive=XirAI-${version}.7z" >> "$GITHUB_OUTPUT"
+          echo "Publishing version ${version} from tag ${GITHUB_REF_NAME}"
+
+      - run: npm ci
+
+      # A release must at least build and pass its own fast checks. Browser fixtures need a
+      # runner-installed browser and are skipped here exactly as they are in verification.
+      - name: Run fast Node checks
+        env:
+          XIRAI_SKIP_BROWSER_FIXTURES: "1"
+        run: npm run test:setup
+
+      - run: npm run build
+
+      - name: Install 7-Zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v 7z >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y p7zip-full
+          fi
+          7z i > /dev/null
+
+      # The package is the program, and only the program. `git archive` takes exactly the tracked
+      # files at this tag, which is what keeps .venv, node_modules, models, outputs, logs,
+      # state-cache, .cache and .env out of it — a user's environment and creations must survive
+      # the update that replaces the code around them. `dist/` is deliberately absent too: it is
+      # gitignored, the running app serves the dev server rather than a bundle, and the updater
+      # rebuilds the frontend itself while validating the replacement.
+      - name: Package the program archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          archive="${{ steps.version.outputs.archive }}"
+          staging="$(mktemp -d)/XiriaCanvas-AI-${version}"
+          mkdir -p "$staging" release
+          # HEAD is the tag commit by definition here, and needs no tag ref to exist locally.
+          git archive --format=tar HEAD | tar -x -C "$staging"
+
+          # One wrapper directory is what the updater accepts besides a bare project root, and it
+          # is friendlier for anyone extracting the archive by hand.
+          ( cd "$(dirname "$staging")" && 7z a -t7z -mx=9 -bd -bso0 -bsp0 "${GITHUB_WORKSPACE}/release/${archive}" "$(basename "$staging")" )
+
+          for forbidden in .venv node_modules outputs state-cache .cache .env; do
+            if [ -e "${staging}/${forbidden}" ]; then
+              echo "::error::the package contains ${forbidden}, which an update must never replace"
+              exit 1
+            fi
+          done
+          ls -l "release/${archive}"
+
+      # Named for the archive so the checksum survives being downloaded on its own, and in the
+      # `sha256sum` format the updater already reads.
+      - name: Generate the checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum "${{ steps.version.outputs.archive }}" > "${{ steps.version.outputs.archive }}.sha256"
+          cat "${{ steps.version.outputs.archive }}.sha256"
+
+      # The last gate, and the one that matters most: the archive is handed to the updater that
+      # will install it, against this very checkout as the project being updated. A release that
+      # the updater would refuse is caught here rather than on a user's machine.
+      - name: Verify the updater accepts this archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import { prepareUpdate } from "./scripts/archive-update.mjs";
+            import { rm } from "node:fs/promises";
+            const archivePath = process.env.RELEASE_ARCHIVE;
+            const prepared = await prepareUpdate({ projectRoot: process.cwd(), archivePath });
+            if (!prepared.plan.length) throw new Error("the update plan is empty; the archive replaces nothing");
+            console.log(`updater accepted the archive: ${prepared.plan.length} managed items, tool ${prepared.archiveTool.kind}`);
+            await rm(prepared.stagingDirectory, { recursive: true, force: true });
+          '
+        env:
+          RELEASE_ARCHIVE: ${{ github.workspace }}/release/${{ steps.version.outputs.archive }}
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: XiriaCanvas AI ${{ steps.version.outputs.version }}
+          draft: false
+          # A pre-release is invisible to the update check: GitHub's latest-release endpoint, which
+          # the check reads, never returns one. Publishing a release users cannot see would look
+          # exactly like a broken updater.
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/${{ steps.version.outputs.archive }}
+            release/${{ steps.version.outputs.archive }}.sha256
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Release ${{ github.ref_name }}"
+            echo
+            echo "- Version: ${{ steps.version.outputs.version }}"
+            echo "- Archive: ${{ steps.version.outputs.archive }}"
+            if [ -f "release/${{ steps.version.outputs.archive }}" ]; then
+              echo "- Size: $(du -h "release/${{ steps.version.outputs.archive }}" | cut -f1)"
+              echo "- SHA-256: \`$(cut -d' ' -f1 "release/${{ steps.version.outputs.archive }}.sha256")\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
