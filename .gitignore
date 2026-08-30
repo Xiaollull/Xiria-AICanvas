@@ -13,6 +13,8 @@ state-cache/
 .env.local
 .env.*.local
 .XAIG.7z
+# CI captures the Node test stream here so the run summary can quote the failures.
+node-tests.tap
 Thumbs.db
 .DS_Store
 .finesse/

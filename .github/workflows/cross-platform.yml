@@ -32,10 +32,33 @@ jobs:
       - run: npm ci
       - run: npm run setup:cli -- --diagnose --source=official --torch=cpu
       - name: Run fast Node checks
+        id: node_tests
+        shell: bash
         env:
           # Browser fixtures require a runner-installed browser and stay enabled by default locally.
           XIRAI_SKIP_BROWSER_FIXTURES: "1"
-        run: npm run test:setup
+        run: |
+          set -o pipefail
+          npm run test:setup 2>&1 | tee node-tests.tap
+
+      # A failing run reports 700-odd TAP results, and the name and reason of the handful that
+      # failed are the only part worth reading. Lifting them onto the run summary means a
+      # cross-platform failure is legible without paging through the raw log.
+      - name: Report failing Node tests
+        if: always() && steps.node_tests.outcome == 'failure'
+        shell: bash
+        run: |
+          {
+            echo "## Failing Node tests on ${{ matrix.os }}"
+            echo
+            echo '```'
+            grep -E "^# (tests|pass|fail|cancelled|skipped) " node-tests.tap || true
+            echo
+            # Each failure is a TAP block that opens with `not ok` and closes with `...`, so the
+            # whole block is printed: a multi-line assertion diff is the useful part of it.
+            awk '/^not ok /{inside=1} inside{print} inside&&/^  \.\.\.$/{inside=0}' node-tests.tap | head -200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - run: node --check vite.config.js
       - run: node --check scripts/setup.mjs
       - run: node --check scripts/python.mjs
