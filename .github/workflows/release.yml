@@ -617,13 +617,9 @@ jobs:
             });
             assertOwnedDraft(release);
 
-            // A lost create response is recoverable on rerun. After a successful response, also
-            // reject any same-tag race rather than guessing which draft is safe to modify.
-            const discovered = await findExactDraft();
-            if (!discovered || discovered.id !== release.id) {
-              throw new Error(`Created draft ${release.id} is not the unique discoverable draft for ${process.env.TAG}`);
-            }
-            release = discovered;
+            // The create response is authoritative. GitHub's list endpoint can lag briefly after
+            // a successful create, so an immediate list-and-compare would turn a valid draft into
+            // a false failure. A rerun performs the full exact-marker lookup before mutating it.
             console.log(`Created workflow-owned draft ${release.id} for ${process.env.TAG}.`);
           }
 
