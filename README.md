@@ -142,6 +142,13 @@ download is pinned to GitHub itself, because bytes that become program files
 are not worth taking from an unverifiable proxy. The feed, repository, mirror
 and an optional token are configurable in `.env`; see `.env.example`.
 
+Publishing a release: tag it with a version (`v1.0.1` or `1.0.1`; drafts and
+non-version tags are ignored) and attach one program archive whose filename
+contains that version, such as `XirAI-1.0.1.7z`. When several archives are
+attached, the one naming the version wins and size only breaks a remaining tie.
+A repository with no release yet reads as "already up to date" rather than as
+an error.
+
 The **Settings → About → Manual program update** page accepts trusted clean
 XiriaCanvas AI project archives such as ZIP, 7Z, RAR, TAR, TAR.GZ, and TAR.XZ.
 Archives are inspected and extracted with command-line tools into a temporary

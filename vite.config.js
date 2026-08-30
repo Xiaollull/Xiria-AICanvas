@@ -15,7 +15,9 @@ import {
   parseChecksumFile,
   parseRelease,
   releaseDownloadRoutes,
+  missingReleaseMeaning,
   releaseFeedUrl,
+  releaseRepository,
   updateAvailable,
 } from "./scripts/release-feed.mjs";
 import { getLogsDirectory, writeDiagnosticLog } from "./scripts/diagnostics.mjs";
@@ -4238,6 +4240,23 @@ export function updateApiPlugin() {
   };
   const report = (event) => setState({ phase: event.phase, progress: event.progress, message: event.message });
 
+  /** Whether the configured repository can be read, which is what tells a 404 apart.
+   *
+   * Asked only for the built-in feed; `missingReleaseMeaning` decides what the answer means.
+   */
+  const releaseSourceExists = async () => {
+    try {
+      const probe = await fetchWithTimeout(
+        `https://api.github.com/repos/${releaseRepository(process.env)}`,
+        { headers: { Accept: "application/vnd.github+json", "User-Agent": "XiriaCanvas-AI" } },
+        10000,
+      );
+      return probe.ok;
+    } catch {
+      return false;
+    }
+  };
+
   /** Reads the release feed and remembers what it offers. */
   const checkForRelease = async () => {
     const feedUrl = releaseFeedUrl(process.env);
@@ -4255,7 +4274,21 @@ export function updateApiPlugin() {
       throw Object.assign(new Error(`无法连接更新服务器：${error.message}`), { statusCode: 502 });
     }
     if (feedResponse.status === 404) {
-      throw Object.assign(new Error("未找到发布源，请确认仓库与 Release 是否公开"), { statusCode: 502 });
+      // A repository that exists but has published nothing answers 404 exactly as a private or
+      // misspelled one does. That is not a failure to report: it means there is no newer version,
+      // which is the ordinary state of a project between releases. Only when the repository itself
+      // cannot be read is the configuration actually wrong.
+      const customFeed = Boolean(String(process.env.XIRAI_UPDATE_FEED || "").trim());
+      const meaning = missingReleaseMeaning({
+        customFeed,
+        repositoryReachable: customFeed ? false : await releaseSourceExists(),
+      });
+      if (meaning === "no-release") {
+        onlineRelease = null;
+        onlineCheckedAt = new Date().toISOString();
+        return;
+      }
+      throw Object.assign(new Error("未找到发布源，请确认仓库地址与 Release 是否公开"), { statusCode: 502 });
     }
     if (feedResponse.status === 403 || feedResponse.status === 429) {
       throw Object.assign(new Error("更新服务器暂时限制了请求频率，请稍后再试"), { statusCode: 503 });

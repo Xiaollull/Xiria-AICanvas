@@ -79,6 +79,19 @@ export function releaseFeedUrl(environment = process.env) {
   return `https://api.github.com/repos/${releaseRepository(environment)}/releases/latest`;
 }
 
+/** What a 404 from the release feed actually means.
+ *
+ * GitHub answers "no release has been published yet" with the same 404 it uses for a repository
+ * that is private or misspelled. Those need opposite responses: the first is the ordinary state of
+ * a project between releases and should read as "you are up to date", while the second is a
+ * configuration error worth showing. The repository itself is what tells them apart, and only for
+ * the built-in feed — a custom feed is one URL whose 404 says nothing about any repository.
+ */
+export function missingReleaseMeaning({ customFeed = false, repositoryReachable = false } = {}) {
+  if (customFeed) return "source-missing";
+  return repositoryReachable ? "no-release" : "source-missing";
+}
+
 function assetChecksum(asset) {
   // GitHub reports an asset digest as `sha256:<hex>`; it arrives over TLS from the API host, so it
   // is trustworthy in a way a mirror's copy of the bytes is not.
@@ -87,13 +100,20 @@ function assetChecksum(asset) {
   return match ? match[0].toLowerCase() : null;
 }
 
-/** The archive a release offers, plus wherever its checksum can be had from. */
-export function selectReleaseAsset(assets = []) {
+/** The archive a release offers, plus wherever its checksum can be had from.
+ *
+ * A release is expected to carry one program archive. When it carries several, the one whose name
+ * contains the version wins — `XirAI-1.0.1.7z` for tag `v1.0.1` — because that is the package
+ * built for this release rather than something else that happens to be attached to it. Size is
+ * only the last resort, and on its own it is a poor rule: run against a real release that also
+ * publishes a source tarball, smallest-wins picks the source.
+ */
+export function selectReleaseAsset(assets = [], version = "") {
   const archives = assets.filter((asset) => RELEASE_ARCHIVE_PATTERN.test(String(asset?.name || "")));
   if (!archives.length) return null;
-  // Smallest first: a release may carry both a full package and a program-only archive, and the
-  // updater replaces program files only.
-  const chosen = archives.slice().sort((first, second) => (first.size || 0) - (second.size || 0))[0];
+  const bySize = archives.slice().sort((first, second) => (first.size || 0) - (second.size || 0));
+  const versioned = version ? bySize.filter((asset) => String(asset.name).includes(version)) : [];
+  const chosen = versioned[0] || bySize[0];
   const name = String(chosen.name);
   const sidecar = assets.find((asset) => String(asset?.name || "") === `${name}${CHECKSUM_SUFFIX}`);
   return {
@@ -111,7 +131,7 @@ export function parseRelease(payload) {
   if (payload.draft) return null;
   const version = parseVersion(payload.tag_name || payload.name);
   if (!version) return null;
-  const asset = selectReleaseAsset(Array.isArray(payload.assets) ? payload.assets : []);
+  const asset = selectReleaseAsset(Array.isArray(payload.assets) ? payload.assets : [], version.text);
   if (!asset || !asset.url) return null;
   return {
     version: version.text,

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   checksumRoutes,
   compareVersions,
+  missingReleaseMeaning,
   parseChecksumFile,
   parseRelease,
   parseVersion,
@@ -64,7 +65,7 @@ test("the release feed defaults to the project repository and honours an overrid
   assert.equal(releaseFeedUrl({ XIRAI_UPDATE_FEED: "https://mirror.example/latest.json" }), "https://mirror.example/latest.json");
 });
 
-test("the smallest archive asset wins and its digest is read from the API", () => {
+test("the archive named for the release wins, and its digest is read from the API", () => {
   const asset = selectReleaseAsset([
     { name: "notes.txt", browser_download_url: "https://x/notes.txt", size: 10 },
     { name: "XirAI-full-1.1.0.7z", browser_download_url: "https://x/full.7z", size: 9_000_000_000 },
@@ -149,4 +150,86 @@ test("a configured mirror replaces the built-in accelerated hosts", () => {
   assert.deepEqual(routes.map((route) => route.id), ["release-mirror", "release-github"]);
   assert.equal(routes[0].url, `https://mirror.example/gh/${parsed.asset.url}`);
   assert.deepEqual(releaseDownloadRoutes(null, { checksum: "x" }), []);
+});
+
+test("a 404 from the feed is read as 'nothing published yet' only when the repository is there", () => {
+  // The state this project is in between releases: the repository is public and readable, and the
+  // latest-release endpoint still answers 404. Reporting that as a broken configuration told the
+  // user to check whether their repository was public when it already was.
+  assert.equal(missingReleaseMeaning({ customFeed: false, repositoryReachable: true }), "no-release");
+  // A repository that cannot be read is a genuine configuration problem worth surfacing.
+  assert.equal(missingReleaseMeaning({ customFeed: false, repositoryReachable: false }), "source-missing");
+  // A custom feed is one URL; its 404 says nothing about any repository, so it is never guessed at.
+  assert.equal(missingReleaseMeaning({ customFeed: true, repositoryReachable: true }), "source-missing");
+  assert.equal(missingReleaseMeaning(), "source-missing");
+});
+
+test("a release in GitHub's real response shape parses end to end", () => {
+  // Captured from api.github.com rather than invented: the field names, the `sha256:` digest
+  // prefix and the presence of sidecar `.sha256` assets are what the live API actually returns.
+  const parsed = parseRelease({
+    tag_name: "1.0.0",
+    name: "1.0.0",
+    draft: false,
+    prerelease: false,
+    published_at: "2026-09-01T12:00:00Z",
+    body: "首个正式版本",
+    assets: [
+      {
+        name: "XirAI-1.0.0.7z",
+        browser_download_url: "https://github.com/Xiaollull/Xiria-AICanvas/releases/download/1.0.0/XirAI-1.0.0.7z",
+        size: 18284455,
+        digest: "sha256:1611d0f4be72b0a354ad9a6ae954093dd4c91e93e36b8b490326a05a039ffe14",
+        content_type: "application/x-7z-compressed",
+        state: "uploaded",
+        download_count: 0,
+      },
+      {
+        name: "XirAI-1.0.0.7z.sha256",
+        browser_download_url: "https://github.com/Xiaollull/Xiria-AICanvas/releases/download/1.0.0/XirAI-1.0.0.7z.sha256",
+        size: 89,
+        digest: null,
+      },
+    ],
+  });
+  assert.equal(parsed.version, "1.0.0");
+  assert.equal(parsed.asset.name, "XirAI-1.0.0.7z");
+  assert.equal(parsed.asset.bytes, 18284455);
+  assert.equal(parsed.asset.sha256, "1611d0f4be72b0a354ad9a6ae954093dd4c91e93e36b8b490326a05a039ffe14");
+  assert.equal(parsed.asset.checksumUrl.endsWith(".7z.sha256"), true);
+  // A tag without the leading v is as valid as one with it, and both must compare cleanly.
+  assert.equal(updateAvailable(parsed.version, "0.9.0"), true);
+  assert.equal(updateAvailable(parsed.version, "1.0.0"), false);
+});
+
+test("an asset digest GitHub did not compute does not become a checksum", () => {
+  // `digest` is null on assets GitHub has not hashed. Treating that as a hash would hand
+  // downloadFile an expected checksum of "null" and fail every verified download.
+  const parsed = parseRelease({
+    tag_name: "1.0.1",
+    assets: [{ name: "XirAI-1.0.1.7z", browser_download_url: "https://x/a.7z", size: 10, digest: null }],
+  });
+  assert.equal(parsed.asset.sha256, null);
+  // With no checksum from anywhere, the download must stay on the official route.
+  assert.deepEqual(releaseDownloadRoutes(parsed, { checksum: null, environment: {} }).map((r) => r.id), ["release-github"]);
+});
+
+test("the archive built for the release wins over anything else attached to it", () => {
+  // Observed against a real release: a project that also publishes a source tarball has an asset
+  // smaller than its program package, and picking by size alone would install the source.
+  const assets = [
+    { name: "source.tar.gz", browser_download_url: "https://x/source.tar.gz", size: 8_000_000 },
+    { name: "XirAI-1.0.1.7z", browser_download_url: "https://x/XirAI-1.0.1.7z", size: 700_000_000 },
+  ];
+  assert.equal(selectReleaseAsset(assets, "1.0.1").name, "XirAI-1.0.1.7z");
+  // Two packages that both name the version: the smaller one is the program-only archive.
+  assert.equal(selectReleaseAsset([
+    { name: "XirAI-full-1.0.1.7z", browser_download_url: "https://x/full", size: 9_000_000_000 },
+    { name: "XirAI-1.0.1.7z", browser_download_url: "https://x/program", size: 700_000_000 },
+  ], "1.0.1").name, "XirAI-1.0.1.7z");
+  // Nothing carries the version: size decides, as before.
+  assert.equal(selectReleaseAsset(assets, "9.9.9").name, "source.tar.gz");
+  assert.equal(selectReleaseAsset(assets).name, "source.tar.gz");
+  // And the whole rule runs through parseRelease, which knows the version from the tag.
+  assert.equal(parseRelease({ tag_name: "v1.0.1", assets }).asset.name, "XirAI-1.0.1.7z");
 });

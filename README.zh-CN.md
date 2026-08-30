@@ -77,6 +77,8 @@ Windows 用户可双击 `Start-XirAI.bat`。Linux 用户可运行 `sh Start-XirA
 
 只有当发布同时提供 SHA-256（API 的 asset digest，或 `<归档名>.sha256` 附件）时才会使用加速镜像；没有校验和时下载会固定走 GitHub 官方直连，因为即将成为程序文件的字节不值得从无法校验的代理获取。发布源、仓库、镜像与可选令牌均可在 `.env` 中配置，参见 `.env.example`。
 
+发布新版本时：使用版本号打标签（`v1.0.1` 或 `1.0.1`；草稿与非版本号标签会被忽略），并上传一个文件名包含该版本号的程序归档，例如 `XirAI-1.0.1.7z`。当附件中存在多个归档时，文件名包含版本号的优先，体积仅用于最后的平局判定。仓库尚未发布任何版本时会显示“已是最新版本”，而不是报错。
+
 **Settings → About → Manual program update（设置 → 关于 → 手动程序更新）** 页面接受受信任的干净 XiriaCanvas AI 项目归档，例如 ZIP、7Z、RAR、TAR、TAR.GZ 与 TAR.XZ。归档会使用命令行工具检查并解压到项目外部的临时目录。当系统命令无法读取归档时，更新程序会为当前 Windows 或 Linux 架构下载带校验和固定的官方 7-Zip 命令行文件到 `.cache/tools/7zip/`；它绝不运行安装程序，也不使用桌面文件关联。
 
 手动更新需要与已安装环境相同的 Node 和 Python 依赖清单。只替换程序文件。`.venv`、`node_modules`、`models`、`outputs`、`logs`、`state-cache`、`.cache` 与 `.env` 保持原样。替换前，受管理的文件会备份到项目外部。复制失败、Python 校验失败和生产构建失败都会自动回滚。
