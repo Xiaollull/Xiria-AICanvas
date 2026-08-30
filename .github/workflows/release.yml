@@ -636,7 +636,10 @@ jobs:
               release.name !== releaseName ||
               release.body !== marker
             ) {
-              throw new Error(`Draft release ${process.env.TAG} is not the exact workflow-owned draft for this repository, workflow, tag, and commit; refusing to modify it`);
+              throw new Error(
+                `Draft release ${process.env.TAG} is not the exact workflow-owned draft for this repository, workflow, tag, and commit; `
+                + "refusing to modify it. If an earlier run left a draft behind that no longer matches, delete that draft and re-run this workflow.",
+              );
             }
           };
           const findExactDraft = async () => {
@@ -690,25 +693,7 @@ jobs:
           await appendFile(process.env.GITHUB_OUTPUT, `release_id=${release.id}\n`);
           NODE
 
-      - name: Upload assets while keeping the owned release as a draft
-        id: upload
-        # softprops/action-gh-release v2.6.2, audited at the v2 commit on 2026-08-30.
-        # Draft creation and authentication happen above; this pinned action only uploads files,
-        # and the next step requires its release ID and exact uploaded-asset IDs to match.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          tag_name: ${{ needs.verify-and-package.outputs.tag }}
-          draft: true
-          preserve_order: true
-          overwrite_files: false
-          fail_on_unmatched_files: true
-          files: |
-            release/${{ needs.verify-and-package.outputs.archive }}
-            release/${{ needs.verify-and-package.outputs.archive }}.sha256
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-      - name: Verify assets, generate notes, and publish the owned draft
+      - name: Upload the assets, verify them, and publish the owned draft
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -719,14 +704,13 @@ jobs:
           TARGET_SHA: ${{ github.sha }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release_id }}
-          UPLOADED_RELEASE_ID: ${{ steps.upload.outputs.id }}
-          UPLOADED_ASSETS: ${{ steps.upload.outputs.assets }}
         run: |
           set -euo pipefail
           node --input-type=module <<'NODE'
-          import { stat } from "node:fs/promises";
+          import { readFile, stat } from "node:fs/promises";
 
           const apiRoot = `https://api.github.com/repos/${process.env.REPOSITORY}`;
+          const uploadRoot = `https://uploads.github.com/repos/${process.env.REPOSITORY}`;
           const marker = `<!-- xirai-release-workflow-owned:v2 repository=${process.env.REPOSITORY} workflow_ref=${process.env.WORKFLOW_REF} tag=${process.env.TAG} sha=${process.env.TARGET_SHA} -->`;
           const releaseName = `XiriaCanvas AI ${process.env.VERSION}`;
           const expectedAssets = new Map(await Promise.all([
@@ -741,10 +725,10 @@ jobs:
             "X-GitHub-Api-Version": "2022-11-28",
           };
 
-          const request = async (path, { method = "GET", body, extraHeaders = {} } = {}) => {
+          const request = async (path, { method = "GET", body } = {}) => {
             const response = await fetch(`${apiRoot}${path}`, {
               method,
-              headers: { ...headers, ...extraHeaders },
+              headers,
               body: body === undefined ? undefined : JSON.stringify(body),
             });
             const text = await response.text();
@@ -757,7 +741,7 @@ jobs:
             if (!response.ok) {
               throw new Error(`GitHub API ${response.status} for ${method} ${path}: ${data?.message || text}`);
             }
-            return { data, etag: response.headers.get("etag") };
+            return { data };
           };
           const listAll = async (path) => {
             const values = [];
@@ -786,25 +770,48 @@ jobs:
           if (!/^\d+$/.test(process.env.EXPECTED_RELEASE_ID || "")) {
             throw new Error("The draft preparation step did not return a valid release ID");
           }
-          if (process.env.UPLOADED_RELEASE_ID !== process.env.EXPECTED_RELEASE_ID) {
-            throw new Error(`The pinned upload action used release ${process.env.UPLOADED_RELEASE_ID}, not authenticated draft ${process.env.EXPECTED_RELEASE_ID}; refusing to publish`);
+          const releasePath = `/releases/${process.env.EXPECTED_RELEASE_ID}`;
+
+          // Uploading here, with the same authenticated identity that created and verified the
+          // draft, keeps the release under this workflow's own control from creation to publish.
+          // Nothing else is allowed to touch it, so there is no third-party output shape to trust
+          // and no window in which another tool could rewrite the ownership marker.
+          const uploadedAssetIds = new Set();
+          for (const [name, size] of expectedAssets) {
+            const body = await readFile(`release/${name}`);
+            if (body.byteLength !== size) {
+              throw new Error(`Release asset ${name} changed size between verification and upload`);
+            }
+            const response = await fetch(`${uploadRoot}${releasePath}/assets?name=${encodeURIComponent(name)}`, {
+              method: "POST",
+              headers: {
+                ...headers,
+                "Content-Type": "application/octet-stream",
+                "Content-Length": String(body.byteLength),
+              },
+              body,
+            });
+            const text = await response.text();
+            let data;
+            try {
+              data = text ? JSON.parse(text) : undefined;
+            } catch {
+              throw new Error(`GitHub returned non-JSON data while uploading ${name}`);
+            }
+            if (!response.ok) {
+              throw new Error(`GitHub API ${response.status} while uploading ${name}: ${data?.message || text}`);
+            }
+            if (!/^\d+$/.test(String(data?.id)) || data.name !== name) {
+              throw new Error(`GitHub did not confirm the uploaded asset ${name}`);
+            }
+            uploadedAssetIds.add(String(data.id));
+            console.log(`Uploaded ${name} (${body.byteLength} bytes) as asset ${data.id}.`);
           }
-          let uploadedAssets;
-          try {
-            uploadedAssets = JSON.parse(process.env.UPLOADED_ASSETS || "[]");
-          } catch {
-            throw new Error("The pinned upload action returned invalid asset metadata");
-          }
-          if (!Array.isArray(uploadedAssets) || uploadedAssets.length !== expectedAssets.size) {
-            throw new Error(`The pinned upload action did not report exactly ${expectedAssets.size} newly uploaded assets`);
-          }
-          const uploadedAssetIds = new Set(uploadedAssets.map((asset) => String(asset.id)));
-          if (uploadedAssetIds.size !== expectedAssets.size || uploadedAssetIds.has("undefined")) {
-            throw new Error("The pinned upload action returned duplicate or invalid asset IDs");
+          if (uploadedAssetIds.size !== expectedAssets.size) {
+            throw new Error("The upload did not produce one distinct asset per release file");
           }
 
-          const releasePath = `/releases/${process.env.EXPECTED_RELEASE_ID}`;
-          const { data: draft, etag } = await request(releasePath);
+          const { data: draft } = await request(releasePath);
           assertOwnedDraft(draft);
 
           const sameTag = (await listAll("/releases")).filter((release) => release.tag_name === process.env.TAG);
@@ -812,7 +819,17 @@ jobs:
             throw new Error(`Draft ${process.env.EXPECTED_RELEASE_ID} is not the unique release for ${process.env.TAG}; refusing to publish`);
           }
 
-          const assets = await listAll(`${releasePath}/assets`);
+          // A freshly uploaded asset can still report `starter` for a moment. Wait for the
+          // terminal state rather than reading the race as a broken release, and fail on any
+          // state that is neither in progress nor complete.
+          let assets = [];
+          for (let attempt = 1; attempt <= 12; attempt += 1) {
+            assets = await listAll(`${releasePath}/assets`);
+            if (assets.length === expectedAssets.size && assets.every((asset) => asset.state === "uploaded")) break;
+            if (assets.some((asset) => !["starter", "uploaded"].includes(asset.state))) break;
+            if (attempt === 12) throw new Error(`Draft ${draft.id} still has assets that never finished uploading`);
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+          }
           if (assets.length !== expectedAssets.size) {
             throw new Error(`Draft ${draft.id} has ${assets.length} assets; expected exactly ${expectedAssets.size}`);
           }
@@ -824,7 +841,7 @@ jobs:
               asset.size !== expectedSize ||
               !uploadedAssetIds.has(String(asset.id))
             ) {
-              throw new Error(`Draft ${draft.id} has an unexpected or incomplete asset ${asset.name}`);
+              throw new Error(`Draft ${draft.id} has an unexpected or incomplete asset ${asset.name} (state ${asset.state}, ${asset.size} bytes)`);
             }
             expectedAssets.delete(asset.name);
           }
@@ -842,10 +859,12 @@ jobs:
           if (typeof notes?.body !== "string") throw new Error("GitHub did not return generated release notes");
 
           // Keep the marker until every fallible preparation and upload operation succeeds. This
-          // final mutation atomically replaces it with generated notes and publishes the draft.
+          // final mutation replaces it with generated notes and publishes the draft. The safety
+          // here is the ownership assertion above plus the confirmation below, not a conditional
+          // request header: this job is the only writer, and a rejected precondition would strand
+          // a fully verified release rather than protect it.
           const { data: published } = await request(releasePath, {
             method: "PATCH",
-            extraHeaders: etag ? { "If-Match": etag } : {},
             body: {
               tag_name: process.env.TAG,
               target_commitish: process.env.TARGET_SHA,
