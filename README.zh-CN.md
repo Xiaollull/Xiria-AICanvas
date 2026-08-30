@@ -14,7 +14,26 @@
   <a href="README.md">English</a> · <strong>简体中文</strong>
 </p>
 
-XiriaCanvas AI 是一款本地运行的 Stable Diffusion、Illustrious 与原生 Anima 图像生成界面。同一套源代码同时支持 Windows 与 Linux。项目在运行时不依赖 ComfyUI 或 Stable Diffusion WebUI。
+XiriaCanvas AI 是一款本地运行的图像生成界面，支持 Stable Diffusion、Illustrious，以及原生 Anima、FLUX.1、FLUX.2 与 Krea 2 引擎。同一套源代码同时支持 Windows 与 Linux。项目在运行时不依赖 ComfyUI 或 Stable Diffusion WebUI。
+
+## 引擎
+
+生成页可选择六个引擎。它们共用同一套提示词语法、同一套采样器名称与同一个图库，区别在于模型如何装配、引导如何施加。
+
+| 引擎 | 模型 | 组件 |
+| --- | --- | --- |
+| **SD** | Stable Diffusion | 单个大模型 |
+| **iL** | Illustrious / SDXL | 单个大模型 |
+| **Anima** | 原生 Flow Matching | 扩散模型 + 文本编码器 + VAE |
+| **Flux** | FLUX.1，蒸馏引导 | 扩散模型 + CLIP-L + T5-XXL + VAE |
+| **Flux2** | FLUX.2，大模型引导 | 扩散模型 + 文本编码器 + VAE |
+| **Krea2** | Krea 2 单流 DiT | 扩散模型 + 文本编码器 + VAE |
+
+SD 与 iL 加载单个大模型文件。四个原生引擎分别加载各自组件，因此文本编码器与 VAE 可以在多个模型之间共用，而不必在每个大模型里各存一份。FLUX.1 是唯一需要两个文本编码器的引擎。
+
+两代 FLUX 均为蒸馏引导：没有无条件分支，负面提示词不承载任何内容，也不会随请求发送；输入框中的文字会保留给其他引擎使用。Krea 2 是唯一未经蒸馏的原生引擎，负面提示词正常生效。
+
+引导能力遵循同样的划分：PAG 适用于 SD、iL 与原生 Anima；CFG-Zero* 适用于原生 Anima 与 Krea 2。两代 FLUX 均不适用。
 
 ## 环境要求
 
@@ -81,7 +100,9 @@ Windows 用户可双击 `Start-XirAI.bat`。Linux 用户可运行 `sh Start-XirA
 
 **Settings → About → Manual program update（设置 → 关于 → 手动程序更新）** 页面接受受信任的干净 XiriaCanvas AI 项目归档，例如 ZIP、7Z、RAR、TAR、TAR.GZ 与 TAR.XZ。归档会使用命令行工具检查并解压到项目外部的临时目录。当系统命令无法读取归档时，更新程序会为当前 Windows 或 Linux 架构下载带校验和固定的官方 7-Zip 命令行文件到 `.cache/tools/7zip/`；它绝不运行安装程序，也不使用桌面文件关联。
 
-手动更新需要与已安装环境相同的 Node 和 Python 依赖清单。只替换程序文件。`.venv`、`node_modules`、`models`、`outputs`、`logs`、`state-cache`、`.cache` 与 `.env` 保持原样。替换前，受管理的文件会备份到项目外部。复制失败、Python 校验失败和生产构建失败都会自动回滚。
+更新包必须与已安装环境使用相同的 Node 依赖。改变了 Node 依赖的归档会被拒绝而不是应用，因为在 Windows 上替换正在运行进程使用的 `node_modules` 并不安全；这类版本会以完整安装包的形式发布，供全新安装。`backend/requirements.txt` 发生变化则受支持：先替换文件，随后自动修复 Python 环境。
+
+只替换程序文件。`.venv`、`node_modules`、`models`、`outputs`、`logs`、`state-cache`、`.cache`、`.env` 与已安装的 `plugins` 保持原样，你自己的 `models/model-paths.json` 同样保留。替换前，受管理的文件会备份到项目外部。复制失败、Python 校验失败和生产构建失败都会自动回滚。
 
 安装脚本会执行以下步骤：
 
@@ -142,7 +163,7 @@ Web UI 可通过 `http://localhost:7709/` 与 `http://YOUR-LAN-IP:7709/` 访问�
 
 ## 提示词权重与引导
 
-SD、iL/SDXL 与原生 Anima 共享核心的 ComfyUI 括号语法：
+六个引擎共享核心的 ComfyUI 括号语法：
 
 - `(text)` 应用默认的 `1.1` 强调。
 - `((text))` 对嵌套强调进行连乘。
@@ -151,11 +172,11 @@ SD、iL/SDXL 与原生 Anima 共享核心的 ComfyUI 括号语法：
 
 方括号减弱、`BREAK`、文本反转（textual inversion）标签、Prompt LoRA 标签与 A1111 调度语法不由此语法解释。Anima 独立解析 Qwen 与 T5 的 token 边界，并将权重应用于 T5 对齐的 LLM 适配器输出。
 
-PAG 可用于 SD、iL 与原生 Anima，scale 范围 `0..5`，scope 为 `mid|all`。Anima 使用原生的 Cosmos 恒等自注意力分支，而不是 Diffusers UNet 适配器。它按顺序运行分支，以始终保持一个物理 transformer 前向过程存活，并将相同的设置传播到原生 Hires 与 ADetailer 细化中。CFG-Zero* 仍然是 Anima 独有。
+PAG 可用于 SD、iL 与原生 Anima，scale 范围 `0..5`，scope 为 `mid|all`。Anima 使用原生的 Cosmos 恒等自注意力分支，而不是 Diffusers UNet 适配器。它按顺序运行分支，以始终保持一个物理 transformer 前向过程存活，并将相同的设置传播到原生 Hires 与 ADetailer 细化中。CFG-Zero* 覆盖原生 Anima 与 Krea 2；两代 FLUX 为蒸馏引导，两者均不适用。
 
 原生 Anima 适配器融合接受标准 LoRA、静态全秩 T-LoRA、线性 LoHa、受支持的线性 LoKr 形式以及使用 `dora_scale` 的输出轴 LyCORIS 线性 DoRA。受支持的线性 LoKr 也可以携带输出轴 `dora_scale`。权重为零即为精确禁用。Tucker/卷积形式、分解的 LoKr 第一因子、PEFT `lora_magnitude_vector` 与 `lora_mid.weight` 会以失败关闭（fail closed）。
 
-Anima 在 Generate 与 Gallery 中使用相同的 44 个采样器名称和 9 个调度器名称。全部 9 个调度器都是原生的 Flow-shift-3 轨迹。具名的兼容性求解器映射会在任务警告和 PNG 采样元数据中报告，而不是静默地伪装成另一种实现。
+四个原生引擎在 Generate 与 Gallery 中都提供相同的 44 个采样器名称和 9 个调度器名称。名称是共用的，其背后的调度并不相同：Anima 的 9 个调度器都是原生的 Flow-shift-3 轨迹；两代 FLUX 与 Krea 2 运行同一张 ModelSamplingFlux 表，FLUX.2 的 shift 取自模型，Krea 2 取自其模型配置声明的静态 shift。具名的兼容性求解器映射会在任务警告和 PNG 采样元数据中报告，而不是静默地伪装成另一种实现。
 
 ## 图像批次
 
@@ -199,7 +220,19 @@ XIRAI_OUTPUT_DIR=outputs/my-project
 
 ## 模型
 
-参见 `models/README.md`。`models/model-paths.json` 中的模型配置使用 `models` 下的项目相对路径，在 Windows 与 Linux 上均无需改动即可工作。每个根目录都可以使用自定义名称和任意嵌套。检查点、LoRA、放大模型、YOLO 检测器与兼容的背景移除模型会被递归扫描；程序更新会保留用户的路径清单。
+参见 `models/README.md`。`models/model-paths.json` 中的模型配置使用 `models` 下的项目相对路径，在 Windows 与 Linux 上均无需改动即可工作。每个根目录都可以使用自定义名称和任意嵌套。检查点、LoRA、放大模型、YOLO 检测器与兼容的背景移除模型会被递归扫描。
+
+程序更新会保留你自己的 `models/model-paths.json`，而不是覆盖它，因此自定义的模型根目录可以跨版本升级保留。未写出的键会回退到内置默认值，所以为旧版本编写的文件在新版本中依然正确。只有文件缺失、或更新后的项目无法使用该文件时，才会从发布包恢复默认副本。推荐模型、YOLO 与背景移除目录则由每次更新刷新，因为那些是程序自带的清单，而非你的配置。
+
+除你自己放入 `models` 的文件外，推荐模型浏览器覆盖：
+
+- **Illustrious** —— WAI Illustrious SDXL、MiaoMiao Harem 与 Obsession Illustrious XL，各自跟踪其 Civitai 版本列表。
+- **Anima** —— CircleStone Labs 官方版本，同时来自 Civitai 与 Hugging Face 的 `split_files` 目录，并自动搭配共用的 Qwen 0.6B 文本编码器与 Qwen Image VAE。
+- **FLUX.2** —— Klein 9B True V3 的 Safetensors 或 GGUF 版本，以及官方 Klein 9B KV 单文件版本（受限仓库，需接受许可并提供 Hugging Face Token）。两者都搭配 Qwen 3 8B 文本编码器与 FLUX.2 VAE。
+- **Krea 2** —— 12B 模型的 Raw 与 Turbo 变体，并可单独选择 4B 文本编码器精度。其 VAE 与 Anima 共用。
+- **放大模型** —— Hires.fix 第一阶段所使用的 Real-ESRGAN 官方模型。
+
+发布方提供量化版本时也会一并列出，因此同一个模型可以按可用显存选择 bf16、fp8、mxfp8、nvfp4、int4/int8 或 GGUF Q4-Q8。FLUX.1 没有推荐系列：它使用你自行准备的扩散模型、CLIP-L、T5-XXL 与 VAE 文件运行。
 
 ## 开发
 

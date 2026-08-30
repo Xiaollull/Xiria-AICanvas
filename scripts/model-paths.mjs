@@ -60,6 +60,19 @@ export function configuredModelDirectories(config, projectRoot) {
   return [...new Set(directories)];
 }
 
+/**
+ * The exact predicate an updated project must satisfy. The updater keeps a user's own
+ * `models/model-paths.json` instead of replacing it, so it has to decide beforehand, using this
+ * same check, whether the kept file would still pass validation after the update.
+ */
+export function assertModelPathsUsable(config, projectRoot) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("根节点必须是对象");
+  if (!config.checkpoints || !config.loras || typeof config.upscalers !== "string" || typeof config.configs !== "string") {
+    throw new Error("缺少 checkpoints、loras、upscalers 或 configs 路径");
+  }
+  configuredModelDirectories(config, projectRoot);
+}
+
 export const defaultLoraCategories = [
   { id: "character", label: "角色", directory: "character" },
   { id: "style", label: "风格", directory: "style" },

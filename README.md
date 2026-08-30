@@ -14,9 +14,39 @@
   <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-XiriaCanvas AI is a local Stable Diffusion, Illustrious, and native Anima image-generation UI.
-The same source tree supports Windows and Linux. The project does not depend on
-ComfyUI or Stable Diffusion WebUI at runtime.
+XiriaCanvas AI is a local image-generation UI for Stable Diffusion, Illustrious,
+and the native Anima, FLUX.1, FLUX.2, and Krea 2 engines. The same source tree
+supports Windows and Linux. The project does not depend on ComfyUI or Stable
+Diffusion WebUI at runtime.
+
+## Engines
+
+Six engines are selectable in Generate. They share one prompt grammar, one
+sampler vocabulary, and one gallery, and differ in how a model is assembled and
+how guidance is applied.
+
+| Engine | Model | Components |
+| --- | --- | --- |
+| **SD** | Stable Diffusion | one checkpoint |
+| **iL** | Illustrious / SDXL | one checkpoint |
+| **Anima** | native Flow Matching | diffusion model + text encoder + VAE |
+| **Flux** | FLUX.1, distilled guidance | diffusion model + CLIP-L + T5-XXL + VAE |
+| **Flux2** | FLUX.2, large-model guidance | diffusion model + text encoder + VAE |
+| **Krea2** | Krea 2 single-stream DiT | diffusion model + text encoder + VAE |
+
+SD and iL mount one checkpoint file. The four native engines mount their parts
+separately, so a text encoder or VAE can be shared between models instead of
+being duplicated inside every checkpoint. FLUX.1 is the only engine that takes
+two text encoders.
+
+Both FLUX generations are guidance distilled: they have no unconditional branch,
+so the negative prompt carries nothing and is not sent. What you typed stays in
+the box for the other engines. Krea 2 is the one native engine that is not
+distilled and keeps a working negative prompt.
+
+Guidance support follows the same split. PAG is available for SD, iL, and native
+Anima; CFG-Zero* is available for native Anima and Krea 2. Neither applies to
+either FLUX generation.
 
 ## Requirements
 
@@ -161,12 +191,18 @@ the updater downloads checksum-pinned official 7-Zip command files for the
 current Windows or Linux architecture to `.cache/tools/7zip/`; it never runs an
 installer or uses desktop file associations.
 
-Manual updates require the same Node and Python dependency manifests as the
-installed environment. Only program files are replaced. `.venv`,
-`node_modules`, `models`, `outputs`, `logs`, `state-cache`, `.cache`, and `.env`
-remain in place. Before replacement, managed files are backed up outside the
-project. Copy failures, Python validation failures, and production build
-failures are rolled back automatically.
+An update must carry the same Node dependencies as the installed environment.
+An archive that changes them is refused rather than applied, because replacing
+`node_modules` under a running process is not safe on Windows; such a version is
+delivered as a full package to install fresh. A changed
+`backend/requirements.txt` is supported: the files are replaced and the Python
+environment is then repaired automatically.
+
+Only program files are replaced. `.venv`, `node_modules`, `models`, `outputs`,
+`logs`, `state-cache`, `.cache`, `.env`, and installed `plugins` remain in
+place, as does your own `models/model-paths.json`. Before replacement, managed
+files are backed up outside the project. Copy failures, Python validation
+failures, and production build failures are rolled back automatically.
 
 The setup script:
 
@@ -298,7 +334,7 @@ and proxied local inference APIs to devices that can reach port 7709.
 
 ## Prompt weights and guidance
 
-SD, iL/SDXL, and native Anima share the core ComfyUI parenthesis grammar:
+All six engines share the core ComfyUI parenthesis grammar:
 
 - `(text)` applies the default `1.1` emphasis.
 - `((text))` multiplies nested emphasis.
@@ -314,7 +350,8 @@ PAG is available for SD, iL, and native Anima with scale `0..5` and `mid|all`
 scope. Anima uses a native Cosmos identity-self-attention branch rather than a
 Diffusers UNet adapter. It runs branches sequentially to keep one physical
 transformer forward live at a time and propagates the same settings into native
-Hires and ADetailer refinement. CFG-Zero* remains Anima-only.
+Hires and ADetailer refinement. CFG-Zero* covers native Anima and Krea 2. Both
+FLUX generations are guidance distilled and take neither.
 
 Native Anima adapter fusion accepts standard LoRA, static full-rank T-LoRA,
 linear LoHa, supported linear LoKr forms, and output-axis LyCORIS linear DoRA
@@ -323,10 +360,13 @@ using `dora_scale`. Supported linear LoKr may also carry output-axis
 decomposed LoKr first factors, PEFT `lora_magnitude_vector`, and
 `lora_mid.weight` fail closed.
 
-Anima uses the same 44 sampler and nine scheduler names in Generate and Gallery.
-All nine schedules are native Flow-shift-3 trajectories. Named compatibility
-solver mappings are reported in task warnings and PNG sampling metadata rather
-than silently pretending to be a different implementation.
+All four native engines offer the same 44 sampler and nine scheduler names in
+Generate and Gallery. The vocabulary is shared; the schedules behind it are not.
+Anima's nine are native Flow-shift-3 trajectories. Both FLUX generations and
+Krea 2 run the same ModelSamplingFlux table, FLUX.2 taking its shift from the
+model and Krea 2 from the static shift its own model config declares. Named
+compatibility solver mappings are reported in task warnings and PNG sampling
+metadata rather than silently pretending to be a different implementation.
 
 ## Image batches
 
@@ -444,7 +484,37 @@ See `models/README.md`. Model configuration in `models/model-paths.json` uses
 project-relative paths below `models` and works unchanged on Windows and Linux.
 Every root may use custom names and arbitrary nesting. Checkpoints, LoRAs,
 upscalers, YOLO detectors, and compatible background-removal models are scanned
-recursively; program updates preserve the user's path manifest.
+recursively.
+
+A program update keeps your own `models/model-paths.json` instead of replacing
+it, so custom model roots survive an upgrade. Keys you leave out fall back to
+the built-in defaults, which is why a file written for an older version stays
+correct. Only a missing file, or one the updated project could not use, is
+restored from the release. The recommended-model, YOLO, and background-removal
+catalogs are refreshed by every update, since those are the lists the program
+ships rather than your configuration.
+
+The recommended-model browser covers, in addition to any file you place in
+`models` yourself:
+
+- **Illustrious** — WAI Illustrious SDXL, MiaoMiao Harem, and Obsession
+  Illustrious XL, each tracking its Civitai version list.
+- **Anima** — the official CircleStone Labs releases from both Civitai and the
+  Hugging Face `split_files` tree, paired automatically with the shared Qwen
+  0.6B text encoder and Qwen Image VAE.
+- **FLUX.2** — Klein 9B True V3 as Safetensors or GGUF, and the official
+  Klein 9B KV single-file build, which is gated and needs an accepted repository
+  licence and a Hugging Face token. Both pair with a Qwen 3 8B text encoder and
+  the FLUX.2 VAE.
+- **Krea 2** — the 12B model in Raw and Turbo variants, with a separately chosen
+  4B text encoder precision. Its VAE is shared with Anima.
+- **Upscalers** — the official Real-ESRGAN models used by the first Hires.fix
+  stage.
+
+Quantized variants are offered where the publisher ships them, so the same model
+can be taken at bf16, fp8, mxfp8, nvfp4, int4/int8, or GGUF Q4-Q8 to match the
+available VRAM. FLUX.1 has no recommended family: it runs from diffusion model,
+CLIP-L, T5-XXL, and VAE files you supply yourself.
 
 ## Development
 

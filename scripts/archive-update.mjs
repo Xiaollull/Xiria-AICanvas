@@ -6,6 +6,7 @@ import { assertEnvironmentBackup, assertOfflineUpdateTemp, createOfflineUpdateTe
 import { assertOfflineUpdateLock } from "./offline-update-lock.mjs";
 import { getSetupMarkerPath, readSetupMarker, writeSetupMarker } from "./setup-state.mjs";
 import { RELEASE_MANAGED_DIRECTORIES, RELEASE_MANAGED_FILES, RELEASE_MANIFEST_FILE, validateReleasePackageDirectory } from "./release-package.mjs";
+import { assertModelPathsUsable } from "./model-paths.mjs";
 
 const SEVEN_ZIP_URL = "https://github.com/ip7z/7zip/releases/download/26.02/7zr.exe";
 const SEVEN_ZIP_SHA256 = "56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72";
@@ -65,6 +66,13 @@ const MANAGED_ITEM_KINDS = new Map([
   ...MANAGED_DIRECTORIES.map((relativePath) => [relativePath, "directory"]),
   ...MANAGED_FILES.map((relativePath) => [relativePath, "file"]),
 ]);
+// A release ships a default copy of this file, but it is the user's own configuration: it names the
+// model roots and may be hand-edited to custom names and nesting. Replacing it on every update would
+// silently point a customized installation back at the default folders and hide the user's models,
+// so an existing usable file is left untouched. Missing keys still fall back to the code defaults,
+// which is why a kept file from an older release stays correct. Only a missing or unusable file is
+// restored from the release package.
+const PRESERVED_USER_CONFIG_FILES = new Set(["models/model-paths.json"]);
 
 const FORBIDDEN_TOP_LEVEL_ITEMS = new Set([
   ".venv",
@@ -701,6 +709,24 @@ async function dependencyChangesRequired(projectRoot, packageRoot) {
   }
 }
 
+/**
+ * Decide whether the project's own copy of a preserved configuration file can be kept. The check is
+ * the one `validateUpdatedProject` runs afterwards, so a kept file can never fail post-update
+ * validation; anything unreadable, unsafe, or unusable is replaced by the release default instead.
+ */
+async function preservedUserConfigUsable(projectRoot, relativePath) {
+  if (!PRESERVED_USER_CONFIG_FILES.has(relativePath)) return false;
+  const target = resolveWithin(projectRoot, relativePath);
+  const stats = await lstatOrNull(target);
+  if (!stats || !stats.isFile() || stats.isSymbolicLink()) return false;
+  try {
+    assertModelPathsUsable(JSON.parse(await readFile(target, "utf8")), projectRoot);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function createUpdatePlan(projectRoot, packageRoot) {
   const plan = [];
   for (const relativePath of MANAGED_DIRECTORIES) {
@@ -721,6 +747,8 @@ async function createUpdatePlan(projectRoot, packageRoot) {
       if (!sourceStats.isFile() || sourceStats.isSymbolicLink()) {
         throw new ArchiveSecurityError(`更新包中的 ${relativePath} 不是安全文件`);
       }
+      // Kept files stay out of the plan entirely, so backup, apply, and rollback never touch them.
+      if (await preservedUserConfigUsable(projectRoot, relativePath)) continue;
       plan.push({ relativePath, kind: "file", action: "replace" });
     } else if (await lstatOrNull(resolveWithin(projectRoot, relativePath))) {
       plan.push({ relativePath, kind: "file", action: "remove" });
@@ -1219,11 +1247,15 @@ export async function recoverInterruptedUpdate({ projectRoot, transactionPath, r
   };
 }
 
+export const NODE_DEPENDENCY_UPDATE_ERROR = NODE_DEPENDENCY_ERROR;
+
 export const archiveUpdateInternals = {
   FORBIDDEN_TOP_LEVEL_ITEMS,
   MANAGED_FILES,
   MANAGED_DIRECTORIES,
+  PRESERVED_USER_CONFIG_FILES,
   createUpdatePlan,
+  preservedUserConfigUsable,
   dependencyChangesRequired,
   dependencyEnvironmentEqual,
   identifyProjectRoot,

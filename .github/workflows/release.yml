@@ -347,6 +347,7 @@ jobs:
           NODE
 
       - name: Exercise the real updater against the release archive
+        id: exercise
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -359,11 +360,36 @@ jobs:
           set -euo pipefail
           node --input-type=module <<'NODE'
           import { constants } from "node:fs";
-          import { copyFile, readFile, rm } from "node:fs/promises";
+          import { appendFile, copyFile, readFile, rm } from "node:fs/promises";
           import path from "node:path";
-          import { applyPreparedUpdate, prepareUpdate } from "./scripts/archive-update.mjs";
+          import { applyPreparedUpdate, archiveUpdateInternals, NODE_DEPENDENCY_UPDATE_ERROR, prepareUpdate } from "./scripts/archive-update.mjs";
           import { createReleaseManifest } from "./scripts/release-package.mjs";
           import { removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
+
+          // Files the updater deliberately keeps from the installed project. The release ships a
+          // default copy, so they are excluded from the byte comparison below and asserted to be
+          // untouched instead.
+          const preservedFiles = [...archiveUpdateInternals.PRESERVED_USER_CONFIG_FILES];
+
+          // A Node dependency change is not a packaging fault; it is a release the in-app updater
+          // refuses by design, because replacing node_modules under a running Windows process is
+          // unsafe. Translate it once, here, into something a maintainer can act on.
+          const explainDependencyRefusal = (error) => {
+            if (!String(error?.message || "").includes(NODE_DEPENDENCY_UPDATE_ERROR)) return error;
+            return new Error(
+              "This release changes Node dependencies, so the in-app updater refuses it and existing "
+              + "users cannot upgrade through Settings -> About. Publishing is blocked. Ship this "
+              + "change as a full package that users install fresh, or revert the dependency change.",
+              { cause: error },
+            );
+          };
+          const prepare = async (options) => {
+            try {
+              return await prepareUpdate(options);
+            } catch (error) {
+              throw explainDependencyRefusal(error);
+            }
+          };
 
           const cleanupPrepared = async (prepared) => {
             if (!prepared?.stagingOwnership) return;
@@ -374,17 +400,23 @@ jobs:
               kind: "stage",
             });
           };
-          const assertUpdatedTree = async (projectRoot, expectedRoot, expectedManifest) => {
+          const assertUpdatedTree = async (projectRoot, expectedRoot, expectedManifest, preservedBefore) => {
             const actualManifest = await createReleaseManifest({ projectRoot });
             if (JSON.stringify(actualManifest.files) !== JSON.stringify(expectedManifest.files)) {
               throw new Error("Applied tree does not have the exact new release manifest file set");
             }
             for (const relative of expectedManifest.files) {
               const segments = relative.split("/");
-              const [actual, expected] = await Promise.all([
-                readFile(path.join(projectRoot, ...segments)),
-                readFile(path.join(expectedRoot, ...segments)),
-              ]);
+              const actual = await readFile(path.join(projectRoot, ...segments));
+              if (preservedFiles.includes(relative)) {
+                // The installed copy is the user's own; the update must not have rewritten it.
+                const before = preservedBefore.get(relative);
+                if (before && !actual.equals(before)) {
+                  throw new Error(`Update overwrote preserved user configuration: ${relative}`);
+                }
+                continue;
+              }
+              const expected = await readFile(path.join(expectedRoot, ...segments));
               if (!actual.equals(expected)) throw new Error(`Applied release file differs: ${relative}`);
             }
             const pkg = JSON.parse(await readFile(path.join(projectRoot, "package.json"), "utf8"));
@@ -403,14 +435,14 @@ jobs:
             let updateRoot = process.env.CURRENT_PACKAGE_ROOT;
             if (process.env.PREVIOUS_FOUND === "true") {
               // prepareUpdate performs the security-aware extraction of the authenticated old archive.
-              previousPrepared = await prepareUpdate({
+              // Only its extracted tree is wanted here, as the baseline a real user is upgrading from.
+              // Nothing is ever installed into it, so its environment-repair flag says nothing about
+              // this release and is deliberately not treated as a publishing gate.
+              previousPrepared = await prepare({
                 projectRoot: process.env.CURRENT_PACKAGE_ROOT,
                 archivePath: process.env.PREVIOUS_ARCHIVE,
               });
               if (!previousPrepared.plan.length) throw new Error("Previous release extraction produced an empty update plan");
-              if (previousPrepared.environmentRepairRequired) {
-                throw new Error("Requirements differ from the previous release; this workflow has no release environment to verify repair, so publishing is blocked");
-              }
               updateRoot = previousPrepared.packageRoot;
             } else if (process.env.VERSION !== "1.0.0") {
               throw new Error("Only first release 1.0.0 may be validated without a previous stable archive");
@@ -418,14 +450,22 @@ jobs:
 
             // A byte-identical copy is used because applyPreparedUpdate securely removes its input
             // after success; the actual release asset must remain available for artifact upload.
-            candidatePrepared = await prepareUpdate({
+            candidatePrepared = await prepare({
               projectRoot: updateRoot,
               archivePath: process.env.CANDIDATE_ARCHIVE,
             });
             if (!candidatePrepared.releaseManifest) throw new Error("New release archive did not pass manifest validation");
             if (!candidatePrepared.plan.length) throw new Error("New release archive produced an empty update plan");
-            if (candidatePrepared.environmentRepairRequired) {
-              throw new Error("Requirements changed and cannot be validated without environment repair; publishing is blocked");
+
+            // A Python requirement change is a supported release: the updater repairs the
+            // environment after replacing the files. This workflow installs nothing, so it cannot
+            // prove the repair itself, but blocking would make every backend dependency change
+            // unshippable. Record it instead, verify everything that can be verified, and say so.
+            const environmentRepair = candidatePrepared.environmentRepairRequired;
+            const preservedBefore = new Map();
+            for (const relative of preservedFiles) {
+              const current = await readFile(path.join(updateRoot, ...relative.split("/"))).catch(() => null);
+              if (current) preservedBefore.set(relative, current);
             }
 
             const expectedRoot = candidatePrepared.packageRoot;
@@ -434,15 +474,21 @@ jobs:
               projectRoot: updateRoot,
               prepared: candidatePrepared,
               validate: async ({ projectRoot, environmentRepairRequired }) => {
-                if (environmentRepairRequired) throw new Error("Unexpected environment repair request during release validation");
-                await assertUpdatedTree(projectRoot, expectedRoot, expectedManifest);
+                if (environmentRepairRequired !== environmentRepair) {
+                  throw new Error("The environment repair decision changed between preparation and validation");
+                }
+                await assertUpdatedTree(projectRoot, expectedRoot, expectedManifest, preservedBefore);
                 return { verified: true };
               },
             });
             candidatePrepared = undefined;
+            await appendFile(process.env.GITHUB_OUTPUT, `environment_repair=${environmentRepair}\n`);
             console.log(process.env.PREVIOUS_FOUND === "true"
               ? "The real updater prepared, applied, and byte-validated the new archive over the previous stable package."
               : "The real updater prepared, applied, and byte-validated the initial archive over an isolated current package.");
+            console.log(environmentRepair
+              ? "This release changes backend/requirements.txt: updating users will run an automatic environment repair."
+              : "This release keeps the previous dependency environment: updating users need no environment repair.");
           } finally {
             await cleanupPrepared(candidatePrepared).catch(() => {});
             await cleanupPrepared(previousPrepared).catch(() => {});
@@ -468,6 +514,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           ARCHIVE: ${{ steps.version.outputs.archive }}
           PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
+          ENVIRONMENT_REPAIR: ${{ steps.exercise.outputs.environment_repair }}
         run: |
           {
             echo "## Verified release ${GITHUB_REF_NAME}"
@@ -479,6 +526,11 @@ jobs:
               echo "- SHA-256: \`$(cut -d' ' -f1 "release/${ARCHIVE}.sha256")\`"
             fi
             echo "- Update baseline: ${PREVIOUS_VERSION:-initial 1.0.0 structural/apply validation}"
+            case "${ENVIRONMENT_REPAIR:-}" in
+              true) echo "- Environment repair on update: **yes** — \`backend/requirements.txt\` changed, so updating users run an automatic repair after the files are replaced." ;;
+              false) echo "- Environment repair on update: no" ;;
+              *) echo "- Environment repair on update: not determined" ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:

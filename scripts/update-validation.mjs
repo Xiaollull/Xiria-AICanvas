@@ -8,7 +8,7 @@ import path from "node:path";
 import { isolatedPythonEnv, verifyProjectVenv } from "./python.mjs";
 import { getSetupMarkerPath, readSetupMarker, writeSetupMarker } from "./setup-state.mjs";
 import { createEnvironmentBackupOwnership, removeEnvironmentBackup, removeEnvironmentOwnershipMarker, restoreEnvironmentBackup, writeEnvironmentBackupOwnership } from "./offline-update-temp.mjs";
-import { configuredModelDirectories } from "./model-paths.mjs";
+import { assertModelPathsUsable } from "./model-paths.mjs";
 import { createHttpFetch } from "./node-tools.mjs";
 
 const REQUIRED_MODEL_MANIFESTS = [
@@ -183,10 +183,7 @@ async function validateModelManifests(projectRoot) {
       const value = JSON.parse(await readFile(path.join(projectRoot, relativePath), "utf8"));
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("根节点必须是对象");
       if (relativePath.endsWith("model-paths.json")) {
-        if (!value.checkpoints || !value.loras || typeof value.upscalers !== "string" || typeof value.configs !== "string") {
-          throw new Error("缺少 checkpoints、loras、upscalers 或 configs 路径");
-        }
-        configuredModelDirectories(value, projectRoot);
+        assertModelPathsUsable(value, projectRoot);
       } else if (relativePath.endsWith("recommended-models.json")) {
         if (!Number.isInteger(value.schema) || !Array.isArray(value.artifacts) || !Array.isArray(value.staticFamilies) || !Array.isArray(value.civitaiFamilies)) {
           throw new Error("缺少推荐模型目录数组");

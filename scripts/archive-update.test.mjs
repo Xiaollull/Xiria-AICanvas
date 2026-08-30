@@ -16,6 +16,7 @@ import {
 import { createEnvironmentBackupOwnership, createOfflineUpdateTemp, writeEnvironmentBackupOwnership } from "./offline-update-temp.mjs";
 import { acquireOfflineUpdateLock } from "./offline-update-lock.mjs";
 import { stageReleasePackage } from "./release-package.mjs";
+import { defaultModelPaths } from "./model-paths.mjs";
 
 const {
   FORBIDDEN_TOP_LEVEL_ITEMS,
@@ -324,6 +325,52 @@ test("update plan preserves user model paths and weights while refreshing catalo
       "models/README.md",
     ]);
     assert.equal(plan.some((item) => item.relativePath.endsWith(".onnx") || item.relativePath.endsWith(".bin")), false);
+  } finally {
+    await Promise.all([
+      rm(projectRoot, { recursive: true, force: true }),
+      rm(packageRoot, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("a usable model path configuration survives the update, an unusable one is restored", async () => {
+  const projectRoot = await temporaryDirectory("xirai-plan-preserve-current-");
+  const packageRoot = await temporaryDirectory("xirai-plan-preserve-package-");
+  const configured = path.join(projectRoot, "models", "model-paths.json");
+  const shipped = { ...defaultModelPaths };
+  const planned = async () => (await createUpdatePlan(projectRoot, packageRoot))
+    .some((item) => item.relativePath === "models/model-paths.json");
+  try {
+    await Promise.all([
+      mkdir(path.join(projectRoot, "models"), { recursive: true }),
+      mkdir(path.join(packageRoot, "models"), { recursive: true }),
+    ]);
+    await writeFile(path.join(packageRoot, "models", "model-paths.json"), JSON.stringify(shipped));
+
+    // Nothing to keep yet: a fresh or repaired project takes the release default.
+    assert.equal(await planned(), true);
+
+    await writeFile(configured, JSON.stringify(shipped));
+    assert.equal(await planned(), false);
+
+    // The whole point: a hand-edited model root must still be there after the update.
+    await writeFile(configured, JSON.stringify({
+      ...shipped,
+      checkpoints: { ...shipped.checkpoints, illustrious: "models/checkpoints/my-illustrious" },
+    }));
+    assert.equal(await planned(), false);
+
+    // Anything the post-update validation would reject is replaced instead of kept, so preserving
+    // a file can never turn into an update that rolls back.
+    for (const unusable of [
+      "{ not json",
+      JSON.stringify({ checkpoints: {}, loras: {} }),
+      JSON.stringify({ ...shipped, upscalers: "../../elsewhere" }),
+      JSON.stringify({ ...shipped, configs: 7 }),
+    ]) {
+      await writeFile(configured, unusable);
+      assert.equal(await planned(), true, `expected replacement for ${unusable.slice(0, 40)}`);
+    }
   } finally {
     await Promise.all([
       rm(projectRoot, { recursive: true, force: true }),
