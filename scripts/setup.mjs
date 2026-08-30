@@ -1,11 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import * as http from "node:http";
-import * as https from "node:https";
 import os from "node:os";
 import path from "node:path";
-import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { benchmarkRoutes, downloadFile } from "./download.mjs";
 import { createInstallerRunner } from "./install-progress.mjs";
@@ -20,24 +17,12 @@ import { availableTorchVersions, resolveLatestStableTorch, torchInternals } from
 import { resolveUvTarget, uvDownloadRoutes, uvVersionMatches } from "./uv-bootstrap.mjs";
 import { configuredModelDirectories } from "./model-paths.mjs";
 import { requireBundledAnimaTokenizers } from "./anima-models.mjs";
+import { applyInstallerProxyPolicy, createInstallerFetch, npmInstallerEnvironment } from "./proxy-policy.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 Object.assign(process.env, loadLocalEnv(projectRoot));
-const allProxy = process.env.ALL_PROXY || process.env.all_proxy;
-if (allProxy) {
-  process.env.HTTP_PROXY ||= allProxy;
-  process.env.HTTPS_PROXY ||= allProxy;
-}
-const hasProxyEnvironment = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-  .some((name) => Boolean(process.env[name]));
-const nativeProxyConfigured = hasProxyEnvironment && typeof http.setGlobalProxyFromEnv === "function";
-if (nativeProxyConfigured) http.setGlobalProxyFromEnv();
-const fallbackProxyAgents = hasProxyEnvironment && !nativeProxyConfigured
-  ? {
-      "http:": new http.Agent({ proxyEnv: process.env }),
-      "https:": new https.Agent({ proxyEnv: process.env }),
-    }
-  : null;
+const proxyPolicy = applyInstallerProxyPolicy();
+const fetchWithProxy = createInstallerFetch(proxyPolicy);
 
 const argumentsSet = new Map(process.argv.slice(2).map((argument) => {
   const [key, value = "true"] = argument.replace(/^--/, "").split("=", 2);
@@ -333,47 +318,6 @@ async function choosePackageSource(taskId, kind, packageName, mode) {
   return { name: selected.id, source: selectedSource, ranked };
 }
 
-async function fetchWithProxy(url, options = {}) {
-  if (!hasProxyEnvironment || nativeProxyConfigured) return fetch(url, options);
-  return proxyFetch(url, options);
-}
-
-function proxyFetch(url, options = {}, redirects = 0) {
-  if (redirects > 10) return Promise.reject(new Error("下载重定向次数过多"));
-  const target = new URL(url);
-  const client = target.protocol === "https:" ? https : http;
-  return new Promise((resolve, reject) => {
-    const request = client.request(target, {
-      method: options.method || "GET",
-      headers: options.headers,
-      agent: fallbackProxyAgents[target.protocol],
-      signal: options.signal,
-    }, (response) => {
-      const location = response.headers.location;
-      if (location && [301, 302, 303, 307, 308].includes(response.statusCode)) {
-        response.resume();
-        const nextTarget = new URL(location, target);
-        const nextHeaders = new Headers(options.headers || {});
-        if (nextTarget.origin !== target.origin) nextHeaders.delete("authorization");
-        proxyFetch(nextTarget.href, { ...options, headers: Object.fromEntries(nextHeaders) }, redirects + 1).then(resolve, reject);
-        return;
-      }
-      const headers = new Headers();
-      for (const [name, value] of Object.entries(response.headers)) {
-        if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
-        else if (value != null) headers.set(name, value);
-      }
-      resolve(new Response(Readable.toWeb(response), {
-        status: response.statusCode,
-        statusText: response.statusMessage,
-        headers,
-      }));
-    });
-    request.on("error", reject);
-    request.end(options.body);
-  });
-}
-
 function uvFetch(url, options = {}) {
   const githubToken = process.env.UV_GITHUB_TOKEN;
   if (!githubToken) return fetchWithProxy(url, options);
@@ -589,7 +533,8 @@ async function fetchText(url) {
       signal: controller.signal,
     });
     return response.ok ? await response.text() : "";
-  } catch {
+  } catch (error) {
+    if (proxyPolicy.useProxy) throw error;
     return "";
   } finally {
     clearTimeout(timeout);
@@ -669,6 +614,7 @@ console.log(`XiriaCanvas AI 一键环境配置 (${process.platform}/${process.ar
 startTask("machine");
 const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
 if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 21)) fail("需要 Node.js 22.21 或更高版本");
+if (proxyPolicy.useProxy && !proxyPolicy.configured) fail("已显式启用代理，但未设置 HTTP_PROXY、HTTPS_PROXY 或 ALL_PROXY");
 if (!sources[requestedSource] && requestedSource !== "auto") fail(`未知下载源：${requestedSource}`);
 if (rtxVsrChoiceError) fail(rtxVsrChoiceError);
 if (acceleratorChoiceError) fail(acceleratorChoiceError);
@@ -708,13 +654,14 @@ const managedPythonEnvironment = {
   UV_CACHE_DIR: path.resolve(projectRoot, process.env.XIRAI_CACHE_DIR || ".cache", "uv-cache"),
   UV_PYTHON_INSTALL_DIR: path.resolve(projectRoot, process.env.XIRAI_CACHE_DIR || ".cache", "python"),
   UV_PYTHON_PREFERENCE: "only-managed",
+  UV_NO_CONFIG: "1",
 };
 
 let basePython = findPython(projectRoot, { includeVenv: !recreateVenv });
 if (!basePython && !diagnoseOnly) {
   const uvExecutable = await bootstrapUv();
   console.log("未检测到 Python，使用项目内 uv 自动下载 Python 3.12...");
-  run(uvExecutable, ["venv", "--seed", "--python", "3.12", venvRoot], { env: managedPythonEnvironment });
+  run(uvExecutable, ["venv", "--no-config", "--seed", "--python", "3.12", venvRoot], { env: managedPythonEnvironment });
   basePython = findPython(projectRoot);
 }
 if (!basePython) {
@@ -751,7 +698,7 @@ if (!diagnoseOnly) {
       console.warn(`不完整的环境已保留为 ${path.basename(backupPath)}`);
     }
     const uvExecutable = await bootstrapUv();
-    run(uvExecutable, ["venv", "--seed", "--python", "3.12", venvRoot], { env: managedPythonEnvironment });
+    run(uvExecutable, ["venv", "--no-config", "--seed", "--python", "3.12", venvRoot], { env: managedPythonEnvironment });
   }
 }
 const venvPython = diagnoseOnly ? basePython : findPython(projectRoot);
@@ -976,6 +923,12 @@ const backendPackages = readFileSync(path.join(projectRoot, "backend", "requirem
   .filter((line) => line && !line.startsWith("#"));
 const setupCacheDirectory = path.resolve(projectRoot, process.env.XIRAI_CACHE_DIR || ".cache", "setup");
 mkdirSync(setupCacheDirectory, { recursive: true });
+const npmConfigPath = path.join(setupCacheDirectory, "npmrc");
+writeFileSync(npmConfigPath, "# XiriaCanvas setup-owned npm boundary\nproxy=null\nhttps-proxy=null\n", { encoding: "utf8", mode: 0o600 });
+const npmEnvironment = npmInstallerEnvironment(process.env, {
+  useProxy: proxyPolicy.useProxy,
+  userConfig: npmConfigPath,
+});
 const torchConstraintPath = path.join(setupCacheDirectory, "torch-constraint.txt");
 writeFileSync(torchConstraintPath, `torch==${torchPlan.version}\n`, "utf8");
 const downloadPlan = [
@@ -1253,7 +1206,7 @@ if (backendCheckpointReady && backendDependenciesReady && pipelineConfigsReady) 
     if (pipelineConfigsDeferred) {
       warn(checkPipelineConfigs(["--required"])
         ? "模型运行配置下载失败（Hugging Face 与 HF-Mirror 均不可达）；已安装的模型不受影响，下次配置或联网后会自动补齐"
-        : "模型运行配置下载失败（Hugging Face 与 HF-Mirror 均不可达）；已安装的底模在补齐前无法生成，可在 .env 设置 HF_ENDPOINT 或 HTTPS_PROXY 后重新配置");
+        : "模型运行配置下载失败（Hugging Face 与 HF-Mirror 均不可达）；已安装的底模在补齐前无法生成，可在 .env 设置 HF_ENDPOINT，或显式启用 --use-proxy 后重新配置");
     }
   }
   checkpointTask("backend", backendFingerprint, pipelineConfigsDeferred ? "partial" : "complete");
@@ -1544,6 +1497,7 @@ if (!skipNode) {
         // it is filling is the only place the progress can come from.
         meterDirectories: [path.join(projectRoot, "node_modules")],
         stallMs: index + 1 < nodeRoutes.length ? installStallMs : 0,
+        options: { env: npmEnvironment },
       });
       if (result.status === 0) break;
     }

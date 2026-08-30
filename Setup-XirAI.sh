@@ -9,4 +9,5 @@ fi
 printf '%s\n' 'XiriaCanvas AI Environment Setup'
 printf '%s\n' 'A browser window will open. Choose Auto or Manual setup, then click Start.'
 printf '%s\n' 'The wizard queries the PyTorch catalog first — nothing is installed yet.'
-exec node scripts/setup-gui.mjs
+printf '%s\n' 'Downloads use a direct connection by default; use --use-proxy only when needed.'
+exec node scripts/setup-gui.mjs "$@"

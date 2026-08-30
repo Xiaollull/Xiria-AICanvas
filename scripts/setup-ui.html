@@ -47,8 +47,8 @@
 
     <section id="setupView">
       <div class="intro">
-        <div><span class="eyebrow">SETUP WIZARD</span><h1 id="setupTitle">准备本地 AI 环境</h1><p id="setupMessage">正在读取硬件和官方 PyTorch wheel 目录。完成前不会创建环境、下载模型或安装软件。</p></div>
-        <aside class="intro-note"><strong>确认后才开始</strong>系统会先验证 GPU 驱动与 Python ABI。你可以自动选择推荐组合，也可以手动锁定 CUDA runtime 与 PyTorch 版本。</aside>
+        <div><span class="eyebrow">SETUP WIZARD</span><h1 id="setupTitle">准备本地 AI 环境</h1><p id="setupMessage">默认不会使用应用层 HTTP(S) 代理。流量仍遵循操作系统路由和全隧道 VPN；正在读取硬件和官方 PyTorch wheel 目录，完成前不会安装软件。</p></div>
+        <aside class="intro-note"><strong>默认应用层直连</strong>只有通过 <code>--use-proxy</code> 或 <code>XIRAI_USE_PROXY=1</code> 显式开启时才使用 HTTP(S) 代理；系统路由或全隧道 VPN 不在应用控制范围内。</aside>
       </div>
       <div class="notice" id="setupNotice" hidden><i></i><span></span></div>
       <section class="hardware" id="hardwareCards" aria-label="机器环境"><div class="hardware-card"><span>GPU</span><strong>正在检测</strong></div><div class="hardware-card"><span>驱动</span><strong>--</strong></div><div class="hardware-card"><span>CUDA 上限</span><strong>--</strong></div><div class="hardware-card"><span>PYTHON ABI</span><strong>--</strong></div></section>

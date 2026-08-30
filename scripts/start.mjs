@@ -8,7 +8,7 @@ import { writeDiagnosticLog } from "./diagnostics.mjs";
 import { recoverInterruptedUpdate } from "./archive-update.mjs";
 import { getVenvPythonPath, isolatedPythonEnv, loadLocalEnv } from "./python.mjs";
 import { readSetupMarker } from "./setup-state.mjs";
-import { viteInvocation } from "./node-tools.mjs";
+import { createHttpFetch, viteInvocation } from "./node-tools.mjs";
 import { acquireOfflineUpdateLock } from "./offline-update-lock.mjs";
 import { requireBundledAnimaTokenizers } from "./anima-models.mjs";
 
@@ -77,11 +77,16 @@ function lanUrls() {
   return [...new Set(urls)];
 }
 
+// Global fetch answers to NODE_USE_ENV_PROXY and NODE_OPTIONS=--use-env-proxy, which would send
+// this loopback probe out through the user's proxy. The health of a service on 127.0.0.1 is not
+// something a proxy can answer, so the probe carries its own agent and never reads proxy settings.
+const localFetch = createHttpFetch();
+
 async function getHealth(timeout = 1500) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(`http://127.0.0.1:${webPort}/api/inference/health`, { cache: "no-store", signal: controller.signal });
+    const response = await localFetch(`http://127.0.0.1:${webPort}/api/inference/health`, { signal: controller.signal });
     return response.ok ? await response.json() : null;
   } catch {
     return null;

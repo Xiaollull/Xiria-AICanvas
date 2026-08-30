@@ -26,6 +26,7 @@ const chromeCandidates = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
 ];
+const skipBrowserFixture = process.env.XIRAI_SKIP_BROWSER_FIXTURES === "1";
 
 function dragEvent({ currentTarget, target = currentTarget, dataTransfer = null } = {}) {
   let prevented = false;
@@ -265,7 +266,9 @@ function browserFixture(helperHref) {
   </script></body></html>`;
 }
 
-test("temporary Chromium fixture admits only nested six-dot path transfers and rejects every mismatched drop at 1100/800/600", async (context) => {
+test("local Chromium fixture admits only nested six-dot path transfers and rejects every mismatched drop at 1100/800/600", {
+  skip: skipBrowserFixture && "XIRAI_SKIP_BROWSER_FIXTURES keeps CI independent of runner browsers",
+}, async (context) => {
   const chrome = await chromePath();
   if (!chrome) {
     context.skip("Chromium is unavailable; pure drag/session and source contracts were checked");

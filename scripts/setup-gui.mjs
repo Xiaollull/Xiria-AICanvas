@@ -11,12 +11,16 @@ import { getSetupMarkerPath, readSetupMarker, writeSetupMarker } from "./setup-s
 import { detectNvidiaDriverApi, detectNvidiaSmi, mergeNvidiaDetection } from "./nvidia.mjs";
 import { buildSetupArguments, parseCudaVariants, parseTorchWheelVersions, buildSetupCatalog, recommendRepairPlan, validateSetupConfiguration } from "./setup-options.mjs";
 import { parseInstallerProgress } from "./install-progress.mjs";
-import * as http from "node:http";
-import * as https from "node:https";
-import { Readable } from "node:stream";
+import { applyInstallerProxyPolicy, createInstallerFetch } from "./proxy-policy.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 Object.assign(process.env, loadLocalEnv(projectRoot));
+// Captured before the policy strips this process: the direct-connection rule covers installer
+// downloads, not the application the wizard hands over to. XiriaCanvas AI has its own proxy
+// handling for model downloads, and it must still see the proxy the user configured.
+const applicationEnvironment = { ...process.env };
+const proxyPolicy = applyInstallerProxyPolicy();
+const fetchWithProxy = createInstallerFetch(proxyPolicy);
 const uiPath = path.join(projectRoot, "scripts", "setup-ui.html");
 const logoPath = path.join(projectRoot, "public", "xiriacanvas-logo.svg");
 const stateDirectory = path.resolve(projectRoot, process.env.XIRAI_STATE_DIR || "state-cache");
@@ -28,21 +32,6 @@ const webPort = Number(process.env.WEB_PORT || 7709);
 const webHost = process.env.WEB_HOST || "0.0.0.0";
 if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65535) throw new Error("WEB_PORT 必须是 1-65535 的整数");
 
-const allProxy = process.env.ALL_PROXY || process.env.all_proxy;
-if (allProxy) {
-  process.env.HTTP_PROXY ||= allProxy;
-  process.env.HTTPS_PROXY ||= allProxy;
-}
-const hasProxyEnvironment = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-  .some((name) => Boolean(process.env[name]));
-const nativeProxyConfigured = hasProxyEnvironment && typeof http.setGlobalProxyFromEnv === "function";
-if (nativeProxyConfigured) http.setGlobalProxyFromEnv();
-const fallbackProxyAgents = hasProxyEnvironment && !nativeProxyConfigured
-  ? {
-      "http:": new http.Agent({ proxyEnv: process.env }),
-      "https:": new https.Agent({ proxyEnv: process.env }),
-    }
-  : null;
 
 function accessUrls() {
   const addresses = new Set([`http://localhost:${webPort}/`]);
@@ -407,47 +396,6 @@ function consumeStream(stream, streamName) {
   });
 }
 
-async function fetchWithProxy(url, options = {}) {
-  if (!hasProxyEnvironment || nativeProxyConfigured) return fetch(url, options);
-  return proxyFetch(url, options);
-}
-
-function proxyFetch(url, options = {}, redirects = 0) {
-  if (redirects > 10) return Promise.reject(new Error("下载重定向次数过多"));
-  const target = new URL(url);
-  const client = target.protocol === "https:" ? https : http;
-  return new Promise((resolve, reject) => {
-    const request = client.request(target, {
-      method: options.method || "GET",
-      headers: options.headers,
-      agent: fallbackProxyAgents[target.protocol],
-      signal: options.signal,
-    }, (response) => {
-      const location = response.headers.location;
-      if (location && [301, 302, 303, 307, 308].includes(response.statusCode)) {
-        response.resume();
-        const nextTarget = new URL(location, target);
-        const nextHeaders = new Headers(options.headers || {});
-        if (nextTarget.origin !== target.origin) nextHeaders.delete("authorization");
-        proxyFetch(nextTarget.href, { ...options, headers: Object.fromEntries(nextHeaders) }, redirects + 1).then(resolve, reject);
-        return;
-      }
-      const headers = new Headers();
-      for (const [name, value] of Object.entries(response.headers)) {
-        if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
-        else if (value != null) headers.set(name, value);
-      }
-      resolve(new Response(Readable.toWeb(response), {
-        status: response.statusCode,
-        statusText: response.statusMessage,
-        headers,
-      }));
-    });
-    request.on("error", reject);
-    request.end(options.body);
-  });
-}
-
 async function fetchText(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
@@ -458,7 +406,10 @@ async function fetchText(url) {
       signal: controller.signal,
     });
     return response.ok ? await response.text() : "";
-  } catch {
+  } catch (error) {
+    // An explicit proxy choice is a contract: surfacing its failure is safer
+    // than turning it into an indistinguishable empty catalog response.
+    if (proxyPolicy.useProxy) throw error;
     return "";
   } finally {
     clearTimeout(timeout);
@@ -628,7 +579,7 @@ function startMainService() {
   server.close(() => {
     appProcess = spawn(vite.command, vite.args, {
       cwd: projectRoot,
-      env: process.env,
+      env: applicationEnvironment,
       windowsHide: true,
       stdio: "inherit",
     });

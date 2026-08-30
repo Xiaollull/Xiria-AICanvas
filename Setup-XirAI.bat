@@ -11,5 +11,6 @@ if errorlevel 1 (
 echo XiriaCanvas AI Environment Setup
 echo A browser window will open. Choose Auto or Manual setup, then click Start.
 echo The wizard queries the PyTorch catalog first - nothing is installed yet.
-node "scripts\setup-gui.mjs"
+echo Downloads use a direct connection by default; use --use-proxy only when needed.
+node "scripts\setup-gui.mjs" %*
 if errorlevel 1 pause

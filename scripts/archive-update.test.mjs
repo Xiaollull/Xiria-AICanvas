@@ -35,13 +35,36 @@ function pathIsOutside(root, candidate) {
   return Boolean(relative) && (path.isAbsolute(relative) || relative.split(path.sep)[0] === "..");
 }
 
-function run(command, args, options = {}) {
+const COMMAND_TIMEOUT_MS = 30_000;
+
+function run(command, args, { timeoutMs = COMMAND_TIMEOUT_MS, ...options } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { ...options, windowsHide: true, stdio: "ignore" });
-    child.once("error", reject);
-    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`)));
+    let settled = false;
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      // These helpers invoke a direct archive executable, so terminating the child
+      // also releases the fixture's archive handle on Windows.
+      child.kill();
+      finish(() => reject(new Error(`${command} timed out after ${timeoutMs}ms`)));
+    }, timeoutMs);
+    timer.unref();
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("close", (code) => finish(() => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}`))));
   });
 }
+
+test("archive command helper terminates a stalled child", async () => {
+  await assert.rejects(
+    run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 100 }),
+    /timed out after 100ms/,
+  );
+});
 
 async function createProjectRoot(root) {
   await Promise.all([

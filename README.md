@@ -53,6 +53,19 @@ enable **auto-repair**: if the installed PyTorch/CUDA combination fails the
 post-install CUDA tensor operation, the setup automatically tries the next-best
 compatible combination without re-opening the wizard.
 
+**Network policy:** setup, its visual wizard, direct/Range downloads, and the
+`uv`, `pip`, and `npm` child installers use a direct connection by default.
+They clear inherited HTTP(S)/ALL proxy variables and npm/pip/uv proxy settings
+only in their own process environment; they never modify system, VPN, shell, or
+user-level tool configuration. `NO_PROXY` remains unchanged. To deliberately
+use an already configured proxy, pass `--use-proxy` (for example
+`npm run setup:cli -- --use-proxy`) or set `XIRAI_USE_PROXY=1`. An opted-in
+proxy that is unavailable is reported as an error; setup never silently retries
+that request directly. The visual wizard clearly starts in **direct by default**
+mode and also accepts `npm run setup -- --use-proxy`. This is application-level
+HTTP(S) control only: it cannot change operating-system routing or a full-tunnel
+VPN, which still carry the traffic whatever setup chooses.
+
 **Windows:** double-click `Setup-XirAI.bat`.
 
 **Linux:** run `sh Setup-XirAI.sh`, or mark `XirAI-Setup.desktop` as trusted and
@@ -178,6 +191,7 @@ npm run setup:cli -- --diagnose
 npm run setup:cli -- --without-xformers
 npm run setup:cli -- --connections=12
 npm run setup:cli -- --refresh-selection
+npm run setup:cli -- --use-proxy
 ```
 
 CUDA runtime variants are discovered dynamically from the current stable
@@ -224,8 +238,9 @@ appended automatically. Multiple direct bases can be whitespace-separated.
 GitHub Enterprise host. Artifact hashes remain mandatory for every mirror.
 Setting any of these source variables replaces the built-in accelerated route
 list, so an official-only or private mirror policy remains available.
-Bootstrap requests honor `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
-`NO_PROXY` (including lowercase forms) through Node's built-in proxy support.
+Bootstrap requests use the same direct-by-default policy. `HTTP_PROXY`,
+`HTTPS_PROXY`, and `ALL_PROXY` (including lowercase forms) are honored only
+after explicit `--use-proxy` or `XIRAI_USE_PROXY=1`; `NO_PROXY` remains intact.
 
 Unlike a user-level uv installation, XirAI deliberately ignores installation
 directory and PATH mutation settings: it never modifies shell profiles, the
@@ -420,5 +435,18 @@ npm run inference
 Do not copy `node_modules` or `.venv` between operating systems. Recreate both
 with `npm run setup` on the target machine.
 
-GitHub Actions runs syntax, environment-detection, and frontend-build checks on
-both `windows-latest` and `ubuntu-latest` for every push and pull request.
+GitHub Actions runs lightweight cross-platform checks on both `windows-latest`
+and `ubuntu-latest` for every push and pull request: Node installation and
+diagnostics, fast Node tests, Node/Python syntax checks, and the Vite build. It
+does not create a project virtual environment, install CPU PyTorch or backend
+requirements, or run backend tests. Run the complete backend suite and real GPU
+validation locally.
+
+To validate a real clean environment without downloading its dependencies on
+your local connection, open **Actions → Environment setup validation → Run
+workflow**. Choose `both`, `windows`, or `ubuntu`, then choose the allowed
+package source (`official`, `aliyun`, or `tsinghua`). This manual GitHub-hosted
+workflow runs `setup:cli` with CPU PyTorch and `--without-xformers`, verifies
+the project `.venv`, performs a minimal backend import/compile smoke test, and
+builds Vite. It does not download model weights or run the complete backend
+behavior suite, but it does consume GitHub Actions minutes and download budget.

@@ -34,6 +34,8 @@ PyTorch wheel 自带各自的 CUDA 运行时。系统级 CUDA Toolkit 并非必�
 
 两种模式都包含 xformers 开关（默认开启）。手动模式还可以启用 **auto-repair（自动修复）**：如果已安装的 PyTorch/CUDA 组合未通过安装后的 CUDA 张量运算，安装程序会自动尝试下一个最合适的兼容组合，而无需重新打开向导。
 
+**网络策略：** 配置器、可视化向导、直接/Range 下载及其启动的 `uv`、`pip`、`npm` 子进程默认均为**直连**。它们只在自身进程环境中清除继承的 HTTP(S)/ALL 代理变量和 npm/pip/uv 代理配置，绝不会修改系统、VPN、shell 或用户级工具配置；`NO_PROXY` 保持不变。只有显式传入 `--use-proxy`（例如 `npm run setup:cli -- --use-proxy`）或设置 `XIRAI_USE_PROXY=1` 才使用已配置代理。显式选择的代理不可用时会明确报错，绝不会悄悄直连回退；可视化向导也会明确显示“默认直连”。这只是应用层 HTTP(S) 控制：它无法改变操作系统路由或全隧道 VPN，这类流量仍会照常经由其转发。
+
 **Windows：** 双击 `Setup-XirAI.bat`。
 
 **Linux：** 运行 `sh Setup-XirAI.sh`，或将 `XirAI-Setup.desktop` 标记为受信任后双击它。两个启动器都会根据自身文件所在位置定位项目，因此安装路径中包含空格和非英文字符也受支持。
@@ -102,6 +104,7 @@ npm run setup:cli -- --diagnose
 npm run setup:cli -- --without-xformers
 npm run setup:cli -- --connections=12
 npm run setup:cli -- --refresh-selection
+npm run setup:cli -- --use-proxy
 ```
 
 CUDA 运行时变体会从当前稳定版 PyTorch wheel 索引动态发现；脚本没有固定的最大 CUDA 版本。如果检测或兼容性选择失败，NVIDIA 机器绝不会静默回退到 CPU wheel。仅凭 GPU 硬件代数并不会被当作超越当前已安装驱动所报告兼容上限的许可。例如，一块能够运行 CUDA 12.8 构建的 GPU，在当前驱动报告 12.6 上限时仍会收到 `cu126`。`--torch=cpu` 仍然是一个明确的诊断性覆盖项。`xformers` 默认在无依赖的情况下安装，因此它不可能替换已选的确切 PyTorch 版本。如果导入兼容性检查失败，它会被自动移除。高级用户可以使用 `--without-xformers` 禁用它。
@@ -112,7 +115,7 @@ CUDA 运行时变体会从当前稳定版 PyTorch wheel 索引动态发现；脚
 
 默认的 uv 目标文件基准测试还会在 Astral 与 GitHub 后备之前包含 `ghfast.top` 和 `ghproxy.net` 加速线路。它们仅被视为不可信的字节传输通道：每个完成的归档都必须匹配内嵌的官方 SHA-256，否则即被删除。由于 Windows uv 归档约为 25 MB，uv 使用专门的 8 MB 阈值，因此会运行最多 8 个 HTTP Range 连接，而不是回退到单个连接。
 
-高级镜像可以使用官方安装程序变量 `UV_DOWNLOAD_URL`、`INSTALLER_DOWNLOAD_URL`、`UV_INSTALLER_GHE_BASE_URL` 或 `UV_INSTALLER_GITHUB_BASE_URL`；每个都是基础 URL，归档文件名会自动追加。多个直接基础地址可以用空白字符分隔。`UV_GITHUB_TOKEN` 只会转发到 GitHub 或明确配置的 GitHub Enterprise 主机。每个镜像都必须通过构件哈希校验。设置这些源变量中的任何一个都会替换内置的加速线路列表，因此仅官方或私有镜像策略仍然可用。引导请求通过 Node 内置的代理支持遵循 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`（包括小写形式）。
+高级镜像可以使用官方安装程序变量 `UV_DOWNLOAD_URL`、`INSTALLER_DOWNLOAD_URL`、`UV_INSTALLER_GHE_BASE_URL` 或 `UV_INSTALLER_GITHUB_BASE_URL`；每个都是基础 URL，归档文件名会自动追加。多个直接基础地址可以用空白字符分隔。`UV_GITHUB_TOKEN` 只会转发到 GitHub 或明确配置的 GitHub Enterprise 主机。每个镜像都必须通过构件哈希校验。设置这些源变量中的任何一个都会替换内置的加速线路列表，因此仅官方或私有镜像策略仍然可用。引导请求采用同一默认直连策略：只有显式 `--use-proxy` 或 `XIRAI_USE_PROXY=1` 后才会使用 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`（含小写形式）；`NO_PROXY` 始终保持不变。
 
 与用户级 uv 安装不同，XirAI 会刻意忽略安装目录和 PATH 修改设置：它绝不修改 shell 配置文件、Windows 注册表、`PATH`、Cargo/XDG 目录或用户级 uv receipt，也不启用 `uv self update`。应用始终直接调用其固定的项目本地可执行文件。
 
@@ -204,4 +207,6 @@ npm run inference
 
 不要在操作系统之间复制 `node_modules` 或 `.venv`。在目标机器上使用 `npm run setup` 重新创建两者。
 
-GitHub Actions 会在每次 push 和 pull request 时，对 `windows-latest` 与 `ubuntu-latest` 运行语法、环境检测和前端构建检查。
+GitHub Actions 会在每次 push 和 pull request 时，对 `windows-latest` 与 `ubuntu-latest` 运行轻量跨平台检查：Node 安装与诊断、快速 Node 测试、Node/Python 语法检查以及 Vite 构建。它不会创建项目虚拟环境、安装 CPU PyTorch 或后端 requirements，也不会运行后端测试。完整后端测试与真实 GPU 验证请在本地运行。
+
+如需在干净环境中验证真实配置、同时避免在本地连接上下载依赖，请打开 **Actions → Environment setup validation → Run workflow**。选择 `both`、`windows` 或 `ubuntu`，再选择允许的包源（`official`、`aliyun` 或 `tsinghua`）。这个手动 GitHub 托管 workflow 会以 CPU PyTorch 和 `--without-xformers` 运行 `setup:cli`，验证项目 `.venv`，执行最小后端导入/编译 smoke test，并构建 Vite。它不会下载模型权重，也不会运行完整后端行为测试；但会消耗 GitHub Actions 分钟数和下载额度。

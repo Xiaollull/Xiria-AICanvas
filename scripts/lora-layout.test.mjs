@@ -13,6 +13,7 @@ const chromeCandidates = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
 ];
+const skipBrowserFixture = process.env.XIRAI_SKIP_BROWSER_FIXTURES === "1";
 
 async function chromePath() {
   for (const candidate of chromeCandidates) {
@@ -32,7 +33,9 @@ function hasIntersection(first, second) {
   return first[0] < second[2] && first[2] > second[0] && first[1] < second[3] && first[3] > second[1];
 }
 
-test("LoRA modal CSS keeps cards in flow across 1100/800/600 breakpoints", async (context) => {
+test("local Chromium fixture keeps LoRA modal cards in flow across 1100/800/600 breakpoints", {
+  skip: skipBrowserFixture && "XIRAI_SKIP_BROWSER_FIXTURES keeps CI independent of runner browsers",
+}, async (context) => {
   const styles = await readFile(join(projectRoot, "src", "styles.css"), "utf8");
   assert.match(styles, /\.lora-library-grid \{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(180px, 1fr\)\)/);
   assert.match(styles, /\.lora-card-preview \{[^}]*aspect-ratio: 3 \/ 4/);

@@ -9,6 +9,7 @@ import { isolatedPythonEnv, verifyProjectVenv } from "./python.mjs";
 import { getSetupMarkerPath, readSetupMarker, writeSetupMarker } from "./setup-state.mjs";
 import { createEnvironmentBackupOwnership, removeEnvironmentBackup, removeEnvironmentOwnershipMarker, restoreEnvironmentBackup, writeEnvironmentBackupOwnership } from "./offline-update-temp.mjs";
 import { configuredModelDirectories } from "./model-paths.mjs";
+import { createHttpFetch } from "./node-tools.mjs";
 
 const REQUIRED_MODEL_MANIFESTS = [
   "models/model-paths.json",
@@ -17,6 +18,11 @@ const REQUIRED_MODEL_MANIFESTS = [
   "models/background-removal-models.json",
 ];
 const INFERENCE_PROTOCOL = 34;
+
+// The validation backend is reachable only on loopback, and the shutdown call carries a one-time
+// token in a header. Global fetch honours NODE_USE_ENV_PROXY, so both would be handed to whatever
+// proxy the user has configured; this adapter has its own agent and reads no proxy settings.
+const localFetch = createHttpFetch();
 
 export class UpdateValidationError extends Error {
   constructor(kind, message, options = {}) {
@@ -142,13 +148,13 @@ async function probeInferenceService(projectRoot, python, environment) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 2000);
       try {
-        const response = await fetch(`http://127.0.0.1:${port}/api/inference/health`, { signal: controller.signal });
+        const response = await localFetch(`http://127.0.0.1:${port}/api/inference/health`, { signal: controller.signal });
         if (response.ok) {
           const health = await response.json();
           if (health.status !== "ready" || health.protocol !== INFERENCE_PROTOCOL || health.workspace_id !== workspaceId) {
             throw new Error("后端健康响应不属于本次离线更新验证");
           }
-          await fetch(`http://127.0.0.1:${port}/api/inference/shutdown`, {
+          await localFetch(`http://127.0.0.1:${port}/api/inference/shutdown`, {
             method: "POST",
             headers: { "X-Shutdown-Token": shutdownToken },
           });

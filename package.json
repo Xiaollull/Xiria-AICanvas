@@ -9,7 +9,7 @@
   "scripts": {
     "setup": "node scripts/setup-gui.mjs",
     "setup:cli": "node scripts/setup.mjs",
-    "test:setup": "node --test scripts/*.test.mjs",
+    "test:setup": "node --test --test-timeout=60000 scripts/*.test.mjs",
     "test:backend": "python -m unittest discover -s backend -p \"test_*.py\" -v",
     "start": "node scripts/start.mjs",
     "dev": "node scripts/start.mjs",

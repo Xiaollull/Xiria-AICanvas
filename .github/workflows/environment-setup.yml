@@ -1,0 +1,121 @@
+name: Environment setup validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Clean runner operating system to validate
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - windows
+          - ubuntu
+      source:
+        description: Package source used by setup:cli
+        required: true
+        default: official
+        type: choice
+        options:
+          - official
+          - aliyun
+          - tsinghua
+
+# A new click supersedes an in-flight validation for this ref. Each job uses an
+# isolated runner, so cancellation leaves no shared project environment behind.
+concurrency:
+  group: environment-setup-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Validate selections
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.selections.outputs.matrix }}
+      source: ${{ steps.selections.outputs.source }}
+    steps:
+      - id: selections
+        shell: bash
+        env:
+          REQUESTED_OS: ${{ inputs.os }}
+          REQUESTED_SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_OS" in
+            both) matrix='{"os":["windows-latest","ubuntu-latest"]}' ;;
+            windows) matrix='{"os":["windows-latest"]}' ;;
+            ubuntu) matrix='{"os":["ubuntu-latest"]}' ;;
+            *) echo "Unsupported OS selection" >&2; exit 1 ;;
+          esac
+          case "$REQUESTED_SOURCE" in
+            official|aliyun|tsinghua) ;;
+            *) echo "Unsupported package source selection" >&2; exit 1 ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "source=$REQUESTED_SOURCE" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: ${{ matrix.os }} (${{ needs.prepare.outputs.source }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run isolated CPU environment setup
+        id: setup
+        run: npm run setup:cli -- --source=${{ needs.prepare.outputs.source }} --torch=cpu --without-xformers
+
+      - name: Verify project venv and backend import smoke test
+        id: backend_smoke
+        shell: pwsh
+        run: |
+          $python = if ($env:RUNNER_OS -eq 'Windows') { '.venv\Scripts\python.exe' } else { '.venv/bin/python' }
+          node -e "import('./scripts/python.mjs').then(({verifyProjectVenv}) => { const result = verifyProjectVenv(process.cwd()); if (!result.ok) throw new Error(result.error); })"
+          & $python -I -c "import os,sys; sys.path.insert(0, os.environ['GITHUB_WORKSPACE']); import backend.inference_server, backend.memory_policy; print('Backend import smoke test passed')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $python -I -m py_compile backend/inference_server.py backend/memory_policy.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Summarize validation
+        if: always()
+        shell: pwsh
+        env:
+          SELECTED_SOURCE: ${{ needs.prepare.outputs.source }}
+          SETUP_RESULT: ${{ steps.setup.outcome }}
+          BACKEND_SMOKE_RESULT: ${{ steps.backend_smoke.outcome }}
+        run: |
+          $python = if ($env:RUNNER_OS -eq 'Windows') { '.venv\Scripts\python.exe' } else { '.venv/bin/python' }
+          @(
+            '## Environment setup validation'
+            ''
+            "- OS: $env:RUNNER_OS ($env:RUNNER_ARCH)"
+            "- Package source: $env:SELECTED_SOURCE"
+            '- Setup arguments: `--torch=cpu --without-xformers`'
+            "- setup:cli result: $env:SETUP_RESULT"
+            "- Backend import/compile result: $env:BACKEND_SMOKE_RESULT"
+            "- npm: $(npm --version)"
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          if (Test-Path -LiteralPath $python) {
+            @(
+              "- Python: $(& $python --version 2>&1)"
+              "- torch: $(& $python -I -c 'import torch; print(torch.__version__)' 2>&1)"
+              "- Vite build: $(if ($env:SETUP_RESULT -eq 'success') { 'passed by setup:cli' } else { 'not completed' })"
+            ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          } else {
+            '- Python/torch: project .venv was not created' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            '- Vite build: not completed' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          }
