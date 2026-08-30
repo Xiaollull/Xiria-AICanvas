@@ -64,6 +64,18 @@ function run(command, args, { timeoutMs = COMMAND_TIMEOUT_MS, ...options } = {})
   });
 }
 
+/** Builds a fixture archive under the same constraint the update code works under.
+ *
+ * GNU tar treats an argument containing a colon as `host:path`, so handing it an absolute Windows
+ * path makes it try to reach a machine called `D` and exit 128. Git for Windows ships GNU tar and
+ * is ahead of the System32 bsdtar on PATH on a GitHub Windows runner, so the archive is named
+ * relative to the directory tar runs in, with separators tar accepts on either implementation.
+ */
+function createTar(archivePath, parentDirectory, entry) {
+  const name = path.relative(parentDirectory, archivePath).split(path.sep).join("/");
+  return run("tar", ["-cf", name, entry], { cwd: parentDirectory });
+}
+
 test("archive command helper terminates a stalled child", async () => {
   await assert.rejects(
     run(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 100 }),
@@ -376,7 +388,7 @@ test("an applied update leaves installed plugins untouched and never delivers pa
       writeFile(path.join(packageRoot, "plugins", "attacker-plugin", "index.js"), "attacker code"),
       writeFile(path.join(packageRoot, "src", "new.jsx"), "new"),
     ]);
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
 
     const prepared = await prepareUpdate({ projectRoot, archivePath });
     await applyPreparedUpdate({ projectRoot, prepared });
@@ -417,7 +429,7 @@ test("a small tar update is staged externally and mirrors managed directories", 
       writeFile(path.join(packageRoot, "src", "new.jsx"), "new"),
       writeFile(path.join(packageRoot, "README.md"), "new readme"),
     ]);
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
 
     const prepared = await prepareUpdate({ projectRoot, archivePath });
     assert.equal(pathIsOutside(projectRoot, prepared.stagingDirectory), true);
@@ -456,7 +468,7 @@ test("apply rolls back files already replaced when a later copy fails", async (c
       writeFile(path.join(projectRoot, "src", "old.jsx"), "old"),
       writeFile(path.join(packageRoot, "src", "new.jsx"), "new"),
     ]);
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     prepared = await prepareUpdate({ projectRoot, archivePath });
 
     let faultInjected = false;
@@ -503,7 +515,7 @@ test("post-apply validation failure restores the previous managed files", async 
       writeFile(path.join(projectRoot, "Start-XirAI.sh"), "old launcher"),
       writeFile(path.join(packageRoot, "src", "version.txt"), "new"),
     ]);
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     prepared = await prepareUpdate({ projectRoot, archivePath });
     await assert.rejects(applyPreparedUpdate({
       projectRoot,
@@ -536,7 +548,7 @@ test("transaction remains applying until complete validation succeeds", async (c
   try {
     await Promise.all([createProjectRoot(projectRoot), createProjectRoot(packageRoot)]);
     await writeFile(path.join(packageRoot, "src", "version.txt"), "new");
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     prepared = await prepareUpdate({ projectRoot, archivePath });
     let phaseDuringValidation;
     let phaseDuringCommit;
@@ -581,7 +593,7 @@ test("transactional apply rejects a missing validation receipt and rolls back", 
       writeFile(path.join(projectRoot, "src", "version.txt"), "old"),
       writeFile(path.join(packageRoot, "src", "version.txt"), "new"),
     ]);
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     prepared = await prepareUpdate({ projectRoot, archivePath });
     await assert.rejects(applyPreparedUpdate({
       projectRoot,
@@ -616,7 +628,7 @@ test("program files still roll back when Python environment rollback fails", asy
       writeFile(path.join(projectRoot, "src", "version.txt"), "old"),
       writeFile(path.join(packageRoot, "src", "version.txt"), "new"),
     ]);
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     prepared = await prepareUpdate({ projectRoot, archivePath });
     await assert.rejects(applyPreparedUpdate({
       projectRoot,
@@ -651,7 +663,7 @@ test("Python requirement changes are accepted and require automatic environment 
   try {
     await Promise.all([createProjectRoot(projectRoot), createProjectRoot(packageRoot)]);
     await writeFile(path.join(packageRoot, "backend", "requirements.txt"), "fastapi==2\n");
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     prepared = await prepareUpdate({ projectRoot, archivePath });
     assert.equal(prepared.environmentRepairRequired, true);
   } finally {
@@ -675,7 +687,7 @@ test("npm lock environment changes are rejected before replacing live Node modul
   try {
     await Promise.all([createProjectRoot(projectRoot), createProjectRoot(packageRoot)]);
     await writeFile(path.join(packageRoot, "package-lock.json"), JSON.stringify({ packages: { "": { dependencies: { react: "20" } } } }));
-    await run("tar", ["-cf", archivePath, "-C", packageParent, path.basename(packageRoot)]);
+    await createTar(archivePath, packageParent, path.basename(packageRoot));
     await assert.rejects(prepareUpdate({ projectRoot, archivePath }), /前端依赖变化/);
     await access(path.join(projectRoot, "package-lock.json"));
   } finally {

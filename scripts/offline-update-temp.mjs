@@ -31,11 +31,16 @@ function allowedParents(projectRoot) {
  * Windows puts an 8.3 spelling in TEMP for a profile name it cannot fit, `C:\\Users\\JOHNSM~1\\...`,
  * and that is what a CI runner exports too. Comparing one against the other made this module
  * reject a record it had just written, so both spellings are permitted here.
+ *
+ * The resolution has to be the `native` one. `fs.realpathSync` walks the path resolving links and
+ * leaves a short name exactly as it found it, while the `realpath` this module records a directory
+ * with expands it — so the plain variant agrees on a junction and disagrees on precisely the
+ * machines this function exists for.
  */
 function allowedParentSpellings(projectRoot) {
   return [...new Set(allowedParents(projectRoot).flatMap((parent) => {
     try {
-      return [parent, realpathSync(parent)];
+      return [parent, realpathSync.native(parent)];
     } catch {
       return [parent];
     }

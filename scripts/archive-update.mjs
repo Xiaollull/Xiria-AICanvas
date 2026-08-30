@@ -418,7 +418,10 @@ async function ensureDownloadedLinuxSevenZip(projectRoot, report) {
   // The official Linux package is data only. Rebuild the command directory from the verified archive.
   await rm(portableDirectory, { recursive: true, force: true });
   await ensureSafeDirectory(toolDirectory, "portable");
-  await runCommand(tar.command, ["-xf", portableArchive, "-C", portableDirectory]);
+  const portableSource = tarArchiveLocation(portableArchive);
+  await runCommand(tar.command, ["-xf", portableSource.name, "-C", tarDirectoryArgument(portableDirectory)], {
+    cwd: portableSource.cwd,
+  });
   await inspectExtractedTree(portableDirectory);
   await chmod(portableExecutable, 0o755);
   if (!await commandAvailable(portableExecutable, ["i"])) {
@@ -479,11 +482,32 @@ function parseSevenZipListing(output) {
   return members;
 }
 
+/** How to name an archive to `tar` so that either Windows implementation opens it.
+ *
+ * GNU tar reads an archive name containing a colon as `host:path` and tries to reach a remote
+ * machine, so an absolute Windows path fails with "Cannot connect to D: resolve failed". Windows
+ * ships bsdtar in System32, but Git for Windows also ships GNU tar and puts it earlier on PATH on
+ * plenty of developer machines — and on GitHub's Windows runners. `--force-local` is not a
+ * portable answer: bsdtar rejects the option outright, and GNU tar built on MSYS still will not
+ * take backslashes as separators. Naming the archive relative to a working directory keeps the
+ * colon out of the argument, which both implementations accept.
+ */
+function tarArchiveLocation(archivePath) {
+  const resolved = path.resolve(archivePath);
+  return { cwd: path.dirname(resolved), name: path.basename(resolved) };
+}
+
+/** A `-C` target both implementations accept: absolute, but never backslash-separated. */
+function tarDirectoryArgument(directory) {
+  return path.resolve(directory).split(path.sep).join("/");
+}
+
 async function listArchive(tool, archivePath) {
   if (tool.kind === "tar") {
+    const { cwd, name } = tarArchiveLocation(archivePath);
     const [{ stdout }, { stdout: verboseOutput }] = await Promise.all([
-      runCommand(tool.command, ["-tf", archivePath]),
-      runCommand(tool.command, ["-tvf", archivePath]),
+      runCommand(tool.command, ["-tf", name], { cwd }),
+      runCommand(tool.command, ["-tvf", name], { cwd }),
     ]);
     assertTarHasNoLinks(verboseOutput);
     const members = tarMembers(stdout);
@@ -540,7 +564,8 @@ async function selectArchiveTool(projectRoot, archivePath, kind, report) {
 
 async function extractArchive(tool, archivePath, destination) {
   if (tool.kind === "tar") {
-    await runCommand(tool.command, ["-xf", archivePath, "-C", destination]);
+    const { cwd, name } = tarArchiveLocation(archivePath);
+    await runCommand(tool.command, ["-xf", name, "-C", tarDirectoryArgument(destination)], { cwd });
     return;
   }
   await runCommand(tool.command, ["x", "-y", "-bd", "-bso0", "-bsp0", `-o${destination}`, archivePath]);
