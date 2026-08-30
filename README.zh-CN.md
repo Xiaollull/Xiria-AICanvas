@@ -73,6 +73,10 @@ Windows 用户可双击 `Start-XirAI.bat`。Linux 用户可运行 `sh Start-XirA
 
 失败的行可以从下载器页面重试。重试会保留原始分段数并复用已保留的 `.part`/`.part.N` 文件，因此可用字节会从已保存的偏移量处继续下载。Provider 令牌仅保存在浏览器本地，并在重试时重新提交；它们绝不会写入持久化的队列状态。
 
+**Settings → About → Online program update（设置 → 关于 → 在线更新程序）** 会联网检查发布源是否有新版本。检查本身不下载任何内容：发现新版本时会显示版本号、大小、发布时间与更新说明，并在你确认之后才开始更新。随后归档会由下文的更新程序校验与应用，回滚机制完全相同——在线与离线两条路径的差别仅在于归档如何到达本机。
+
+只有当发布同时提供 SHA-256（API 的 asset digest，或 `<归档名>.sha256` 附件）时才会使用加速镜像；没有校验和时下载会固定走 GitHub 官方直连，因为即将成为程序文件的字节不值得从无法校验的代理获取。发布源、仓库、镜像与可选令牌均可在 `.env` 中配置，参见 `.env.example`。
+
 **Settings → About → Manual program update（设置 → 关于 → 手动程序更新）** 页面接受受信任的干净 XiriaCanvas AI 项目归档，例如 ZIP、7Z、RAR、TAR、TAR.GZ 与 TAR.XZ。归档会使用命令行工具检查并解压到项目外部的临时目录。当系统命令无法读取归档时，更新程序会为当前 Windows 或 Linux 架构下载带校验和固定的官方 7-Zip 命令行文件到 `.cache/tools/7zip/`；它绝不运行安装程序，也不使用桌面文件关联。
 
 手动更新需要与已安装环境相同的 Node 和 Python 依赖清单。只替换程序文件。`.venv`、`node_modules`、`models`、`outputs`、`logs`、`state-cache`、`.cache` 与 `.env` 保持原样。替换前，受管理的文件会备份到项目外部。复制失败、Python 校验失败和生产构建失败都会自动回滚。

@@ -8,12 +8,22 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import { applyPreparedUpdate, archiveExtensionAllowed, prepareUpdate } from "./scripts/archive-update.mjs";
+import { appVersion } from "./scripts/app-version.mjs";
 import { downloadFile } from "./scripts/download.mjs";
+import {
+  checksumRoutes,
+  parseChecksumFile,
+  parseRelease,
+  releaseDownloadRoutes,
+  releaseFeedUrl,
+  updateAvailable,
+} from "./scripts/release-feed.mjs";
 import { getLogsDirectory, writeDiagnosticLog } from "./scripts/diagnostics.mjs";
 import { findPython, isolatedPythonEnv, loadLocalEnv, verifyProjectVenv } from "./scripts/python.mjs";
 import { getSetupMarkerPath, readSetupMarker } from "./scripts/setup-state.mjs";
 import { ensureUpdatedProjectReady, repairUpdatedEnvironment, validateUpdatedProject } from "./scripts/update-validation.mjs";
 import { createUpdateRestartHandoff } from "./scripts/update-restart.mjs";
+import { updateBusy } from "./src/update-navigation.js";
 import { acquireOfflineUpdateLock } from "./scripts/offline-update-lock.mjs";
 import { createOfflineUpdateTemp, removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
 import { configuredModelDirectory, defaultLoraCategories, groupLoraModels, mergeModelPaths } from "./scripts/model-paths.mjs";
@@ -4074,6 +4084,10 @@ export function updateApiPlugin() {
   let uploadDirectory;
   let uploadOwnership;
   let operationLock;
+  // The last answer the release feed gave. Held in memory only: a check is cheap, and a cached
+  // "update available" that outlived the release it named would offer a download that 404s.
+  let onlineRelease = null;
+  let onlineCheckedAt = null;
   let updateState = {
     status: "idle",
     phase: "idle",
@@ -4145,7 +4159,7 @@ export function updateApiPlugin() {
         };
         await persistUpdateState(true);
       }
-      if (["uploading", "preparing", "applying", "repairing"].includes(updateState.status)) {
+      if (updateBusy(updateState.status)) {
         // A server restart cannot safely resume an in-flight archive operation.
         let stateRecoveryLock;
         try {
@@ -4197,18 +4211,86 @@ export function updateApiPlugin() {
   };
   const updateStateReady = restoreUpdateState();
 
+  const publicOnlineRelease = () => (onlineRelease ? {
+    version: onlineRelease.version,
+    prerelease: onlineRelease.prerelease,
+    published_at: onlineRelease.publishedAt,
+    notes: onlineRelease.notes.slice(0, 4000),
+    asset_name: onlineRelease.asset.name,
+    asset_bytes: onlineRelease.asset.bytes,
+    // Whether the archive can be verified decides whether accelerated mirrors are used at all.
+    verified: Boolean(onlineRelease.asset.sha256 || onlineRelease.asset.checksumUrl),
+    update_available: updateAvailable(onlineRelease.version, appVersion),
+  } : null);
   const publicState = () => ({
     ...updateState,
     prepared_items: preparedUpdate?.plan?.map((item) => item.relativePath) || [],
     prepared_plan: preparedUpdate?.plan?.map(({ relativePath, kind, action }) => ({ relativePath, kind, action })) || [],
     environment_repair_required: Boolean(preparedUpdate?.environmentRepairRequired),
     maximum_bytes: maximumUpdateArchiveBytes,
+    current_version: appVersion,
+    online_checked_at: onlineCheckedAt,
+    online_release: publicOnlineRelease(),
   });
   const setState = (updates, immediate = false) => {
     updateState = { ...updateState, ...updates, updated_at: new Date().toISOString() };
     return persistUpdateState(immediate);
   };
   const report = (event) => setState({ phase: event.phase, progress: event.progress, message: event.message });
+
+  /** Reads the release feed and remembers what it offers. */
+  const checkForRelease = async () => {
+    const feedUrl = releaseFeedUrl(process.env);
+    const token = String(process.env.XIRAI_UPDATE_TOKEN || "").trim();
+    let feedResponse;
+    try {
+      feedResponse = await fetchWithTimeout(feedUrl, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "XiriaCanvas-AI",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      }, 15000);
+    } catch (error) {
+      throw Object.assign(new Error(`无法连接更新服务器：${error.message}`), { statusCode: 502 });
+    }
+    if (feedResponse.status === 404) {
+      throw Object.assign(new Error("未找到发布源，请确认仓库与 Release 是否公开"), { statusCode: 502 });
+    }
+    if (feedResponse.status === 403 || feedResponse.status === 429) {
+      throw Object.assign(new Error("更新服务器暂时限制了请求频率，请稍后再试"), { statusCode: 503 });
+    }
+    if (!feedResponse.ok) {
+      throw Object.assign(new Error(`更新服务器返回 HTTP ${feedResponse.status}`), { statusCode: 502 });
+    }
+    let payload;
+    try {
+      payload = await feedResponse.json();
+    } catch {
+      throw Object.assign(new Error("更新服务器返回的内容不是有效的发布信息"), { statusCode: 502 });
+    }
+    onlineRelease = parseRelease(payload);
+    onlineCheckedAt = new Date().toISOString();
+  };
+
+  /** The checksum, from a route a mirror cannot rewrite.
+   *
+   * The API's own digest is preferred because it arrives over TLS from the API host. A checksum
+   * asset is the fallback, and it is fetched from GitHub directly rather than through any
+   * accelerated route, since a mirror that could rewrite the archive could rewrite its hash too.
+   */
+  const fetchReleaseChecksum = async (release) => {
+    if (release.asset.sha256) return release.asset.sha256;
+    const [route] = checksumRoutes(release);
+    if (!route) return null;
+    try {
+      const checksumResponse = await fetchWithTimeout(route.url, { headers: { "User-Agent": "XiriaCanvas-AI" } }, 15000);
+      if (!checksumResponse.ok) return null;
+      return parseChecksumFile(await checksumResponse.text(), release.asset.name);
+    } catch {
+      return null;
+    }
+  };
   const validationReport = (event) => report({
     ...event,
     progress: Math.min(99, 92 + Math.round((event.progress || 0) * 0.07)),
@@ -4338,10 +4420,92 @@ export function updateApiPlugin() {
           return;
         }
         if (url.pathname === "/api/system/update" && request.method === "DELETE") {
-          if (activeTask || operationLock || ["uploading", "preparing", "applying", "repairing"].includes(updateState.status)) throw Object.assign(new Error("更新任务正在运行，暂时不能离开"), { statusCode: 409 });
+          if (activeTask || operationLock || updateBusy(updateState.status)) throw Object.assign(new Error("更新任务正在运行，暂时不能离开"), { statusCode: 409 });
           await cleanupPrepared();
-          setState({ status: "idle", phase: "idle", progress: 0, message: "请选择更新归档", filename: undefined, bytes: undefined, restart_required: false, environment_ready: false, repair_available: false });
+          setState({ status: "idle", phase: "idle", source: undefined, progress: 0, message: "请选择更新归档", filename: undefined, bytes: undefined, restart_required: false, environment_ready: false, repair_available: false });
           response.statusCode = 200;
+          response.end(JSON.stringify(publicState()));
+          return;
+        }
+        if (url.pathname === "/api/system/update/check" && request.method === "POST") {
+          if (activeTask || operationLock) throw Object.assign(new Error("更新任务正在运行，暂时不能检查新版本"), { statusCode: 409 });
+          await checkForRelease();
+          response.statusCode = 200;
+          response.end(JSON.stringify(publicState()));
+          return;
+        }
+        if (url.pathname === "/api/system/update/download" && request.method === "POST") {
+          if (activeTask || operationLock || !["idle", "error"].includes(updateState.status)) throw Object.assign(new Error("已有更新包正在处理"), { statusCode: 409 });
+          // The check is the only thing that may name what gets downloaded: a client cannot hand
+          // this endpoint a URL of its own.
+          if (!onlineRelease) throw Object.assign(new Error("请先检查更新"), { statusCode: 409 });
+          if (!updateAvailable(onlineRelease.version, appVersion)) throw Object.assign(new Error("当前已是最新版本"), { statusCode: 409 });
+          const release = onlineRelease;
+          const filename = release.asset.name;
+          if (filename !== path.basename(filename) || !archiveExtensionAllowed(filename)) {
+            throw Object.assign(new Error("发布的更新包格式不受支持"), { statusCode: 502 });
+          }
+          if (release.asset.bytes > maximumUpdateArchiveBytes) throw Object.assign(new Error("更新包不能超过 4 GB"), { statusCode: 413 });
+          await acquireTaskLock("online-download");
+          acquiredTaskLock = true;
+          await cleanupPrepared();
+          uploadOwnership = await createOfflineUpdateTemp({ projectRoot, prefix: "xirai-update-upload-", kind: "upload" });
+          uploadDirectory = uploadOwnership.path;
+          const archivePath = path.join(uploadDirectory, filename);
+          setState({
+            status: "downloading",
+            phase: "download",
+            source: "online",
+            progress: 0,
+            message: `正在下载 ${release.version} 更新包`,
+            filename,
+            bytes: 0,
+            restart_required: false,
+            environment_ready: false,
+            repair_available: false,
+          });
+          activeTask = (async () => {
+            const checksum = await fetchReleaseChecksum(release);
+            const routes = releaseDownloadRoutes(release, { checksum, environment: process.env });
+            if (!routes.length) throw new Error("发布信息中没有可下载的更新包");
+            await downloadFile({
+              routes,
+              destination: archivePath,
+              expectedSha256: checksum || undefined,
+              maximumBytes: maximumUpdateArchiveBytes,
+              sizeHint: release.asset.bytes,
+              connections: 8,
+              fetcher: fetchDownload,
+              // Without a verifiable hash there is exactly one route, so ranking would only cost a
+              // probe request against the host the download has to use anyway.
+              rankRoutes: Boolean(checksum),
+              existingFilePolicy: "replace",
+              onRoute: (route) => setState({ message: `正在通过 ${route.label} 下载 ${release.version} 更新包` }),
+              onProgress: (progress) => setState({
+                bytes: progress.currentBytes || 0,
+                progress: progress.totalBytes ? Math.round((progress.currentBytes || 0) / progress.totalBytes * 100) : 0,
+              }),
+              onWarning: (warning) => setState({ message: warning.message || `正在下载 ${release.version} 更新包` }),
+            });
+            setState({ status: "preparing", phase: "inspect", progress: 0, message: "正在解析更新包" });
+            const prepared = await prepareUpdate({ projectRoot, archivePath, report });
+            preparedUpdate = prepared;
+            await setState({
+              status: "ready",
+              phase: "ready",
+              progress: 100,
+              message: prepared.environmentRepairRequired
+                ? `${release.version} 更新包校验通过；替换后将自动修复环境`
+                : `${release.version} 更新包校验通过，准备应用`,
+              environment_ready: false,
+              repair_available: false,
+            }, true);
+          })().catch(failTask).finally(async () => {
+            activeTask = undefined;
+            await releaseTaskLock().catch(() => {});
+          });
+          acquiredTaskLock = false;
+          response.statusCode = 202;
           response.end(JSON.stringify(publicState()));
           return;
         }
@@ -4367,7 +4531,7 @@ export function updateApiPlugin() {
           const archivePath = path.join(uploadDirectory, filename);
           const destination = await open(archivePath, "wx");
           let bytes = 0;
-          setState({ status: "uploading", phase: "upload", progress: 0, message: "正在接收更新包", filename, bytes: 0, restart_required: false, environment_ready: false, repair_available: false });
+          setState({ status: "uploading", phase: "upload", source: "local", progress: 0, message: "正在接收更新包", filename, bytes: 0, restart_required: false, environment_ready: false, repair_available: false });
           try {
             for await (const chunk of request) {
               if (request.aborted) throw new Error("更新包上传中断，请重新选择归档");
@@ -4660,6 +4824,9 @@ export default defineConfig({
     // typing paths for, so the path hints have to come from the host. See
     // src/host-platform.js.
     __XIRAI_HOST_PLATFORM__: JSON.stringify(process.platform),
+    // Read from package.json at build time so the About panel and the update check can never
+    // disagree about which release is running. See scripts/app-version.mjs.
+    __XIRAI_APP_VERSION__: JSON.stringify(appVersion),
   },
   build: {
     rolldownOptions: {

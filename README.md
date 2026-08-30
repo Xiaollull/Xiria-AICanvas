@@ -129,6 +129,19 @@ segment count and reuses retained `.part`/`.part.N` files, so available bytes
 continue from their saved offsets. Provider tokens remain browser-local and are
 resubmitted for retry; they are never written to the persisted queue state.
 
+**Settings → About → Online program update** checks the release feed for a
+newer version. Nothing is downloaded by the check itself: when a newer release
+exists the version, size, publication date and release notes are shown and the
+update starts only after you confirm it. The archive is then verified and
+applied by the updater described below, with the same rollback, so the online
+and offline routes differ only in how the archive reaches the machine.
+
+Accelerated mirrors are used only when the release publishes a SHA-256 — either
+an asset digest from the API or a `<archive>.sha256` asset. Without one the
+download is pinned to GitHub itself, because bytes that become program files
+are not worth taking from an unverifiable proxy. The feed, repository, mirror
+and an optional token are configurable in `.env`; see `.env.example`.
+
 The **Settings → About → Manual program update** page accepts trusted clean
 XiriaCanvas AI project archives such as ZIP, 7Z, RAR, TAR, TAR.GZ, and TAR.XZ.
 Archives are inspected and extracted with command-line tools into a temporary

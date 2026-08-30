@@ -6,6 +6,7 @@ import { pluginDiagnosticMessage, pluginRegistrySummary, pluginRemoveConfirmatio
 import {
   ArrowDown,
   ArrowLeft,
+  ArrowRight,
   ArrowUp,
   Blocks,
   Check,
@@ -57,6 +58,7 @@ import {
   normalizePostprocessOrder,
   postprocessTargetSize,
 } from "./postprocessing";
+import { APP_VERSION } from "./app-version";
 import { BrandLogo, LoadingLogo } from "./BrandLogo";
 import { formatFileSize } from "./format-size";
 import { DEFAULT_THEME, applyThemeToDocument, deriveLogoTheme, loadThemeState, normalizeHex } from "./theme";
@@ -1116,6 +1118,8 @@ function App() {
   const panelResizeRef = useRef(null);
   const [settingsTab, setSettingsTab] = useState("general");
   const [settingsError, setSettingsError] = useState("");
+  const [onlineUpdate, setOnlineUpdate] = useState({ checking: false, error: "", release: null, checked: false });
+  const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
   const [reconfiguring, setReconfiguring] = useState(false);
   const [performanceConfig, setPerformanceConfig] = useState(DEFAULT_PERFORMANCE);
   const [performanceEditorMode, setPerformanceEditorMode] = useState("recommended");
@@ -3056,6 +3060,40 @@ function App() {
     if (reconfiguring || status === "running") return;
     persistUiState(true);
     window.location.assign("/update");
+  };
+
+  const checkForOnlineUpdate = async () => {
+    if (onlineUpdate.checking || reconfiguring || status === "running") return;
+    setOnlineUpdate({ checking: true, error: "", release: null, checked: false });
+    try {
+      const response = await fetch("/api/system/update/check", { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "检查更新失败");
+      const release = payload.online_release;
+      setOnlineUpdate({ checking: false, error: "", release, checked: true });
+      // Only a release that is both newer and installable becomes a prompt; anything else is
+      // answered in place so the user is never asked to confirm a no-op.
+      if (release?.update_available) setUpdateConfirmOpen(true);
+    } catch (error) {
+      setOnlineUpdate({ checking: false, error: error.message, release: null, checked: true });
+    }
+  };
+
+  const startOnlineUpdate = async () => {
+    if (onlineUpdate.checking) return;
+    setOnlineUpdate((current) => ({ ...current, checking: true, error: "" }));
+    try {
+      const response = await fetch("/api/system/update/download", { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "无法开始下载更新包");
+      setUpdateConfirmOpen(false);
+      // The download runs on the server; the updater page is where its progress, the apply step
+      // and the restart already live, so the flow joins the offline one from here on.
+      persistUiState(true);
+      window.location.assign("/update");
+    } catch (error) {
+      setOnlineUpdate((current) => ({ ...current, checking: false, error: error.message }));
+    }
   };
 
   const controlGeneration = async (action) => {
@@ -5988,10 +6026,14 @@ function App() {
                 {diagnosticLogsError && <p className="settings-error">{diagnosticLogsError}</p>}
               </section>}
               {settingsTab === "about" && <section className="settings-section about-section">
-                <div className="about-mark"><BrandLogo className="about-logo" /><div><span>XIRIA CANVAS</span><strong>XiriaCanvas AI</strong><small>LOCAL GENERATIVE WORKSPACE · 0.1.0</small></div></div>
+                <div className="about-mark"><BrandLogo className="about-logo" /><div><span>XIRIA CANVAS</span><strong>XiriaCanvas AI</strong><small>LOCAL GENERATIVE WORKSPACE · {APP_VERSION}</small></div></div>
                 <p className="about-copy">面向本地 Stable Diffusion 与 Illustrious 工作流的创作界面。模型、Prompt 和生成结果均由当前设备处理。</p>
                 <div className="about-facts"><div><span>运行模式</span><strong>Local First</strong></div><div><span>推理框架</span><strong>PyTorch + Diffusers</strong></div><div><span>工作区标识</span><strong title={inferenceHealth?.workspace_id}>{inferenceHealth?.workspace_id?.slice(0, 12) || "--"}</strong></div><div><span>数据处理</span><strong>仅在本地设备</strong></div></div>
                 <div className="about-note"><strong>数据与隐私</strong><p>工作区参数与性能方案保存在项目的 <code>state-cache</code> 目录。底模、LoRA 与输出文件保留在项目配置目录中，不会因进入设置或环境配置器而清除。</p></div>
+                <div className="manual-update-card"><div><span>ONLINE PROGRAM UPDATE</span><strong>在线更新程序</strong><p>联网检查是否有新版本。发现新版本后会先征求确认，再下载官方发布的更新包并按手动更新的同一流程校验、替换与回滚。当前版本 {APP_VERSION}。</p>
+                  {onlineUpdate.error && <em className="update-check-note error">{onlineUpdate.error}</em>}
+                  {!onlineUpdate.error && onlineUpdate.checked && !onlineUpdate.release?.update_available && <em className="update-check-note">已是最新版本，无需更新。</em>}
+                </div><button type="button" disabled={onlineUpdate.checking || reconfiguring || status === "running"} onClick={checkForOnlineUpdate}><RefreshCw size={15} className={onlineUpdate.checking ? "spin" : ""} />{onlineUpdate.checking ? "正在检查" : "检查更新"}</button></div>
                 <div className="manual-update-card"><div><span>OFFLINE PROGRAM UPDATE</span><strong>手动更新程序</strong><p>导入新的干净项目 ZIP、7Z 等归档。更新器通过命令安全解压并替换程序文件，保留现有环境、模型和创作数据。</p></div><button type="button" disabled={reconfiguring || status === "running"} onClick={enterManualUpdater}><Upload size={15} />进入手动更新</button></div>
                 <div className="about-platform"><span>系统</span><code>{inferenceHealth?.platform || "正在读取..."}</code></div>
               </section>}
@@ -5999,6 +6041,29 @@ function App() {
           </div>
           <footer className="settings-foot"><span>{inferenceHealth?.status === "ready" ? "推理服务在线" : "推理服务不可用"} · 协议 {inferenceHealth?.protocol || "--"}</span><button disabled={reconfiguring} onClick={() => setSettingsOpen(false)}>完成</button></footer>
         </section>
+      </div>}
+      {updateConfirmOpen && onlineUpdate.release && <div className="update-confirm-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !onlineUpdate.checking && setUpdateConfirmOpen(false)}>
+        <div className="update-confirm" role="dialog" aria-label="发现新版本">
+          <header><span className="eyebrow">UPDATE AVAILABLE</span><strong>发现新版本</strong></header>
+          <div className="update-confirm-versions">
+            <div><span>当前版本</span><strong>{APP_VERSION}</strong></div>
+            <ArrowRight size={16} />
+            <div><span>可更新到</span><strong>{onlineUpdate.release.version}{onlineUpdate.release.prerelease ? " · 预览版" : ""}</strong></div>
+          </div>
+          <div className="update-confirm-facts">
+            <div><span>更新包</span><strong>{onlineUpdate.release.asset_name}</strong></div>
+            {onlineUpdate.release.asset_bytes > 0 && <div><span>大小</span><strong>{formatFileSize(onlineUpdate.release.asset_bytes)}</strong></div>}
+            {onlineUpdate.release.published_at && <div><span>发布时间</span><strong>{new Date(onlineUpdate.release.published_at).toLocaleDateString()}</strong></div>}
+            <div><span>校验</span><strong>{onlineUpdate.release.verified ? "SHA-256 校验" : "仅官方直连"}</strong></div>
+          </div>
+          {onlineUpdate.release.notes && <div className="update-confirm-notes"><span>更新内容</span><pre>{onlineUpdate.release.notes}</pre></div>}
+          <p className="update-confirm-hint">更新会替换程序文件，并保留现有环境、模型、输出与创作数据。失败时自动回滚到当前版本。</p>
+          {onlineUpdate.error && <p className="update-confirm-error">{onlineUpdate.error}</p>}
+          <footer>
+            <button type="button" className="ghost" disabled={onlineUpdate.checking} onClick={() => setUpdateConfirmOpen(false)}>稍后再说</button>
+            <button type="button" disabled={onlineUpdate.checking} onClick={startOnlineUpdate}><Download size={15} />{onlineUpdate.checking ? "正在开始" : "立即更新"}</button>
+          </footer>
+        </div>
       </div>}
       {hardwareMonitorOpen && <div className="hw-monitor-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setHardwareMonitorOpen(false)}>
         <div className="hw-monitor" role="dialog" aria-label="硬件性能检测">

@@ -6,6 +6,8 @@ import { DEFAULT_THEME, applyThemeToDocument, loadThemeState } from "./theme";
 import {
   clearUpdateRestart,
   markUpdateRestart,
+  updateBusy,
+  UPDATE_OCCUPIED_STATUSES,
   updateRestartPending,
   waitForUpdatedApplication,
 } from "./update-navigation";
@@ -170,7 +172,7 @@ export default function ManualUpdatePage() {
   };
 
   const returnHome = async () => {
-    if (uploading || ["uploading", "preparing", "applying", "repairing"].includes(updateState.status) || updateState.restart_required) return;
+    if (uploading || updateBusy(updateState.status) || updateState.restart_required) return;
     try { await fetch("/api/system/update", { method: "DELETE" }); } catch {}
     window.location.replace("/");
   };
@@ -204,19 +206,22 @@ export default function ManualUpdatePage() {
     }
   };
 
-  const busy = uploading || updateActionBusy || ["uploading", "preparing", "applying", "repairing"].includes(updateState.status) || restarting;
+  const busy = uploading || updateActionBusy || updateBusy(updateState.status) || restarting;
+  // The two origins share every step after the archive reaches disk, so the server marks which one
+  // started it and the wording follows that rather than the phase alone.
+  const online = updateState.source === "online";
   const visualProgress = restarting ? 100
     : uploading ? uploadProgress * .2
-      : updateState.status === "uploading" ? updateState.progress * .2
+      : updateState.status === "uploading" || updateState.status === "downloading" ? updateState.progress * .2
         : updateState.status === "preparing" ? 20 + updateState.progress * .35
           : updateState.status === "ready" ? 55
             : updateState.status === "applying" ? 55 + updateState.progress * .45
               : updateState.status === "repairing" ? Math.max(92, updateState.progress || 0)
                 : updateState.status === "complete" ? 100 : 0;
   const phaseOrder = ["upload", "inspect", "extract", "dependencies", "backup", "apply", "verify", "environment", "complete"];
-  const phaseMap = { idle: -1, tools: 1, validate: 2, plan: 3, ready: 3, shutdown: 4, repair: 7, cleanup: 8, restart: 8, error: -1 };
-  const phaseIndex = uploading || updateState.status === "uploading" ? 0 : phaseMap[updateState.phase] ?? phaseOrder.indexOf(updateState.phase);
-  const phaseLabels = ["上传更新包", "安全检查", "命令解压", "依赖分析", "创建回滚", "替换程序", "代码验证", "环境修复验证", "更新完成"];
+  const phaseMap = { idle: -1, download: 0, tools: 1, validate: 2, plan: 3, ready: 3, shutdown: 4, repair: 7, cleanup: 8, restart: 8, error: -1 };
+  const phaseIndex = uploading || ["uploading", "downloading"].includes(updateState.status) ? 0 : phaseMap[updateState.phase] ?? phaseOrder.indexOf(updateState.phase);
+  const phaseLabels = [online ? "下载更新包" : "上传更新包", "安全检查", "命令解压", "依赖分析", "创建回滚", "替换程序", "代码验证", "环境修复验证", "更新完成"];
   const replacementPlan = (updateState.prepared_plan || []).filter((item) => item.action !== "remove");
   const removalPlan = (updateState.prepared_plan || []).filter((item) => item.action === "remove");
 
@@ -226,14 +231,16 @@ export default function ManualUpdatePage() {
     <section className="update-panel">
       <div className={`update-visual ${busy ? "busy" : ""} ${updateState.status === "complete" ? "complete" : ""}`}>
         <div className="update-emblem"><LoadingLogo /></div>
-        <span>LOCAL PACKAGE UPDATE</span>
-        <h1>手动更新</h1>
-        <p>使用打包好的干净项目归档更新程序文件。已有环境、模型、输出、日志和创作状态不会被覆盖。</p>
+        <span>{online ? "ONLINE PACKAGE UPDATE" : "LOCAL PACKAGE UPDATE"}</span>
+        <h1>{online ? "在线更新" : "手动更新"}</h1>
+        <p>{online
+          ? `正在获取并安装 ${updateState.online_release?.version || "新"} 版本的程序文件。已有环境、模型、输出、日志和创作状态不会被覆盖。`
+          : "使用打包好的干净项目归档更新程序文件。已有环境、模型、输出、日志和创作状态不会被覆盖。"}</p>
         <div className="update-safety-list"><span><Check size={13} />新版镜像删除旧文件</span><span><Check size={13} />环境异常自动修复</span><span><Check size={13} />失败自动回滚</span></div>
       </div>
       <div className="update-workspace">
-        <header><span>UPDATE WORKSPACE</span><strong>{updateState.status === "complete" ? "更新已完成" : updateState.status === "ready" ? "等待确认" : busy ? "正在处理" : "选择本地更新包"}</strong></header>
-        {!["uploading", "preparing", "ready", "applying", "repairing", "complete"].includes(updateState.status) && !updateState.restart_required && !updateState.repair_available && !restarting && <button
+        <header><span>UPDATE WORKSPACE</span><strong>{updateState.status === "complete" ? "更新已完成" : updateState.status === "ready" ? "等待确认" : updateState.status === "downloading" ? "正在下载更新包" : busy ? "正在处理" : "选择本地更新包"}</strong></header>
+        {!UPDATE_OCCUPIED_STATUSES.includes(updateState.status) && !updateState.restart_required && !updateState.repair_available && !restarting && <button
           type="button"
           className={`update-dropzone ${dragging ? "dragging" : ""}`}
           onClick={() => !uploading && fileInput.current?.click()}

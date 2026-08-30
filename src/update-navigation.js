@@ -1,5 +1,20 @@
 export const UPDATE_RESTART_SESSION_KEY = "xirai-update-restart-return";
 
+/** Statuses in which a task owns the update state and nothing else may take it over.
+ *
+ * Both the server and the updater page gate on this. It is one list rather than a literal repeated
+ * at each gate because a status that is missing from one of them is not a visible bug: it is a
+ * second update starting on top of a running one.
+ */
+export const UPDATE_BUSY_STATUSES = ["uploading", "downloading", "preparing", "applying", "repairing"];
+
+/** Statuses that already own an archive, so starting a fresh one has to be refused. */
+export const UPDATE_OCCUPIED_STATUSES = [...UPDATE_BUSY_STATUSES, "ready", "complete"];
+
+export function updateBusy(status) {
+  return UPDATE_BUSY_STATUSES.includes(status);
+}
+
 export function markUpdateRestart(storage, now = Date.now()) {
   try {
     storage.setItem(UPDATE_RESTART_SESSION_KEY, String(now));

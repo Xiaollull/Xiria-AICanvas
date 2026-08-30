@@ -66,6 +66,8 @@ jobs:
       - run: node --check scripts/node-tools.mjs
       - run: node --check scripts/nvidia.mjs
       - run: node --check scripts/proxy-policy.mjs
+      - run: node --check scripts/release-feed.mjs
+      - run: node --check scripts/app-version.mjs
       - run: node --check scripts/setup-options.mjs
       - run: node --check scripts/setup-gui.mjs
       - run: node --check scripts/setup-state.mjs
