@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,7 +26,10 @@ import {
 } from "../src/shared-model-refs.js";
 
 async function fixture() {
-  const base = await mkdtemp(path.join(os.tmpdir(), "xiria-shared-"));
+  // Overlap detection resolves both sides before comparing them, so an unresolved base makes a
+  // real overlap look like two unrelated trees. `os.tmpdir()` is the 8.3 short form on a Windows
+  // CI runner and may sit behind a link anywhere else.
+  const base = await realpath(await mkdtemp(path.join(os.tmpdir(), "xiria-shared-")));
   return {
     base,
     async cleanup() { await rm(base, { recursive: true, force: true }); },

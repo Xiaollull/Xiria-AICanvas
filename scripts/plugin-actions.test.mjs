@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,7 +16,10 @@ function baseManifest(overrides = {}) {
 }
 
 async function temporaryProject(prefix) {
-  const root = await mkdtemp(path.join(os.tmpdir(), prefix));
+  // Resolved so the reveal path this test asserts on is the same spelling the path-safety contract
+  // produces. `os.tmpdir()` is the 8.3 short form on a Windows CI runner, and the symlink cases
+  // below need the escape to be the only thing `realpath` changes.
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), prefix)));
   return {
     root,
     async plugin(name, manifest, extraFiles = {}) {

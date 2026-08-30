@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { lstat, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,25 @@ function allowedParents(projectRoot) {
   return [...new Set([os.tmpdir(), path.dirname(projectRoot)].map((item) => path.resolve(item)))];
 }
 
+/** Every spelling a permitted parent can legitimately carry.
+ *
+ * A staging record stores the canonical path of the directory that was created, while the parent
+ * it was created in is spelled however `os.tmpdir()` reports it. Those are the same directory but
+ * not the same string whenever the temp directory is reached through a link or a short name —
+ * Windows puts an 8.3 spelling in TEMP for a profile name it cannot fit, `C:\\Users\\JOHNSM~1\\...`,
+ * and that is what a CI runner exports too. Comparing one against the other made this module
+ * reject a record it had just written, so both spellings are permitted here.
+ */
+function allowedParentSpellings(projectRoot) {
+  return [...new Set(allowedParents(projectRoot).flatMap((parent) => {
+    try {
+      return [parent, realpathSync(parent)];
+    } catch {
+      return [parent];
+    }
+  }))];
+}
+
 function validateRecord(projectRoot, record, prefix, kind) {
   if (!record || record.schema !== 1 || typeof record.path !== "string" || typeof record.token !== "string"
     || typeof record.projectRoot !== "string" || record.product !== PRODUCT
@@ -30,7 +50,7 @@ function validateRecord(projectRoot, record, prefix, kind) {
   }
   const resolved = path.resolve(record.path);
   if (!path.basename(resolved).startsWith(prefix)
-    || !allowedParents(projectRoot).some((parent) => pathsEqual(path.dirname(resolved), parent))
+    || !allowedParentSpellings(projectRoot).some((parent) => pathsEqual(path.dirname(resolved), parent))
     || isWithin(projectRoot, resolved, true)) {
     throw new Error(`离线更新${kind}目录路径无效：${resolved}`);
   }

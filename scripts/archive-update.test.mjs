@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -26,8 +26,13 @@ const {
   validateArchiveMemberPath,
 } = archiveUpdateInternals;
 
+// The update code canonicalises every path it is handed before deciding whether it is inside a
+// managed root, so a fixture root has to be canonical too or the comparison fails on the machine
+// rather than on the behaviour. `os.tmpdir()` is not always canonical: a Windows CI runner exports
+// TEMP in its 8.3 short form (C:\Users\RUNNER~1\...), and a temp directory can sit behind a
+// junction or a symlink on any platform.
 async function temporaryDirectory(prefix) {
-  return mkdtemp(path.join(os.tmpdir(), prefix));
+  return realpath(await mkdtemp(path.join(os.tmpdir(), prefix)));
 }
 
 function pathIsOutside(root, candidate) {
