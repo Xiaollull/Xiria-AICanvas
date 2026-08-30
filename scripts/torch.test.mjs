@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { torchInternals } from "./torch.mjs";
+import { checkForTorchvision, torchInternals } from "./torch.mjs";
 
 test("stable versions sort newest first", () => {
   const versions = ["2.9.1+cu128", "2.10.0+cu128", "2.9.0+cu128"];
@@ -129,4 +133,81 @@ test("stable plans rank newest PyTorch releases first", () => {
 test("a custom index may point directly at one CUDA variant", () => {
   assert.equal(torchInternals.directRootVariant("https://example.test/pytorch/cu130"), "cu130");
   assert.equal(torchInternals.directRootVariant("https://example.test/pytorch/"), null);
+});
+
+/** A stand-in for an installed torch/torchvision pair, shaped like the real wheels.
+ *
+ * `cuda` mirrors what `torchvision/version.py` does: it assigns the attribute only when there is a
+ * CUDA runtime to name, so a CPU wheel has no attribute rather than one holding None.
+ */
+function writeWheelStubs(root, { torchVersion, torchCuda, torchvisionCuda }) {
+  mkdirSync(path.join(root, "torch"), { recursive: true });
+  mkdirSync(path.join(root, "torchvision"), { recursive: true });
+  writeFileSync(path.join(root, "torch", "__init__.py"), [
+    `__version__ = ${JSON.stringify(torchVersion)}`,
+    "class _Tensor:",
+    "    def numel(self): return 1",
+    "def tensor(*args, **kwargs): return _Tensor()",
+    "class version:",
+    `    cuda = ${torchCuda === null ? "None" : JSON.stringify(torchCuda)}`,
+    "",
+  ].join("\n"), "utf8");
+  writeFileSync(path.join(root, "torchvision", "__init__.py"), "from . import version, ops\n", "utf8");
+  writeFileSync(path.join(root, "torchvision", "version.py"),
+    torchvisionCuda === null ? "" : `cuda = ${torchvisionCuda}\n`, "utf8");
+  writeFileSync(path.join(root, "torchvision", "ops.py"), [
+    "def nms(boxes, scores, threshold): return boxes",
+    "",
+  ].join("\n"), "utf8");
+}
+
+/** Runs the generated check against the stubs, and against nothing else.
+ *
+ * `-c` puts the working directory first on `sys.path`, so the stubs shadow any real installation,
+ * and user site-packages are excluded so the result does not depend on the developer's machine.
+ * Isolated mode is deliberately not used here: it would drop the working directory too.
+ */
+function runCheck(root, source) {
+  const command = process.platform === "win32" ? "python" : "python3";
+  return spawnSync(command, ["-c", source], {
+    cwd: root,
+    env: { ...process.env, PYTHONNOUSERSITE: "1", PYTHONDONTWRITEBYTECODE: "1" },
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+
+test("the torchvision check accepts a matching pair and rejects a mismatched one", (context) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "xirai-torchvision-check-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const probe = spawnSync(process.platform === "win32" ? "python" : "python3", ["-I", "-c", "print(1)"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (probe.status !== 0) {
+    context.skip("no Python interpreter available to execute the generated check");
+    return;
+  }
+
+  // A CPU wheel: torchvision names no CUDA runtime at all, which used to raise AttributeError and
+  // report the freshly installed wheel as "no matching torchvision" on every CPU install.
+  writeWheelStubs(root, { torchVersion: "2.13.0+cpu", torchCuda: null, torchvisionCuda: null });
+  const cpu = runCheck(root, checkForTorchvision({ version: "2.13.0+cpu", variant: "cpu" }));
+  assert.equal(cpu.status, 0, cpu.stderr);
+
+  // A CUDA wheel: torchvision reports 12060 where torch reports "12.6"; both normalise to 12.6.
+  writeWheelStubs(root, { torchVersion: "2.13.0+cu126", torchCuda: "12.6", torchvisionCuda: "12060" });
+  const cuda = runCheck(root, checkForTorchvision({ version: "2.13.0+cu126", variant: "cu126" }));
+  assert.equal(cuda.status, 0, cuda.stderr);
+
+  // A genuinely mismatched pair still has to fail, or the check is worth nothing.
+  writeWheelStubs(root, { torchVersion: "2.13.0+cu126", torchCuda: "12.6", torchvisionCuda: "12080" });
+  const mismatch = runCheck(root, checkForTorchvision({ version: "2.13.0+cu126", variant: "cu126" }));
+  assert.notEqual(mismatch.status, 0);
+  assert.match(mismatch.stderr, /torchvision built for CUDA 12080, torch for 12\.6/);
+
+  // So does a torch that is not the planned build.
+  writeWheelStubs(root, { torchVersion: "2.12.0+cpu", torchCuda: null, torchvisionCuda: null });
+  const wrongTorch = runCheck(root, checkForTorchvision({ version: "2.13.0+cpu", variant: "cpu" }));
+  assert.notEqual(wrongTorch.status, 0);
 });

@@ -13,7 +13,7 @@ import { detectNvidiaDriverApi, detectNvidiaSmi, mergeNvidiaDetection } from "./
 import { resolveRtxVsrChoice, rtxVsrEligibility, RTX_VSR_INDEX, RTX_VSR_PRODUCT_SOURCE, RTX_VSR_VERSION } from "./rtx-vsr.mjs";
 import { installOptionalAccelerator, resolveAcceleratorChoice, sageAttentionSmokeSource, SAGE_ATTENTION_REQUIREMENT, tritonPackageName, tritonSmokeSource } from "./anima-accelerators.mjs";
 import { readSetupMarker, readSetupResume, writeSetupMarker, writeSetupResume } from "./setup-state.mjs";
-import { availableTorchVersions, resolveLatestStableTorch, torchInternals } from "./torch.mjs";
+import { availableTorchVersions, checkForTorchvision, resolveLatestStableTorch, torchInternals } from "./torch.mjs";
 import { resolveUvTarget, uvDownloadRoutes, uvVersionMatches } from "./uv-bootstrap.mjs";
 import { configuredModelDirectories } from "./model-paths.mjs";
 import { requireBundledAnimaTokenizers } from "./anima-models.mjs";
@@ -995,32 +995,6 @@ function indexesForTorchPlan(plan) {
   ].filter(Boolean))];
 }
 
-/** torchvision ships compiled ops that bind to one exact PyTorch build.
- *
- * Nothing in `backend/requirements.txt` names it — it arrives as an Ultralytics dependency, from
- * whichever index resolved the backend packages — so it can land as a build compiled against a
- * different CUDA runtime than the torch beside it. That mismatch is silent until the first call
- * into its C++ ops, where it surfaces as `operator torchvision::nms does not exist` and takes
- * `transformers.AutoImageProcessor` and every Diffusers import down with it. So it is installed
- * from the torch plan's own index, and verified by running one of those ops.
- */
-function checkForTorchvision(plan) {
-  const cudaRuntime = plan.variant === "cpu" ? "None" : torchInternals.cudaVariantVersion(plan.variant)?.text;
-  if (!cudaRuntime) return null;
-  return [
-    "import torch,torchvision",
-    `assert torch.__version__==${JSON.stringify(plan.version)}`,
-    // torchvision reports its CUDA build as a packed integer from 0.28 onward — 12060 for 12.6 —
-    // where it used to be a dotted string and where torch still is one. Compared raw, a correctly
-    // matched pair reads as a mismatch: torchvision 0.28.0+cu126 beside torch 2.13.0+cu126 failed
-    // this assert on every mirror in turn and ended the whole run with "no matching torchvision",
-    // having in fact installed the right wheel. Both forms are normalised to major.minor first.
-    "_cuda=lambda v:(lambda t: f'{int(t)//1000}.{(int(t)%1000)//10}' if t.isdigit() and len(t)>=4 else t)(str(v))",
-    `assert _cuda(torchvision.version.cuda)==_cuda(${JSON.stringify(cudaRuntime)}), f'torchvision built for CUDA {torchvision.version.cuda}, torch for {torch.version.cuda}'`,
-    "from torchvision.ops import nms",
-    "assert nms(torch.tensor([[0.,0.,1.,1.],[0.,0.,1.,1.]]),torch.tensor([0.9,0.5]),0.5).numel()==1",
-  ].join(";");
-}
 
 function checkForTorchPlan(plan) {
   const cudaRuntime = plan.variant === "cpu" ? "None" : torchInternals.cudaVariantVersion(plan.variant)?.text;

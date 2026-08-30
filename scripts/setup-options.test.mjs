@@ -366,16 +366,14 @@ test("an explicitly configured torch index outranks the one a plan was resolved 
   assert.match(setup, /\.\.\.\(process\.env\.XIRAI_TORCH_INDEX \? forVariant\(process\.env\.XIRAI_TORCH_INDEX\) : \[\]\),\s*\n\s*plan\.indexUrl,/);
   // torchvision has to come from the same place, and before the backend dependencies can resolve
   // one of their own.
-  assert.match(setup, /function checkForTorchvision\(plan\)/);
+  assert.match(setup, /import \{[^}]*\bcheckForTorchvision\b[^}]*\} from "\.\/torch\.mjs"/);
+  assert.match(setup, /const torchvisionCheck = checkForTorchvision\(torchPlan\)/);
   assert.match(setup, /from torchvision\.ops import nms/);
   assert.match(setup, /torchvision==\$\{installedTorchvision\.stdout\.trim\(\)\}/);
-  // torchvision 0.28 reports `version.cuda` as the packed integer 12060 where torch reports the
-  // string "12.6". Compared raw, torchvision 0.28.0+cu126 beside torch 2.13.0+cu126 read as a
-  // mismatch and ended a completed install with "no matching torchvision", so the comparison
-  // normalises both spellings instead of stringifying one of them.
-  assert.doesNotMatch(setup, /assert str\(torchvision\.version\.cuda\)==/);
-  assert.match(setup, /_cuda=lambda v:/);
-  assert.match(setup, /assert _cuda\(torchvision\.version\.cuda\)==_cuda\(/);
+  // What that check actually accepts and rejects is proved by running it, in torch.test.mjs. It
+  // lives beside the CUDA variant parsing it depends on for that reason: twice now a matching pair
+  // has been reported as "no matching torchvision", and neither spelling of the bug was visible to
+  // a test that only read this file.
 });
 
 test("the environment check proves the symbols Krea 2 loads through, not just the packages", async () => {

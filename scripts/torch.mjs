@@ -31,6 +31,38 @@ function cudaVariantVersion(variant) {
   };
 }
 
+/** torchvision ships compiled ops that bind to one exact PyTorch build.
+ *
+ * Nothing in `backend/requirements.txt` names it — it arrives as an Ultralytics dependency, from
+ * whichever index resolved the backend packages — so it can land as a build compiled against a
+ * different CUDA runtime than the torch beside it. That mismatch is silent until the first call
+ * into its C++ ops, where it surfaces as `operator torchvision::nms does not exist` and takes
+ * `transformers.AutoImageProcessor` and every Diffusers import down with it. So it is installed
+ * from the torch plan's own index, and verified by running one of those ops.
+ */
+export function checkForTorchvision(plan) {
+  const cudaRuntime = plan.variant === "cpu" ? "None" : cudaVariantVersion(plan.variant)?.text;
+  if (!cudaRuntime) return null;
+  return [
+    "import torch,torchvision",
+    `assert torch.__version__==${JSON.stringify(plan.version)}`,
+    // torchvision reports its CUDA build as a packed integer from 0.28 onward — 12060 for 12.6 —
+    // where it used to be a dotted string and where torch still is one. Compared raw, a correctly
+    // matched pair reads as a mismatch: torchvision 0.28.0+cu126 beside torch 2.13.0+cu126 failed
+    // this assert on every mirror in turn and ended the whole run with "no matching torchvision",
+    // having in fact installed the right wheel. Both forms are normalised to major.minor first.
+    "_cuda=lambda v:(lambda t: f'{int(t)//1000}.{(int(t)%1000)//10}' if t.isdigit() and len(t)>=4 else t)(str(v))",
+    // A CPU wheel does not report an absent CUDA runtime — it has no `cuda` attribute at all. Its
+    // version module assigns one only when there is a runtime to name, so reading the attribute
+    // raises rather than answering None, and every CPU install failed exactly the way a genuine
+    // mismatch does: "no matching torchvision" for the wheel it had just installed correctly.
+    "_tv_cuda=getattr(torchvision.version,'cuda',None)",
+    `assert _cuda(_tv_cuda)==_cuda(${JSON.stringify(cudaRuntime)}), f'torchvision built for CUDA {_tv_cuda}, torch for {torch.version.cuda}'`,
+    "from torchvision.ops import nms",
+    "assert nms(torch.tensor([[0.,0.,1.,1.],[0.,0.,1.,1.]]),torch.tensor([0.9,0.5]),0.5).numel()==1",
+  ].join(";");
+}
+
 function cudaVariantIsCompatible(variant, cuda) {
   const version = cudaVariantVersion(variant);
   if (!version || !cuda) return false;
