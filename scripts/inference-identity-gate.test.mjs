@@ -241,10 +241,11 @@ test("only the opened picture loads a full-resolution original", async () => {
     "switching image resets the swap");
 
   const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
-  // drop-shadow is a per-pixel filter over the whole picture; running it on a
-  // six-megapixel original every paint is what made the stage expensive.
+  // Originals can exceed 20 MP. A per-pixel filter can exhaust the browser's
+  // GPU texture budget and paint the decoded image as a solid black rectangle.
   assert.doesNotMatch(styles, /\.gallery-focus-preview \{[^}]*drop-shadow/);
-  assert.match(styles, /\.gallery-focus-frame\.ready \.gallery-focus-full \{[^}]*drop-shadow/);
+  assert.match(styles, /\.gallery-focus-frame\.ready \.gallery-focus-full \{ opacity: 1; \}/);
+  assert.doesNotMatch(styles, /\.gallery-focus-frame\.ready \.gallery-focus-full \{[^}]*drop-shadow/);
   assert.match(styles, /prefers-reduced-motion[\s\S]*?\.gallery-focus-full \{ opacity: 1; \}/,
     "the picture must still become visible without the cross-fade");
 });

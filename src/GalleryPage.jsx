@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   ArrowDown,
   ArrowLeft,
+  ArrowRight,
   ArrowUp,
   BookOpen,
   Check,
   ChevronRight,
   Copy,
   FolderPlus,
+  FolderOpen,
   ImageIcon,
   ImagePlus,
   Images,
@@ -16,6 +19,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  Search,
   SlidersHorizontal,
   Sparkles,
   Trash2,
@@ -26,12 +30,13 @@ import {
 } from "lucide-react";
 import { SAMPLER_NAMES as SAMPLERS, SCHEDULER_NAMES as SCHEDULERS } from "./sampling-options";
 import { normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed } from "./hires-settings";
-import { DEFAULT_SETTINGS, GUIDANCE, clone, displayTitle, galleryRequest, normalizedSettings, useDialogLifecycle } from "./gallery-core";
+import { DEFAULT_SETTINGS, GUIDANCE, boundedGalleryImageIndex, clone, displayTitle, distributeGalleryCards, galleryImageSeed, galleryRequest, normalizedSettings, useDialogLifecycle } from "./gallery-core";
 import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
 
 const MAX_MANUAL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_MANUAL_TOTAL_BYTES = 100 * 1024 * 1024;
+const clampViewerValue = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 // Prompt first: it is what a user almost always wants from a curated card, and
 // it is the only group that cannot invalidate the current workspace by pulling
 // in a model or LoRA set that is not installed.
@@ -146,13 +151,13 @@ function thumbUrl(image) {
  * empty for as long as a five-megabyte PNG took to arrive and decode, which is
  * what "it freezes for a few seconds" actually was.
  */
-function FocusImage({ image, alt }) {
+function FocusImage({ image, alt, style }) {
   const [loaded, setLoaded] = useState(false);
   const preview = thumbUrl(image);
   const hasPreview = preview && preview !== image.url;
   useEffect(() => setLoaded(false), [image.url]);
   return (
-    <div className={`gallery-focus-frame ${loaded ? "ready" : ""}`}>
+    <div className={`gallery-focus-frame ${loaded ? "ready" : ""}`} style={style}>
       {hasPreview && !loaded && <img className="gallery-focus-preview" src={preview} alt="" aria-hidden="true" decoding="async" />}
       <img
         className="gallery-focus-full"
@@ -182,13 +187,13 @@ function PromptBlock({ tone, label, value, onNotice }) {
 }
 
 function PromptLibraryDialog({ entry, onClose, onSaved }) {
-  const dialogRef = useDialogLifecycle(true, onClose);
   const [title, setTitle] = useState(entry?.title || "");
   const [positivePrompt, setPositivePrompt] = useState(entry?.positive_prompt || "");
   const [negativePrompt, setNegativePrompt] = useState(entry?.negative_prompt || "");
   const [notes, setNotes] = useState(entry?.notes || "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useDialogLifecycle(true, onClose, "", !busy);
   const save = async (event) => {
     event.preventDefault();
     if (!title.trim() || (!positivePrompt.trim() && !negativePrompt.trim()) || busy) return;
@@ -313,7 +318,7 @@ function GalleryCardTile({ card, tileIndex = 0, onOpen, onMenu, dragState, reord
     } else {
       onReorderOver(card, null, { x: event.clientX, y: event.clientY });
     }
-    const scroll = current.node.closest(".gallery-scroll");
+    const scroll = current.node.closest(".gallery-room") || current.node.closest(".gallery-scroll");
     if (scroll) {
       const bounds = scroll.getBoundingClientRect();
       if (event.clientY < bounds.top + 56) scroll.scrollBy({ top: -14 });
@@ -347,6 +352,7 @@ function GalleryCardTile({ card, tileIndex = 0, onOpen, onMenu, dragState, reord
       {first ? <img src={thumbUrl(first)} alt="" loading="lazy" decoding="async" /> : <span className="gallery-card-empty"><ImageIcon size={25} /><b>{displayTitle(card)}</b></span>}
       {card.image_count > 1 && <b className="gallery-image-count"><Images size={12} />{card.image_count}</b>}
       <i>{settings.model || "--"}</i>
+      <span className="gallery-card-open-hint"><b>{String(tileIndex + 1).padStart(2, "0")}</b><span>查看预览<ChevronRight size={14} /></span></span>
     </span>
     <span className="gallery-card-copy">
       <strong>{displayTitle(card)}</strong>
@@ -354,6 +360,29 @@ function GalleryCardTile({ card, tileIndex = 0, onOpen, onMenu, dragState, reord
       <span><b>{settings.steps || "--"} STEP</b><b>CFG {settings.cfg ?? "--"}</b><b>{settings.loras?.filter((item) => item.enabled !== false).length || 0} LoRA</b></span>
     </span>
   </button>;
+}
+
+function useGalleryColumnCount() {
+  const getCount = () => typeof window === "undefined" ? 4 : window.innerWidth <= 680 ? 2 : window.innerWidth <= 980 ? 3 : 4;
+  const [columnCount, setColumnCount] = useState(getCount);
+  useEffect(() => {
+    const update = () => setColumnCount(getCount());
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+  return columnCount;
+}
+
+function GalleryCardColumns({ cards, dragState, reorderBusy, onOpen, onMenu, onReorderStart, onReorderOver, onReorderEnd }) {
+  const columnCount = useGalleryColumnCount();
+  const columns = distributeGalleryCards(cards, columnCount);
+  const cardIndexes = new Map(cards.map((card, index) => [card.id, index]));
+  return <div className={`gallery-card-grid gallery-columns-${columnCount}${dragState ? " reordering" : ""}`}>
+    {columns.map((column, columnIndex) => <div className="gallery-card-column" key={columnIndex}>{column.map((card) => {
+      const index = cardIndexes.get(card.id) ?? 0;
+      return <GalleryCardTile card={card} tileIndex={index} key={card.id} onOpen={onOpen} onMenu={onMenu} dragState={dragState} reorderBusy={reorderBusy} onReorderStart={onReorderStart} onReorderOver={onReorderOver} onReorderEnd={onReorderEnd} />;
+    })}</div>)}
+  </div>;
 }
 
 function GalleryCardMenu({ menu, onClose, onEdit, onDelete }) {
@@ -441,11 +470,11 @@ function AddCardTile({ collectionId, tileIndex = 0, onAdd, onDropError }) {
 }
 
 function CollectionDialog({ collection, onClose, onSaved, onDeleted }) {
-  const dialogRef = useDialogLifecycle(true, onClose);
   const [id, setId] = useState(collection?.id || "");
   const [description, setDescription] = useState(collection?.description || "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useDialogLifecycle(true, onClose, "", !busy);
   const save = async (event) => {
     event.preventDefault();
     if (!id.trim() || busy) return;
@@ -475,9 +504,9 @@ function CollectionDialog({ collection, onClose, onSaved, onDeleted }) {
       setBusy(false);
     }
   };
-  return <div className="gallery-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+  return <div className="gallery-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
     <form ref={dialogRef} className="gallery-small-dialog" role="dialog" aria-modal="true" aria-labelledby="gallery-collection-dialog-title" tabIndex="-1" onSubmit={save}>
-      <header><div><span>COLLECTION</span><h2 id="gallery-collection-dialog-title">{collection ? "编辑收藏夹" : "创建收藏夹"}</h2></div><button type="button" aria-label="关闭收藏夹编辑" onClick={onClose}><X size={18} /></button></header>
+      <header><div><span>COLLECTION</span><h2 id="gallery-collection-dialog-title">{collection ? "编辑收藏夹" : "创建收藏夹"}</h2></div><button type="button" aria-label="关闭收藏夹编辑" disabled={busy} onClick={onClose}><X size={18} /></button></header>
       <div className="gallery-dialog-body">
         <label className="gallery-field"><span>收藏夹 ID</span><input value={id} maxLength={64} autoFocus onChange={(event) => setId(event.target.value)} placeholder="例如 portraits-2026" /></label>
         <label className="gallery-field"><span>简介（可选）</span><textarea value={description} maxLength={1000} onChange={(event) => setDescription(event.target.value)} placeholder="记录主题、用途或筛选说明" /></label>
@@ -553,7 +582,7 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
       const cardSettings = normalizedSettings(card.settings, DEFAULT_SETTINGS, { hiresSourceKind: "persisted_card" });
       const imageHires = selectedImageHiresSeed(cardSettings, index);
       const hasImageHires = Array.isArray(card.settings?.imageHiresSeedModes) && index < card.settings.imageHiresSeedModes.length;
-      return { kind: "existing", id: image.id, name: image.name, url: image.url, seed: card.settings?.imageSeeds?.[index] || "", hiresSeedMode: hasImageHires ? imageHires.seedMode : undefined, hiresSeed: hasImageHires ? imageHires.seed : undefined };
+      return { kind: "existing", id: image.id, name: image.name, url: image.url, seed: card.settings?.imageSeeds?.[index] ?? "", hiresSeedMode: hasImageHires ? imageHires.seedMode : undefined, hiresSeed: hasImageHires ? imageHires.seed : undefined };
     })
     : initialImages);
   const [checkpoints, setCheckpoints] = useState([]);
@@ -562,7 +591,7 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [modelCatalogError, setModelCatalogError] = useState("");
-  const dialogRef = useDialogLifecycle(!loraOpen, onClose);
+  const dialogRef = useDialogLifecycle(!loraOpen, onClose, "", !busy);
   const fileInput = useRef(null);
   const setField = (key, value) => setSettings((current) => busy ? current : ({ ...current, [key]: value }));
   const setNested = (group, key, value) => setSettings((current) => busy ? current : ({ ...current, [group]: { ...current[group], [key]: value } }));
@@ -695,9 +724,9 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
       setBusy(false);
     }
   };
-  return <div className="gallery-editor-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+  return <div className="gallery-editor-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
     <form ref={dialogRef} className="gallery-card-editor" role="dialog" aria-modal="true" aria-labelledby="gallery-card-editor-title" tabIndex="-1" onSubmit={save}>
-      <header><div><span>CURATED CARD EDITOR</span><h2 id="gallery-card-editor-title">{card ? "编辑精选卡片" : "添加精选卡片"}</h2><p>图片可选，参数可独立于当前生图工作区保存</p></div><button type="button" aria-label="关闭卡片编辑器" onClick={onClose}><X size={20} /></button></header>
+      <header><div><span>CURATED CARD EDITOR</span><h2 id="gallery-card-editor-title">{card ? "编辑精选卡片" : "添加精选卡片"}</h2><p>图片可选，参数可独立于当前生图工作区保存</p></div><button type="button" aria-label="关闭卡片编辑器" disabled={busy} onClick={onClose}><X size={20} /></button></header>
       <fieldset className="gallery-editor-body" disabled={busy}>
         <section className="gallery-editor-media">
           <div className="gallery-editor-section-head"><div><span>01</span><strong>卡片与图片</strong></div><button type="button" onClick={() => fileInput.current?.click()}><Upload size={13} />添加图片</button><input ref={fileInput} type="file" hidden multiple accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} /></div>
@@ -768,13 +797,13 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
 }
 
 function ApplySettingsDialog({ card, onClose, onApply }) {
-  const dialogRef = useDialogLifecycle(true, onClose);
   // Defaults to Prompt only. Applying everything replaces the model, the whole
   // LoRA mount and every sampling parameter, which is a much larger action than
   // "I want this card's prompt" — the reason people open this dialog.
   const [selected, setSelected] = useState(() => new Set(APPLY_DEFAULT_GROUPS));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useDialogLifecycle(true, onClose, "", !busy);
   const toggle = (id) => setSelected((current) => { if (busy) return current; const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const apply = async (groups) => {
     setBusy(true);
@@ -788,9 +817,9 @@ function ApplySettingsDialog({ card, onClose, onApply }) {
       setBusy(false);
     }
   };
-  return <div className="gallery-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+  return <div className="gallery-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
     <section ref={dialogRef} className="gallery-apply-dialog" role="dialog" aria-modal="true" aria-labelledby="gallery-apply-dialog-title" tabIndex="-1">
-      <header><div><span>APPLY PARAMETERS</span><h2 id="gallery-apply-dialog-title">应用到生图区域</h2><p title={card.title || card.settings?.positive}>{displayTitle(card)}</p></div><button type="button" aria-label="关闭参数应用窗口" onClick={onClose}><X size={18} /></button></header>
+      <header><div><span>APPLY PARAMETERS</span><h2 id="gallery-apply-dialog-title">应用到生图区域</h2><p title={card.title || card.settings?.positive}>{displayTitle(card)}</p></div><button type="button" aria-label="关闭参数应用窗口" disabled={busy} onClick={onClose}><X size={18} /></button></header>
       <div className="gallery-apply-grid">{APPLY_GROUPS.map(([id, label, detail]) => <button type="button" className={selected.has(id) ? "selected" : ""} aria-pressed={selected.has(id)} disabled={busy} key={id} onClick={() => toggle(id)}><i>{selected.has(id) && <Check size={12} />}</i><span><strong>{label}</strong><small>{detail}</small></span></button>)}</div>
       {card.settings?.loraGroupPrompt && selected.has("prompts") && (
         // Applied prompts are the handwritten part only. The prefix came from
@@ -805,65 +834,147 @@ function ApplySettingsDialog({ card, onClose, onApply }) {
   </div>;
 }
 
-function GalleryDetail({ card, onBack, onEdit, onDelete, onApply, onNotice }) {
-  const [imageIndex, setImageIndex] = useState(0);
-  const [applyOpen, setApplyOpen] = useState(false);
-  useEffect(() => setImageIndex(0), [card.id]);
-  const baseSettings = normalizedSettings({ ...card.settings, seed: card.settings?.imageSeeds?.[imageIndex] || card.settings?.seed });
-  const settings = { ...baseSettings, hires: { ...baseSettings.hires, ...selectedImageHiresSeed(baseSettings, imageIndex) } };
-  const image = card.images?.[imageIndex];
+function GalleryInspector({ card, settings, isAnima, onEdit, onDelete, onNotice, onApplyOpenChange }) {
   const stageLabels = { hires: "Hires.fix", adetailer: "ADetailer", rtx: "RTX VSR" };
-  const isAnima = settings.model === "Anima";
-  return <section className="gallery-focus">
-    <div className="gallery-focus-media">
-      <header><button type="button" onClick={onBack}><ArrowLeft size={15} />返回卡片</button><span>{card.collection_id} / {card.image_count || 0} IMAGE</span></header>
-      <div className="gallery-focus-stage">{image ? <FocusImage image={image} alt={displayTitle(card)} /> : <div><ImageIcon size={42} /><strong>{card.title?.trim() || "无图片精选卡片"}</strong><p>{settings.positive || "未填写 Prompt"}</p></div>}</div>
-      {card.images?.length > 1 && <div className="gallery-focus-thumbs">{card.images.map((item, index) => <button type="button" className={index === imageIndex ? "active" : ""} key={item.id} onClick={() => setImageIndex(index)}><img src={thumbUrl(item)} alt={`图片 ${index + 1}`} loading="lazy" decoding="async" /><b>{index + 1}</b></button>)}</div>}
-    </div>
-    <aside className="gallery-inspector">
-      <header><div><span>CURATED DETAIL</span><h1 title={card.title || settings.positive}>{displayTitle(card)}</h1><p>{card.collection_id} · 更新于 {formatDate(card.updated_at)}</p></div><div><button type="button" onClick={() => onEdit(card)}><Pencil size={14} />编辑</button><button type="button" className="danger" aria-label="删除精选卡片" onClick={() => onDelete(card)}><Trash2 size={14} /></button></div></header>
-      <div className="gallery-inspector-scroll">
-        {settings.loraGroupPrompt && (
-          <PromptBlock tone="composed" label="实际提交的正向 Prompt" value={effectivePrompt(settings)} onNotice={onNotice} />
-        )}
-        <PromptBlock tone="positive" label={settings.loraGroupPrompt ? "正向 Prompt（手写部分）" : "正向 Prompt"} value={settings.positive} onNotice={onNotice} />
-        <PromptBlock tone="negative" label="负向 Prompt" value={settings.negative} onNotice={onNotice} />
-        {settings.loraGroups.length > 0 && (
-          <section className="gallery-detail-section gallery-group-section">
-            <header><span>LORA GROUPS</span><strong>生成时启用的组合</strong></header>
-            <div className="gallery-group-list">
-              {settings.loraGroups.map((group) => {
-                const members = settings.loras.filter((item) => item.groupId === group.id);
-                return (
-                  <div className="gallery-group-entry" key={group.id}>
-                    <header><i /><strong title={group.name}>{group.name}</strong><b>{members.length} 个 LoRA</b></header>
-                    {group.presetPrompt
-                      ? <p className="gallery-group-preset">{group.presetPrompt}</p>
-                      : <p className="gallery-group-preset empty">该组合没有预设提示词</p>}
-                    {members.length > 0 && (
-                      <ul>{members.map((item) => (
-                        <li className={item.enabled === false ? "disabled" : ""} key={item.value}>
-                          <span title={item.name}>{item.name || compactName(item.value)}</span>
-                          <b>{formatWeight(item.weight ?? 1)}</b>
-                        </li>
-                      ))}</ul>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-            <p className="gallery-detail-line">组合的预设提示词在提交生成时拼接到正向 Prompt 最前面，生图页的输入框不会被改写。</p>
-          </section>
-        )}
-        <section className="gallery-detail-section"><header><span>MODEL</span><strong>模型组件与 LoRA</strong></header><dl><div><dt>引擎</dt><dd>{settings.model}</dd></div>{isAnima ? <><div><dt>扩散模型</dt><dd title={settings.diffusionModel}>{compactName(settings.diffusionModel)}</dd></div><div><dt>文本编码器</dt><dd title={settings.textEncoder}>{compactName(settings.textEncoder)}</dd></div><div><dt>VAE</dt><dd title={settings.vae}>{compactName(settings.vae)}</dd></div></> : <div><dt>底模</dt><dd title={settings.checkpoint}>{compactName(settings.checkpoint)}</dd></div>}</dl><div className="gallery-detail-loras">{settings.loras.length ? settings.loras.map((item, index) => { const owner = settings.loraGroups.find((group) => group.id === item.groupId); return <div className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name || compactName(item.value)}</strong>{owner && <em className="gallery-lora-group-tag" title={`来自组合 ${owner.name}`}>{owner.name}</em>}<b>{formatWeight(item.weight ?? 1)}</b><small>{item.enabled === false ? "关闭" : "启用"}</small></div>; }) : <p>未使用 LoRA</p>}</div></section>
+  return <section className="gallery-inspector" aria-label="生成参数">
+    <header><div><span>CURATED DETAIL</span><h1 title={card.title || settings.positive}>{displayTitle(card)}</h1><p>{card.collection_id} · 更新于 {formatDate(card.updated_at)}</p></div><div><button type="button" onClick={() => onEdit(card)}><Pencil size={14} />编辑</button><button type="button" className="danger" aria-label="删除精选卡片" onClick={() => onDelete(card)}><Trash2 size={14} /></button></div></header>
+    <div className="gallery-inspector-scroll">
+      {settings.loraGroupPrompt && (
+        <PromptBlock tone="composed" label="实际提交的正向 Prompt" value={effectivePrompt(settings)} onNotice={onNotice} />
+      )}
+      <PromptBlock tone="positive" label={settings.loraGroupPrompt ? "正向 Prompt（手写部分）" : "正向 Prompt"} value={settings.positive} onNotice={onNotice} />
+      <PromptBlock tone="negative" label="负向 Prompt" value={settings.negative} onNotice={onNotice} />
+      {settings.loraGroups.length > 0 && (
+        <section className="gallery-detail-section gallery-group-section">
+          <header><span>LORA GROUPS</span><strong>生成时启用的组合</strong></header>
+          <div className="gallery-group-list">
+            {settings.loraGroups.map((group) => {
+              const members = settings.loras.filter((item) => item.groupId === group.id);
+              return (
+                <div className="gallery-group-entry" key={group.id}>
+                  <header><i /><strong title={group.name}>{group.name}</strong><b>{members.length} 个 LoRA</b></header>
+                  {group.presetPrompt
+                    ? <p className="gallery-group-preset">{group.presetPrompt}</p>
+                    : <p className="gallery-group-preset empty">该组合没有预设提示词</p>}
+                  {members.length > 0 && (
+                    <ul>{members.map((item) => (
+                      <li className={item.enabled === false ? "disabled" : ""} key={item.value}>
+                        <span title={item.name}>{item.name || compactName(item.value)}</span>
+                        <b>{formatWeight(item.weight ?? 1)}</b>
+                      </li>
+                    ))}</ul>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          <p className="gallery-detail-line">组合的预设提示词在提交生成时拼接到正向 Prompt 最前面，生图页的输入框不会被改写。</p>
+        </section>
+      )}
+      <section className="gallery-detail-section"><header><span>MODEL</span><strong>模型组件与 LoRA</strong></header><dl><div><dt>引擎</dt><dd>{settings.model}</dd></div>{isAnima ? <><div><dt>扩散模型</dt><dd title={settings.diffusionModel}>{compactName(settings.diffusionModel)}</dd></div><div><dt>文本编码器</dt><dd title={settings.textEncoder}>{compactName(settings.textEncoder)}</dd></div><div><dt>VAE</dt><dd title={settings.vae}>{compactName(settings.vae)}</dd></div></> : <div><dt>底模</dt><dd title={settings.checkpoint}>{compactName(settings.checkpoint)}</dd></div>}</dl><div className="gallery-detail-loras">{settings.loras.length ? settings.loras.map((item, index) => { const owner = settings.loraGroups.find((group) => group.id === item.groupId); return <div className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name || compactName(item.value)}</strong>{owner && <em className="gallery-lora-group-tag" title={`来自组合 ${owner.name}`}>{owner.name}</em>}<b>{formatWeight(item.weight ?? 1)}</b><small>{item.enabled === false ? "关闭" : "启用"}</small></div>; }) : <p>未使用 LoRA</p>}</div></section>
       <section className="gallery-detail-section"><header><span>SAMPLING</span><strong>采样与画布</strong></header><div className="gallery-stat-grid"><div><span>STEP</span><b>{settings.steps}</b></div><div><span>CFG</span><b>{settings.cfg}</b></div><div><span>DENOISE</span><b>{settings.denoise}</b></div><div><span>SEED</span><b title={settings.seed}>{settings.seed}</b></div><div><span>SIZE</span><b>{settings.size.width} × {settings.size.height}</b></div><div><span>BATCH</span><b>{settings.imagesPerBatch} × {settings.batchCount}</b></div></div><p className="gallery-detail-line">{GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "无（None）"}{settings.guidance === "pag" ? ` ${settings.pag.scale} / ${settings.pag.appliedLayers === "mid" ? "Mid" : "全部层"}` : ""} · {settings.sampler} · {settings.scheduler} · 过程预览 {settings.processPreview === false ? "关闭" : "开启"}</p></section>
-        <section className="gallery-detail-section"><header><span>POST PROCESS</span><strong>后处理开关与顺序</strong></header><div className="gallery-process-list">{settings.postprocessOrder.map((stage, index) => { const stageSettings = settings[stage]; return <div className={stageSettings?.enabled ? "enabled" : "disabled"} key={stage}><span>{index + 1}</span><strong>{stageLabels[stage]}</strong><b>{stageSettings?.enabled ? "ON" : "OFF"}</b><small>{stage === "hires" ? `${stageSettings.scale}x · ${compactName(stageSettings.model)}${isAnima ? ` · ${stageSettings.executionMode === "usdu_tiled" ? "USDU 分块重绘" : "整图重绘"}` : ""}` : stage === "adetailer" ? `${compactName(stageSettings.detector)} · ${stageSettings.confidence}` : `${stageSettings.scale}x · ${String(stageSettings.quality).toUpperCase()}`}</small></div>; })}</div><p className="gallery-detail-line">Hires Seed · {settings.hires.seedMode === "inherit" ? "继承当前图片首轮 Seed" : settings.hires.seedMode === "random" ? "每张安全随机" : settings.hires.seed}</p></section>
-        <section className="gallery-detail-section"><header><span>ADETAILER DETAIL</span><strong>局部重绘参数</strong></header><dl><div><dt>Prompt</dt><dd>{settings.adetailer.prompt || "继承主 Prompt"}</dd></div><div><dt>负向</dt><dd>{settings.adetailer.negativePrompt || "继承主负向"}</dd></div><div><dt>蒙版</dt><dd>{settings.adetailer.maskMinRatio}–{settings.adetailer.maskMaxRatio} · blur {settings.adetailer.maskBlur}</dd></div><div><dt>重绘</dt><dd>{settings.adetailer.denoise} · {settings.adetailer.useSteps ? `${settings.adetailer.steps} steps` : "继承步数"}</dd></div></dl></section>
-      </div>
-      <footer><button type="button" onClick={() => setApplyOpen(true)}><SlidersHorizontal size={15} /><span><strong>应用参数</strong><small>选择性回填到生图区域</small></span><ChevronRight size={15} /></button></footer>
-      {applyOpen && <ApplySettingsDialog card={{ ...card, settings }} onClose={() => setApplyOpen(false)} onApply={onApply} />}
-    </aside>
+      <section className="gallery-detail-section"><header><span>POST PROCESS</span><strong>后处理开关与顺序</strong></header><div className="gallery-process-list">{settings.postprocessOrder.map((stage, index) => { const stageSettings = settings[stage]; return <div className={stageSettings?.enabled ? "enabled" : "disabled"} key={stage}><span>{index + 1}</span><strong>{stageLabels[stage]}</strong><b>{stageSettings?.enabled ? "ON" : "OFF"}</b><small>{stage === "hires" ? `${stageSettings.scale}x · ${compactName(stageSettings.model)}${isAnima ? ` · ${stageSettings.executionMode === "usdu_tiled" ? "USDU 分块重绘" : "整图重绘"}` : ""}` : stage === "adetailer" ? `${compactName(stageSettings.detector)} · ${stageSettings.confidence}` : `${stageSettings.scale}x · ${String(stageSettings.quality).toUpperCase()}`}</small></div>; })}</div><p className="gallery-detail-line">Hires Seed · {settings.hires.seedMode === "inherit" ? "继承当前图片首轮 Seed" : settings.hires.seedMode === "random" ? "每张安全随机" : settings.hires.seed}</p></section>
+      <section className="gallery-detail-section"><header><span>ADETAILER DETAIL</span><strong>局部重绘参数</strong></header><dl><div><dt>Prompt</dt><dd>{settings.adetailer.prompt || "继承主 Prompt"}</dd></div><div><dt>负向</dt><dd>{settings.adetailer.negativePrompt || "继承主负向"}</dd></div><div><dt>蒙版</dt><dd>{settings.adetailer.maskMinRatio}–{settings.adetailer.maskMaxRatio} · blur {settings.adetailer.maskBlur}</dd></div><div><dt>重绘</dt><dd>{settings.adetailer.denoise} · {settings.adetailer.useSteps ? `${settings.adetailer.steps} steps` : "继承步数"}</dd></div></dl></section>
+    </div>
+    <footer><button type="button" onClick={() => onApplyOpenChange(true)}><SlidersHorizontal size={15} /><span><strong>应用参数</strong><small>选择性回填到生图区域</small></span><ChevronRight size={15} /></button></footer>
   </section>;
+}
+
+function GalleryDetail({ card, cards, onBack, onNavigate, onEdit, onDelete, onApply, onNotice }) {
+  const [imageIndex, setImageIndex] = useState(0);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 });
+  const panSession = useRef(null);
+  const closeViewer = () => {
+    if (drawerOpen) {
+      setDrawerOpen(false);
+      return;
+    }
+    onBack();
+  };
+  const dialogRef = useDialogLifecycle(!applyOpen, closeViewer);
+  const resetViewport = () => {
+    panSession.current = null;
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+    setZoomOrigin({ x: 50, y: 50 });
+  };
+  const viewerCards = cards?.length ? cards : [card];
+  const cardIndex = Math.max(0, viewerCards.findIndex((item) => item.id === card.id));
+  const imageCount = card.images?.length || 0;
+  const safeImageIndex = boundedGalleryImageIndex(imageIndex, imageCount);
+  const viewerCardKey = viewerCards.map((item) => item.id).join("\u0000");
+  useEffect(() => {
+    setImageIndex(0);
+    setDrawerOpen(false);
+    resetViewport();
+  }, [card.id]);
+  const changeCard = (direction) => {
+    if (viewerCards.length < 2) return;
+    onNavigate(viewerCards[(cardIndex + direction + viewerCards.length) % viewerCards.length]);
+  };
+  useEffect(() => {
+    if (applyOpen) return undefined;
+    const onKeyDown = (event) => {
+      if (event.defaultPrevented || ["INPUT", "TEXTAREA", "SELECT"].includes(event.target?.tagName)) return;
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        changeCard(-1);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        changeCard(1);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [applyOpen, cardIndex, viewerCardKey]);
+  const baseSettings = normalizedSettings({ ...card.settings, seed: galleryImageSeed(card.settings, safeImageIndex) });
+  const settings = { ...baseSettings, hires: { ...baseSettings.hires, ...selectedImageHiresSeed(baseSettings, safeImageIndex) } };
+  const image = card.images?.[safeImageIndex];
+  const isAnima = settings.model === "Anima";
+  const zoomAtPointer = (event) => {
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    setZoomOrigin({ x: clampViewerValue(((event.clientX - rect.left) / rect.width) * 100, 0, 100), y: clampViewerValue(((event.clientY - rect.top) / rect.height) * 100, 0, 100) });
+    setZoom((current) => {
+      const nextZoom = clampViewerValue(current * (event.deltaY < 0 ? 1.18 : 0.84), 1, 5);
+      if (nextZoom === 1) setPan({ x: 0, y: 0 });
+      return nextZoom;
+    });
+  };
+  const beginPan = (event) => {
+    if ((event.pointerType === "mouse" ? event.button !== 2 : !event.isPrimary) || zoom <= 1) return;
+    event.preventDefault();
+    panSession.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, startX: pan.x, startY: pan.y };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+  const movePan = (event) => {
+    const current = panSession.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const limitX = rect.width * (zoom - 1) / 2;
+    const limitY = rect.height * (zoom - 1) / 2;
+    setPan({ x: clampViewerValue(current.startX + event.clientX - current.x, -limitX, limitX), y: clampViewerValue(current.startY + event.clientY - current.y, -limitY, limitY) });
+  };
+  const endPan = (event) => {
+    if (!panSession.current || panSession.current.pointerId !== event.pointerId) return;
+    panSession.current = null;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+  return <div className={`gallery-focus${drawerOpen ? " inspector-open" : ""}`}>
+    <div className="gallery-focus-backdrop" aria-hidden="true" />
+    <section ref={dialogRef} className="gallery-focus-shell" role="dialog" aria-modal="true" aria-labelledby="gallery-viewer-title" tabIndex="-1">
+      <header className="gallery-viewer-topline"><div><span>NOW VIEWING / {String(cardIndex + 1).padStart(2, "0")} OF {String(viewerCards.length).padStart(2, "0")}</span><h1 id="gallery-viewer-title" title={card.title || settings.positive}>{displayTitle(card)}</h1></div><div><button type="button" className={drawerOpen ? "active" : ""} aria-pressed={drawerOpen} onClick={() => setDrawerOpen((current) => !current)}><SlidersHorizontal size={15} /><span>参数</span></button><button type="button" className="gallery-viewer-reset-zoom" disabled={zoom === 1 && pan.x === 0 && pan.y === 0} title="重置缩放与平移" onClick={resetViewport}><RefreshCw size={14} /><span>{Math.round(zoom * 100)}%</span></button><button type="button" className="gallery-viewer-close" aria-label="关闭图片预览" onClick={onBack}><X size={18} /><span>关闭</span></button></div></header>
+      <div className="gallery-viewer-content"><button type="button" className="gallery-viewer-nav previous" aria-label="上一张精选" disabled={viewerCards.length < 2} onClick={() => changeCard(-1)}><ArrowLeft size={18} /></button><figure className="gallery-viewer-figure"><div className={`gallery-viewer-image-viewport${zoom > 1 ? " zoomed" : ""}${panSession.current ? " panning" : ""}`} onWheel={zoomAtPointer} onDoubleClick={() => { if (zoom > 1) resetViewport(); else setZoom(2.5); }} onPointerDown={beginPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan} onContextMenu={(event) => { if (zoom > 1) event.preventDefault(); }}>{image ? <FocusImage key={image.id || image.url} image={image} alt={displayTitle(card)} style={{ "--gallery-viewer-zoom": zoom, "--gallery-viewer-pan-x": `${pan.x}px`, "--gallery-viewer-pan-y": `${pan.y}px`, "--gallery-viewer-origin-x": `${zoomOrigin.x}%`, "--gallery-viewer-origin-y": `${zoomOrigin.y}%` }} /> : <div className="gallery-viewer-empty"><ImageIcon size={42} /><strong>{card.title?.trim() || "无图片精选卡片"}</strong><p>{settings.positive || "未填写 Prompt"}</p></div>}</div><figcaption><div><span>{card.collection_id} / {settings.model} / {settings.size.width} × {settings.size.height} / IMAGE {String(imageCount ? safeImageIndex + 1 : 0).padStart(2, "0")} OF {String(imageCount).padStart(2, "0")}</span><strong>{displayTitle(card)}</strong></div><p>滚轮或双击缩放 · 右键/触摸拖拽 · Esc 关闭</p></figcaption>{imageCount > 1 && <div className="gallery-viewer-thumbs">{card.images.map((item, index) => <button type="button" className={index === safeImageIndex ? "active" : ""} key={item.id} aria-label={`查看图片 ${index + 1}`} onClick={() => { setImageIndex(index); resetViewport(); }}><img src={thumbUrl(item)} alt="" loading="lazy" decoding="async" /><b>{String(index + 1).padStart(2, "0")}</b></button>)}</div>}</figure><button type="button" className="gallery-viewer-nav next" aria-label="下一张精选" disabled={viewerCards.length < 2} onClick={() => changeCard(1)}><ArrowRight size={18} /></button></div>
+      <div className="gallery-viewer-drawer" aria-hidden={!drawerOpen}><button type="button" className="gallery-viewer-drawer-backdrop" tabIndex={drawerOpen ? 0 : -1} aria-label="关闭参数面板" onClick={() => setDrawerOpen(false)} /><aside className="gallery-viewer-drawer-sheet" inert={drawerOpen ? undefined : ""}><header><div><span>GENERATION RECORD</span><strong>参数与复现</strong></div><button type="button" aria-label="关闭参数面板" onClick={() => setDrawerOpen(false)}><X size={17} /></button></header><GalleryInspector card={card} settings={settings} isAnima={isAnima} onEdit={onEdit} onDelete={onDelete} onNotice={onNotice} onApplyOpenChange={setApplyOpen} /></aside></div>
+    </section>
+    {applyOpen && <ApplySettingsDialog card={{ ...card, settings }} onClose={() => setApplyOpen(false)} onApply={onApply} />}
+  </div>;
 }
 
 export default function GalleryPage({ currentSettings, focus, onApplySettings, onApplyPrompt, onNotice }) {
@@ -882,6 +993,8 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
   const [promptLoading, setPromptLoading] = useState(true);
   const [promptError, setPromptError] = useState("");
   const [promptDialog, setPromptDialog] = useState(null);
+  const [gallerySearch, setGallerySearch] = useState("");
+  const [galleryFilter, setGalleryFilter] = useState("all");
   const dragSession = useRef(null);
   const refresh = async () => {
     setLoading(true);
@@ -919,7 +1032,31 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
     if (focus.cardId) setSelectedCard(data.cards.find((item) => item.id === focus.cardId) || null);
   }, [focus, loading, data.cards]);
   const cardsByCollection = new Map(data.collections.map((collection) => [collection.id, data.cards.filter((card) => card.collection_id === collection.id)]));
-  const visibleCollections = selectedCollection === null ? data.collections : data.collections.filter((item) => item.id === selectedCollection);
+  const selectedCollectionRecord = data.collections.find((item) => item.id === selectedCollection) || null;
+  const searchQuery = gallerySearch.trim().toLocaleLowerCase();
+  const filteredCards = data.cards.filter((card) => {
+    if (selectedCollection !== null && card.collection_id !== selectedCollection) return false;
+    const imageCount = card.images?.length || 0;
+    if (galleryFilter === "single" && imageCount !== 1) return false;
+    if (galleryFilter === "multi" && imageCount < 2) return false;
+    if (galleryFilter === "text" && imageCount !== 0) return false;
+    if (!searchQuery) return true;
+    const settings = normalizedSettings(card.settings);
+    return [card.title, card.collection_id, settings.positive, settings.negative, settings.model, settings.checkpoint, settings.diffusionModel, ...settings.loras.map((item) => item.name || item.value)]
+      .some((value) => String(value || "").toLocaleLowerCase().includes(searchQuery));
+  });
+  const visibleImageCount = filteredCards.reduce((total, card) => total + (card.images?.length || 0), 0);
+  const collectionScopes = [null, ...data.collections.map((item) => item.id)];
+  const navigateCollection = (direction) => {
+    if (collectionScopes.length < 2) return;
+    const currentIndex = Math.max(0, collectionScopes.indexOf(selectedCollection));
+    setActiveSection("gallery");
+    setSelectedCollection(collectionScopes[(currentIndex + direction + collectionScopes.length) % collectionScopes.length]);
+    setSelectedCard(null);
+  };
+  const viewerCards = selectedCard
+    ? filteredCards.length ? filteredCards : selectedCollection === null ? data.cards : cardsByCollection.get(selectedCard.collection_id) || [selectedCard]
+    : [];
   const deleteCard = async (card) => {
     if (!window.confirm(`删除精选卡片“${displayTitle(card)}”？精选副本会被删除，原始生成图片不受影响。`)) return;
     try {
@@ -1040,34 +1177,37 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
       onNotice(applyError.message, true);
     }
   };
-  return <section className="gallery-page">
-    <aside className="gallery-collection-rail">
-      <header><div><span>PERSONAL LIBRARY</span><h1>画廊</h1></div><button type="button" title="创建收藏夹" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={17} /></button></header>
-      <button type="button" className={`gallery-all-collection ${activeSection === "gallery" && selectedCollection === null ? "active" : ""}`} onClick={() => { setActiveSection("gallery"); setSelectedCollection(null); setSelectedCard(null); }}><span><Images size={15} /><b>全部收藏夹</b></span><small>{data.cards.length} 卡片 · {data.collections.reduce((sum, item) => sum + item.image_count, 0)} 图片</small></button>
-      <button type="button" className={`gallery-prompt-library-nav ${activeSection === "prompts" ? "active" : ""}`} onClick={() => { setActiveSection("prompts"); setSelectedCard(null); }}><span><BookOpen size={15} /><b>词库</b></span><small>{promptEntries.length} 个 Prompt 词条</small></button>
-      <nav>{data.collections.map((collection, index) => <button type="button" className={activeSection === "gallery" && selectedCollection === collection.id ? "active" : ""} key={collection.id} onClick={() => { setActiveSection("gallery"); setSelectedCollection(collection.id); setSelectedCard(null); }}><i>{String(index + 1).padStart(2, "0")}</i><span><strong>{collection.id}</strong><small>{collection.description || "无简介"}</small></span><b>{collection.card_count}</b></button>)}</nav>
-      <footer>{activeSection === "gallery" && selectedCollection !== null && <button type="button" onClick={() => setCollectionDialog({ mode: "edit", collection: data.collections.find((item) => item.id === selectedCollection) })}><Pencil size={13} />编辑当前收藏夹</button>}<span>SQLite 本地索引 · 图片与 Prompt 独立保存</span></footer>
-    </aside>
-    <main className="gallery-main">
-      {activeSection === "prompts" ? <PromptLibrary entries={promptEntries} loading={promptLoading} error={promptError} onRefresh={() => void refreshPrompts()} onAdd={() => setPromptDialog({})} onEdit={(entry) => setPromptDialog({ entry })} onDelete={(entry) => void deletePromptEntry(entry)} onApply={(entry, target) => void applyPromptEntry(entry, target)} onNotice={onNotice} /> : selectedCard ? <GalleryDetail card={selectedCard} onBack={() => setSelectedCard(null)} onEdit={(card) => setEditor({ mode: "edit", card })} onDelete={deleteCard} onApply={onApplySettings} onNotice={onNotice} /> : <>
-        <header className="gallery-hero"><div><span>CURATED COLLECTION / {selectedCollection === null ? "ALL" : selectedCollection.toUpperCase()}</span><h2>{selectedCollection === null ? "全部精选" : selectedCollection}</h2><p>{selectedCollection === null ? "按收藏夹浏览全部精选卡片，点击卡片进入大图与完整参数视图。" : data.collections.find((item) => item.id === selectedCollection)?.description || "这个收藏夹还没有简介。"}</p></div><div><button type="button" className={selectedCollection === null ? "active" : ""} onClick={() => { setSelectedCollection(null); setSelectedCard(null); }}><Images size={15} />全部</button>{selectedCollection !== null && <button type="button" onClick={() => setCollectionDialog({ mode: "edit", collection: data.collections.find((item) => item.id === selectedCollection) })}><Pencil size={14} />管理</button>}<button type="button" onClick={() => void refresh()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={15} />刷新</button></div></header>
-        <div className="gallery-scroll">
-          {error && <div className="gallery-page-error"><X size={22} /><strong>无法读取画廊</strong><p>{error}</p></div>}
-          {!error && loading && <div className="gallery-loading"><RefreshCw className="spin" size={25} /><span>正在读取精选集</span></div>}
-          {!error && !loading && data.collections.length === 0 && <div className="gallery-first-empty"><span><Sparkles size={33} /></span><strong>创建第一个精选收藏夹</strong><p>自定义收藏夹 ID 与简介，然后添加生成结果或手动卡片。</p><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={15} />创建收藏夹</button></div>}
-          {!error && !loading && visibleCollections.map((collection) => {
-            const collectionCards = cardsByCollection.get(collection.id) || [];
-            return <section className="gallery-collection-section" key={collection.id}>
-              <header><div><span>{collection.id}</span><small>{collection.description || "PERSONAL COLLECTION"}</small></div><b>{collection.card_count} CARDS / {collection.image_count} IMAGES</b></header>
-              <div className={`gallery-card-grid ${dragState?.collectionId === collection.id ? "reordering" : ""}`}>
-                {collectionCards.map((card, index) => <GalleryCardTile card={card} tileIndex={index} key={card.id} onOpen={setSelectedCard} onMenu={openCardMenu} dragState={dragState} reorderBusy={reorderBusy === collection.id} onReorderStart={startCardReorder} onReorderOver={moveCardDuringReorder} onReorderEnd={finishCardReorder} />)}
-                <AddCardTile collectionId={collection.id} tileIndex={collectionCards.length} onAdd={(id, initialImages) => setEditor({ mode: "create", collectionId: id, initialImages })} onDropError={(message) => onNotice(message, true)} />
-              </div>
-            </section>;
-          })}
-        </div>
+  return <section className="gallery-page gallery-room">
+    <div className="gallery-room-grain" aria-hidden="true" />
+    <div className="gallery-room-wash" aria-hidden="true" />
+    <header className="gallery-room-header">
+      <div className="gallery-room-wordmark"><span><i /><i /><i /></span><strong>XIRIA GALLERY</strong><em>/</em><small>LOCAL</small></div>
+      <div className="gallery-room-status"><i />SQLITE CURATED ARCHIVE</div>
+      <button type="button" onClick={() => { setActiveSection(activeSection === "prompts" ? "gallery" : "prompts"); setSelectedCard(null); }}><span>{activeSection === "prompts" ? "RETURN TO THE ROOM" : "OPEN PROMPT LIBRARY"}</span>{activeSection === "prompts" ? <ArrowLeft size={15} /> : <BookOpen size={15} />}</button>
+    </header>
+    <main className="gallery-main gallery-room-main">
+      {activeSection === "prompts" ? <div className="gallery-room-prompts"><PromptLibrary entries={promptEntries} loading={promptLoading} error={promptError} onRefresh={() => void refreshPrompts()} onAdd={() => setPromptDialog({})} onEdit={(entry) => setPromptDialog({ entry })} onDelete={(entry) => void deletePromptEntry(entry)} onApply={(entry, target) => void applyPromptEntry(entry, target)} onNotice={onNotice} /></div> : <>
+        <section className="gallery-room-archive">
+          <nav className="gallery-room-library" aria-label="画廊收藏夹"><button type="button" className={selectedCollection === null ? "active" : ""} onClick={() => { setSelectedCollection(null); setSelectedCard(null); }}><i />全部作品 <b>{data.cards.length}</b></button>{data.collections.map((collection) => <button type="button" className={selectedCollection === collection.id ? "active" : ""} key={collection.id} onClick={() => { setSelectedCollection(collection.id); setSelectedCard(null); }}><i />{collection.id} <b>{collection.card_count}</b></button>)}</nav>
+          <div className="gallery-room-navigator"><button type="button" aria-label="上一个收藏夹" disabled={collectionScopes.length < 2} onClick={() => navigateCollection(-1)}><ArrowLeft size={17} /></button><div><span>{selectedCollection === null ? "ALL COLLECTIONS" : "CURRENT COLLECTION"}</span><strong>{selectedCollection === null ? "全部作品" : selectedCollection}</strong><small>{selectedCollectionRecord?.description || (selectedCollection === null ? "跨收藏夹浏览全部本地精选卡片" : "这个收藏夹还没有简介")}</small></div><button type="button" aria-label="下一个收藏夹" disabled={collectionScopes.length < 2} onClick={() => navigateCollection(1)}><ArrowRight size={17} /></button></div>
+          <div className="gallery-room-tools">
+            <label><Search size={15} /><input type="search" value={gallerySearch} onChange={(event) => setGallerySearch(event.target.value)} placeholder="搜索标题、Prompt、模型或 LoRA" />{gallerySearch && <button type="button" aria-label="清空搜索" onClick={() => setGallerySearch("")}><X size={13} /></button>}</label>
+            <div className="gallery-room-filters">{[["all", "全部"], ["single", "单图"], ["multi", "多图"], ["text", "无图卡片"]].map(([id, label]) => <button type="button" className={galleryFilter === id ? "active" : ""} key={id} onClick={() => setGalleryFilter(id)}>{label}</button>)}</div>
+            <div className="gallery-room-actions"><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={14} />新建收藏夹</button>{selectedCollectionRecord && <AddCardTile collectionId={selectedCollectionRecord.id} onAdd={(id, initialImages) => setEditor({ mode: "create", collectionId: id, initialImages })} onDropError={(message) => onNotice(message, true)} />}{selectedCollectionRecord && <button type="button" onClick={() => setCollectionDialog({ mode: "edit", collection: selectedCollectionRecord })}><Pencil size={14} />管理</button>}<button type="button" onClick={() => void refresh()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={14} />刷新</button></div>
+          </div>
+          <div className="gallery-room-meta"><span>{filteredCards.length} STUDIES</span><i /><span>{visibleImageCount} IMAGES</span><b>按住卡片可拖拽排序 · 右键管理</b></div>
+          <div className="gallery-scroll gallery-room-scroll">
+            {error && <div className="gallery-page-error"><X size={22} /><strong>无法读取画廊</strong><p>{error}</p></div>}
+            {!error && loading && <div className="gallery-loading"><RefreshCw className="spin" size={25} /><span>正在读取精选集</span></div>}
+            {!error && !loading && data.collections.length === 0 && <div className="gallery-first-empty"><span><Sparkles size={33} /></span><strong>创建第一个精选收藏夹</strong><p>自定义收藏夹 ID 与简介，然后添加生成结果或手动卡片。</p><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={15} />创建收藏夹</button></div>}
+            {!error && !loading && data.collections.length > 0 && filteredCards.length === 0 && <div className="gallery-first-empty"><span><FolderOpen size={33} /></span><strong>{gallerySearch || galleryFilter !== "all" ? "没有匹配的作品" : "这个收藏夹还是空的"}</strong><p>{gallerySearch || galleryFilter !== "all" ? "尝试清空搜索或切换筛选条件。" : "从生图结果加入画廊，或手动添加一张精选卡片。"}</p>{selectedCollectionRecord && <button type="button" onClick={() => setEditor({ mode: "create", collectionId: selectedCollectionRecord.id, initialImages: [] })}><ImagePlus size={15} />添加作品</button>}</div>}
+            {!error && !loading && filteredCards.length > 0 && <GalleryCardColumns cards={filteredCards} dragState={dragState} reorderBusy={Boolean(reorderBusy)} onOpen={setSelectedCard} onMenu={openCardMenu} onReorderStart={startCardReorder} onReorderOver={moveCardDuringReorder} onReorderEnd={finishCardReorder} />}
+          </div>
+        </section>
       </>}
+      <footer className="gallery-room-footer"><span>XIRIA CANVAS AI / LOCAL GALLERY</span><span>SQLITE INDEX · INDEPENDENT COPIES</span><span>2026 / PERSONAL ARCHIVE</span></footer>
     </main>
+    {selectedCard && createPortal(<GalleryDetail card={selectedCard} cards={viewerCards} onBack={() => setSelectedCard(null)} onNavigate={setSelectedCard} onEdit={(card) => { setSelectedCard(null); setEditor({ mode: "edit", card }); }} onDelete={deleteCard} onApply={onApplySettings} onNotice={onNotice} />, document.body)}
     {dragState && <div className="gallery-drag-ghost" style={{ left: dragState.x, top: dragState.y }}><Images size={14} /><span><strong>正在排序</strong><small>{displayTitle(data.cards.find((card) => card.id === dragState.cardId), 42)}</small></span></div>}
     {cardMenu && <GalleryCardMenu menu={cardMenu} onClose={() => setCardMenu(null)} onEdit={editFromCardMenu} onDelete={deleteFromCardMenu} />}
     {collectionDialog && <CollectionDialog collection={collectionDialog.collection} onClose={() => setCollectionDialog(null)} onSaved={saveCollection} onDeleted={collectionDeleted} />}

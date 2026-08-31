@@ -116,3 +116,89 @@ export function writeWorkspaceLayout(storage, layout) {
   }
   return normalized;
 }
+
+// The image workspace owns a separate right-hand rail. Keeping its state in a different key means
+// a comfortable image-to-image layout never changes the generate page's left configuration panel.
+export const IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY = "xirai-image-workspace-layout-v1";
+export const IMAGE_WORKSPACE_LAYOUT_SCHEMA_VERSION = 1;
+export const IMAGE_CONTROLS_MINIMUM_WIDTH = 300;
+export const IMAGE_CONTROLS_MAXIMUM_WIDTH = 540;
+export const IMAGE_CONTROLS_COLLAPSE_WIDTH = 208;
+export const IMAGE_CONTROLS_WIDTH_STEP = 16;
+export const DEFAULT_IMAGE_WORKSPACE_LAYOUT = Object.freeze({ controlsWidth: 0, controlsCollapsed: false });
+
+export function clampImageControlsWidth(value) {
+  const numeric = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+  if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+  return Math.round(Math.min(IMAGE_CONTROLS_MAXIMUM_WIDTH, Math.max(IMAGE_CONTROLS_MINIMUM_WIDTH, numeric)));
+}
+
+export function normalizeImageWorkspaceLayout(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    controlsWidth: clampImageControlsWidth(source.controlsWidth),
+    controlsCollapsed: source.controlsCollapsed === true,
+  };
+}
+
+export function isDefaultImageWorkspaceLayout(layout) {
+  const normalized = normalizeImageWorkspaceLayout(layout);
+  return normalized.controlsWidth === DEFAULT_IMAGE_WORKSPACE_LAYOUT.controlsWidth
+    && normalized.controlsCollapsed === DEFAULT_IMAGE_WORKSPACE_LAYOUT.controlsCollapsed;
+}
+
+// The rail is on the right, so moving its left seam left increases its width. As with the generate
+// page, every movement starts from the pointer-down width so a clamped edge cannot accumulate drift.
+export function resizeImageControlsPanel(layout, startWidth, deltaX) {
+  const current = normalizeImageWorkspaceLayout(layout);
+  const target = (Number.isFinite(startWidth) ? startWidth : 0) - (Number.isFinite(deltaX) ? deltaX : 0);
+  if (target < IMAGE_CONTROLS_COLLAPSE_WIDTH) {
+    return { controlsWidth: clampImageControlsWidth(startWidth) || current.controlsWidth, controlsCollapsed: true };
+  }
+  return { controlsWidth: clampImageControlsWidth(target), controlsCollapsed: false };
+}
+
+export function steppedImageControlsPanel(layout, direction, measuredWidth) {
+  const current = normalizeImageWorkspaceLayout(layout);
+  if (current.controlsCollapsed) return direction > 0 ? { ...current, controlsCollapsed: false } : current;
+  const base = current.controlsWidth || clampImageControlsWidth(measuredWidth) || IMAGE_CONTROLS_MINIMUM_WIDTH;
+  return { controlsWidth: clampImageControlsWidth(base + direction * IMAGE_CONTROLS_WIDTH_STEP), controlsCollapsed: false };
+}
+
+export function toggleImageControlsPanel(layout) {
+  const current = normalizeImageWorkspaceLayout(layout);
+  return { ...current, controlsCollapsed: !current.controlsCollapsed };
+}
+
+export function imageWorkspaceLayoutClassName(layout) {
+  const normalized = normalizeImageWorkspaceLayout(layout);
+  if (normalized.controlsCollapsed) return "image-workspace controls-collapsed";
+  return normalized.controlsWidth ? "image-workspace controls-sized" : "image-workspace";
+}
+
+export function imageWorkspaceLayoutStyle(layout) {
+  const normalized = normalizeImageWorkspaceLayout(layout);
+  if (normalized.controlsCollapsed || !normalized.controlsWidth) return undefined;
+  return { "--i2i-controls-width": `${normalized.controlsWidth}px` };
+}
+
+export function readImageWorkspaceLayout(storage) {
+  try {
+    const saved = storage?.getItem(IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY);
+    if (!saved) return { ...DEFAULT_IMAGE_WORKSPACE_LAYOUT };
+    return normalizeImageWorkspaceLayout(JSON.parse(saved));
+  } catch {
+    return { ...DEFAULT_IMAGE_WORKSPACE_LAYOUT };
+  }
+}
+
+export function writeImageWorkspaceLayout(storage, layout) {
+  const normalized = normalizeImageWorkspaceLayout(layout);
+  try {
+    if (isDefaultImageWorkspaceLayout(normalized)) storage?.removeItem(IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY);
+    else storage?.setItem(IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY, JSON.stringify({ schemaVersion: IMAGE_WORKSPACE_LAYOUT_SCHEMA_VERSION, ...normalized }));
+  } catch {
+    // A browser that blocks storage still has a functional, session-only layout.
+  }
+  return normalized;
+}

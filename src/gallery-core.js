@@ -143,11 +143,31 @@ export function displayTitle(card, maxLength = 96) {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength).trimEnd()}…` : normalized;
 }
 
-export function useDialogLifecycle(open, onClose, focusReturnSelector = "") {
+export function boundedGalleryImageIndex(index, imageCount) {
+  const count = Number.isFinite(imageCount) ? Math.max(0, Math.trunc(imageCount)) : 0;
+  if (!count) return 0;
+  const numeric = Number.isFinite(index) ? Math.trunc(index) : 0;
+  return Math.max(0, Math.min(count - 1, numeric));
+}
+
+export function galleryImageSeed(settings, imageIndex) {
+  return settings?.imageSeeds?.[imageIndex] ?? settings?.seed;
+}
+
+export function distributeGalleryCards(cards, columnCount) {
+  const count = Math.max(1, Math.trunc(columnCount) || 1);
+  const columns = Array.from({ length: count }, () => []);
+  for (const [index, card] of (Array.isArray(cards) ? cards : []).entries()) columns[index % count].push(card);
+  return columns;
+}
+
+export function useDialogLifecycle(open, onClose, focusReturnSelector = "", canClose = true) {
   const dialogRef = useRef(null);
   const closeRef = useRef(onClose);
+  const canCloseRef = useRef(canClose);
   const focusReturnSelectorRef = useRef(focusReturnSelector);
   closeRef.current = onClose;
+  canCloseRef.current = canClose;
   focusReturnSelectorRef.current = focusReturnSelector;
   useEffect(() => {
     if (!open) return undefined;
@@ -158,12 +178,12 @@ export function useDialogLifecycle(open, onClose, focusReturnSelector = "") {
     const handleKeyDown = (event) => {
       if (event.key === "Escape") {
         event.stopPropagation();
-        closeRef.current();
+        if (canCloseRef.current) closeRef.current();
         return;
       }
       if (event.key !== "Tab") return;
       const focusable = [...(dialogRef.current?.querySelectorAll(focusableSelector) || [])]
-        .filter((element) => !element.hidden && element.getClientRects().length > 0);
+        .filter((element) => !element.hidden && !element.closest("[inert]") && element.getClientRects().length > 0);
       if (!focusable.length) {
         event.preventDefault();
         dialogRef.current?.focus();

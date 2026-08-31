@@ -10,9 +10,10 @@ test("image workspace has responsive layout contracts", async () => {
   // came later — the sort of agreement that survives until someone reorders the file.
   const bases = [...css.matchAll(/^\.image-workspace \{/gm)];
   assert.equal(bases.length, 1, "the grid is defined once");
-  // The stage takes everything the rail does not need; row 2 is the scrollport each column lives in.
-  assert.match(css, /^\.image-workspace \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) minmax\(330px, 400px\);[^}]*grid-template-rows: auto minmax\(0, 1fr\)/m);
-  assert.match(css, /@media \(max-width: 1279px\)[\s\S]*?minmax\(0, 1fr\) minmax\(300px, 340px\)/);
+  // The stage takes everything the rail does not need; the 7px middle track is the resize seam and
+  // row 2 is the scrollport the stage and parameter rail live in.
+  assert.match(css, /^\.image-workspace \{[^}]*display: grid;[^}]*grid-template-columns: minmax\(0, 1fr\) 7px minmax\(330px, 400px\);[^}]*grid-template-rows: auto minmax\(0, 1fr\)/m);
+  assert.match(css, /@media \(max-width: 1279px\)[\s\S]*?minmax\(0, 1fr\) 7px minmax\(300px, 340px\)/);
   assert.match(css, /@media \(max-width: 959px\)[\s\S]*?\.image-workspace \{ display: block/);
   assert.match(css, /@media \(max-width: 640px\)[\s\S]*?overflow-x: auto/);
 });
@@ -111,6 +112,25 @@ test("shared SizeGrid exposes pointer capture and keyboard controls", async () =
   const grid = await read("src/SizeGrid.jsx");
   for (const anchor of ["setPointerCapture", 'role="slider"', "ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown", "Home", "End", "tabIndex={disabled ? -1 : 0}"]) assert.ok(grid.includes(anchor), `${anchor} is required`);
   assert.match(grid, /min = 0, max = 2048, step = 64/);
+  assert.match(grid, /grid\.setPointerCapture\?\.\(event\.pointerId\)/, "the grid owns pointer capture after the nested handle starts a drag");
+  assert.match(grid, /drag\.startWidth \+ widthDelta/, "handle drags preserve the initial width instead of jumping to the pointer");
+  assert.match(grid, /className="grid-handle-hitbox"/, "the visual handle has an expanded pointer target");
+});
+
+test("image controls use the shared seam interaction with an independent right-side layout", async () => {
+  const page = await read("src/ImageToImagePage.jsx");
+  const layout = await read("src/workspace-layout.js");
+  const css = await read("src/styles.css");
+  assert.match(page, /imageWorkspaceLayoutClassName\(imageWorkspaceLayout\)/);
+  assert.match(page, /className="panel-resizer i2i-controls-resizer"/);
+  for (const anchor of ["beginControlsResize", "continueControlsResize", "endControlsResize", "controlsResizeKeyDown", "toggleImageControlsPanel"]) assert.ok(page.includes(anchor), `${anchor} is required`);
+  assert.match(page, /imageWorkspaceLayout\.controlsCollapsed \? "展开右侧参数面板"/);
+  assert.match(layout, /IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY = "xirai-image-workspace-layout-v1"/);
+  assert.match(layout, /const target = \(Number\.isFinite\(startWidth\) \? startWidth : 0\) - \(Number\.isFinite\(deltaX\) \? deltaX : 0\)/);
+  assert.match(css, /\.image-workspace \{[^}]*grid-template-columns: minmax\(0, 1fr\) 7px minmax\(330px, 400px\)/);
+  assert.match(css, /\.image-workspace\.controls-sized \{[^}]*var\(--i2i-controls-width\)/);
+  assert.match(css, /\.image-workspace\.controls-collapsed \.i2i-controls-panel \{[^}]*visibility: hidden/);
+  assert.match(css, /@media \(max-width: 959px\) \{[\s\S]*?\.image-workspace \.panel-resizer \{ display: none; \}[\s\S]*?\.image-workspace\.controls-collapsed \.i2i-controls-panel \{ visibility: visible/);
 });
 
 test("i2i custom dimensions use the shared 64..2048 grid and latest-wins source token", async () => {

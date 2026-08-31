@@ -5,19 +5,34 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import {
+  DEFAULT_IMAGE_WORKSPACE_LAYOUT,
   DEFAULT_WORKSPACE_LAYOUT,
+  IMAGE_CONTROLS_COLLAPSE_WIDTH,
+  IMAGE_CONTROLS_MAXIMUM_WIDTH,
+  IMAGE_CONTROLS_MINIMUM_WIDTH,
+  IMAGE_CONTROLS_WIDTH_STEP,
+  IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY,
   LEFT_PANEL_COLLAPSE_WIDTH,
   LEFT_PANEL_MAXIMUM_WIDTH,
   LEFT_PANEL_MINIMUM_WIDTH,
   LEFT_PANEL_WIDTH_STEP,
   WORKSPACE_LAYOUT_STORAGE_KEY,
+  clampImageControlsWidth,
   clampLeftPanelWidth,
+  imageWorkspaceLayoutClassName,
+  imageWorkspaceLayoutStyle,
   isDefaultWorkspaceLayout,
+  normalizeImageWorkspaceLayout,
   normalizeWorkspaceLayout,
+  readImageWorkspaceLayout,
   readWorkspaceLayout,
+  resizeImageControlsPanel,
   resizeLeftPanel,
+  steppedImageControlsPanel,
   steppedLeftPanel,
+  toggleImageControlsPanel,
   toggleLeftPanel,
+  writeImageWorkspaceLayout,
   workspaceLayoutClassName,
   workspaceLayoutStyle,
   writeWorkspaceLayout,
@@ -110,6 +125,32 @@ test("the keyboard reaches everything the pointer does", () => {
   assert.deepEqual(toggleLeftPanel({ leftWidth: 400, leftCollapsed: true }), { leftWidth: 400, leftCollapsed: false });
 });
 
+test("the image controls rail has independent right-side resize and collapse semantics", () => {
+  assert.deepEqual({ ...DEFAULT_IMAGE_WORKSPACE_LAYOUT }, { controlsWidth: 0, controlsCollapsed: false });
+  assert.equal(imageWorkspaceLayoutClassName(DEFAULT_IMAGE_WORKSPACE_LAYOUT), "image-workspace");
+  assert.equal(imageWorkspaceLayoutStyle(DEFAULT_IMAGE_WORKSPACE_LAYOUT), undefined);
+
+  assert.equal(clampImageControlsWidth(10), IMAGE_CONTROLS_MINIMUM_WIDTH);
+  assert.equal(clampImageControlsWidth(9000), IMAGE_CONTROLS_MAXIMUM_WIDTH);
+  assert.deepEqual(normalizeImageWorkspaceLayout({ controlsWidth: 9000, controlsCollapsed: "yes" }), { controlsWidth: IMAGE_CONTROLS_MAXIMUM_WIDTH, controlsCollapsed: false });
+
+  // This rail sits on the right: moving its left seam left is a negative delta and makes it wider.
+  assert.deepEqual(resizeImageControlsPanel(DEFAULT_IMAGE_WORKSPACE_LAYOUT, 360, -60), { controlsWidth: 420, controlsCollapsed: false });
+  assert.deepEqual(resizeImageControlsPanel(DEFAULT_IMAGE_WORKSPACE_LAYOUT, 360, 160), { controlsWidth: 360, controlsCollapsed: true });
+  assert.ok(360 - 160 < IMAGE_CONTROLS_COLLAPSE_WIDTH);
+  assert.deepEqual(steppedImageControlsPanel(DEFAULT_IMAGE_WORKSPACE_LAYOUT, 1, 360), { controlsWidth: 360 + IMAGE_CONTROLS_WIDTH_STEP, controlsCollapsed: false });
+  assert.deepEqual(steppedImageControlsPanel({ controlsWidth: 400, controlsCollapsed: true }, 1, 0), { controlsWidth: 400, controlsCollapsed: false });
+  assert.deepEqual(toggleImageControlsPanel({ controlsWidth: 400, controlsCollapsed: false }), { controlsWidth: 400, controlsCollapsed: true });
+
+  const storage = fakeStorage();
+  writeWorkspaceLayout(storage, { leftWidth: 420, leftCollapsed: false });
+  writeImageWorkspaceLayout(storage, { controlsWidth: 440, controlsCollapsed: false });
+  assert.deepEqual(readImageWorkspaceLayout(storage), { controlsWidth: 440, controlsCollapsed: false });
+  writeImageWorkspaceLayout(storage, DEFAULT_IMAGE_WORKSPACE_LAYOUT);
+  assert.equal(storage.map.has(IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY), false, "resetting the image rail only removes its own key");
+  assert.equal(storage.map.has(WORKSPACE_LAYOUT_STORAGE_KEY), true, "the generate page layout remains intact");
+});
+
 test("the default is stored as absence, so a reset leaves nothing to be read back", () => {
   const storage = fakeStorage();
   writeWorkspaceLayout(storage, { leftWidth: 420, leftCollapsed: false });
@@ -145,7 +186,7 @@ test("layout is stored apart from every creation parameter, so a reset cannot re
   // prose, which necessarily names the stores this module exists to stay out of.
   assert.match(layout, /WORKSPACE_LAYOUT_STORAGE_KEY = "xirai-workspace-layout-v1"/);
   const keys = [...layout.matchAll(/(?:get|set|remove)Item\(([^,)]+)/g)].map((match) => match[1].trim());
-  assert.deepEqual([...new Set(keys)], ["WORKSPACE_LAYOUT_STORAGE_KEY"], "layout may read and write exactly its own key");
+  assert.deepEqual([...new Set(keys)], ["WORKSPACE_LAYOUT_STORAGE_KEY", "IMAGE_WORKSPACE_LAYOUT_STORAGE_KEY"], "each workspace may read and write only its dedicated layout key");
   assert.ok(!/^import /m.test(layout), "the layout model is dependency-free, so it cannot reach a parameter store");
   assert.ok(!/fetch\(|\/api\//.test(layout), "layout is browser-local and never posted to the control plane");
 });
@@ -186,7 +227,7 @@ test("the panel is resizable and collapsible from the gutter, and the grid keeps
   assert.match(styles, /\.workspace\.left-collapsed \.panel-resizer \{[^}]*background: color-mix/);
   // Below the two-column breakpoint there is no gutter, and the panel is the only place those
   // controls exist, so a collapse chosen on a wide screen must not hide them on a narrow one.
-  assert.match(styles, /@media \(max-width: 1100px\) \{[\s\S]*?\.panel-resizer \{ display: none; \}/);
+  assert.match(styles, /@media \(max-width: 1100px\) \{[\s\S]*?\.workspace \.panel-resizer \{ display: none; \}/);
   assert.match(styles, /@media \(max-width: 1100px\) \{[\s\S]*?\.workspace\.left-collapsed \.left-panel \{ visibility: visible/);
 });
 

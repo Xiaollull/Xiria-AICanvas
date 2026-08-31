@@ -38,6 +38,16 @@ import WorkspaceSelect from "./WorkspaceSelect";
 import { hiresEffectiveSteps, secureRandomUint64Seed } from "./hires-settings";
 import { formatWeight } from "./lora-weight";
 import {
+  DEFAULT_IMAGE_WORKSPACE_LAYOUT,
+  imageWorkspaceLayoutClassName,
+  imageWorkspaceLayoutStyle,
+  readImageWorkspaceLayout,
+  resizeImageControlsPanel,
+  steppedImageControlsPanel,
+  toggleImageControlsPanel,
+  writeImageWorkspaceLayout,
+} from "./workspace-layout";
+import {
   ADETAILER_UNIT_LIMIT,
   DISTILLED_GUIDANCE_ENGINES,
   activeADetailerUnits,
@@ -292,11 +302,54 @@ export default function ImageToImagePage({
   const rtxReady = !config.rtx.enabled || (engine.features?.rtx !== false && postprocess.rtxHealth?.available === true && dimensions.valid);
   const [dragging, setDragging] = useState(false);
   const [loadingSource, setLoadingSource] = useState(false);
+  const [imageWorkspaceLayout, setImageWorkspaceLayout] = useState(() => readImageWorkspaceLayout(typeof window === "undefined" ? null : window.localStorage));
+  const [controlsResizing, setControlsResizing] = useState(false);
   const fileInputRef = useRef(null);
   const sourceTokenRef = useRef(0);
+  const controlsPanelRef = useRef(null);
+  const controlsResizeRef = useRef(null);
   const running = job.status === "running";
   const update = (patch) => onSettingsChange({ ...config, ...patch });
   const updateStage = (stage, patch) => update({ [stage]: { ...config[stage], ...patch } });
+  const measuredControlsPanelWidth = () => controlsPanelRef.current?.getBoundingClientRect().width || 0;
+  const commitImageWorkspaceLayout = (next) => {
+    setImageWorkspaceLayout((current) => writeImageWorkspaceLayout(window.localStorage, typeof next === "function" ? next(current) : next));
+  };
+  const beginControlsResize = (event) => {
+    if (event.button !== 0) return;
+    controlsResizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: measuredControlsPanelWidth() };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setControlsResizing(true);
+  };
+  const continueControlsResize = (event) => {
+    const session = controlsResizeRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    setImageWorkspaceLayout((current) => resizeImageControlsPanel(current, session.startWidth, event.clientX - session.startX));
+  };
+  const endControlsResize = (event) => {
+    const session = controlsResizeRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    controlsResizeRef.current = null;
+    setControlsResizing(false);
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    commitImageWorkspaceLayout((current) => current);
+  };
+  const controlsResizeKeyDown = (event) => {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      commitImageWorkspaceLayout((current) => steppedImageControlsPanel(current, event.key === "ArrowLeft" ? 1 : -1, measuredControlsPanelWidth()));
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      commitImageWorkspaceLayout(toggleImageControlsPanel);
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      commitImageWorkspaceLayout({ ...DEFAULT_IMAGE_WORKSPACE_LAYOUT });
+    }
+  };
   const moveStage = (stage, direction) => {
     if (running) return;
     const index = order.indexOf(stage);
@@ -371,7 +424,7 @@ export default function ImageToImagePage({
   const sourceIssue = postprocessOnly ? postprocessSourceIssue(source) : "";
 
   return (
-    <section className="image-workspace">
+    <section className={`${imageWorkspaceLayoutClassName(imageWorkspaceLayout)}${controlsResizing ? " panel-resizing" : ""}`} style={imageWorkspaceLayoutStyle(imageWorkspaceLayout)}>
       <header className="i2i-page-head">
         <h1 className="eyebrow">{postprocessOnly ? "IMAGE POST-PROCESSING WORKBENCH" : "IMAGE TRANSFORMATION WORKBENCH"}</h1>
         <div className="i2i-head-status"><span className={source ? "ready" : ""}><i />{source ? "来源图已就绪" : "等待来源图"}</span><b>{canvas.width} × {canvas.height}</b></div>
@@ -496,7 +549,23 @@ export default function ImageToImagePage({
             what it produces and read as the supporting pair below it. */}
       </section>
 
-      <aside className="i2i-controls-panel panel">
+      <div
+        className="panel-resizer i2i-controls-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-expanded={!imageWorkspaceLayout.controlsCollapsed}
+        aria-label={imageWorkspaceLayout.controlsCollapsed ? "展开右侧参数面板" : "调整右侧参数面板宽度"}
+        tabIndex={0}
+        onPointerDown={beginControlsResize}
+        onPointerMove={continueControlsResize}
+        onPointerUp={endControlsResize}
+        onPointerCancel={endControlsResize}
+        onKeyDown={controlsResizeKeyDown}
+        onDoubleClick={() => commitImageWorkspaceLayout(toggleImageControlsPanel)}
+        title={imageWorkspaceLayout.controlsCollapsed ? "双击或向左拖动展开右侧参数面板" : "拖动调整宽度 · 双击折叠"}
+      />
+
+      <aside className="i2i-controls-panel panel" ref={controlsPanelRef}>
         <div className="panel-scroll">
           <div className="section-heading"><span>02</span><h2>模型引擎</h2><small className="i2i-section-kicker">与文生图共享</small></div>
           <div className="i2i-model-picker">
