@@ -30,6 +30,7 @@ try:
         resolve_anima_sampler,
         validate_prepared_anima_refinement_sigmas,
     )
+    from .gguf_loader import GGUF_SUFFIX, load_gguf_state_dict
     from .prompt_encoding import tokenize_weighted_prompt
 except ImportError:
     from anima_sampling import (
@@ -42,6 +43,7 @@ except ImportError:
         resolve_anima_sampler,
         validate_prepared_anima_refinement_sigmas,
     )
+    from gguf_loader import GGUF_SUFFIX, load_gguf_state_dict
     from prompt_encoding import tokenize_weighted_prompt
 
 
@@ -442,6 +444,34 @@ def _require_safetensors(path_value: str | Path, label: str) -> Path:
     if path.suffix.lower() != ".safetensors":
         raise ValueError(f"{label} must be a .safetensors checkpoint: {path}")
     return path
+
+
+def _require_diffusion_weights(path_value: str | Path, label: str) -> Path:
+    """A diffusion model may also arrive as GGUF; every other component is safetensors only.
+
+    GGUF is how several of these models are published at all below bf16, and the recommended-model
+    browser offers those files. The other three components have no GGUF worth reading: their
+    published quantisations are safetensors, and a GGUF text encoder is named in llama.cpp's own
+    key space rather than the checkpoint's, which is a translation this loader does not do.
+    """
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+    if path.suffix.lower() not in (".safetensors", GGUF_SUFFIX):
+        raise ValueError(f"{label} must be a .safetensors or {GGUF_SUFFIX} checkpoint: {path}")
+    return path
+
+
+def _load_diffusion_state_dict(path: Path, dtype: torch.dtype, deps, label: str) -> dict[str, torch.Tensor]:
+    """Read a diffusion model from either container into one plain state dict.
+
+    A GGUF is expanded to ``dtype`` here, which puts it in exactly the state the safetensors branch
+    reaches after ``resolve_quantized_state_dict``: from this point on nothing downstream can tell
+    the two apart, so conversion, LoRA fusion and the strict load stay single-path.
+    """
+    if path.suffix.lower() == GGUF_SUFFIX:
+        return load_gguf_state_dict(path, dtype=dtype, label=label)
+    return deps["load_file"](str(path), device="cpu")
 
 
 def _require_tokenizer_json(path_value: str | Path, label: str) -> Path:

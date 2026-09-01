@@ -41,7 +41,9 @@ try:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_diffusion_state_dict,
         _module_nbytes,
+        _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
         euler_ancestral_rf_step,
@@ -77,7 +79,9 @@ except ImportError:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_diffusion_state_dict,
         _module_nbytes,
+        _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
         euler_ancestral_rf_step,
@@ -586,7 +590,7 @@ def _load_flux2_vae(path: Path, dtype: torch.dtype, deps):
 
 def _load_flux2_transformer(path: Path, dtype: torch.dtype, deps, loras=(), state_dict=None):
     if state_dict is None:
-        state_dict = deps["load_file"](str(path), device="cpu")
+        state_dict = _load_diffusion_state_dict(path, dtype, deps, "FLUX.2 diffusion model")
     state_dict = normalize_flux_checkpoint_keys(state_dict)
     state_dict = resolve_quantized_state_dict(state_dict, dtype, "FLUX.2 diffusion model")
     config = infer_flux2_transformer_config(state_dict)
@@ -1348,7 +1352,7 @@ def load_flux2_runtime(
     Qwen3 file both mount through the same picker without the user declaring which is which.
     """
     deps = _runtime_dependencies()
-    diffusion_path = _require_safetensors(diffusion_model, "Flux2 diffusion model")
+    diffusion_path = _require_diffusion_weights(diffusion_model, "Flux2 diffusion model")
     encoder_path = _require_safetensors(text_encoder, "Flux2 text encoder")
     vae_path = _require_safetensors(vae, "Flux2 VAE")
 

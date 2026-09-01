@@ -1700,6 +1700,10 @@ def native_model_roots(engine: str):
 CHECKPOINT_EXTENSIONS = frozenset({".safetensors", ".ckpt"})
 LORA_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".pt", ".pth"})
 ANIMA_LORA_EXTENSIONS = frozenset({".safetensors"})
+# FLUX.1, FLUX.2 and Krea 2 also read a GGUF diffusion model, which is the only form some of their
+# quantisations are published in. The other three components stay safetensors: see
+# `anima_pipeline._require_diffusion_weights` for why a GGUF text encoder is not the same problem.
+NATIVE_DIFFUSION_EXTENSIONS = frozenset({".safetensors", ".gguf"})
 
 
 def validate_child_path(requested_path: str, root: Path, label: str):
@@ -1716,6 +1720,13 @@ def validate_anima_component(requested_path: str, root: Path, label: str):
     path = validate_child_path(requested_path, root, label)
     if path.suffix.lower() != ".safetensors":
         raise ValueError(f"{label} must be a .safetensors file")
+    return path
+
+
+def validate_native_diffusion_model(requested_path: str, root: Path, label: str):
+    path = validate_child_path(requested_path, root, label)
+    if path.suffix.lower() not in NATIVE_DIFFUSION_EXTENSIONS:
+        raise ValueError(f"{label} must be a .safetensors or .gguf file")
     return path
 
 
@@ -6312,7 +6323,7 @@ def run_generation(job_id: str, request: GenerateInput):
                 raise ValueError("Native Anima does not support ultra-low-memory mode")
         elif request.engine == "Flux":
             roots = flux_model_roots()
-            diffusion_model = validate_anima_component(
+            diffusion_model = validate_native_diffusion_model(
                 request.diffusion_model, roots["diffusion_model"], "Flux diffusion model"
             )
             text_encoder = validate_anima_component(
@@ -6339,7 +6350,7 @@ def run_generation(job_id: str, request: GenerateInput):
                 raise ValueError("Native Flux does not support ultra-low-memory mode")
         elif request.engine == "Flux2":
             roots = flux2_model_roots()
-            diffusion_model = validate_anima_component(
+            diffusion_model = validate_native_diffusion_model(
                 request.diffusion_model, roots["diffusion_model"], "Flux2 diffusion model"
             )
             text_encoder = validate_anima_component(
@@ -6364,7 +6375,7 @@ def run_generation(job_id: str, request: GenerateInput):
                 raise ValueError("Native Flux2 does not support ultra-low-memory mode")
         elif request.engine == "Krea2":
             roots = krea2_model_roots()
-            diffusion_model = validate_anima_component(
+            diffusion_model = validate_native_diffusion_model(
                 request.diffusion_model, roots["diffusion_model"], "Krea2 diffusion model"
             )
             text_encoder = validate_anima_component(

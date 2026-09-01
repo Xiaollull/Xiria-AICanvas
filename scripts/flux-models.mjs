@@ -1,7 +1,7 @@
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { readSafetensorsHeader } from "./anima-models.mjs";
+import { componentFileExtensions, readDiffusionModelHeader } from "./gguf-header.mjs";
 
 // FLUX.1 mounts four component files out of one shared set of directories, so the picker cannot
 // ask the user which file is which — it has to know. Every classifier below reads the same tensors
@@ -83,7 +83,7 @@ export function classifyFluxSafetensorsHeader(header) {
   return matches.length === 1 ? matches[0][0] : null;
 }
 
-async function scanFluxRoot(directory, role, relativeDirectory = "", readHeader = readSafetensorsHeader) {
+async function scanFluxRoot(directory, role, relativeDirectory = "", readHeader = readDiffusionModelHeader) {
   let entries;
   try {
     entries = await readdir(path.join(directory, relativeDirectory), { withFileTypes: true });
@@ -97,7 +97,7 @@ async function scanFluxRoot(directory, role, relativeDirectory = "", readHeader 
       models.push(...await scanFluxRoot(directory, role, relativePath, readHeader));
       continue;
     }
-    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".safetensors") continue;
+    if (!entry.isFile() || !componentFileExtensions(role).has(path.extname(entry.name).toLowerCase())) continue;
     try {
       const filePath = path.join(directory, relativePath);
       const [header, fileStat] = await Promise.all([readHeader(filePath), stat(filePath)]);
@@ -111,7 +111,7 @@ async function scanFluxRoot(directory, role, relativeDirectory = "", readHeader 
   return models;
 }
 
-export async function discoverFluxModels(roots, readHeader = readSafetensorsHeader) {
+export async function discoverFluxModels(roots, readHeader = readDiffusionModelHeader) {
   const entries = await Promise.all(Object.entries(roots).map(async ([role, directory]) => {
     const models = await scanFluxRoot(directory, role, "", readHeader);
     models.sort((first, second) => first.name.localeCompare(second.name, "en"));

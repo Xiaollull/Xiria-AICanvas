@@ -1,5 +1,6 @@
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -34,6 +35,8 @@ from flux_pipeline import (
     unmatched_lora_targets,
     unpack_flux_latents,
 )
+from gguf_loader import gguf_quantization_summary, read_gguf_header
+from test_gguf_loader import write_checkpoint_gguf
 
 
 HIDDEN = FLUX_ATTENTION_HEAD_DIM  # one attention head keeps the fixture small but architecturally real
@@ -281,6 +284,38 @@ class MixedPrecisionTests(unittest.TestCase):
         self.assertTrue(torch.allclose(
             transformer.x_embedder.weight.detach(), state["img_in.weight"], atol=1e-6
         ))
+
+
+class GgufCheckpointTests(unittest.TestCase):
+    """A GGUF diffusion model has to arrive at the transformer the safetensors path builds."""
+
+    def test_a_quantised_gguf_checkpoint_loads_through_the_same_conversion(self):
+        state = comfy_flux_checkpoint()
+        deps = _runtime_dependencies()
+        expected, expected_config, _report = _load_flux_transformer(
+            Path("unused.safetensors"), torch.float32, deps, state_dict=dict(state)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_checkpoint_gguf(Path(directory) / "flux.gguf", state)
+            # The fixture has to actually exercise a block layout, not degrade to a file of F32.
+            self.assertIn("Q8_0", gguf_quantization_summary(read_gguf_header(path)))
+            transformer, config, report = _load_flux_transformer(path, torch.float32, deps)
+        self.assertEqual(config, expected_config)
+        self.assertEqual(report["unclaimed_tensors"], [])
+        produced = dict(transformer.named_parameters())
+        self.assertEqual(sorted(produced), sorted(name for name, _ in expected.named_parameters()))
+        for name, parameter in expected.named_parameters():
+            self.assertTrue(torch.allclose(produced[name], parameter, atol=1e-3), name)
+
+    def test_the_loaded_size_is_read_from_the_shapes_rather_than_the_file(self):
+        # A Q8_0 file is about a quarter of what it becomes at bf16. Budgeting from its size on
+        # disk would admit a load that then cannot fit.
+        state = comfy_flux_checkpoint()
+        elements = sum(value.numel() for value in state.values())
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_checkpoint_gguf(Path(directory) / "flux.gguf", state)
+            self.assertEqual(flux_pipeline.flux_component_bytes([path]), elements * 2)
+            self.assertGreater(elements * 2, path.stat().st_size)
 
 
 class TransformerConfigTests(unittest.TestCase):

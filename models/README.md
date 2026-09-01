@@ -50,7 +50,9 @@ models/
   custom folders and arbitrary nesting are discovered automatically.
 - `loras/illustrious`: Illustrious LoRA root with the same recursive behavior.
 - `vae`: Standalone and shared VAEs used by split model pipelines.
-- `diffusion_models`: Anima, Flux, Krea 2, and other split diffusion weights.
+- `diffusion_models`: Anima, Flux, FLUX.2, Krea 2, and other split diffusion
+  weights. `.safetensors` throughout, plus `.gguf` for the three engines that
+  read it.
 - `text_encoders`: Standalone text encoders required by split model pipelines.
 - `embeddings`: Reserved for future textual inversion support.
 - `yolo`: Project-owned Ultralytics `.pt` detection or segmentation models for
@@ -83,8 +85,11 @@ and SD 1.x `.ckpt` checkpoints, with `.safetensors` preferred. Illustrious
 models must be placed under `checkpoints/illustrious` so the correct SDXL
 pipeline is selected.
 
-Anima, Flux, and Krea 2 downloads use `diffusion_models`, `text_encoders`, and
-`vae`. Native Anima generation is enabled and requires one compatible file from
-each directory. Its Qwen3 and T5 tokenizer JSON files ship with the program and
-are integrity-checked during setup, startup and updates. Flux and Krea 2 remain
-download-only until their native inference pipelines are added.
+Anima, FLUX.1, FLUX.2, and Krea 2 use `diffusion_models`, `text_encoders`, and
+`vae`. All four generate natively and each needs one compatible file from every
+directory it mounts. The Anima Qwen3 and T5 tokenizer JSON files ship with the
+program and are integrity-checked during setup, startup and updates.
+
+FLUX.1, FLUX.2, and Krea 2 also load a `.gguf` diffusion model; text encoders
+and VAEs stay `.safetensors`. A GGUF is expanded to the compute dtype while
+loading, so it is a smaller download rather than a smaller model in memory.

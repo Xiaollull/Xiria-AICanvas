@@ -37,6 +37,8 @@ from krea2_pipeline import (
     krea2_vae_layout,
     load_krea2_runtime,
 )
+from gguf_loader import gguf_quantization_summary, read_gguf_header
+from test_gguf_loader import write_checkpoint_gguf
 
 # One 128-wide attention head is the narrowest fixture `model_detection`'s fixed head width allows,
 # and it is the production width, so nothing about the attention is scaled down.
@@ -214,6 +216,25 @@ class TransformerConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError) as error:
             infer_krea2_transformer_config(state)
         self.assertIn("no multiplier between 1 and 16", str(error.exception))
+
+
+class Krea2GgufCheckpointTests(unittest.TestCase):
+    def test_a_quantised_gguf_checkpoint_loads_through_the_same_conversion(self):
+        state = comfy_krea2_checkpoint()
+        deps = _runtime_dependencies()
+        expected, expected_config, _report = _load_krea2_transformer(
+            None, torch.float32, deps, state_dict=dict(state)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_checkpoint_gguf(Path(directory) / "krea2.gguf", state)
+            self.assertIn("Q8_0", gguf_quantization_summary(read_gguf_header(path)))
+            transformer, config, report = _load_krea2_transformer(path, torch.float32, deps)
+        self.assertEqual(config, expected_config)
+        self.assertEqual(report["unclaimed_tensors"], [])
+        produced = dict(transformer.named_parameters())
+        self.assertEqual(sorted(produced), sorted(name for name, _ in expected.named_parameters()))
+        for name, parameter in expected.named_parameters():
+            self.assertTrue(torch.allclose(produced[name], parameter, atol=1e-3), name)
 
 
 class TransformerModuleTests(unittest.TestCase):

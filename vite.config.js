@@ -93,6 +93,9 @@ const checkpointExtensions = new Set([".safetensors", ".ckpt"]);
 const loraExtensions = new Set([".safetensors", ".ckpt", ".pt", ".pth"]);
 const animaLoraExtensions = new Set([".safetensors"]);
 const modelExtensions = new Set([...checkpointExtensions, ...loraExtensions]);
+// FLUX.1, FLUX.2 and Krea 2 also load a GGUF diffusion model, so one has to be matchable by name
+// when a saved image is read back — not only selectable in the picker.
+const diffusionModelExtensions = new Set([...checkpointExtensions, ".gguf"]);
 const checkpointEnginePathKeys = { SD: "sd", iL: "illustrious" };
 // The two native engines accept only .safetensors LoRAs: their fusion reads tensors directly
 // rather than through a pickle loader.
@@ -3718,7 +3721,7 @@ async function buildModelCatalogs() {
   try {
     const directory = await getAuxiliaryModelDirectory("diffusion_models");
     const relative = path.relative(projectRoot, directory).split(path.sep).join("/");
-    for (const model of await findModels(directory, directory, false, checkpointExtensions)) {
+    for (const model of await findModels(directory, directory, false, diffusionModelExtensions)) {
       checkpoints.push(catalogEntry("local", model.value, `${relative} · Anima`, { engine: "Anima" }));
     }
   } catch {}

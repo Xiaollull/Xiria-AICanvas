@@ -36,7 +36,9 @@ from flux2_pipeline import (
     unpack_flux2_latents,
     unpatchify_flux2_latents,
 )
+from gguf_loader import gguf_quantization_summary, read_gguf_header
 from test_flux_pipeline import comfy_flux_checkpoint
+from test_gguf_loader import write_checkpoint_gguf
 
 HIDDEN = FLUX2_ATTENTION_HEAD_DIM  # one attention head keeps the fixture small but real
 LLM_HIDDEN = 32
@@ -227,6 +229,25 @@ class TransformerLoadTests(unittest.TestCase):
         with self.assertRaises(ValueError) as error:
             _load_flux2_transformer(Path("unused.safetensors"), torch.float32, deps, state_dict=state)
         self.assertIn("img_mlp.2.weight", str(error.exception))
+
+
+class Flux2GgufCheckpointTests(unittest.TestCase):
+    def test_a_quantised_gguf_checkpoint_loads_through_the_same_conversion(self):
+        state = comfy_flux2_checkpoint()
+        deps = _runtime_dependencies()
+        expected, expected_config, _report = _load_flux2_transformer(
+            Path("unused.safetensors"), torch.float32, deps, state_dict=dict(state)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_checkpoint_gguf(Path(directory) / "flux2.gguf", state)
+            self.assertIn("Q8_0", gguf_quantization_summary(read_gguf_header(path)))
+            transformer, config, report = _load_flux2_transformer(path, torch.float32, deps)
+        self.assertEqual(config, expected_config)
+        self.assertEqual(report["unclaimed_tensors"], [])
+        produced = dict(transformer.named_parameters())
+        self.assertEqual(sorted(produced), sorted(name for name, _ in expected.named_parameters()))
+        for name, parameter in expected.named_parameters():
+            self.assertTrue(torch.allclose(produced[name], parameter, atol=1e-3), name)
 
 
 class LatentGeometryTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
-import { readSafetensorsHeader } from "./anima-models.mjs";
+import { componentFileExtensions, readDiffusionModelHeader } from "./gguf-header.mjs";
 import { normalizeFluxSafetensorsKey } from "./flux-models.mjs";
 
 // FLUX.2 mounts three component files out of the same shared directories FLUX.1 and Anima use, so
@@ -105,7 +105,7 @@ export function classifyFlux2SafetensorsHeader(header) {
   return matches.length === 1 ? matches[0][0] : null;
 }
 
-async function scanFlux2Root(directory, role, relativeDirectory = "", readHeader = readSafetensorsHeader) {
+async function scanFlux2Root(directory, role, relativeDirectory = "", readHeader = readDiffusionModelHeader) {
   let entries;
   try {
     entries = await readdir(path.join(directory, relativeDirectory), { withFileTypes: true });
@@ -119,7 +119,7 @@ async function scanFlux2Root(directory, role, relativeDirectory = "", readHeader
       models.push(...await scanFlux2Root(directory, role, relativePath, readHeader));
       continue;
     }
-    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".safetensors") continue;
+    if (!entry.isFile() || !componentFileExtensions(role).has(path.extname(entry.name).toLowerCase())) continue;
     try {
       const filePath = path.join(directory, relativePath);
       const [header, fileStat] = await Promise.all([readHeader(filePath), stat(filePath)]);
@@ -133,7 +133,7 @@ async function scanFlux2Root(directory, role, relativeDirectory = "", readHeader
   return models;
 }
 
-export async function discoverFlux2Models(roots, readHeader = readSafetensorsHeader) {
+export async function discoverFlux2Models(roots, readHeader = readDiffusionModelHeader) {
   const entries = await Promise.all(Object.entries(roots).map(async ([role, directory]) => {
     const models = await scanFlux2Root(directory, role, "", readHeader);
     models.sort((first, second) => first.name.localeCompare(second.name, "en"));

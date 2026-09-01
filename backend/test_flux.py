@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -136,6 +137,29 @@ class FluxEngineWiringTests(unittest.TestCase):
         self.assertEqual(flux_roots["lora"].name, "flux")
         self.assertEqual(inference_server.native_model_roots("Flux"), flux_roots)
         self.assertEqual(inference_server.native_model_roots("Anima"), anima_roots)
+
+    def test_only_the_diffusion_model_slot_accepts_a_gguf(self):
+        # The recommended-model browser downloads GGUF diffusion models, so refusing one here was
+        # a file the program itself had fetched and could not then load.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nested").mkdir()
+            for name in ("model.safetensors", "nested/model.gguf", "model.ckpt", "encoder.gguf"):
+                (root / name).write_bytes(b"weights")
+            self.assertEqual(
+                inference_server.validate_native_diffusion_model("nested/model.gguf", root, "Flux diffusion model"),
+                (root / "nested" / "model.gguf").resolve(),
+            )
+            self.assertEqual(
+                inference_server.validate_native_diffusion_model("model.safetensors", root, "Flux diffusion model"),
+                (root / "model.safetensors").resolve(),
+            )
+            with self.assertRaisesRegex(ValueError, r"\.safetensors or \.gguf"):
+                inference_server.validate_native_diffusion_model("model.ckpt", root, "Flux diffusion model")
+            with self.assertRaisesRegex(ValueError, "safetensors"):
+                inference_server.validate_anima_component("encoder.gguf", root, "Flux text encoder")
+            with self.assertRaises((ValueError, FileNotFoundError)):
+                inference_server.validate_native_diffusion_model("../outside.gguf", root, "Flux diffusion model")
 
     def test_a_flux_run_executes_every_requested_step_whatever_the_denoise(self):
         # The same rule the ADetailer and Hires accounting follow: a native refinement pass moves

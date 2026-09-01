@@ -29,7 +29,7 @@ XiriaCanvas AI 是一款本地运行的图像生成界面，支持 Stable Diffus
 | **Flux2** | FLUX.2，大模型引导 | 扩散模型 + 文本编码器 + VAE |
 | **Krea2** | Krea 2 单流 DiT | 扩散模型 + 文本编码器 + VAE |
 
-SD 与 iL 加载单个大模型文件。四个原生引擎分别加载各自组件，因此文本编码器与 VAE 可以在多个模型之间共用，而不必在每个大模型里各存一份。FLUX.1 是唯一需要两个文本编码器的引擎。
+SD 与 iL 加载单个大模型文件。四个原生引擎分别加载各自组件，因此文本编码器与 VAE 可以在多个模型之间共用，而不必在每个大模型里各存一份。FLUX.1 是唯一需要两个文本编码器的引擎。FLUX.1、FLUX.2 与 Krea 2 的扩散模型可以是 `.safetensors`，也可以是 `.gguf`，详见「模型」一节的**文件格式**。
 
 两代 FLUX 均为蒸馏引导：没有无条件分支，负面提示词不承载任何内容，也不会随请求发送；输入框中的文字会保留给其他引擎使用。Krea 2 是唯一未经蒸馏的原生引擎，负面提示词正常生效。
 
@@ -228,11 +228,19 @@ XIRAI_OUTPUT_DIR=outputs/my-project
 
 - **Illustrious** —— WAI Illustrious SDXL、MiaoMiao Harem 与 Obsession Illustrious XL，各自跟踪其 Civitai 版本列表。
 - **Anima** —— CircleStone Labs 官方版本，同时来自 Civitai 与 Hugging Face 的 `split_files` 目录，并自动搭配共用的 Qwen 0.6B 文本编码器与 Qwen Image VAE。
-- **FLUX.2** —— Klein 9B True V3 的 Safetensors 或 GGUF 版本，以及官方 Klein 9B KV 单文件版本（受限仓库，需接受许可并提供 Hugging Face Token）。两者都搭配 Qwen 3 8B 文本编码器与 FLUX.2 VAE。
+- **FLUX.2** —— Klein 9B True V3 的 Safetensors 或 GGUF 版本，以及官方 Klein 9B KV 单文件版本（受限仓库，需接受许可并提供 Hugging Face Token）。两者都搭配 Qwen 3 8B 文本编码器与 FLUX.2 VAE。文本编码器请选择 BF16：官方发布的 fp8 版本有 85 层量化为 nvfp4，其压缩权重本程序无法展开。
 - **Krea 2** —— 12B 模型的 Raw 与 Turbo 变体，并可单独选择 4B 文本编码器精度。其 VAE 与 Anima 共用。
 - **放大模型** —— Hires.fix 第一阶段所使用的 Real-ESRGAN 官方模型。
 
-发布方提供量化版本时也会一并列出，因此同一个模型可以按可用显存选择 bf16、fp8、mxfp8、nvfp4、int4/int8 或 GGUF Q4-Q8。FLUX.1 没有推荐系列：它使用你自行准备的扩散模型、CLIP-L、T5-XXL 与 VAE 文件运行。
+发布方提供量化版本时也会一并列出，因此同一个模型可以选择 bf16、fp8、mxfp8、nvfp4、int4/int8 或 GGUF Q4-Q8。FLUX.1 没有推荐系列：它使用你自行准备的扩散模型、CLIP-L、T5-XXL 与 VAE 文件运行。
+
+### 文件格式
+
+所有组件都支持 `.safetensors`。FLUX.1、FLUX.2 与 Krea 2 的扩散模型还支持 `.gguf`——某些量化版本只以这种形式发布。文本编码器与 VAE 仍然只接受 `.safetensors`：GGUF 文本编码器使用的是 llama.cpp 的张量命名空间，而不是检查点自身的命名，本程序不做这层转换。放入 `models/diffusion_models` 的 GGUF 文件会与 safetensors 文件一同出现在选择器中，并以同样的方式识别——依据文件内含的张量，而非文件名。
+
+可读取的块布局为 F16、BF16、F32、Q4_0、Q4_1、Q5_0、Q5_1、Q8_0、Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ4_NL 与 IQ4_XS。使用其他布局的文件不会出现在选择器中，而不是先列出再在加载时拒绝。
+
+量化文件的下载体积与磁盘占用都小得多，但它在内存中并不是一个更小的模型：fp8、mxfp8 与 GGUF 等所有格式都会在加载时展开为计算精度，因为本运行时构建的 Diffusers 模块没有可以接收压缩权重的量化线性算子。显存由显存模式与块级卸载决定，而不是由文件格式决定。加载体积按张量形状计算而非按文件大小计算，因此 Q4_K 模型是按展开后的大小计入预算，而不是按磁盘上的大小。
 
 ## 开发
 

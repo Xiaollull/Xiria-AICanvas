@@ -40,12 +40,15 @@ try:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_diffusion_state_dict,
         _module_nbytes,
+        _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
         euler_ancestral_rf_step,
         euler_rf_step,
     )
+    from .gguf_loader import GGUF_SUFFIX, read_gguf_header
     from .flux_sampling import (
         FLUX_SAMPLERS,
         FLUX_SCHEDULERS,
@@ -61,12 +64,15 @@ except ImportError:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_diffusion_state_dict,
         _module_nbytes,
+        _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
         euler_ancestral_rf_step,
         euler_rf_step,
     )
+    from gguf_loader import GGUF_SUFFIX, read_gguf_header
     from flux_sampling import (
         FLUX_SAMPLERS,
         FLUX_SCHEDULERS,
@@ -577,18 +583,25 @@ def flux_component_bytes(paths) -> int:
     Every component is expanded to the BF16 compute dtype, so an fp8 file costs twice what it
     occupies on disk and an fp32 file costs half.  Reporting that before the first tensor is read
     is the difference between a precondition the user can act on and an allocation failure
-    thousands of tensors in.
+    thousands of tensors in.  A GGUF is the extreme case of the same rule — a Q4_K file expands to
+    roughly four times its size on disk — which is exactly why this counts elements rather than
+    bytes.
     """
     from safetensors import safe_open
 
     total = 0
     for path in paths:
-        with safe_open(str(Path(path)), framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                elements = 1
-                for dimension in handle.get_slice(key).get_shape():
-                    elements *= int(dimension)
-                total += elements * 2
+        path = Path(path)
+        if path.suffix.lower() == GGUF_SUFFIX:
+            shapes = [tensor.shape for tensor in read_gguf_header(path).tensors]
+        else:
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                shapes = [handle.get_slice(key).get_shape() for key in handle.keys()]
+        for shape in shapes:
+            elements = 1
+            for dimension in shape:
+                elements *= int(dimension)
+            total += elements * 2
     return total
 
 
@@ -811,7 +824,7 @@ def _load_flux_vae(path: Path, dtype: torch.dtype, deps):
 
 def _load_flux_transformer(path: Path, dtype: torch.dtype, deps, loras=(), state_dict=None):
     if state_dict is None:
-        state_dict = deps["load_file"](str(path), device="cpu")
+        state_dict = _load_diffusion_state_dict(path, dtype, deps, "FLUX.1 diffusion model")
     state_dict = normalize_flux_checkpoint_keys(state_dict)
     state_dict = resolve_quantized_state_dict(state_dict, dtype, "FLUX.1 diffusion model")
     config = infer_flux_transformer_config(state_dict)
@@ -1585,7 +1598,7 @@ def load_flux_runtime(
     instead of a shape error thousands of tensors later.
     """
     deps = _runtime_dependencies()
-    diffusion_path = _require_safetensors(diffusion_model, "Flux diffusion model")
+    diffusion_path = _require_diffusion_weights(diffusion_model, "Flux diffusion model")
     first_path = _require_safetensors(text_encoder, "Flux text encoder")
     second_path = _require_safetensors(text_encoder_2, "Flux second text encoder")
     vae_path = _require_safetensors(vae, "Flux VAE")

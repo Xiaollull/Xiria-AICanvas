@@ -170,7 +170,7 @@
       "size": 16381517176,
       "sha256": "f0ff9239d56269ca1d05e5f86da6a79fac111af464955681f11c7ab0ec5ef6c1",
       "url": "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/23fbc8aa8b621f29f2249cd1bd9c47e5d0eebd83/split_files/text_encoders/qwen_3_8b.safetensors",
-      "detail": "完整精度，显存和磁盘占用最高"
+      "detail": "推荐：目前唯一可加载的 FLUX.2 文本编码器；显存与磁盘占用最高"
     },
     {
       "id": "flux-qwen-8b-fp8",
@@ -180,7 +180,7 @@
       "size": 8664848742,
       "sha256": "abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6",
       "url": "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/23fbc8aa8b621f29f2249cd1bd9c47e5d0eebd83/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
-      "detail": "推荐的平衡选项"
+      "detail": "混合量化：其中 85 层为 nvfp4 压缩权重，本程序无法展开，请改用 BF16"
     },
     {
       "id": "flux-qwen-8b-fp4",
@@ -291,7 +291,7 @@
       "size": 5716892032,
       "sha256": "d8ad4c27c683064796cc9894e6d5633d7a4977d029edb3228caedc19d65ee5e4",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-Q4_K.gguf",
-      "detail": "需要 GGUF 自定义加载器"
+      "detail": "GGUF Q4_K，下载体积最小；加载时展开为计算精度"
     },
     {
       "id": "flux-true-v3-gguf-q5",
@@ -301,7 +301,7 @@
       "size": 6813702528,
       "sha256": "8167105716c715be31018f682916b5b9988f9afec4e20d7ad7cd9b42aa9774ce",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-Q5_K.gguf",
-      "detail": "需要 GGUF 自定义加载器"
+      "detail": "GGUF Q5_K，体积与画质的折中；加载时展开为计算精度"
     },
     {
       "id": "flux-true-v3-gguf-q6",
@@ -311,7 +311,7 @@
       "size": 7865424256,
       "sha256": "7fd4438a51e76d7076f625a2c63516a075dad48ee980f4bc9b4bc63e58e8adc0",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-Q6_K.gguf",
-      "detail": "需要 GGUF 自定义加载器"
+      "detail": "GGUF Q6_K，接近 BF16 画质；加载时展开为计算精度"
     },
     {
       "id": "flux-true-v3-gguf-q8",
@@ -321,7 +321,7 @@
       "size": 9978304896,
       "sha256": "44b08a48da8a8037d0d2cc9f64fdc13094483a1d1bbfd4c2b5fea82bc0be0dcb",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-Q8_0.gguf",
-      "detail": "需要 GGUF 自定义加载器"
+      "detail": "GGUF Q8_0，GGUF 中画质最高；加载时展开为计算精度"
     },
     {
       "id": "flux-kv-bf16",

@@ -37,7 +37,8 @@ how guidance is applied.
 SD and iL mount one checkpoint file. The four native engines mount their parts
 separately, so a text encoder or VAE can be shared between models instead of
 being duplicated inside every checkpoint. FLUX.1 is the only engine that takes
-two text encoders.
+two text encoders. For FLUX.1, FLUX.2, and Krea 2 the diffusion model may be a
+`.safetensors` or a `.gguf` file; see **File formats** under Models.
 
 Both FLUX generations are guidance distilled: they have no unconditional branch,
 so the negative prompt carries nothing and is not sent. What you typed stays in
@@ -505,16 +506,40 @@ The recommended-model browser covers, in addition to any file you place in
 - **FLUX.2** — Klein 9B True V3 as Safetensors or GGUF, and the official
   Klein 9B KV single-file build, which is gated and needs an accepted repository
   licence and a Hugging Face token. Both pair with a Qwen 3 8B text encoder and
-  the FLUX.2 VAE.
+  the FLUX.2 VAE. Take the text encoder at BF16: the published fp8 file
+  quantizes 85 of its layers to nvfp4, which stores packed weights this program
+  cannot expand.
 - **Krea 2** — the 12B model in Raw and Turbo variants, with a separately chosen
   4B text encoder precision. Its VAE is shared with Anima.
 - **Upscalers** — the official Real-ESRGAN models used by the first Hires.fix
   stage.
 
 Quantized variants are offered where the publisher ships them, so the same model
-can be taken at bf16, fp8, mxfp8, nvfp4, int4/int8, or GGUF Q4-Q8 to match the
-available VRAM. FLUX.1 has no recommended family: it runs from diffusion model,
-CLIP-L, T5-XXL, and VAE files you supply yourself.
+can be taken at bf16, fp8, mxfp8, nvfp4, int4/int8, or GGUF Q4-Q8. FLUX.1 has no
+recommended family: it runs from diffusion model, CLIP-L, T5-XXL, and VAE files
+you supply yourself.
+
+### File formats
+
+Every component loads from `.safetensors`. FLUX.1, FLUX.2, and Krea 2 also load
+a `.gguf` diffusion model, which is the only form some quantizations are
+published in. The text encoder and VAE stay `.safetensors`: a GGUF text encoder
+is named in llama.cpp's key space rather than the checkpoint's, and translating
+that is not something this program does. A GGUF placed in
+`models/diffusion_models` appears in the picker beside the safetensors files and
+is identified the same way — by the tensors it holds, not by its filename.
+
+The block layouts read are F16, BF16, F32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K,
+Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, and IQ4_XS. A file using anything else is left
+out of the picker rather than offered and then refused at load.
+
+A quantized file is a much smaller download and takes far less disk, but it is
+not a smaller model in memory. Every format — fp8, mxfp8, and GGUF alike — is
+expanded to the compute dtype while loading, because the Diffusers modules this
+runtime builds have no quantized linear op to hand packed weights to. VRAM is
+bought by the memory mode and block-level offload, not by the file format. The
+loaded size is measured from the tensor shapes rather than the file size, so a
+Q4_K model is budgeted as what it becomes rather than as what it weighs on disk.
 
 ## Development
 

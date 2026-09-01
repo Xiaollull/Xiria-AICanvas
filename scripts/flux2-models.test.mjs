@@ -125,10 +125,14 @@ test("recursively discovers each FLUX.2 role in its configured root", async (con
     writeFile(path.join(roots.vae, "flux2-vae.safetensors"), "fixture"),
     writeFile(path.join(roots.vae, "broken.safetensors"), "fixture"),
     writeFile(path.join(roots.diffusion_model, "flux2-dev.ckpt"), "not a safetensors file"),
+    writeFile(path.join(roots.diffusion_model, "flux2-dev-Q4_K.gguf"), "fixture"),
+    writeFile(path.join(roots.text_encoder, "flux2-text-encoder-Q8_0.gguf"), "fixture"),
   ]);
 
   const headers = new Map([
     ["flux2-dev.safetensors", flux2DiffusionHeader("model.diffusion_model.")],
+    ["flux2-dev-Q4_K.gguf", flux2DiffusionHeader()],
+    ["flux2-text-encoder-Q8_0.gguf", languageModelHeader({ hidden: 5120 })],
     ["flux1-dev.safetensors", {
       "double_blocks.0.img_attn.norm.key_norm.scale": tensor([128]),
       "img_in.weight": tensor([3072, 64]),
@@ -142,7 +146,9 @@ test("recursively discovers each FLUX.2 role in its configured root", async (con
     return headers.get(path.basename(filePath));
   });
 
-  assert.deepEqual(discovered.diffusion_model.map((model) => model.value), ["nested/flux2-dev.safetensors"]);
+  assert.deepEqual(discovered.diffusion_model.map((model) => model.value), ["flux2-dev-Q4_K.gguf", "nested/flux2-dev.safetensors"]);
+  // The encoder GGUF classifies, and is still left out: only the diffusion slot reads one.
+  assert.ok(!discovered.text_encoder.some((model) => model.value.endsWith(".gguf")));
   assert.deepEqual(discovered.text_encoder.map((model) => model.value), ["flux2-text-encoder.safetensors"]);
   assert.deepEqual(discovered.vae.map((model) => model.value), ["flux2-vae.safetensors"]);
   assert.ok(discovered.diffusion_model[0].size > 0);

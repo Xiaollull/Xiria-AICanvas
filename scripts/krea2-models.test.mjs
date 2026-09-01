@@ -143,10 +143,14 @@ test("recursively discovers each Krea 2 role in its configured root", async (con
     writeFile(path.join(roots.vae, "qwen_image_vae.safetensors"), "fixture"),
     writeFile(path.join(roots.vae, "broken.safetensors"), "fixture"),
     writeFile(path.join(roots.diffusion_model, "krea2_raw_bf16.ckpt"), "not a safetensors file"),
+    writeFile(path.join(roots.diffusion_model, "krea2_raw-Q4_K.gguf"), "fixture"),
+    writeFile(path.join(roots.text_encoder, "qwen3vl_4b-Q8_0.gguf"), "fixture"),
   ]);
 
   const headers = new Map([
     ["krea2_raw_bf16.safetensors", krea2DiffusionHeader("model.diffusion_model.")],
+    ["krea2_raw-Q4_K.gguf", krea2DiffusionHeader()],
+    ["qwen3vl_4b-Q8_0.gguf", qwen3vlHeader()],
     ["flux2-dev.safetensors", {
       "double_stream_modulation_img.lin.weight": tensor([6144 * 6, 6144]),
       "img_in.weight": tensor([6144, 128]),
@@ -160,7 +164,9 @@ test("recursively discovers each Krea 2 role in its configured root", async (con
     return headers.get(path.basename(filePath));
   });
 
-  assert.deepEqual(discovered.diffusion_model.map((model) => model.value), ["nested/krea2_raw_bf16.safetensors"]);
+  assert.deepEqual(discovered.diffusion_model.map((model) => model.value), ["krea2_raw-Q4_K.gguf", "nested/krea2_raw_bf16.safetensors"]);
+  // The encoder GGUF classifies, and is still left out: only the diffusion slot reads one.
+  assert.ok(!discovered.text_encoder.some((model) => model.value.endsWith(".gguf")));
   assert.deepEqual(discovered.text_encoder.map((model) => model.value), ["qwen3vl_4b_bf16.safetensors"]);
   assert.deepEqual(discovered.vae.map((model) => model.value), ["qwen_image_vae.safetensors"]);
   assert.ok(discovered.diffusion_model[0].size > 0);
