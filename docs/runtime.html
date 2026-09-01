@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runtime &amp; updates — XiriaCanvas AI</title>
+<meta name="description" content="Environment configuration, services and ports, VRAM memory modes, the download queue, and how program updates are verified, applied and rolled back.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">Releases</a>
+    <a class="lang" href="zh/runtime.html">简体中文</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>Documentation</h2>
+    <ul>
+      <li><a href="index.html">Overview</a></li>
+      <li><a href="setup.html">Installation</a></li>
+      <li><a href="models.html">Models</a></li>
+      <li><a href="usage.html">Generating images</a></li>
+      <li><a href="runtime.html" aria-current="page">Runtime &amp; updates</a></li>
+    </ul>
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#configuration">Configuration</a></li>
+      <li><a href="#paths">Runtime paths</a></li>
+      <li><a href="#memory">VRAM memory modes</a></li>
+      <li><a href="#cache">The pipeline cache</a></li>
+      <li><a href="#downloader">Model downloader</a></li>
+      <li><a href="#updates">Program updates</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>Runtime &amp; updates</h1>
+    <p class="lede">How the running program is configured, how it decides what fits in VRAM, and
+      how it replaces itself with a newer version without losing your models or outputs.</p>
+
+    <h2 id="configuration">Configuration</h2>
+    <p>Copy <code>.env.example</code> to <code>.env</code> only when defaults need to be changed.
+      Relative paths are resolved from the repository root on both operating systems.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Service</th><th>Address</th></tr></thead>
+        <tbody>
+          <tr><td>Configuration and Web UI</td><td><code>0.0.0.0:7709</code></td></tr>
+          <tr><td>Inference backend</td><td><code>127.0.0.1:8718</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The Web UI is available at both <code>http://localhost:7709/</code> and
+      <code>http://YOUR-LAN-IP:7709/</code>. Only the Web UI is exposed to the LAN; the Python
+      inference service remains loopback-only and is accessed through the Web proxy.</p>
+
+    <div class="note">
+      <span class="label">Use the LAN address only on a trusted network</span>
+      <p>It exposes the development UI and proxied local inference APIs to any device that can reach
+        port 7709.</p>
+    </div>
+
+    <h2 id="paths">Runtime paths</h2>
+    <p>Runtime paths can be moved outside a read-only checkout:</p>
+<pre><code>XIRAI_CACHE_DIR=.cache
+XIRAI_OUTPUT_DIR=outputs/my-project</code></pre>
+    <p>The output value may use a custom folder name or any nested relative path. An absolute local
+      value is also accepted in <code>.env</code>; no absolute user or system path is committed to
+      the repository. Blank output paths are rejected.</p>
+
+    <h2 id="memory">VRAM memory modes</h2>
+    <p>Runtime VRAM management defaults to <code>XIRAI_MEMORY_MODE=auto</code> and follows the
+      memory-budgeting behavior of ComfyUI without importing or depending on ComfyUI. Before the
+      first checkpoint load, XirAI measures current free and total VRAM, estimates the checkpoint's
+      FP16 runtime weight size from its tensor metadata, accounts for the requested canvas, reserves
+      at least 0.8 GB for inference, and keeps the same OS headroom as ComfyUI: 600 MB on Windows,
+      plus 100 MB on GPUs over 15 GB; 400 MB elsewhere.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>HIGH_VRAM</code></td>
+            <td>Selected only when the complete pipeline and inference workspace fit. Keeps all
+              model components on CUDA and enables the fastest CUDA/TF32/cuDNN path.</td>
+          </tr>
+          <tr>
+            <td><code>NORMAL_VRAM</code></td>
+            <td>Component-level dynamic CPU/GPU scheduling. The denoiser stays on the GPU throughout
+              its sampling loop, while inactive components are moved as required. Native Anima on an
+              eligible 8 GB budget keeps the complete Cosmos Transformer resident during sampling
+              for high utilization.</td>
+          </tr>
+          <tr>
+            <td><code>LOW_VRAM</code></td>
+            <td>Sequential layer offload plus VAE slicing and tiling for GPUs that cannot safely
+              hold the largest component and inference workspace. Native Anima uses synchronous
+              one-block Cosmos group offload and serial image microbatches where required.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>If Anima's resident Transformer path encounters a real CUDA OOM, XirAI restores the CPU
+      generator state and automatically replays that sampling chunk with one-block group offload.
+      This keeps auto mode speed-first without turning a tight-VRAM machine into a failed job or
+      changing its Seed trajectory.</p>
+
+    <p>Advanced users may force <code>high_vram</code>, <code>normal_vram</code> or
+      <code>low_vram</code> with <code>XIRAI_MEMORY_MODE</code>; an unsafe forced mode
+      automatically downgrades. Set <code>XIRAI_RESERVE_VRAM_GB</code> to override the default OS
+      and application reserve.</p>
+
+    <div class="note">
+      <span class="label">Quantized files do not lower VRAM</span>
+      <p>Every weight format is expanded to the compute dtype while loading, and the budget is
+        computed from tensor shapes rather than file size. See
+        <a href="models.html#quantization">quantization, honestly</a>.</p>
+    </div>
+
+    <h2 id="cache">The pipeline cache</h2>
+    <p>All three modes keep the loaded pipeline object cached after a successful, cancelled, or
+      non-OOM failed generation, so another generation with the same engine and model identity does
+      not read and reconstruct the model again. For native Anima, that identity includes the
+      diffusion model, text encoder, VAE, fixed tokenizer revisions, and ordered nonzero adapter
+      revisions and weights.</p>
+
+    <p>The cache is released when the engine or model selection changes, CUDA reports an
+      out-of-memory error, an interrupted offload chain cannot be safely restored, or the inference
+      service shuts down. SD/iL LoRA changes do not reload the base model; native Anima adapters are
+      densely fused into its composite runtime identity. PyTorch SDPA is used automatically when
+      available, with xformers preferred when its compatible native extension is installed.</p>
+
+    <h2 id="downloader">Model downloader</h2>
+    <p>The model downloader keeps one serial queue for pasted links and recommended model
+      selections. While one file is downloading, you can continue adding links, open the
+      recommended-model browser, and append more selections without interrupting the active
+      transfer. Recommended artifacts that already pass their catalog size and SHA-256 checks, or
+      are already present in the queue, are omitted from the waiting list.</p>
+
+    <p>Failed rows can be retried from the downloader page. Retry keeps the original segment count
+      and reuses retained <code>.part</code> and <code>.part.N</code> files, so available bytes
+      continue from their saved offsets. Provider tokens remain browser-local and are resubmitted
+      for retry; they are never written to the persisted queue state.</p>
+
+    <h2 id="updates">Program updates</h2>
+
+    <h3>Online update</h3>
+    <p><strong>Settings → About → Online program update</strong> checks the release feed for a newer
+      version. Nothing is downloaded by the check itself: when a newer release exists the version,
+      size, publication date and release notes are shown, and the update starts only after you
+      confirm it.</p>
+
+    <p>Accelerated mirrors are used only after the release publishes both the exact
+      <code>XirAI-&lt;version&gt;.7z</code> archive and its exact uploaded
+      <code>XirAI-&lt;version&gt;.7z.sha256</code> sidecar. The sidecar is fetched and strictly
+      validated before any archive route is enabled, and an API digest is cross-checked when
+      present. Missing, malformed, ambiguous, draft, prerelease, or incorrectly named releases fail
+      closed instead of being presented as an available update. The feed, repository, mirror and
+      optional token are configurable in <code>.env</code>; see <code>.env.example</code>.</p>
+
+    <h3>Manual update</h3>
+    <p><strong>Settings → About → Manual program update</strong> accepts trusted clean XiriaCanvas AI
+      project archives such as ZIP, 7Z, RAR, TAR, TAR.GZ and TAR.XZ. Archives are inspected and
+      extracted with command-line tools into a temporary directory outside the project. When system
+      commands cannot read the archive, the updater downloads checksum-pinned official 7-Zip command
+      files for the current Windows or Linux architecture to <code>.cache/tools/7zip/</code>; it
+      never runs an installer or uses desktop file associations.</p>
+
+    <p>The archive is then verified and applied by the same updater with the same rollback, so the
+      online and offline routes differ only in how the archive reaches the machine.</p>
+
+    <h3>What an update may and may not change</h3>
+    <p>An update must carry the same Node dependencies as the installed environment. An archive that
+      changes them is refused rather than applied, because replacing <code>node_modules</code> under
+      a running process is not safe on Windows; such a version is delivered as a full package to
+      install fresh. A changed <code>backend/requirements.txt</code> is supported: the files are
+      replaced and the Python environment is then repaired automatically.</p>
+
+    <p>Only program files are replaced. <code>.venv</code>, <code>node_modules</code>,
+      <code>models</code>, <code>outputs</code>, <code>logs</code>, <code>state-cache</code>,
+      <code>.cache</code>, <code>.env</code> and installed <code>plugins</code> remain in place, as
+      does your own <code>models/model-paths.json</code>. Before replacement, managed files are
+      backed up outside the project. Copy failures, Python validation failures and production build
+      failures are rolled back automatically.</p>
+
+    <p>Publishing a release is intentionally strict; that procedure is documented in the
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Release-process">wiki</a>.</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">Source on GitHub</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+      <a href="zh/runtime.html">简体中文</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

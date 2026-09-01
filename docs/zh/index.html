@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XiriaCanvas AI — 文档</title>
+<meta name="description" content="XiriaCanvas AI 使用文档：本地运行的图像生成界面，支持 Stable Diffusion、Illustrious 以及原生 Anima、FLUX.1、FLUX.2 与 Krea 2 引擎。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="../assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">发布</a>
+    <a class="lang" href="../index.html">English</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>文档</h2>
+    <ul>
+      <li><a href="index.html" aria-current="page">总览</a></li>
+      <li><a href="setup.html">安装</a></li>
+      <li><a href="models.html">模型</a></li>
+      <li><a href="usage.html">生成图像</a></li>
+      <li><a href="runtime.html">运行与更新</a></li>
+    </ul>
+    <h2>其他</h2>
+    <ul>
+      <li><a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a></li>
+      <li><a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">发布版本</a></li>
+      <li><a href="https://github.com/Xiaollull/Xiria-AICanvas/issues">问题反馈</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <section class="hero">
+      <img class="mark" src="../assets/logo.svg" alt="XiriaCanvas AI logo">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="../assets/wordmark-dark.svg">
+        <img class="wordmark" src="../assets/wordmark-light.svg" alt="XiriaCanvas AI" width="460">
+      </picture>
+      <p>一款本地运行的图像生成界面，支持 Stable Diffusion、Illustrious，以及原生 Anima、FLUX.1、FLUX.2 与 Krea 2 引擎。</p>
+      <div class="actions">
+        <a class="button primary" href="setup.html">开始安装</a>
+        <a class="button" href="models.html">模型</a>
+        <a class="button" href="https://github.com/Xiaollull/Xiria-AICanvas/releases">下载发布版</a>
+      </div>
+    </section>
+
+    <h2 id="what-it-is">这是什么</h2>
+    <p>XiriaCanvas AI 完全运行在你自己的机器上。同一套源代码同时支持 Windows 与 Linux；项目在运行时不依赖
+      ComfyUI 或 Stable Diffusion WebUI——不会读取、导入、升级或修改它们及其环境。</p>
+    <p>一次安装即可创建隔离的 Python 环境、挑选与你 GPU 驱动匹配的 PyTorch 构建，并在本机网络上提供 Web
+      界面。以下是该程序的使用手册；维护者与故障排查资料放在
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>。</p>
+
+    <h2 id="engines">引擎</h2>
+    <p>生成页可选择六个引擎。它们共用同一套提示词语法、同一套采样器名称与同一个图库，区别在于模型如何装配、引导如何施加。</p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>引擎</th><th>模型</th><th>组件</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>SD</strong></td><td>Stable Diffusion</td><td>单个大模型</td></tr>
+          <tr><td><strong>iL</strong></td><td>Illustrious / SDXL</td><td>单个大模型</td></tr>
+          <tr><td><strong>Anima</strong></td><td>原生 Flow Matching</td><td>扩散模型 + 文本编码器 + VAE</td></tr>
+          <tr><td><strong>Flux</strong></td><td>FLUX.1，蒸馏引导</td><td>扩散模型 + CLIP-L + T5-XXL + VAE</td></tr>
+          <tr><td><strong>Flux2</strong></td><td>FLUX.2，大模型引导</td><td>扩散模型 + 文本编码器 + VAE</td></tr>
+          <tr><td><strong>Krea2</strong></td><td>Krea 2 单流 DiT</td><td>扩散模型 + 文本编码器 + VAE</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>SD 与 iL 加载单个大模型文件。四个原生引擎分别加载各自组件，因此文本编码器与 VAE 可以在多个模型之间共用，而不必在每个大模型里各存一份。FLUX.1
+      是唯一需要两个文本编码器的引擎。FLUX.1、FLUX.2 与 Krea 2 的扩散模型可以是 <code>.safetensors</code>，也可以是
+      <code>.gguf</code>，详见<a href="models.html#file-formats">文件格式</a>。</p>
+
+    <p>两代 FLUX 均为蒸馏引导：没有无条件分支，负面提示词不承载任何内容，也不会随请求发送；输入框中的文字会保留给其他引擎使用。Krea 2
+      是唯一未经蒸馏的原生引擎，负面提示词正常生效。</p>
+
+    <p>引导能力遵循同样的划分：PAG 适用于 SD、iL 与原生 Anima；CFG-Zero* 适用于原生 Anima 与 Krea 2。两代 FLUX 均不适用。</p>
+
+    <h2 id="quick-start">快速开始</h2>
+    <p>以下单行命令在两种操作系统上都适用。它会打开一个本地可视化配置窗口，在安装任何内容之前先检测你的 GPU。</p>
+
+<pre><code>npm run setup   # 仅首次
+npm start       # 之后</code></pre>
+
+    <p><strong>Windows：</strong>双击 <code>Setup-XirAI.bat</code>，之后双击 <code>Start-XirAI.bat</code>。<br>
+      <strong>Linux：</strong>运行 <code>sh Setup-XirAI.sh</code>，之后运行 <code>sh Start-XirAI.sh</code>，
+      或把两个 <code>.desktop</code> 文件标记为受信任后双击。</p>
+
+    <p>配置窗口始终位于 <code>http://localhost:7709/config</code>。在安装与构建校验完成之前，主应用处于锁定状态，<code>/</code>
+      会重定向到该地址。完整说明见<a href="setup.html">安装页</a>。</p>
+
+    <h2 id="next">下一步</h2>
+    <div class="cards">
+      <a class="card" href="setup.html">
+        <h3>安装</h3>
+        <p>环境要求、安装向导、GPU 与 PyTorch 选择、网络策略，以及全部命令行参数。</p>
+      </a>
+      <a class="card" href="models.html">
+        <h3>模型</h3>
+        <p>文件放在哪里、推荐模型浏览器，以及哪些文件格式与量化版本真正能够加载。</p>
+      </a>
+      <a class="card" href="usage.html">
+        <h3>生成图像</h3>
+        <p>提示词权重、引导、采样器、批次，以及图像查看器工作区。</p>
+      </a>
+      <a class="card" href="runtime.html">
+        <h3>运行与更新</h3>
+        <p>配置、显存模式、下载队列，以及程序更新如何应用与回滚。</p>
+      </a>
+      <a class="card" href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">
+        <h3>Wiki</h3>
+        <p>故障排查、量化支持矩阵、发布流程，以及开发与 CI 说明。</p>
+      </a>
+    </div>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+      <a href="../index.html">English</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

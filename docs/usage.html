@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generating images — XiriaCanvas AI</title>
+<meta name="description" content="Prompt weight grammar, guidance methods, adapter fusion, samplers and schedulers, image batches, and the image viewer workspace.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">Releases</a>
+    <a class="lang" href="zh/usage.html">简体中文</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>Documentation</h2>
+    <ul>
+      <li><a href="index.html">Overview</a></li>
+      <li><a href="setup.html">Installation</a></li>
+      <li><a href="models.html">Models</a></li>
+      <li><a href="usage.html" aria-current="page">Generating images</a></li>
+      <li><a href="runtime.html">Runtime &amp; updates</a></li>
+    </ul>
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#prompt">Prompt weights</a></li>
+      <li><a href="#guidance">Guidance</a></li>
+      <li><a href="#adapters">Adapter fusion</a></li>
+      <li><a href="#samplers">Samplers and schedulers</a></li>
+      <li><a href="#batches">Image batches</a></li>
+      <li><a href="#workspace">Image viewer workspace</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>Generating images</h1>
+    <p class="lede">All six engines share one prompt grammar, one sampler vocabulary and one
+      gallery. What differs is which guidance method applies and what the schedule behind a sampler
+      name actually is.</p>
+
+    <h2 id="prompt">Prompt weights</h2>
+    <p>All six engines share the core ComfyUI parenthesis grammar:</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Syntax</th><th>Effect</th></tr></thead>
+        <tbody>
+          <tr><td><code>(text)</code></td><td>Applies the default <code>1.1</code> emphasis.</td></tr>
+          <tr><td><code>((text))</code></td><td>Multiplies nested emphasis.</td></tr>
+          <tr><td><code>(text:1.25)</code></td><td>Applies an explicit finite weight.</td></tr>
+          <tr><td><code>\(text\)</code></td><td>Keeps literal parentheses.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Square-bracket de-emphasis, <code>BREAK</code>, textual-inversion tags, Prompt LoRA tags and
+      A1111 scheduling syntax are <strong>not</strong> interpreted by this grammar. Anima parses
+      Qwen and T5 token boundaries independently and applies weights to the T5-aligned LLM-adapter
+      output.</p>
+
+    <h2 id="guidance">Guidance</h2>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Method</th><th>Engines</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>PAG</td><td>SD, iL, native Anima</td><td>Scale <code>0..5</code>, scope <code>mid|all</code>.</td></tr>
+          <tr><td>CFG-Zero*</td><td>native Anima, Krea 2</td><td>—</td></tr>
+          <tr><td>Negative prompt</td><td>SD, iL, Anima, Krea 2</td><td>Both FLUX generations are distilled and send nothing.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Anima uses a native Cosmos identity-self-attention branch rather than a Diffusers UNet
+      adapter. It runs branches sequentially to keep one physical transformer forward live at a
+      time, and propagates the same settings into native Hires and ADetailer refinement.</p>
+
+    <h2 id="adapters">Adapter fusion</h2>
+    <p>Native Anima adapter fusion accepts standard LoRA, static full-rank T-LoRA, linear LoHa,
+      supported linear LoKr forms, and output-axis LyCORIS linear DoRA using
+      <code>dora_scale</code>. Supported linear LoKr may also carry output-axis
+      <code>dora_scale</code>. Weight zero is an exact disable.</p>
+
+    <p>Tucker and convolution forms, decomposed LoKr first factors, PEFT
+      <code>lora_magnitude_vector</code> and <code>lora_mid.weight</code> fail closed rather than
+      being silently approximated.</p>
+
+    <h2 id="samplers">Samplers and schedulers</h2>
+    <p>All four native engines offer the same 44 sampler and nine scheduler names in Generate and
+      Gallery. The vocabulary is shared; the schedules behind it are not.</p>
+    <ul>
+      <li>Anima's nine are native Flow-shift-3 trajectories.</li>
+      <li>Both FLUX generations and Krea 2 run the same ModelSamplingFlux table, FLUX.2 taking its
+        shift from the model and Krea 2 from the static shift its own model config declares.</li>
+    </ul>
+    <p>Named compatibility solver mappings are reported in task warnings and PNG sampling metadata
+      rather than silently pretending to be a different implementation.</p>
+
+    <h2 id="batches">Image batches</h2>
+    <p>Sampling parameters include two independent output controls:</p>
+    <ul>
+      <li><strong>Images per batch</strong> accepts 1–10. One Diffusers pipeline call uses
+        <code>num_images_per_prompt</code> and an equal-length generator list, so all images in that
+        batch are sampled together rather than as sequential single-image jobs.</li>
+      <li><strong>Batch count</strong> accepts 1–20. Batches are queued inside one controllable job
+        and run in order. For example, 3 images × 4 batches performs four pipeline calls and saves
+        12 images. The maximum task size is 10 images × 20 batches, or 200 saved images.</li>
+    </ul>
+
+    <p>Seeds increase by output position across the complete job and wrap safely in the unsigned
+      64-bit range. The result browser groups outputs by batch and lets you select any image in the
+      active batch; zoom and download always use the selected image. Cancelling or failing a
+      multi-batch job removes partial outputs, while completed PNG files include their batch, image,
+      seed and total batch settings in metadata.</p>
+
+    <h2 id="workspace">Image viewer workspace</h2>
+    <p>The local image workspace can be opened from the preview header or its empty state before any
+      image has been generated. The upper-right <strong>全屏</strong> button expands the workspace to
+      the browser window without using F11.</p>
+
+    <h3>The history rail</h3>
+    <p>The optional left image rail defaults to PNG/GIF files created since the current Web UI
+      session started. Its explorer strip can open the configured output root, enter arbitrary
+      nested folders, and return one level at a time. Each level displays direct child folders and
+      direct images together, so a folder may contain both. Single-image batches appear as
+      individual cards; multi-image batches are grouped into one card with a count badge, and
+      opening that card reveals its images with a return button that restores the previous card
+      scroll position.</p>
+
+    <p>History cards can be left-clicked to switch the active preview, dragged into the workspace,
+      or right-clicked to add a new layer and manage deletion. Deletion offers a preview-only hide
+      or permanent removal of the corresponding PNG source files.</p>
+
+    <h3>Layers, snapping and guides</h3>
+    <p>Layers can be moved, resized from their corner handles, and independently scaled with the
+      toolbar or Ctrl + mouse wheel. The workspace defaults to a 16 px grid and the cell size is
+      editable in pixels.</p>
+
+    <p>Grid and image-edge snapping are separate: edge snapping detects the visible bounds of nearby
+      freeform image layers, shows alignment guides, and snaps their edges together when released.
+      An optional edge-line panel can draw solid, dashed, dotted, double or glow lines around
+      snapped images and template cells, with a standard color palette, the browser's screen color
+      picker when available, and an editable line width.</p>
+
+    <h3>Layout templates and composition</h3>
+    <p>The workspace includes three recommended layouts for each image count from 2 through 9:
+      horizontal comparison, a regular grid, and a feature-image layout. Template cells accept
+      images dragged from the history rail or existing workspace layers. Template layouts react to
+      image aspect ratios, and each selected cell supports image scale plus left/center/right and
+      top/middle/bottom alignment.</p>
+
+    <p>Confirming a filled template creates a lossless PNG composition in the browser; the result can
+      be edited again, copied without PNG generation metadata, deleted without saving, or saved to
+      the current date directory under <code>outputs</code>. For a manually arranged group,
+      <strong>一键拼图</strong> creates one lossless composite from the current visible layout.
+      Changing edge-line settings on an unsaved completed collage restores its editable form and
+      requires confirming it again.</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">Source on GitHub</a>
+      <a href="runtime.html">Runtime &amp; updates</a>
+      <a href="zh/usage.html">简体中文</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型 — XiriaCanvas AI</title>
+<meta name="description" content="模型文件放在哪里、如何被发现、推荐模型浏览器，以及哪些文件格式与量化版本真正能够加载。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="../assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">发布</a>
+    <a class="lang" href="../models.html">English</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>文档</h2>
+    <ul>
+      <li><a href="index.html">总览</a></li>
+      <li><a href="setup.html">安装</a></li>
+      <li><a href="models.html" aria-current="page">模型</a></li>
+      <li><a href="usage.html">生成图像</a></li>
+      <li><a href="runtime.html">运行与更新</a></li>
+    </ul>
+    <h2>本页目录</h2>
+    <ul>
+      <li><a href="#directory">模型目录</a></li>
+      <li><a href="#roots">各根目录的内容</a></li>
+      <li><a href="#paths">model-paths.json</a></li>
+      <li><a href="#catalog">推荐模型浏览器</a></li>
+      <li><a href="#file-formats">文件格式</a></li>
+      <li><a href="#quantization">关于量化，说实话</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>模型</h1>
+    <p class="lede">模型配置使用 <code>models</code> 下的项目相对路径，在 Windows 与 Linux 上均无需改动即可工作。每个根目录都可以使用自定义名称和任意嵌套。</p>
+
+    <h2 id="directory">模型目录</h2>
+    <p>该目录沿用 ComfyUI 的模型分类命名，但完全由本项目自有。推理后端在两种操作系统上都相对项目根目录解析每一个配置路径。检查点、LoRA、放大模型、YOLO
+      检测器与兼容的背景移除模型会被递归扫描。</p>
+
+<pre><code>models/
+|-- checkpoints/
+|   |-- sd/
+|   `-- illustrious/
+|-- loras/
+|   |-- sd/
+|   |   |-- character/  style/  concept/  other/
+|   `-- illustrious/
+|       |-- character/  style/  concept/  other/
+|-- vae/
+|-- diffusion_models/
+|-- text_encoders/
+|-- embeddings/
+|-- yolo/
+|-- background-removal/
+|-- upscalers/
+`-- configs/</code></pre>
+
+    <p>LoRA 根目录下的文件出现在 <code>根目录</code> 分类中；每个自定义的一级文件夹都会成为 UI
+      中的一个分类，更深层的文件夹仍会显示在模型名称里。移动或重命名已选模型会改变它的根相对 ID，因此整理文件后需要刷新并重新选择。</p>
+
+    <h2 id="roots">各根目录的内容</h2>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>根目录</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><td><code>checkpoints/sd</code></td><td>SD 1.x 或 SDXL 单文件检查点。<code>.safetensors</code> 支持 SDXL 检测；有歧义的 SD 2.x 与 SDXL <code>.ckpt</code> 文件目前不支持。</td></tr>
+          <tr><td><code>checkpoints/illustrious</code></td><td>Illustrious / Illustrious XL 检查点。必须放在这里，才能选中正确的 SDXL 管道。</td></tr>
+          <tr><td><code>loras/sd</code>、<code>loras/illustrious</code></td><td>LoRA 根目录。四个默认分类保持可用，同时自定义文件夹与任意嵌套会被自动发现。</td></tr>
+          <tr><td><code>vae</code></td><td>分离式模型管道使用的独立与共享 VAE。</td></tr>
+          <tr><td><code>diffusion_models</code></td><td>Anima、FLUX.1、FLUX.2、Krea 2 及其他分离式扩散权重。全部支持 <code>.safetensors</code>，其中三个引擎另支持 <code>.gguf</code>。</td></tr>
+          <tr><td><code>text_encoders</code></td><td>分离式模型管道所需的独立文本编码器。</td></tr>
+          <tr><td><code>embeddings</code></td><td>为将来的文本反转支持预留。</td></tr>
+          <tr><td><code>yolo</code></td><td>用于本地 ADetailer 流程的 Ultralytics <code>.pt</code> 检测或分割模型。社区模型可以放在这里，包括放在子目录中。</td></tr>
+          <tr><td><code>background-removal</code></td><td>兼容的 ONNX 前景提取模型。推荐文件即使被嵌套或改名，也按固定哈希识别。</td></tr>
+          <tr><td><code>upscalers</code></td><td>Hires.fix 像素空间超分辨率权重。兼容的 <code>.pth</code>、<code>.pt</code>、<code>.ckpt</code> 与 <code>.safetensors</code> 文件按张量结构发现，因此重命名文件不会改变兼容性。PyTorch 文件必须包含权重或 state dict；TorchScript 归档刻意不加载。</td></tr>
+          <tr><td><code>configs</code></td><td>用户与模型的运行时配置产物。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>原生 Anima 的 Qwen3 tokenizer、tokenizer config 与 T5 tokenizer JSON 文件随程序一并打包在
+      <code>backend/resources/anima-tokenizers</code>——它们是程序资源，而不是用户需要下载的模型。安装、启动与程序更新会自动校验打包的
+      tokenizer 字节，因此你只需下载 Anima DiT、文本编码器与 VAE。</p>
+
+    <p>ADetailer 检测在项目已验证的 Python 环境中以 CPU 运行。UI 会在下载官方模型前对 Hugging Face 与 hf-mirror
+      线路进行基准测试，并在 <code>models/yolo</code> 中续传被中断的下载。细节重绘保持在同一环境中，并继承当前的检查点、LoRA、采样器与调度器。模型文件绝不会被上传。</p>
+
+    <h2 id="paths">model-paths.json</h2>
+    <p>程序更新会保留你自己的 <code>models/model-paths.json</code>，而不是覆盖它，因此自定义的模型根目录可以跨版本升级保留。未写出的键会回退到内置默认值，所以为旧版本编写的文件在新版本中依然正确。只有文件缺失、或更新后的项目无法使用该文件时，才会从发布包恢复默认副本。</p>
+    <p>推荐模型、YOLO 与背景移除目录则由每次更新刷新，因为那些是程序自带的清单，而非你的配置。</p>
+
+    <h2 id="catalog">推荐模型浏览器</h2>
+    <p>除你自己放入 <code>models</code> 的文件外，浏览器覆盖：</p>
+    <ul>
+      <li><strong>Illustrious</strong> —— WAI Illustrious SDXL、MiaoMiao Harem 与 Obsession Illustrious XL，各自跟踪其 Civitai 版本列表。</li>
+      <li><strong>Anima</strong> —— CircleStone Labs 官方版本，同时来自 Civitai 与 Hugging Face 的
+        <code>split_files</code> 目录，并自动搭配共用的 Qwen 0.6B 文本编码器与 Qwen Image VAE。</li>
+      <li><strong>FLUX.2</strong> —— Klein 9B True V3 的 Safetensors 或 GGUF 版本，以及官方 Klein 9B KV
+        单文件版本（受限仓库，需接受许可并提供 Hugging Face Token）。两者都搭配 Qwen 3 8B 文本编码器与 FLUX.2 VAE。</li>
+      <li><strong>Krea 2</strong> —— 12B 模型的 Raw 与 Turbo 变体，并可单独选择 4B 文本编码器精度。其 VAE 与 Anima 共用。</li>
+      <li><strong>放大模型</strong> —— Hires.fix 第一阶段所使用的 Real-ESRGAN 官方模型。</li>
+    </ul>
+
+    <div class="note">
+      <span class="label">FLUX.2 文本编码器请选 BF16</span>
+      <p>官方发布的 fp8 版 Qwen 3 8B 有 85 层量化为 <code>nvfp4</code>，其压缩权重本程序无法展开。能够加载的是 BF16 文件。详见
+        Wiki 中的<a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">量化支持矩阵</a>。</p>
+    </div>
+
+    <p>FLUX.1 没有推荐系列：它使用你自行准备的扩散模型、CLIP-L、T5-XXL 与 VAE 文件运行。</p>
+
+    <h2 id="file-formats">文件格式</h2>
+    <p>所有组件都支持 <code>.safetensors</code>。FLUX.1、FLUX.2 与 Krea 2 的扩散模型还支持
+      <code>.gguf</code>——某些量化版本只以这种形式发布。文本编码器与 VAE 仍然只接受
+      <code>.safetensors</code>：GGUF 文本编码器使用的是 llama.cpp 的张量命名空间，而不是检查点自身的命名，本程序不做这层转换。</p>
+
+    <p>放入 <code>models/diffusion_models</code> 的 GGUF 文件会与 safetensors 文件一同出现在选择器中，并以同样的方式识别——依据文件内含的张量，而非文件名。</p>
+
+    <p>可读取的块布局为：</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>类别</th><th>布局</th></tr></thead>
+        <tbody>
+          <tr><td>非量化</td><td><code>F16</code>、<code>BF16</code>、<code>F32</code></td></tr>
+          <tr><td>传统块</td><td><code>Q4_0</code>、<code>Q4_1</code>、<code>Q5_0</code>、<code>Q5_1</code>、<code>Q8_0</code></td></tr>
+          <tr><td>K 量化</td><td><code>Q2_K</code>、<code>Q3_K</code>、<code>Q4_K</code>、<code>Q5_K</code>、<code>Q6_K</code></td></tr>
+          <tr><td>IQ</td><td><code>IQ4_NL</code>、<code>IQ4_XS</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>使用其他布局的文件不会出现在选择器中，而不是先列出再在加载时拒绝。</p>
+
+    <h2 id="quantization">关于量化，说实话</h2>
+    <p>发布方提供量化版本时也会一并列出，因此同一个模型可以选择 bf16、fp8、mxfp8、nvfp4、int4/int8 或 GGUF
+      Q4-Q8。并非全部都能加载；选择器会隐藏运行时无法读取的文件，当前状态列在
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">Wiki 的支持矩阵</a>中。</p>
+
+    <div class="note">
+      <span class="label">量化文件只是更小的下载，不是更小的模型</span>
+      <p>它占用的磁盘小得多，但在内存中并不是一个更小的模型。fp8、mxfp8 与 GGUF
+        等所有格式都会在加载时展开为计算精度，因为本运行时构建的 Diffusers
+        模块没有可以接收压缩权重的量化线性算子。显存由<a href="runtime.html#memory">显存模式</a>与块级卸载决定，而不是由文件格式决定。</p>
+    </div>
+
+    <p>加载体积按张量形状计算而非按文件大小计算，因此 Q4_K 模型是按展开后的大小计入预算，而不是按磁盘上的大小。</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">量化支持矩阵</a>
+      <a href="../models.html">English</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

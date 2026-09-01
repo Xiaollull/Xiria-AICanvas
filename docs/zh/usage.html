@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>生成图像 — XiriaCanvas AI</title>
+<meta name="description" content="提示词权重语法、引导方式、适配器融合、采样器与调度器、图像批次，以及图像查看器工作区。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="../assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">发布</a>
+    <a class="lang" href="../usage.html">English</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>文档</h2>
+    <ul>
+      <li><a href="index.html">总览</a></li>
+      <li><a href="setup.html">安装</a></li>
+      <li><a href="models.html">模型</a></li>
+      <li><a href="usage.html" aria-current="page">生成图像</a></li>
+      <li><a href="runtime.html">运行与更新</a></li>
+    </ul>
+    <h2>本页目录</h2>
+    <ul>
+      <li><a href="#prompt">提示词权重</a></li>
+      <li><a href="#guidance">引导</a></li>
+      <li><a href="#adapters">适配器融合</a></li>
+      <li><a href="#samplers">采样器与调度器</a></li>
+      <li><a href="#batches">图像批次</a></li>
+      <li><a href="#workspace">图像查看器工作区</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>生成图像</h1>
+    <p class="lede">六个引擎共用同一套提示词语法、同一套采样器名称与同一个图库。不同之处在于哪种引导方式适用，以及采样器名称背后真正的调度是什么。</p>
+
+    <h2 id="prompt">提示词权重</h2>
+    <p>六个引擎共享核心的 ComfyUI 括号语法：</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>语法</th><th>效果</th></tr></thead>
+        <tbody>
+          <tr><td><code>(text)</code></td><td>应用默认的 <code>1.1</code> 强调。</td></tr>
+          <tr><td><code>((text))</code></td><td>对嵌套强调进行连乘。</td></tr>
+          <tr><td><code>(text:1.25)</code></td><td>应用显式的有限权重。</td></tr>
+          <tr><td><code>\(text\)</code></td><td>保留字面括号。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>方括号减弱、<code>BREAK</code>、文本反转（textual inversion）标签、Prompt LoRA 标签与 A1111
+      调度语法<strong>不由</strong>此语法解释。Anima 独立解析 Qwen 与 T5 的 token 边界，并将权重应用于 T5 对齐的 LLM 适配器输出。</p>
+
+    <h2 id="guidance">引导</h2>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>方式</th><th>引擎</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>PAG</td><td>SD、iL、原生 Anima</td><td>scale 范围 <code>0..5</code>，scope 为 <code>mid|all</code>。</td></tr>
+          <tr><td>CFG-Zero*</td><td>原生 Anima、Krea 2</td><td>—</td></tr>
+          <tr><td>负面提示词</td><td>SD、iL、Anima、Krea 2</td><td>两代 FLUX 为蒸馏引导，不发送负面提示词。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Anima 使用原生的 Cosmos 恒等自注意力分支，而不是 Diffusers UNet
+      适配器。它按顺序运行分支，以始终保持一个物理 transformer 前向过程存活，并将相同的设置传播到原生 Hires 与 ADetailer 细化中。</p>
+
+    <h2 id="adapters">适配器融合</h2>
+    <p>原生 Anima 适配器融合接受标准 LoRA、静态全秩 T-LoRA、线性 LoHa、受支持的线性 LoKr 形式，以及使用
+      <code>dora_scale</code> 的输出轴 LyCORIS 线性 DoRA。受支持的线性 LoKr 也可以携带输出轴
+      <code>dora_scale</code>。权重为零即为精确禁用。</p>
+
+    <p>Tucker/卷积形式、分解的 LoKr 第一因子、PEFT <code>lora_magnitude_vector</code> 与
+      <code>lora_mid.weight</code> 会以失败关闭（fail closed）处理，而不是被静默近似。</p>
+
+    <h2 id="samplers">采样器与调度器</h2>
+    <p>四个原生引擎在 Generate 与 Gallery 中都提供相同的 44 个采样器名称和 9 个调度器名称。名称是共用的，其背后的调度并不相同：</p>
+    <ul>
+      <li>Anima 的 9 个调度器都是原生的 Flow-shift-3 轨迹。</li>
+      <li>两代 FLUX 与 Krea 2 运行同一张 ModelSamplingFlux 表，FLUX.2 的 shift 取自模型，Krea 2 取自其模型配置声明的静态 shift。</li>
+    </ul>
+    <p>具名的兼容性求解器映射会在任务警告和 PNG 采样元数据中报告，而不是静默地伪装成另一种实现。</p>
+
+    <h2 id="batches">图像批次</h2>
+    <p>采样参数包含两个独立的输出控制：</p>
+    <ul>
+      <li><strong>每批图像数（Images per batch）</strong> 接受 1-10。一次 Diffusers 管道调用会使用
+        <code>num_images_per_prompt</code> 和等长的生成器列表，因此该批次中的所有图像会一起采样，而不是作为顺序执行的单图任务。</li>
+      <li><strong>批次数（Batch count）</strong> 接受 1-20。批次在一个可控制的任务内排队并按顺序运行。例如，3 张图像 × 4
+        批会执行四次管道调用并保存 12 张图像。最大任务规模为 10 张图像 × 20 批，即最多保存 200 张图像。</li>
+    </ul>
+
+    <p>种子会按输出位置在整个任务中递增，并在无符号 64
+      位范围内安全回绕。结果浏览器按批次对输出分组，并允许你选择当前批次中的任意图像；缩放与下载操作始终使用所选图像。取消或失败的多批次任务会移除部分输出，而完成的
+      PNG 文件会在元数据中记录其批次、图像、种子和总批次设置。</p>
+
+    <h2 id="workspace">图像查看器工作区</h2>
+    <p>本地图像工作区可以从预览头部打开，或在任何图像生成之前从其空状态打开。右上角的 <strong>全屏</strong> 按钮无需使用 F11
+      即可将工作区扩展到浏览器窗口。</p>
+
+    <h3>历史轨道</h3>
+    <p>可选的左侧图像轨道默认显示自当前 Web UI 会话开始以来创建的 PNG/GIF
+      文件。其资源管理器条带可以打开配置的输出根目录、进入任意嵌套文件夹，并一次返回一层。每一层都会同时显示直接子文件夹和直接图像，因此一个文件夹可以同时包含两者。单图批次显示为单独的卡片；多图批次分组为一个带数量徽标的卡片，打开该卡片会显示其中的图像，返回按钮会恢复之前卡片的滚动位置。</p>
+
+    <p>历史卡片可以左键点击以切换活动预览，拖入工作区，或右键点击以添加新图层并管理删除。删除提供仅预览的隐藏或永久移除相应 PNG 源文件两种选择。</p>
+
+    <h3>图层、吸附与参考线</h3>
+    <p>图层可以移动、从角落手柄调整大小，并通过工具栏或 Ctrl + 鼠标滚轮独立缩放。工作区默认使用 16 px 网格，网格单元大小可以按像素编辑。</p>
+
+    <p>网格吸附与图像边缘吸附相互独立：边缘吸附会检测附近自由形式图像图层的可见边界，显示对齐参考线，并在释放时使它们的边缘对齐。可选的边缘线面板可以在已吸附图像和模板单元格周围绘制实线、虚线、点线、双线或发光线条，支持标准调色板、浏览器可用的屏幕取色器以及可编辑的线宽。</p>
+
+    <h3>布局模板与拼图</h3>
+    <p>工作区为 2 到 9 的每种图像数量提供三种推荐布局：水平对比、规则网格和特色图像布局。模板单元格接受从历史轨道拖入的图像或已有的工作区图层。模板布局会响应图像宽高比，每个选中的单元格都支持图像缩放以及左/中/右和上/中/下对齐。</p>
+
+    <p>确认已填充的模板会在浏览器中创建无损 PNG 合成图；结果可以再次编辑、以不携带 PNG 生成元数据的方式复制、不保存直接删除，或保存到
+      <code>outputs</code> 下按当前日期命名的目录中。对于手动排列的组，<strong>一键拼图</strong>
+      会根据当前可见布局创建一张无损合成图。在未保存的已完成拼图上更改边缘线设置会恢复其可编辑形式，并需要再次确认。</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>
+      <a href="runtime.html">运行与更新</a>
+      <a href="../usage.html">English</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

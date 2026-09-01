@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>运行与更新 — XiriaCanvas AI</title>
+<meta name="description" content="环境配置、服务与端口、显存模式、下载队列，以及程序更新如何校验、应用与回滚。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="../assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">发布</a>
+    <a class="lang" href="../runtime.html">English</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>文档</h2>
+    <ul>
+      <li><a href="index.html">总览</a></li>
+      <li><a href="setup.html">安装</a></li>
+      <li><a href="models.html">模型</a></li>
+      <li><a href="usage.html">生成图像</a></li>
+      <li><a href="runtime.html" aria-current="page">运行与更新</a></li>
+    </ul>
+    <h2>本页目录</h2>
+    <ul>
+      <li><a href="#configuration">配置</a></li>
+      <li><a href="#paths">运行时路径</a></li>
+      <li><a href="#memory">显存模式</a></li>
+      <li><a href="#cache">管道缓存</a></li>
+      <li><a href="#downloader">模型下载器</a></li>
+      <li><a href="#updates">程序更新</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>运行与更新</h1>
+    <p class="lede">运行中的程序如何配置、如何判断显存装得下什么，以及如何在不丢失模型与输出的前提下把自己替换成更新的版本。</p>
+
+    <h2 id="configuration">配置</h2>
+    <p>仅当需要更改默认值时，才将 <code>.env.example</code> 复制为 <code>.env</code>。相对路径在两种操作系统上都从仓库根目录解析。</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>服务</th><th>地址</th></tr></thead>
+        <tbody>
+          <tr><td>配置与 Web UI</td><td><code>0.0.0.0:7709</code></td></tr>
+          <tr><td>推理后端</td><td><code>127.0.0.1:8718</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Web UI 可通过 <code>http://localhost:7709/</code> 与 <code>http://YOUR-LAN-IP:7709/</code>
+      访问。只有 Web UI 对局域网暴露；Python 推理服务仅限回环访问，并通过 Web 代理访问。</p>
+
+    <div class="note">
+      <span class="label">仅在受信任的网络中使用局域网地址</span>
+      <p>它会把开发 UI 和经代理的本地推理 API 暴露给任何能够访问 7709 端口的设备。</p>
+    </div>
+
+    <h2 id="paths">运行时路径</h2>
+    <p>运行时路径可以移到只读检出目录之外：</p>
+<pre><code>XIRAI_CACHE_DIR=.cache
+XIRAI_OUTPUT_DIR=outputs/my-project</code></pre>
+    <p>输出值可以使用自定义文件夹名称或任意嵌套的相对路径。<code>.env</code> 中也接受绝对的本地值；仓库中不会提交任何绝对的用户或系统路径。空白输出路径会被拒绝。</p>
+
+    <h2 id="memory">显存模式</h2>
+    <p>运行时显存管理默认采用 <code>XIRAI_MEMORY_MODE=auto</code>，遵循 ComfyUI 的内存预算行为，但不导入或依赖
+      ComfyUI。在第一次加载检查点之前，XirAI 会测量当前可用/总显存，根据张量元数据估算检查点的 FP16
+      运行时权重大小，考虑请求的画布大小，为推理至少预留 0.8 GB，并保持与 ComfyUI 相同的操作系统余量：Windows 上 600 MB，超过 15 GB
+      的 GPU 上再加 100 MB；其他情况 400 MB。</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>模式</th><th>行为</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>HIGH_VRAM</code></td>
+            <td>仅在完整管道和推理工作区都能容纳时被选中。它将所有模型组件保留在 CUDA 上，并启用最快的 CUDA/TF32/cuDNN 路径。</td>
+          </tr>
+          <tr>
+            <td><code>NORMAL_VRAM</code></td>
+            <td>组件级动态 CPU/GPU 调度。去噪器在其整个采样循环期间保持于 GPU 上，而非活动组件按需移动。在满足条件的 8 GB
+              预算上，原生 Anima 会在采样期间保持完整的 Cosmos Transformer 驻留，以实现高利用率。</td>
+          </tr>
+          <tr>
+            <td><code>LOW_VRAM</code></td>
+            <td>对无法安全容纳最大组件和推理工作区的 GPU 使用顺序层卸载并辅以 VAE 切片与分块。原生 Anima 在需要时使用同步单块
+              Cosmos 组卸载和串行图像微批次。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>如果 Anima 的驻留 Transformer 路径遇到真实的 CUDA 内存不足（OOM），XirAI 会恢复 CPU
+      生成器状态，并使用单块组卸载自动重放该采样块。这使自动模式保持速度优先，同时不会让显存紧张的机器变成失败的任务，也不会改变其 Seed 轨迹。</p>
+
+    <p>高级用户可以用 <code>XIRAI_MEMORY_MODE</code> 强制 <code>high_vram</code>、<code>normal_vram</code> 或
+      <code>low_vram</code>；不安全的强制模式会自动降级。设置 <code>XIRAI_RESERVE_VRAM_GB</code> 以覆盖默认的操作系统/应用预留量。</p>
+
+    <div class="note">
+      <span class="label">量化文件不会降低显存占用</span>
+      <p>所有权重格式都会在加载时展开为计算精度，预算按张量形状而非文件大小计算。参见<a href="models.html#quantization">关于量化，说实话</a>。</p>
+    </div>
+
+    <h2 id="cache">管道缓存</h2>
+    <p>所有三种模式都会在成功、已取消或非 OOM
+      失败的生成之后缓存已加载的管道对象，因此使用相同引擎与模型身份的另一次生成无需再次读取并重建模型。对于原生
+      Anima，该身份包括扩散模型、文本编码器、VAE、固定的 tokenizer 修订版以及按顺序排列的非零适配器修订版与权重。</p>
+
+    <p>当引擎/模型选择改变、CUDA 报告内存不足错误、中断的卸载链无法安全恢复，或推理服务关闭时，缓存会被释放。SD/iL LoRA
+      更改不会重新加载基础模型；原生 Anima 适配器会被密集融合到其组合运行时身份中。可用时自动使用 PyTorch SDPA，安装兼容原生扩展时优先使用
+      xformers。</p>
+
+    <h2 id="downloader">模型下载器</h2>
+    <p>模型下载器为粘贴的链接和推荐的模型选择维护一条串行队列。当一个文件正在下载时，你可以继续添加链接、打开推荐模型浏览器并追加更多选择，而不会中断当前传输。已经通过目录大小与
+      SHA-256 校验、或已存在于队列中的推荐资源，会从等待列表中省略。</p>
+
+    <p>失败的行可以从下载器页面重试。重试会保留原始分段数并复用已保留的 <code>.part</code>/<code>.part.N</code>
+      文件，因此可用字节会从已保存的偏移量处继续下载。Provider 令牌仅保存在浏览器本地，并在重试时重新提交；它们绝不会写入持久化的队列状态。</p>
+
+    <h2 id="updates">程序更新</h2>
+
+    <h3>在线更新</h3>
+    <p><strong>Settings → About → Online program update（设置 → 关于 → 在线更新程序）</strong>
+      会联网检查发布源是否有新版本。检查本身不下载任何内容：发现新版本时会显示版本号、大小、发布时间与更新说明，并在你确认之后才开始更新。</p>
+
+    <p>只有当发布同时提供精确命名并已完成上传的 <code>XirAI-&lt;version&gt;.7z</code> 与
+      <code>XirAI-&lt;version&gt;.7z.sha256</code> 时才会启用加速镜像。校验和文件会在启用任何归档线路前严格读取和验证；如果 API
+      提供摘要，还会进行交叉校验。缺失、格式错误、歧义、草稿、预发布或命名错误的 Release
+      会安全拒绝，不会显示成可用更新。发布源、仓库、镜像与可选令牌均可在 <code>.env</code> 中配置，参见 <code>.env.example</code>。</p>
+
+    <h3>手动更新</h3>
+    <p><strong>Settings → About → Manual program update（设置 → 关于 → 手动程序更新）</strong>
+      页面接受受信任的干净 XiriaCanvas AI 项目归档，例如 ZIP、7Z、RAR、TAR、TAR.GZ 与
+      TAR.XZ。归档会使用命令行工具检查并解压到项目外部的临时目录。当系统命令无法读取归档时，更新程序会为当前 Windows 或 Linux
+      架构下载带校验和固定的官方 7-Zip 命令行文件到 <code>.cache/tools/7zip/</code>；它绝不运行安装程序，也不使用桌面文件关联。</p>
+
+    <p>随后归档会由同一更新程序校验与应用，回滚机制完全相同——在线与离线两条路径的差别仅在于归档如何到达本机。</p>
+
+    <h3>更新可以改什么、不可以改什么</h3>
+    <p>更新包必须与已安装环境使用相同的 Node 依赖。改变了 Node 依赖的归档会被拒绝而不是应用，因为在 Windows 上替换正在运行进程使用的
+      <code>node_modules</code> 并不安全；这类版本会以完整安装包的形式发布，供全新安装。<code>backend/requirements.txt</code>
+      发生变化则受支持：先替换文件，随后自动修复 Python 环境。</p>
+
+    <p>只替换程序文件。<code>.venv</code>、<code>node_modules</code>、<code>models</code>、<code>outputs</code>、
+      <code>logs</code>、<code>state-cache</code>、<code>.cache</code>、<code>.env</code> 与已安装的
+      <code>plugins</code> 保持原样，你自己的 <code>models/model-paths.json</code>
+      同样保留。替换前，受管理的文件会备份到项目外部。复制失败、Python 校验失败和生产构建失败都会自动回滚。</p>
+
+    <p>发布新版本时规则是严格的；该流程记录在
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Release-process">Wiki</a> 中。</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+      <a href="../runtime.html">English</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

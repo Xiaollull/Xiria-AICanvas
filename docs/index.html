@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XiriaCanvas AI — Documentation</title>
+<meta name="description" content="Documentation for XiriaCanvas AI, a local image-generation UI for Stable Diffusion, Illustrious, Anima, FLUX.1, FLUX.2 and Krea 2.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">Releases</a>
+    <a class="lang" href="zh/index.html">简体中文</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>Documentation</h2>
+    <ul>
+      <li><a href="index.html" aria-current="page">Overview</a></li>
+      <li><a href="setup.html">Installation</a></li>
+      <li><a href="models.html">Models</a></li>
+      <li><a href="usage.html">Generating images</a></li>
+      <li><a href="runtime.html">Runtime &amp; updates</a></li>
+    </ul>
+    <h2>Elsewhere</h2>
+    <ul>
+      <li><a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a></li>
+      <li><a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">Releases</a></li>
+      <li><a href="https://github.com/Xiaollull/Xiria-AICanvas/issues">Issues</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <section class="hero">
+      <img class="mark" src="assets/logo.svg" alt="XiriaCanvas AI logo">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark-dark.svg">
+        <img class="wordmark" src="assets/wordmark-light.svg" alt="XiriaCanvas AI" width="460">
+      </picture>
+      <p>A local image-generation UI for Stable Diffusion, Illustrious, and the native
+        Anima, FLUX.1, FLUX.2 and Krea 2 engines.</p>
+      <div class="actions">
+        <a class="button primary" href="setup.html">Install</a>
+        <a class="button" href="models.html">Models</a>
+        <a class="button" href="https://github.com/Xiaollull/Xiria-AICanvas/releases">Download a release</a>
+      </div>
+    </section>
+
+    <h2 id="what-it-is">What it is</h2>
+    <p>XiriaCanvas AI runs entirely on your own machine. The same source tree supports Windows
+      and Linux, and the project does not depend on ComfyUI or Stable Diffusion WebUI at runtime:
+      it does not read, import, upgrade or modify either of them, or their environments.</p>
+    <p>One installer sets up an isolated Python environment, picks a PyTorch build that matches
+      your GPU driver, and serves a web UI on your own network. Everything below is the manual for
+      that program. Maintainer and troubleshooting material lives in the
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">wiki</a>.</p>
+
+    <h2 id="engines">Engines</h2>
+    <p>Six engines are selectable in Generate. They share one prompt grammar, one sampler
+      vocabulary, and one gallery, and differ in how a model is assembled and how guidance is
+      applied.</p>
+
+    <div class="scroller">
+      <table>
+        <thead>
+          <tr><th>Engine</th><th>Model</th><th>Components</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>SD</strong></td><td>Stable Diffusion</td><td>one checkpoint</td></tr>
+          <tr><td><strong>iL</strong></td><td>Illustrious / SDXL</td><td>one checkpoint</td></tr>
+          <tr><td><strong>Anima</strong></td><td>native Flow Matching</td><td>diffusion model + text encoder + VAE</td></tr>
+          <tr><td><strong>Flux</strong></td><td>FLUX.1, distilled guidance</td><td>diffusion model + CLIP-L + T5-XXL + VAE</td></tr>
+          <tr><td><strong>Flux2</strong></td><td>FLUX.2, large-model guidance</td><td>diffusion model + text encoder + VAE</td></tr>
+          <tr><td><strong>Krea2</strong></td><td>Krea 2 single-stream DiT</td><td>diffusion model + text encoder + VAE</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>SD and iL mount one checkpoint file. The four native engines mount their parts separately,
+      so a text encoder or VAE can be shared between models instead of being duplicated inside
+      every checkpoint. FLUX.1 is the only engine that takes two text encoders. For FLUX.1, FLUX.2
+      and Krea 2 the diffusion model may be a <code>.safetensors</code> or a <code>.gguf</code>
+      file; see <a href="models.html#file-formats">file formats</a>.</p>
+
+    <p>Both FLUX generations are guidance distilled: they have no unconditional branch, so the
+      negative prompt carries nothing and is not sent. What you typed stays in the box for the
+      other engines. Krea 2 is the one native engine that is not distilled and keeps a working
+      negative prompt.</p>
+
+    <p>Guidance support follows the same split. PAG is available for SD, iL and native Anima;
+      CFG-Zero* is available for native Anima and Krea 2. Neither applies to either FLUX
+      generation.</p>
+
+    <h2 id="quick-start">Quick start</h2>
+    <p>The one-line command is the same on both operating systems. It opens a local visual
+      configuration window that detects your GPU before installing anything.</p>
+
+<pre><code>npm run setup   # first time only
+npm start       # afterwards</code></pre>
+
+    <p><strong>Windows:</strong> double-click <code>Setup-XirAI.bat</code>, then
+      <code>Start-XirAI.bat</code>.<br>
+      <strong>Linux:</strong> run <code>sh Setup-XirAI.sh</code>, then <code>sh Start-XirAI.sh</code>,
+      or mark the two <code>.desktop</code> files as trusted and double-click them.</p>
+
+    <p>The configuration window is always served at <code>http://localhost:7709/config</code>. Until
+      setup and build verification finish, the main application is locked and <code>/</code>
+      redirects there. Full detail is on the <a href="setup.html">installation page</a>.</p>
+
+    <h2 id="next">Where to go next</h2>
+    <div class="cards">
+      <a class="card" href="setup.html">
+        <h3>Installation</h3>
+        <p>Requirements, the setup wizard, GPU and PyTorch selection, network policy, and every
+          command-line flag.</p>
+      </a>
+      <a class="card" href="models.html">
+        <h3>Models</h3>
+        <p>Where files go, the recommended-model browser, and which file formats and
+          quantizations actually load.</p>
+      </a>
+      <a class="card" href="usage.html">
+        <h3>Generating images</h3>
+        <p>Prompt weights, guidance, samplers, batches, and the image viewer workspace.</p>
+      </a>
+      <a class="card" href="runtime.html">
+        <h3>Runtime &amp; updates</h3>
+        <p>Configuration, VRAM memory modes, the download queue, and how program updates are
+          applied and rolled back.</p>
+      </a>
+      <a class="card" href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">
+        <h3>Wiki</h3>
+        <p>Troubleshooting, the quantization support matrix, the release process, and the
+          development and CI notes.</p>
+      </a>
+    </div>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">Source on GitHub</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+      <a href="zh/index.html">简体中文</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

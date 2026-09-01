@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安装 — XiriaCanvas AI</title>
+<meta name="description" content="环境要求、可视化安装向导、GPU 与 PyTorch 选择、网络策略，以及完整的安装命令行参考。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="../assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">发布</a>
+    <a class="lang" href="../setup.html">English</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>文档</h2>
+    <ul>
+      <li><a href="index.html">总览</a></li>
+      <li><a href="setup.html" aria-current="page">安装</a></li>
+      <li><a href="models.html">模型</a></li>
+      <li><a href="usage.html">生成图像</a></li>
+      <li><a href="runtime.html">运行与更新</a></li>
+    </ul>
+    <h2>本页目录</h2>
+    <ul>
+      <li><a href="#requirements">环境要求</a></li>
+      <li><a href="#gpu">GPU 与 PyTorch 选择</a></li>
+      <li><a href="#wizard">安装向导</a></li>
+      <li><a href="#network">网络策略</a></li>
+      <li><a href="#launchers">启动器与端口</a></li>
+      <li><a href="#steps">安装脚本做了什么</a></li>
+      <li><a href="#resume">从检查点继续安装</a></li>
+      <li><a href="#cli">命令行参考</a></li>
+      <li><a href="#uv">项目本地 uv 引导</a></li>
+      <li><a href="#never">安装绝不触碰的东西</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>安装</h1>
+    <p class="lede">一条命令即可创建隔离的 Python 环境、选择与 GPU 驱动匹配的 PyTorch 构建，并在交付应用之前用一次真实的 CUDA 运算完成校验。</p>
+
+    <h2 id="requirements">环境要求</h2>
+    <ul>
+      <li>Windows 10/11，或现代的 x86-64 Linux 发行版。</li>
+      <li>Node.js 22.21 或更新版本。</li>
+      <li>Python 3.10 至 3.13，或使用 <code>uv</code> 自动安装 Python 3.12。</li>
+      <li>用于图像生成的 NVIDIA GPU 与当前版本的 NVIDIA 驱动程序。</li>
+    </ul>
+
+    <h2 id="gpu">GPU 与 PyTorch 选择</h2>
+    <p>PyTorch wheel 自带各自的 CUDA 运行时。系统级 CUDA Toolkit 并非必需，即使存在，其版本也会被刻意忽略。已有的全局或项目级
+      PyTorch 安装同样不会影响自动选择。</p>
+
+    <p>安装脚本会检测 NVIDIA GPU 以及其驱动程序支持的最大 CUDA ABI，然后查询当前官方 wheel 索引，选择最新稳定版
+      PyTorch，并搭配仍处于该驱动上限之内的最新捆绑 CUDA 运行时。它只下载这一个组合，然后运行一次真实的 CUDA
+      张量运算；它不会下载多个大型 wheel 来试装不同版本。它不会安装或修改系统 GPU 驱动。</p>
+
+    <div class="note">
+      <span class="label">看驱动上限，而不是硬件代数</span>
+      <p>仅凭 GPU 硬件代数并不会被当作超越当前已安装驱动所报告兼容上限的许可。一块能够运行 CUDA 12.8 构建的 GPU，在当前驱动报告
+        12.6 上限时仍会收到 <code>cu126</code>。如果检测或兼容性选择失败，NVIDIA 机器绝不会静默回退到 CPU
+        wheel——<code>--torch=cpu</code> 仍然是一个明确的诊断性覆盖项。</p>
+    </div>
+
+    <h2 id="wizard">安装向导</h2>
+    <p>最简单的安装方式会打开一个本地可视化配置窗口。向导首先检测你的 GPU 并查询官方 PyTorch wheel 目录，此时不会安装任何内容。然后你可以选择：</p>
+    <ul>
+      <li><strong>自动安装（Auto setup）</strong> —— 一步选择与驱动兼容的最新稳定版 PyTorch 及最高的捆绑 CUDA 运行时。</li>
+      <li><strong>手动安装（Manual setup）</strong> —— 从 wheel 目录中挑选一个 CUDA 运行时和具体的 PyTorch
+        版本。比当前最新稳定版更旧的版本，或使用非首选 CUDA 运行时的版本，会以 <strong>Non-recommended（不推荐）</strong>
+        标记并附注原因。安装只下载所选组合。</li>
+    </ul>
+    <p>两种模式都包含 xformers 开关（默认开启）。手动模式还可以启用 <strong>auto-repair（自动修复）</strong>：如果已安装的
+      PyTorch/CUDA 组合未通过安装后的 CUDA 张量运算，安装程序会自动尝试下一个最合适的兼容组合，而无需重新打开向导。</p>
+
+    <p>窗口中会显示 XirAI 标志、机器检测结果、所选 Python/PyTorch/CUDA 版本、完整的下载计划、每个文件的 MB
+      数与总下载进度、已完成下载数与总下载数、实时日志以及最终的构建校验。当它报告配置与构建已通过时，点击
+      <strong>Restart and enter the main page（重启并进入主页面）</strong>。配置服务器会释放 7709
+      端口，在同一端口启动主服务，等待其就绪，然后自动打开主应用。</p>
+
+    <h2 id="network">网络策略</h2>
+    <p>配置器、可视化向导、直接与 HTTP&nbsp;Range 下载，及其启动的 <code>uv</code>、<code>pip</code>、<code>npm</code>
+      子进程<strong>默认均为直连</strong>。它们只在自身进程环境中清除继承的 HTTP(S)/ALL 代理变量和 npm/pip/uv
+      代理配置，绝不会修改系统、VPN、shell 或用户级工具配置；<code>NO_PROXY</code> 保持不变。</p>
+
+    <p>只有显式传入 <code>--use-proxy</code>（例如 <code>npm run setup:cli -- --use-proxy</code>）或设置
+      <code>XIRAI_USE_PROXY=1</code> 才使用已配置代理。显式选择的代理不可用时会明确报错，绝不会悄悄直连回退；可视化向导也会明确显示“默认直连”，同样接受
+      <code>npm run setup -- --use-proxy</code>。</p>
+
+    <div class="note">
+      <span class="label">作用范围</span>
+      <p>这只是应用层 HTTP(S) 控制：它无法改变操作系统路由或全隧道 VPN，这类流量仍会照常经由其转发。</p>
+    </div>
+
+    <h2 id="launchers">启动器与端口</h2>
+    <p><strong>Windows：</strong>双击 <code>Setup-XirAI.bat</code>。</p>
+    <p><strong>Linux：</strong>运行 <code>sh Setup-XirAI.sh</code>，或将 <code>XirAI-Setup.desktop</code>
+      标记为受信任后双击它。两个启动器都会根据自身文件所在位置定位项目，因此安装路径中包含空格和非英文字符也受支持。</p>
+
+    <p>以下单行命令在 Windows 与 Linux 上均适用：</p>
+<pre><code>npm run setup</code></pre>
+
+    <p>配置窗口始终在 <code>/config</code> 提供服务：</p>
+<pre><code>http://localhost:7709/config
+http://YOUR-LAN-IP:7709/config</code></pre>
+
+    <p>在安装与构建校验完成之前，<code>/</code> 及所有主应用 API 均处于锁定状态。打开
+      <code>http://localhost:7709/</code> 或 <code>http://YOUR-LAN-IP:7709/</code> 会重定向到
+      <code>/config</code>。锁定期间推理后端不会启动。</p>
+
+    <p>安装完成后，常规启动命令是：</p>
+<pre><code>npm start</code></pre>
+
+    <p>Windows 用户可双击 <code>Start-XirAI.bat</code>。Linux 用户可运行 <code>sh Start-XirAI.sh</code>，或将
+      <code>XirAI-Start.desktop</code> 标记为受信任后双击它。启动器绝不会安装或更改环境。如果缺少安装标记、Python
+      环境、Python 依赖、Node 依赖或构建工具，它会拒绝启动：写入一条启动失败诊断日志、打印失败原因，并提示
+      <strong>请先双击 Setup-XirAI 配置环境，或运行：npm run setup</strong>。</p>
+
+    <h2 id="steps">安装脚本做了什么</h2>
+    <ol>
+      <li>检测 Windows 或 Linux，并使用各平台的原生约定查找 Python。</li>
+      <li>使用 Python 3.10-3.13 创建 <code>.venv</code>。</li>
+      <li>当缺少 Python 时，在项目缓存下使用强制性的各平台 SHA-256 哈希安装经过测试且固定版本的 <code>uv</code>
+        发布版，然后在同一缓存下安装受管理的 Python 3.12。</li>
+      <li>使用 <code>nvidia-smi</code>（包括更新的 <code>CUDA UMD Version</code> 输出）以及 CUDA Driver API
+        检测 NVIDIA GPU 与驱动兼容上限。这不是对已安装 CUDA Toolkit 的检测。</li>
+      <li>在下载每个项目之前，对官方、阿里云与清华线路上实际的目标包进行基准测试，若该线路不可用则自动切换。</li>
+      <li>解析适用于当前操作系统、Python 版本、架构、GPU 与驱动的最新稳定版 PyTorch 版本。PyTorch 版本优先；在该版本的各 wheel
+        中，选择最新的驱动兼容捆绑 CUDA 运行时。</li>
+      <li>使用最多 8 个经过验证的 HTTP Range 分段下载大型 PyTorch wheel。其他 Python wheel 使用 <code>uv</code>
+        包级并发，随后所有内容都安装在本仓库隔离的 <code>.venv</code> 中。</li>
+      <li>当存在兼容 wheel 时默认安装 <code>xformers</code>。不兼容的 wheel 会被安全移除，而不会替换已选的 Torch。</li>
+      <li>验证确切的 PyTorch/CUDA 版本，运行一次真实的 CUDA 张量运算，检查依赖一致性，并运行生产前端构建。</li>
+    </ol>
+
+    <p><code>xformers</code> 默认在无依赖的情况下安装，因此它不可能替换已选的确切 PyTorch 版本。如果导入兼容性检查失败，它会被自动移除。高级用户可以使用
+      <code>--without-xformers</code> 禁用它。</p>
+
+    <h2 id="resume">从检查点继续安装</h2>
+    <p>如果安装被中断，<strong>Continue setup from checkpoint（从检查点继续安装）</strong> 会复用缓存的驱动、PyTorch 与 CUDA
+      运行时选择及 wheel 元数据，跳过已完成且已验证的安装步骤，并避免再次查询版本索引。</p>
+    <p><code>.cache/downloads</code> 中的大文件会从每个未完成 Range 分段的已保存字节偏移量处续传；本地 <code>uv</code>
+      缓存中的 Python 包以及 npm 的包缓存也会自动复用。重新创建 <code>.venv</code> 或更改依赖清单只会使受影响的检查点失效。仅在需要重新选择
+      CUDA/PyTorch 时使用 <code>--refresh-selection</code>。</p>
+
+    <h2 id="cli">命令行参考</h2>
+    <p>包源与版本覆盖项：</p>
+<pre><code>npm run setup:cli -- --source=official
+npm run setup:cli -- --source=aliyun
+npm run setup:cli -- --source=tsinghua
+npm run setup:cli -- --torch=cu126
+npm run setup:cli -- --torch=cu126 --torch-version=2.13.0+cu126
+npm run setup:cli -- --torch=cpu
+npm run setup:cli -- --diagnose
+npm run setup:cli -- --without-xformers
+npm run setup:cli -- --connections=12
+npm run setup:cli -- --refresh-selection
+npm run setup:cli -- --use-proxy</code></pre>
+
+    <p>CUDA 运行时变体会从当前稳定版 PyTorch wheel 索引动态发现；脚本没有固定的最大 CUDA 版本。</p>
+
+    <p>同样的选项可以通过环境变量配置。自动路由是默认行为；显式的 <code>--source</code> 会保持该源优先，并仅将官方源用作失败时的后备。</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>变量</th><th>含义</th></tr></thead>
+        <tbody>
+          <tr><td><code>XIRAI_PACKAGE_SOURCE</code></td><td>首选包线路：official、aliyun 或 tsinghua。</td></tr>
+          <tr><td><code>XIRAI_TORCH_VARIANT</code></td><td>CUDA 运行时变体，例如 <code>cu126</code>。</td></tr>
+          <tr><td><code>XIRAI_TORCH_INDEX</code></td><td>显式指定 PyTorch wheel 索引。</td></tr>
+          <tr><td><code>XIRAI_DOWNLOAD_CONNECTIONS</code></td><td>单个大文件的 HTTP Range 分段数，1-16。</td></tr>
+          <tr><td><code>XIRAI_PACKAGE_CONCURRENCY</code></td><td>并行安装的包数量，1-32。</td></tr>
+          <tr><td><code>XIRAI_USE_PROXY</code></td><td>设为 <code>1</code> 时才使用已配置的 HTTP(S) 代理。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="uv">项目本地 uv 引导</h2>
+    <p>项目本地 uv 引导会在不执行下载脚本的情况下复现官方 Bash/PowerShell 安装程序的安全相关行为。它选择 Windows
+      <code>.zip</code> 或 Linux <code>.tar.*</code> 构件，检查官方最低 glibc 版本并在需要时回退到静态 musl 构建，从 Astral
+      发布线路下载并提供 GitHub 后备，验证固定的 SHA-256，在暂存目录中测试确切的 uv 版本，然后原子地提升到
+      <code>.cache/tools/uv/current</code>。解压出的 <code>uvx</code> 与 Windows <code>uvw.exe</code> 二进制会被保留。</p>
+
+    <p>默认的 uv 目标文件基准测试还会在 Astral 与 GitHub 后备之前包含 <code>ghfast.top</code> 和 <code>ghproxy.net</code>
+      加速线路。它们仅被视为不可信的字节传输通道：每个完成的归档都必须匹配内嵌的官方 SHA-256，否则即被删除。由于 Windows uv 归档约为
+      25 MB，uv 使用专门的 8 MB 阈值，因此会运行最多 8 个 HTTP Range 连接，而不是回退到单个连接。</p>
+
+    <p>高级镜像可以使用官方安装程序变量 <code>UV_DOWNLOAD_URL</code>、<code>INSTALLER_DOWNLOAD_URL</code>、
+      <code>UV_INSTALLER_GHE_BASE_URL</code> 或 <code>UV_INSTALLER_GITHUB_BASE_URL</code>；每个都是基础
+      URL，归档文件名会自动追加。多个直接基础地址可以用空白字符分隔。<code>UV_GITHUB_TOKEN</code> 只会转发到 GitHub 或明确配置的
+      GitHub Enterprise 主机。每个镜像都必须通过构件哈希校验。设置这些源变量中的任何一个都会替换内置的加速线路列表，因此仅官方或私有镜像策略仍然可用。引导请求采用同一默认直连策略。</p>
+
+    <h2 id="never">安装绝不触碰的东西</h2>
+    <p>与用户级 uv 安装不同，XirAI 会刻意忽略安装目录和 PATH 修改设置：它绝不修改 shell 配置文件、Windows 注册表、<code>PATH</code>、Cargo/XDG
+      目录或用户级 uv receipt，也不启用 <code>uv self update</code>。应用始终直接调用其固定的项目本地可执行文件。</p>
+
+    <p>安装绝不会安装到系统 Python、修改全局 pip 配置、安装 CUDA Toolkit 或更改 NVIDIA 驱动。运行时只使用规范的项目
+      <code>.venv</code>；Python 与 pip 重定向变量会被移除。旧的未隔离 <code>.venv</code> 会在创建新环境前保留为
+      <code>.venv.backup-&lt;timestamp&gt;</code>。ComfyUI、SD WebUI 及其环境不会被读取、导入、升级或修改。</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Troubleshooting">故障排查</a>
+      <a href="../setup.html">English</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>

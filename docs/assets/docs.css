@@ -1,0 +1,372 @@
+/* XiriaCanvas AI documentation site.
+   Served straight from `docs/` on the default branch, so there is no build step and no framework:
+   one stylesheet, hand-written pages, and `.nojekyll` to stop GitHub from running Jekyll over it. */
+
+:root {
+  color-scheme: light;
+  --ink: #221f31;
+  --ink-soft: #55506b;
+  --ink-faint: #7d7793;
+  --page: #fbfaff;
+  --surface: #ffffff;
+  --surface-alt: #f3f1fa;
+  --line: #e2dced;
+  --line-strong: #cdc5e0;
+  --accent: #6a55e6;
+  --accent-soft: #efecff;
+  --code-bg: #f4f2fb;
+  --shadow: 0 1px 2px rgba(34, 31, 49, .06), 0 8px 24px rgba(34, 31, 49, .05);
+  --measure: 72ch;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ink: #f0edf8;
+    --ink-soft: #b6b0cc;
+    --ink-faint: #8a84a3;
+    --page: #100f16;
+    --surface: #17161f;
+    --surface-alt: #1d1b28;
+    --line: #2b2839;
+    --line-strong: #3b3750;
+    --accent: #a596ff;
+    --accent-soft: #221f35;
+    --code-bg: #1b1926;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .28);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 16px/1.68 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC",
+        "PingFang SC", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+img { max-width: 100%; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+
+/* ---------- masthead ---------- */
+
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 24px;
+  /* The blurred translucent bar needs `color-mix`; the opaque line above keeps older engines
+     readable instead of leaving the header with no background at all. */
+  background: var(--page);
+  background: color-mix(in srgb, var(--page) 88%, transparent);
+  backdrop-filter: saturate(160%) blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+
+.masthead .brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  color: var(--ink);
+  text-decoration: none;
+  letter-spacing: .01em;
+}
+
+.masthead .brand img { width: 26px; height: 26px; }
+
+.masthead nav {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.masthead nav a {
+  color: var(--ink-soft);
+  text-decoration: none;
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 7px;
+}
+
+.masthead nav a:hover { color: var(--ink); background: var(--surface-alt); }
+
+.masthead nav a.lang {
+  border: 1px solid var(--line-strong);
+  color: var(--ink);
+}
+
+/* ---------- layout ---------- */
+
+.shell {
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: 0 24px 96px;
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  gap: 48px;
+  align-items: start;
+}
+
+.sidebar {
+  position: sticky;
+  top: 76px;
+  padding-top: 40px;
+}
+
+.sidebar h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  color: var(--ink-faint);
+  margin: 0 0 10px;
+  font-weight: 600;
+}
+
+.sidebar ul { list-style: none; margin: 0 0 26px; padding: 0; }
+
+.sidebar li { margin: 0; }
+
+.sidebar a {
+  display: block;
+  padding: 5px 10px;
+  border-radius: 7px;
+  color: var(--ink-soft);
+  text-decoration: none;
+  font-size: 14.5px;
+  border-left: 2px solid transparent;
+}
+
+.sidebar a:hover { color: var(--ink); background: var(--surface-alt); }
+
+.sidebar a[aria-current="page"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+  font-weight: 600;
+}
+
+main { padding-top: 40px; min-width: 0; }
+
+main > * { max-width: var(--measure); }
+
+/* ---------- prose ---------- */
+
+h1 {
+  font-size: 2.1rem;
+  line-height: 1.2;
+  letter-spacing: -.015em;
+  margin: 0 0 10px;
+}
+
+.lede {
+  font-size: 1.12rem;
+  color: var(--ink-soft);
+  margin: 0 0 40px;
+}
+
+h2 {
+  font-size: 1.4rem;
+  letter-spacing: -.01em;
+  margin: 52px 0 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+h3 { font-size: 1.06rem; margin: 32px 0 10px; }
+
+p, ul, ol { margin: 0 0 16px; }
+
+ul, ol { padding-left: 22px; }
+
+li { margin: 4px 0; }
+
+strong { font-weight: 650; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: .875em;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: .1em .34em;
+  word-break: break-word;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 0 0 20px;
+  line-height: 1.55;
+}
+
+pre code { background: none; border: 0; padding: 0; font-size: .86rem; }
+
+blockquote {
+  margin: 0 0 20px;
+  padding: 2px 0 2px 16px;
+  border-left: 3px solid var(--line-strong);
+  color: var(--ink-soft);
+}
+
+/* ---------- tables ---------- */
+
+.scroller { overflow-x: auto; margin: 0 0 22px; max-width: var(--measure); }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14.5px;
+}
+
+th, td {
+  text-align: left;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+th {
+  font-weight: 600;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border-bottom-color: var(--line-strong);
+}
+
+tbody tr:last-child td { border-bottom: 0; }
+
+/* ---------- callouts ---------- */
+
+.note {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 10px 10px 0;
+  padding: 14px 18px;
+  margin: 0 0 22px;
+  box-shadow: var(--shadow);
+}
+
+.note p:last-child, .note ul:last-child { margin-bottom: 0; }
+
+.note .label {
+  display: block;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--accent);
+  font-weight: 650;
+  margin-bottom: 4px;
+}
+
+/* ---------- home hero and cards ---------- */
+
+.hero {
+  max-width: none;
+  text-align: center;
+  padding: 56px 0 12px;
+}
+
+.hero img.mark { width: 108px; height: 108px; margin-bottom: 20px; }
+
+.hero .wordmark { max-width: 460px; width: 100%; margin: 0 auto 18px; display: block; }
+
+.hero p {
+  max-width: 60ch;
+  margin: 0 auto 12px;
+  color: var(--ink-soft);
+  font-size: 1.1rem;
+}
+
+.hero .actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 26px; }
+
+.button {
+  display: inline-block;
+  padding: 9px 18px;
+  border-radius: 9px;
+  text-decoration: none;
+  font-size: 14.5px;
+  font-weight: 600;
+  border: 1px solid var(--line-strong);
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.button:hover { border-color: var(--accent); color: var(--accent); }
+
+.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.button.primary:hover { color: #fff; filter: brightness(1.08); }
+
+.cards {
+  max-width: none;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+  gap: 16px;
+  margin: 0 0 24px;
+}
+
+.card {
+  display: block;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  text-decoration: none;
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+
+.card:hover { border-color: var(--accent); }
+
+.card h3 { margin: 0 0 6px; font-size: 1rem; }
+
+.card p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+
+/* ---------- footer ---------- */
+
+.page-footer {
+  max-width: none;
+  margin-top: 72px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-faint);
+  font-size: 13.5px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.page-footer a { color: var(--ink-soft); }
+
+/* ---------- narrow screens ---------- */
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: minmax(0, 1fr); gap: 0; padding: 0 18px 72px; }
+  .sidebar {
+    position: static;
+    padding: 20px 0 0;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 8px;
+  }
+  .sidebar ul { margin-bottom: 16px; }
+  main > *, .scroller { max-width: none; }
+  .hero { padding-top: 32px; }
+  h1 { font-size: 1.7rem; }
+}

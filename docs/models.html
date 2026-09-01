@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Models — XiriaCanvas AI</title>
+<meta name="description" content="Where model files go, how they are discovered, the recommended-model browser, and which file formats and quantizations actually load.">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/docs.css">
+</head>
+<body>
+
+<header class="masthead">
+  <a class="brand" href="index.html"><img src="assets/logo.svg" alt=""> XiriaCanvas AI</a>
+  <nav>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
+    <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases">Releases</a>
+    <a class="lang" href="zh/models.html">简体中文</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <h2>Documentation</h2>
+    <ul>
+      <li><a href="index.html">Overview</a></li>
+      <li><a href="setup.html">Installation</a></li>
+      <li><a href="models.html" aria-current="page">Models</a></li>
+      <li><a href="usage.html">Generating images</a></li>
+      <li><a href="runtime.html">Runtime &amp; updates</a></li>
+    </ul>
+    <h2>On this page</h2>
+    <ul>
+      <li><a href="#directory">The model directory</a></li>
+      <li><a href="#roots">What each root holds</a></li>
+      <li><a href="#paths">model-paths.json</a></li>
+      <li><a href="#catalog">Recommended-model browser</a></li>
+      <li><a href="#file-formats">File formats</a></li>
+      <li><a href="#quantization">Quantization, honestly</a></li>
+    </ul>
+  </aside>
+
+  <main>
+    <h1>Models</h1>
+    <p class="lede">Model configuration uses project-relative paths below <code>models</code> and
+      works unchanged on Windows and Linux. Every root may use custom names and arbitrary
+      nesting.</p>
+
+    <h2 id="directory">The model directory</h2>
+    <p>The directory follows ComfyUI's model-category naming while remaining fully owned by this
+      project. The inference backend resolves every configured path relative to the project root on
+      both operating systems. Checkpoints, LoRAs, upscalers, YOLO detectors, and compatible
+      background-removal models are scanned recursively.</p>
+
+<pre><code>models/
+|-- checkpoints/
+|   |-- sd/
+|   `-- illustrious/
+|-- loras/
+|   |-- sd/
+|   |   |-- character/  style/  concept/  other/
+|   `-- illustrious/
+|       |-- character/  style/  concept/  other/
+|-- vae/
+|-- diffusion_models/
+|-- text_encoders/
+|-- embeddings/
+|-- yolo/
+|-- background-removal/
+|-- upscalers/
+`-- configs/</code></pre>
+
+    <p>LoRA root files appear under <code>根目录</code>; each custom first-level folder becomes a UI
+      category and deeper folders remain visible in the model name. Moving or renaming a selected
+      model changes its root-relative ID, so refresh and reselect it after reorganizing files.</p>
+
+    <h2 id="roots">What each root holds</h2>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Root</th><th>Contents</th></tr></thead>
+        <tbody>
+          <tr><td><code>checkpoints/sd</code></td><td>SD 1.x or SDXL single-file checkpoints. SDXL detection is supported for <code>.safetensors</code>; ambiguous SD 2.x and SDXL <code>.ckpt</code> files are not currently supported.</td></tr>
+          <tr><td><code>checkpoints/illustrious</code></td><td>Illustrious / Illustrious XL checkpoints. They must live here so the correct SDXL pipeline is selected.</td></tr>
+          <tr><td><code>loras/sd</code>, <code>loras/illustrious</code></td><td>LoRA roots. The four default categories remain available, while custom folders and arbitrary nesting are discovered automatically.</td></tr>
+          <tr><td><code>vae</code></td><td>Standalone and shared VAEs used by split model pipelines.</td></tr>
+          <tr><td><code>diffusion_models</code></td><td>Anima, FLUX.1, FLUX.2, Krea 2 and other split diffusion weights. <code>.safetensors</code> throughout, plus <code>.gguf</code> for the three engines that read it.</td></tr>
+          <tr><td><code>text_encoders</code></td><td>Standalone text encoders required by split model pipelines.</td></tr>
+          <tr><td><code>embeddings</code></td><td>Reserved for future textual inversion support.</td></tr>
+          <tr><td><code>yolo</code></td><td>Ultralytics <code>.pt</code> detection or segmentation models for local ADetailer passes. Community models may be placed here, including in subdirectories.</td></tr>
+          <tr><td><code>background-removal</code></td><td>Compatible ONNX foreground-extraction models. Recommended files are identified by fixed hashes even after nesting or renaming.</td></tr>
+          <tr><td><code>upscalers</code></td><td>Hires.fix pixel-space super-resolution weights. Compatible <code>.pth</code>, <code>.pt</code>, <code>.ckpt</code> and <code>.safetensors</code> files are discovered by their tensor structure, so renaming a file does not change compatibility. PyTorch files must contain weights or state dictionaries; TorchScript archives are intentionally not loaded.</td></tr>
+          <tr><td><code>configs</code></td><td>User and model runtime configuration artifacts.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Native Anima's Qwen3 tokenizer, tokenizer config and T5 tokenizer JSON files ship with the
+      program under <code>backend/resources/anima-tokenizers</code> — they are program resources,
+      not user model downloads. Setup, startup and program updates validate the bundled tokenizer
+      bytes automatically, so you only download the Anima DiT, text encoder and VAE.</p>
+
+    <p>ADetailer detection runs on CPU in the project's verified Python environment. The UI
+      benchmarks Hugging Face and hf-mirror routes before downloading an official model, and
+      resumes interrupted downloads in <code>models/yolo</code>. Detail inpainting stays in the same
+      environment and inherits the active checkpoint, LoRAs, sampler and scheduler. Model files are
+      never uploaded.</p>
+
+    <h2 id="paths">model-paths.json</h2>
+    <p>A program update keeps your own <code>models/model-paths.json</code> instead of replacing it,
+      so custom model roots survive an upgrade. Keys you leave out fall back to the built-in
+      defaults, which is why a file written for an older version stays correct. Only a missing file,
+      or one the updated project could not use, is restored from the release.</p>
+    <p>The recommended-model, YOLO and background-removal catalogs are refreshed by every update,
+      since those are the lists the program ships rather than your configuration.</p>
+
+    <h2 id="catalog">Recommended-model browser</h2>
+    <p>In addition to any file you place in <code>models</code> yourself, the browser covers:</p>
+    <ul>
+      <li><strong>Illustrious</strong> — WAI Illustrious SDXL, MiaoMiao Harem and Obsession
+        Illustrious XL, each tracking its Civitai version list.</li>
+      <li><strong>Anima</strong> — the official CircleStone Labs releases from both Civitai and the
+        Hugging Face <code>split_files</code> tree, paired automatically with the shared Qwen 0.6B
+        text encoder and Qwen Image VAE.</li>
+      <li><strong>FLUX.2</strong> — Klein 9B True V3 as Safetensors or GGUF, and the official
+        Klein 9B KV single-file build, which is gated and needs an accepted repository licence and a
+        Hugging Face token. Both pair with a Qwen 3 8B text encoder and the FLUX.2 VAE.</li>
+      <li><strong>Krea 2</strong> — the 12B model in Raw and Turbo variants, with a separately
+        chosen 4B text encoder precision. Its VAE is shared with Anima.</li>
+      <li><strong>Upscalers</strong> — the official Real-ESRGAN models used by the first Hires.fix
+        stage.</li>
+    </ul>
+
+    <div class="note">
+      <span class="label">Take the FLUX.2 text encoder at BF16</span>
+      <p>The published fp8 Qwen 3 8B file quantizes 85 of its layers to <code>nvfp4</code>, which
+        stores packed weights this program cannot expand. The BF16 file is the one that loads. See
+        the <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">quantization
+        support matrix</a> in the wiki.</p>
+    </div>
+
+    <p>FLUX.1 has no recommended family: it runs from diffusion model, CLIP-L, T5-XXL and VAE files
+      you supply yourself.</p>
+
+    <h2 id="file-formats">File formats</h2>
+    <p>Every component loads from <code>.safetensors</code>. FLUX.1, FLUX.2 and Krea 2 also load a
+      <code>.gguf</code> diffusion model, which is the only form some quantizations are published
+      in. The text encoder and VAE stay <code>.safetensors</code>: a GGUF text encoder is named in
+      llama.cpp's key space rather than the checkpoint's, and translating that is not something this
+      program does.</p>
+
+    <p>A GGUF placed in <code>models/diffusion_models</code> appears in the picker beside the
+      safetensors files and is identified the same way — by the tensors it holds, not by its
+      filename.</p>
+
+    <p>The block layouts read are:</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Family</th><th>Layouts</th></tr></thead>
+        <tbody>
+          <tr><td>Plain</td><td><code>F16</code>, <code>BF16</code>, <code>F32</code></td></tr>
+          <tr><td>Legacy blocks</td><td><code>Q4_0</code>, <code>Q4_1</code>, <code>Q5_0</code>, <code>Q5_1</code>, <code>Q8_0</code></td></tr>
+          <tr><td>K-quants</td><td><code>Q2_K</code>, <code>Q3_K</code>, <code>Q4_K</code>, <code>Q5_K</code>, <code>Q6_K</code></td></tr>
+          <tr><td>IQ</td><td><code>IQ4_NL</code>, <code>IQ4_XS</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>A file using anything else is left out of the picker rather than offered and then refused at
+      load.</p>
+
+    <h2 id="quantization">Quantization, honestly</h2>
+    <p>Quantized variants are offered where the publisher ships them, so the same model can be taken
+      at bf16, fp8, mxfp8, nvfp4, int4/int8 or GGUF Q4–Q8. Not all of them load; the picker hides
+      what the runtime cannot read, and the
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">wiki matrix</a>
+      lists the current state.</p>
+
+    <div class="note">
+      <span class="label">A quantized file is a smaller download, not a smaller model</span>
+      <p>It takes far less disk, but it is not a smaller model in memory. Every format — fp8, mxfp8
+        and GGUF alike — is expanded to the compute dtype while loading, because the Diffusers
+        modules this runtime builds have no quantized linear op to hand packed weights to. VRAM is
+        bought by the <a href="runtime.html#memory">memory mode</a> and block-level offload, not by
+        the file format.</p>
+    </div>
+
+    <p>The loaded size is measured from the tensor shapes rather than the file size, so a Q4_K model
+      is budgeted as what it becomes rather than as what it weighs on disk.</p>
+
+    <footer class="page-footer">
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas">Source on GitHub</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">Quantization matrix</a>
+      <a href="zh/models.html">简体中文</a>
+    </footer>
+  </main>
+</div>
+
+</body>
+</html>
