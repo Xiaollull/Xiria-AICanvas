@@ -638,9 +638,12 @@ kbd { padding: 3px 5px; color: #797a74; border: 1px solid #383934; background: #
 .hw-metric { min-height: 44px; padding: 7px 9px; border: 1px solid #262725; border-radius: 4px; background: #151516; }
 .hw-metric > span { display: block; color: #565752; font-size: 7px; }
 .hw-metric > strong { display: block; margin-top: 4px; overflow: hidden; color: #cbccc5; font: 9px "DM Mono"; white-space: nowrap; text-overflow: ellipsis; }
+.hw-metric > small { display: block; margin-top: 5px; overflow: hidden; color: #6f7069; font: 7px "DM Mono"; white-space: nowrap; text-overflow: ellipsis; }
 .hw-vram { margin-bottom: 9px; }
-.hw-bar { height: 2px; margin-top: 6px; overflow: hidden; border-radius: 1px; background: #282926; }
+.hw-bar { position: relative; height: 2px; margin-top: 6px; overflow: hidden; border-radius: 1px; background: #282926; }
 .hw-bar i { display: block; height: 100%; background: var(--lime); box-shadow: 0 0 6px rgb(var(--accent-rgb) / .5); transition: width .35s ease; }
+/* The allocator wall, so a capped card reads as capped rather than as a bar that stops early. */
+.hw-bar b { position: absolute; top: 0; width: 1px; height: 100%; background: #d8d9d2; opacity: .55; }
 .hw-chart-label { margin: 0 0 4px; color: #4c4d49; font: 7px "DM Mono"; }
 .sparkline-placeholder { height: 72px; border: 1px solid #262725; border-radius: 3px; background: #151516; }
 .sparkline { display: block; width: 100%; background: #151516; border: 1px solid #262725; border-radius: 3px; overflow: hidden; }
@@ -1157,6 +1160,9 @@ html[data-theme-mode="light"] .hw-monitor header button { color: #5c5f57; border
 html[data-theme-mode="light"] .hw-metric, html[data-theme-mode="light"] .sparkline-wrap, html[data-theme-mode="light"] .sparkline, html[data-theme-mode="light"] .sparkline-placeholder { border-color: #d0d1cb; background: #fff; }
 html[data-theme-mode="light"] .hw-metric > span { color: #666960; }
 html[data-theme-mode="light"] .hw-metric > strong { color: #292b26; }
+html[data-theme-mode="light"] .hw-metric > small { color: #6b6e65; }
+html[data-theme-mode="light"] .hw-bar { background: #dcddd6; }
+html[data-theme-mode="light"] .hw-bar b { background: #3d3f39; }
 html[data-theme-mode="light"] .sparkline-yaxis { border-color: #dedfd9; }
 html[data-theme-mode="light"] .sparkline-yaxis > span { color: #70736a; }
 html[data-theme-mode="light"] .hw-monitor footer { color: #65685f; border-color: #d1d2cc; background: #eeeeeb; }

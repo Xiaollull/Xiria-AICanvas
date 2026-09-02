@@ -10,7 +10,6 @@ import os
 import platform
 import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -217,6 +216,7 @@ try:
         krea2_sampling_diagnostics,
         KREA2_SHIFT,
     )
+    from .hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware
     from .memory_policy import (
         GIB,
         error_looks_like_oom,
@@ -299,6 +299,7 @@ except ImportError:
         krea2_sampling_diagnostics,
         KREA2_SHIFT,
     )
+    from hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware
     from memory_policy import (
         GIB,
         error_looks_like_oom,
@@ -475,6 +476,13 @@ active_compute_dtype = "none"
 active_vae_mode = "none"
 shutdown_requested = False
 
+# The monitor's two samplers are process-wide on purpose. The GPU one owns a background thread so
+# `nvidia-smi` never lands on the request path, and the CPU one owns the interval that
+# `psutil.cpu_percent` measures over — an interval that is global to the process, so exactly one
+# caller may hold it.
+gpu_sensor_sampler = NvidiaSmiSampler()
+cpu_sampler = CpuSampler()
+
 
 @asynccontextmanager
 async def lifespan(_app):
@@ -482,6 +490,7 @@ async def lifespan(_app):
     rtx_vsr.start_probe()
     yield
     shutdown_requested = True
+    gpu_sensor_sampler.stop()
     with jobs_lock:
         controls = list(job_controls.values())
     for control in controls:
@@ -7551,13 +7560,74 @@ def unload_model_cache(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Kr
     return {"status": "released", "model_cached": False}
 
 
+def cuda_device_identity():
+    """Identify the physical card torch is bound to, so an `nvidia-smi` row can be matched to it.
+
+    ``CUDA_VISIBLE_DEVICES`` renumbers devices and ``CUDA_DEVICE_ORDER=FASTEST_FIRST`` reorders
+    them, so torch's device 0 is not necessarily `nvidia-smi`'s row 0. The UUID settles it wherever
+    torch exposes one; the remapped driver index is the fallback for builds that do not.
+    """
+    if not torch.cuda.is_available():
+        return None, None
+    device_uuid = None
+    try:
+        device_uuid = getattr(torch.cuda.get_device_properties(0), "uuid", None)
+    except Exception:
+        device_uuid = None
+    device_index = None
+    try:
+        logical = int(torch.cuda.current_device())
+        visible = [part.strip() for part in (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",") if part.strip()]
+        if not visible:
+            device_index = str(logical)
+        elif logical < len(visible):
+            device_index = visible[logical]
+        else:
+            device_index = visible[0]
+    except Exception:
+        device_index = None
+    return device_uuid, device_index
+
+
+def psutil_module():
+    try:
+        import psutil
+
+        return psutil
+    except Exception:
+        return None
+
+
 @app.get("/api/inference/hardware")
 def hardware():
-    stats = {"cuda": torch.cuda.is_available(), "rtx_vsr": rtx_vsr.status()}
+    device_uuid, device_index = cuda_device_identity()
+    stats = probe_hardware(
+        torch_module=torch,
+        psutil_module=psutil_module(),
+        smi=gpu_sensor_sampler,
+        cpu=cpu_sampler,
+        device_uuid=device_uuid,
+        device_index=device_index,
+    )
+    stats["cuda"] = torch.cuda.is_available()
+    stats["rtx_vsr"] = rtx_vsr.status()
     if torch.cuda.is_available():
-        stats["vram_used_mb"] = round(torch.cuda.memory_allocated() / 1024**2, 1)
-        stats["vram_total_mb"] = round(torch.cuda.get_device_properties(0).total_memory / 1024**2)
-        stats.setdefault("gpu_name", torch.cuda.get_device_name(0))
+        if not stats.get("gpu_name"):
+            stats["gpu_name"] = torch.cuda.get_device_name(0)
+        try:
+            # The wall the allocator and the admission check both enforce. Without it the bar has
+            # no way to show that a card is "full" at 20 GB of 24 because that is where the cap is.
+            physical_total = int(torch.cuda.get_device_properties(0).total_memory)
+            stats["vram_limit_mb"] = round(
+                effective_vram_limit_bytes(
+                    physical_total,
+                    performance_settings.get("vram_limit_gb", 0.0),
+                    allow_shared_memory=performance_settings["allow_shared_memory"],
+                )
+                / 1024**2
+            )
+        except Exception:
+            pass
     if active_memory_strategy:
         stats.update({
             "memory_mode": active_memory_strategy["mode"],
@@ -7569,42 +7639,6 @@ def hardware():
             "attention_backend": current_attention_backend(),
             "loaded_checkpoint": Path(loaded_checkpoint).name if loaded_checkpoint else None,
         })
-    try:
-        nvidia_smi = os.environ.get("NVIDIA_SMI_PATH") or shutil.which("nvidia-smi")
-        if nvidia_smi:
-            result = subprocess.run(
-                [nvidia_smi, "--query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,fan.speed",
-                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                records = [[part.strip() for part in line.split(",")] for line in result.stdout.splitlines() if line.strip()]
-                visible_device = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",", 1)[0].strip()
-                selected = next((record for record in records if visible_device in record[:2]), records[0])
-
-                def numeric(value):
-                    if not value or value.lower() in {"n/a", "[n/a]", "[not supported]", "not supported"}:
-                        return None
-                    try:
-                        return float(value)
-                    except ValueError:
-                        return None
-
-                stats["gpu_name"] = selected[2] if len(selected) > 2 else stats.get("gpu_name")
-                for key, index in (("gpu_temp", 3), ("gpu_util", 4), ("vram_used_mb", 5), ("vram_total_mb", 6), ("power_w", 7), ("fan_speed", 8)):
-                    value = numeric(selected[index]) if len(selected) > index else None
-                    if value is not None:
-                        stats[key] = value
-    except Exception:
-        pass
-    try:
-        import psutil
-        stats["cpu_percent"] = psutil.cpu_percent()
-        stats["ram_percent"] = psutil.virtual_memory().percent
-        stats["ram_used_gb"] = round(psutil.virtual_memory().used / 1024**3, 1)
-        stats["ram_total_gb"] = round(psutil.virtual_memory().total / 1024**3, 1)
-    except Exception:
-        pass
     return stats
 
 

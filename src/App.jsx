@@ -3,6 +3,7 @@ import { fitViewerZoom, inverseViewerHandleScale, intrinsicDimensions, viewerLay
 import { createViewerRafScheduler, ViewerAsyncSession, viewerOpenPlan } from "./viewer-async-session.js";
 import { VIEWER_TOOLBAR_POPOVER_LAYOUT, VIEWER_TOOLBAR_POPOVER_TEMPLATES, viewerEscapeAction, viewerToolbarPopoverTransition } from "./viewer-toolbar.js";
 import { pluginDiagnosticMessage, pluginRegistrySummary, pluginRemoveConfirmation, pluginStatePresentation, pluginToggleAvailable } from "./plugin-presentation.js";
+import { appendHardwareSample, EMPTY_HARDWARE_HISTORY, formatMib, HARDWARE_POLL_MS, sensorAgeLabel, sparklineSegments, vramWallPercent } from "./hardware-monitor.js";
 import {
   ArrowDown,
   ArrowLeft,
@@ -936,15 +937,12 @@ function ThemeColorField({ label, detail, value, onChange }) {
 
 function Sparkline({ data, color = "var(--lime)", height = 48, max, label }) {
   const [tooltip, setTooltip] = useState(null);
-  if (!data || data.length < 2) return <div className="sparkline-placeholder" style={{ height }} />;
-  const ceiling = max ?? Math.max(...data, 1);
-  const points = data.map((value, index) => {
-    const x = (index / (data.length - 1)) * 100;
-    const y = 100 - (value / ceiling) * 100;
-    return `${x},${y}`;
-  }).join(" ");
+  const measured = (data || []).filter((value) => Number.isFinite(value));
+  if (measured.length < 2) return <div className="sparkline-placeholder" style={{ height }} />;
+  const ceiling = max ?? Math.max(...measured, 1);
+  const segments = sparklineSegments(data, ceiling);
   const ticks = [0, Math.round(ceiling / 2), Math.round(ceiling)];
-  const formatVal = (value) => label ? label(value) : value >= 1000 ? `${(value / 1000).toFixed(1)}K` : String(value);
+  const formatVal = (value) => !Number.isFinite(value) ? "--" : label ? label(value) : value >= 1000 ? `${(value / 1000).toFixed(1)}K` : String(value);
 
   const handleMouse = (event) => {
     const wrapRect = event.currentTarget.getBoundingClientRect();
@@ -961,7 +959,7 @@ function Sparkline({ data, color = "var(--lime)", height = 48, max, label }) {
         {ticks.map((v, i) => <span key={i} style={i === 0 ? { bottom: 0 } : i === ticks.length - 1 ? { top: 0 } : { top: "50%", transform: "translateY(-50%)" }}>{formatVal(v)}</span>)}
       </div>
       <svg className="sparkline-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
-        <polyline points={points} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinecap="round" strokeLinejoin="round" />
+        {segments.map((points, index) => <polyline key={index} points={points} fill="none" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinecap="round" strokeLinejoin="round" />)}
       </svg>
       {tooltip && <div className="sparkline-tooltip" style={{ left: tooltip.x }}><span>{tooltip.value}</span></div>}
     </div>
@@ -1155,7 +1153,7 @@ function App() {
   const [backgroundRemovalModel, setBackgroundRemovalModel] = useState("");
   const [backgroundRemovalPickerOpen, setBackgroundRemovalPickerOpen] = useState(false);
   const [hardwareStats, setHardwareStats] = useState(null);
-  const [hardwareHistory, setHardwareHistory] = useState({ gpu: [], vram: [], cpu: [], ram: [] });
+  const [hardwareHistory, setHardwareHistory] = useState(EMPTY_HARDWARE_HISTORY);
   const [imageViewerOpen, setImageViewerOpen] = useState(false);
   const [viewerZoom, setViewerZoom] = useState(1);
   const [viewerPan, setViewerPan] = useState({ x: 0, y: 0 });
@@ -1969,23 +1967,36 @@ function App() {
 
   useEffect(() => {
     if (!hardwareMonitorOpen) return undefined;
-    const fetchHardware = async () => {
+    let cancelled = false;
+    let timer = 0;
+    const controller = new AbortController();
+    const record = (stats) => setHardwareHistory((current) => appendHardwareSample(current, stats));
+    const poll = async () => {
       try {
-        const response = await fetch("/api/inference/hardware", { cache: "no-store" });
-        if (!response.ok) return;
+        const response = await fetch("/api/inference/hardware", { cache: "no-store", signal: controller.signal });
+        if (!response.ok) throw new Error(`hardware ${response.status}`);
         const stats = await response.json();
+        if (cancelled) return;
         setHardwareStats(stats);
-        setHardwareHistory((current) => ({
-          gpu: [...current.gpu, stats.gpu_util ?? 0].slice(-30),
-          vram: [...current.vram, (stats.vram_used_mb ?? 0) / 1024].slice(-30),
-          cpu: [...current.cpu, stats.cpu_percent ?? 0].slice(-30),
-          ram: [...current.ram, stats.ram_used_gb ?? 0].slice(-30),
-        }));
-      } catch {}
+        record(stats);
+      } catch (error) {
+        if (cancelled || error?.name === "AbortError") return;
+        // A dropped sample is a hole in the curve, not a zero.
+        record(null);
+      } finally {
+        // Chained rather than left on an interval: a reply slower than the period used to overlap
+        // the next request, so samples landed out of order and the time axis silently compressed.
+        if (!cancelled) timer = window.setTimeout(poll, HARDWARE_POLL_MS);
+      }
     };
-    fetchHardware();
-    const timer = window.setInterval(fetchHardware, 2000);
-    return () => { window.clearInterval(timer); setHardwareStats(null); setHardwareHistory({ gpu: [], vram: [], cpu: [], ram: [] }); };
+    poll();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
+      setHardwareStats(null);
+      setHardwareHistory(EMPTY_HARDWARE_HISTORY);
+    };
   }, [hardwareMonitorOpen]);
 
   useEffect(() => {
@@ -5005,6 +5016,8 @@ function App() {
   // encode into.
   const engineAllowsNegativePrompt = !isDistilledGuidance;
   const ultraLowMode = inferenceHealth?.performance_settings?.memory_mode === "ultra_low_vram";
+  const hardwareVramWall = vramWallPercent(hardwareStats);
+  const hardwareSensorAge = sensorAgeLabel(hardwareStats);
   const guidanceFlowCompatible = inferenceHealth?.guidance?.cfg_zero_star?.available === true
     && (inferenceHealth.guidance.cfg_zero_star.engines || []).includes(model);
   const guidancePagCompatible = pagAvailableForEngine(inferenceHealth, model);
@@ -6094,36 +6107,44 @@ function App() {
                 </div>
               </div>
               <div className="hw-metric hw-vram">
-                <span>显存</span>
-                <strong>{hardwareStats?.vram_used_mb != null ? hardwareStats.vram_used_mb < 1024 ? `${hardwareStats.vram_used_mb} MB` : `${(hardwareStats.vram_used_mb / 1024).toFixed(1)}G` : "--"} / {hardwareStats?.vram_total_mb != null ? hardwareStats.vram_total_mb < 1024 ? `${hardwareStats.vram_total_mb} MB` : `${(hardwareStats.vram_total_mb / 1024).toFixed(1)}G` : "--"}</strong>
-                <div className="hw-bar"><i style={{ width: `${Math.min(100, ((hardwareStats?.vram_used_mb || 0) / (hardwareStats?.vram_total_mb || 1)) * 100)}%` }} /></div>
+                <span>显存 · 整卡（含其他程序）</span>
+                <strong>{formatMib(hardwareStats?.vram_used_mb)} / {formatMib(hardwareStats?.vram_total_mb)}</strong>
+                <div className="hw-bar">
+                  <i style={{ width: `${Math.min(100, Math.max(0, ((hardwareStats?.vram_used_mb || 0) / (hardwareStats?.vram_total_mb || 1)) * 100))}%` }} />
+                  {hardwareVramWall != null && <b style={{ left: `${hardwareVramWall}%` }} title={`显存上限墙 ${formatMib(hardwareStats?.vram_limit_mb)}`} />}
+                </div>
+                <small>本程序 {formatMib(hardwareStats?.vram_process_mb)}（张量 {formatMib(hardwareStats?.vram_tensors_mb)}）{hardwareVramWall != null ? ` · 上限墙 ${formatMib(hardwareStats?.vram_limit_mb)}` : ""}</small>
               </div>
               <div className="hw-chart-label">GPU 利用率曲线 (%)</div>
               <Sparkline data={hardwareHistory.gpu} max={100} />
             </div>
             <div className="hw-section">
-              <div className="hw-section-title">显存占用曲线 (GB)</div>
+              <div className="hw-section-title">整卡显存占用曲线 (GB)</div>
               <Sparkline data={hardwareHistory.vram} max={hardwareStats?.vram_total_mb ? hardwareStats.vram_total_mb / 1024 : undefined} label={(v) => `${Number(v).toFixed(1)}G`} />
             </div>
             <div className="hw-section">
               <div className="hw-section-title">系统</div>
               <div className="hw-row">
                 <div className="hw-metric">
-                  <span>CPU</span>
+                  <span>CPU{hardwareStats?.cpu_cores ? ` · ${hardwareStats.cpu_cores} 线程` : ""}</span>
                   <strong>{hardwareStats?.cpu_percent != null ? `${hardwareStats.cpu_percent}%` : "--"}</strong>
                 </div>
                 <div className="hw-metric">
-                  <span>内存</span>
-                  <strong>{hardwareStats?.ram_used_gb != null ? `${hardwareStats.ram_used_gb}G / ${hardwareStats.ram_total_gb}G` : "--"}</strong>
+                  <span>内存（已用 / 总量）</span>
+                  <strong>{formatMib(hardwareStats?.ram_used_mb)} / {formatMib(hardwareStats?.ram_total_mb)}</strong>
+                </div>
+                <div className="hw-metric">
+                  <span>本程序内存{hardwareStats?.process_workers ? ` · 含 ${hardwareStats.process_workers} 个子进程` : ""}</span>
+                  <strong>{formatMib(hardwareStats?.process_ram_mb)}</strong>
                 </div>
               </div>
               <div className="hw-chart-label">CPU 利用率曲线 (%)</div>
               <Sparkline data={hardwareHistory.cpu} max={100} />
-              <div className="hw-chart-label">内存占用曲线 (GB)</div>
-              <Sparkline data={hardwareHistory.ram} max={hardwareStats?.ram_total_gb || undefined} label={(value) => `${Number(value).toFixed(1)}G`} />
+              <div className="hw-chart-label">系统内存占用曲线 (GB)</div>
+              <Sparkline data={hardwareHistory.ram} max={hardwareStats?.ram_total_mb ? hardwareStats.ram_total_mb / 1024 : undefined} label={(value) => `${Number(value).toFixed(1)}G`} />
             </div>
           </div>
-          <footer><i />每 2 秒自动刷新 · 点击遮罩关闭</footer>
+          <footer><i />每 2 秒自动刷新{hardwareSensorAge ? ` · 传感器 ${hardwareSensorAge}` : ""} · 点击遮罩关闭</footer>
         </div>
       </div>}
       {imageViewerOpen && (
