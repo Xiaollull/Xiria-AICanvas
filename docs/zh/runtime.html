@@ -173,7 +173,7 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
 
     <h3>更新可以改什么、不可以改什么</h3>
     <p>更新包必须与已安装环境使用相同的 Node 依赖。改变了 Node 依赖的归档会被拒绝而不是应用，因为在 Windows 上替换正在运行进程使用的
-      <code>node_modules</code> 并不安全；这类版本会以完整安装包的形式发布，供全新安装。<code>backend/requirements.txt</code>
+      <code>node_modules</code> 并不安全；这类版本会以完整安装包的形式发布，供全新安装，其发行说明也会在最上方注明这一点。<code>backend/requirements.txt</code>
       发生变化则受支持：先替换文件，随后自动修复 Python 环境。</p>
 
     <p>只替换程序文件。<code>.venv</code>、<code>node_modules</code>、<code>models</code>、<code>outputs</code>、

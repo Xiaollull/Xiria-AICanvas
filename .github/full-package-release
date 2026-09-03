@@ -1,0 +1,11 @@
+# The one version that ships as a full package rather than an in-app update.
+#
+# 1.0.4 licenses the project under AGPL-3.0. GSAP's Standard License cannot be conveyed under the
+# AGPL, so the dependency was removed and the entrance animation rewritten on the platform's Web
+# Animations API. Removing it changes package-lock.json, and the updater refuses any archive whose
+# Node dependencies differ from the installed ones — replacing node_modules under a running Windows
+# process is not safe. Existing installations therefore install 1.0.4 fresh.
+#
+# Delete this file once a release that can be applied in place is being prepared. A version named
+# here that no longer matches the release is ignored, so a forgotten line cannot weaken a later gate.
+1.0.4

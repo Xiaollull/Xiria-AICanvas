@@ -74,6 +74,8 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       archive: ${{ steps.version.outputs.archive }}
       artifact: ${{ steps.version.outputs.artifact }}
+      full_package: ${{ steps.version.outputs.full_package }}
+      full_package_notice: ${{ steps.version.outputs.full_package_notice }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -98,6 +100,7 @@ jobs:
           set -euo pipefail
           node --input-type=module <<'NODE'
           import { appendFile, readFile } from "node:fs/promises";
+          import { FULL_PACKAGE_NOTICE, isFullPackageRelease } from "./scripts/full-package-release.mjs";
 
           const tag = process.env.GITHUB_REF_NAME;
           const stableTag = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
@@ -118,15 +121,27 @@ jobs:
             if (value !== version) throw new Error(`${source} version ${String(value)} does not match tag ${tag}`);
           }
 
+          // Read here rather than where it is used, so the release's own declaration is resolved
+          // beside the version it names and every later step sees one settled answer.
+          const fullPackage = await isFullPackageRelease(process.cwd(), version);
+
           const archive = `XirAI-${version}.7z`;
           await appendFile(process.env.GITHUB_OUTPUT, [
             `version=${version}`,
             `tag=${tag}`,
             `archive=${archive}`,
             `artifact=xirai-release-${version}`,
+            `full_package=${fullPackage}`,
             "",
           ].join("\n"));
           console.log(`Verified strict stable release ${tag}`);
+          if (fullPackage) {
+            // Carried to the publish job as an output rather than imported there: that job holds
+            // the only contents:write token and deliberately checks out no source, so the notice
+            // travels to it instead of the code that composes it.
+            await appendFile(process.env.GITHUB_OUTPUT, `full_package_notice<<XIRAI_FULL_PACKAGE_NOTICE\n${FULL_PACKAGE_NOTICE}\nXIRAI_FULL_PACKAGE_NOTICE\n`);
+            console.log(`${version} is declared a full-package release: existing installations cannot apply it in place.`);
+          }
           NODE
 
       - name: Prove the tag commit belongs to main
@@ -355,16 +370,21 @@ jobs:
           CURRENT_PACKAGE_ROOT: ${{ runner.temp }}/xirai-release-stage/XiriaCanvas-AI-${{ steps.version.outputs.version }}
           PREVIOUS_FOUND: ${{ steps.previous.outputs.found }}
           PREVIOUS_ARCHIVE: ${{ steps.previous.outputs.archive }}
+          PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
+          FULL_PACKAGE: ${{ steps.version.outputs.full_package }}
           CANDIDATE_ARCHIVE: ${{ runner.temp }}/xirai-update-candidate.7z
         run: |
           set -euo pipefail
           node --input-type=module <<'NODE'
+          import { execFileSync } from "node:child_process";
           import { constants } from "node:fs";
-          import { appendFile, copyFile, readFile, rm } from "node:fs/promises";
+          import { appendFile, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+          import { tmpdir } from "node:os";
           import path from "node:path";
           import { applyPreparedUpdate, archiveUpdateInternals, NODE_DEPENDENCY_UPDATE_ERROR, prepareUpdate } from "./scripts/archive-update.mjs";
           import { createReleaseManifest } from "./scripts/release-package.mjs";
           import { removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
+          import { assertFullPackageJustified } from "./scripts/full-package-release.mjs";
 
           // Files the updater deliberately keeps from the installed project. The release ships a
           // default copy, so they are excluded from the byte comparison below and asserted to be
@@ -426,6 +446,35 @@ jobs:
             }
           };
 
+          // A release the installed base cannot apply in place. The declaration is checked against
+          // the previous release's own metadata before it is honoured, so it can only excuse a
+          // release that genuinely changes dependencies — never one that simply failed something.
+          const fullPackage = process.env.FULL_PACKAGE === "true";
+          if (fullPackage) {
+            if (process.env.PREVIOUS_FOUND !== "true") {
+              throw new Error("A full-package release must have a previous stable release to be measured against");
+            }
+            // Read from the tag rather than the archive: extracting the previous archive is itself
+            // an update the dependency change makes the updater refuse, so it cannot be the source
+            // of the evidence that the refusal is warranted.
+            const previousRoot = await mkdtemp(path.join(tmpdir(), "xirai-previous-metadata-"));
+            try {
+              await mkdir(path.join(previousRoot, "backend"), { recursive: true });
+              for (const relative of ["package-lock.json", "backend/requirements.txt"]) {
+                const contents = execFileSync("git", ["show", `v${process.env.PREVIOUS_VERSION}:${relative}`], { maxBuffer: 1 << 28 });
+                await writeFile(path.join(previousRoot, ...relative.split("/")), contents);
+              }
+              await assertFullPackageJustified({
+                installedRoot: previousRoot,
+                packageRoot: process.env.CURRENT_PACKAGE_ROOT,
+                version: process.env.VERSION,
+              });
+            } finally {
+              await rm(previousRoot, { recursive: true, force: true });
+            }
+            console.log(`Confirmed ${process.env.VERSION} changes Node dependencies against ${process.env.PREVIOUS_VERSION}, so the full-package declaration stands.`);
+          }
+
           let previousPrepared;
           let candidatePrepared;
           try {
@@ -433,7 +482,13 @@ jobs:
             await copyFile(process.env.NEW_ARCHIVE, process.env.CANDIDATE_ARCHIVE, constants.COPYFILE_EXCL);
 
             let updateRoot = process.env.CURRENT_PACKAGE_ROOT;
-            if (process.env.PREVIOUS_FOUND === "true") {
+            // A full-package release is rehearsed the way the very first release was: applied over
+            // an isolated copy of itself rather than over the previous version. Everything the
+            // rehearsal proves — manifest validation, the apply, the byte-for-byte comparison and
+            // the preserved-configuration check — still runs. The one thing dropped is the
+            // in-place upgrade from the previous release, which is exactly what the declaration
+            // says is impossible.
+            if (process.env.PREVIOUS_FOUND === "true" && !fullPackage) {
               // prepareUpdate performs the security-aware extraction of the authenticated old archive.
               // Only its extracted tree is wanted here, as the baseline a real user is upgrading from.
               // Nothing is ever installed into it, so its environment-repair flag says nothing about
@@ -444,7 +499,7 @@ jobs:
               });
               if (!previousPrepared.plan.length) throw new Error("Previous release extraction produced an empty update plan");
               updateRoot = previousPrepared.packageRoot;
-            } else if (process.env.VERSION !== "1.0.0") {
+            } else if (!fullPackage && process.env.VERSION !== "1.0.0") {
               throw new Error("Only first release 1.0.0 may be validated without a previous stable archive");
             }
 
@@ -483,9 +538,11 @@ jobs:
             });
             candidatePrepared = undefined;
             await appendFile(process.env.GITHUB_OUTPUT, `environment_repair=${environmentRepair}\n`);
-            console.log(process.env.PREVIOUS_FOUND === "true"
-              ? "The real updater prepared, applied, and byte-validated the new archive over the previous stable package."
-              : "The real updater prepared, applied, and byte-validated the initial archive over an isolated current package.");
+            console.log(fullPackage
+              ? "The real updater prepared, applied, and byte-validated the full-package archive over an isolated current package; the in-place route from the previous release is declared unavailable."
+              : process.env.PREVIOUS_FOUND === "true"
+                ? "The real updater prepared, applied, and byte-validated the new archive over the previous stable package."
+                : "The real updater prepared, applied, and byte-validated the initial archive over an isolated current package.");
             console.log(environmentRepair
               ? "This release changes backend/requirements.txt: updating users will run an automatic environment repair."
               : "This release keeps the previous dependency environment: updating users need no environment repair.");
@@ -515,11 +572,15 @@ jobs:
           ARCHIVE: ${{ steps.version.outputs.archive }}
           PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
           ENVIRONMENT_REPAIR: ${{ steps.exercise.outputs.environment_repair }}
+          FULL_PACKAGE: ${{ steps.version.outputs.full_package }}
         run: |
           {
             echo "## Verified release ${GITHUB_REF_NAME}"
             echo
             echo "- Version: ${VERSION:-not validated}"
+            if [ "${FULL_PACKAGE:-}" = "true" ]; then
+              echo "- Delivery: **full package** — Node dependencies changed, so existing installations must install fresh rather than update in place."
+            fi
             echo "- Archive: ${ARCHIVE:-not created}"
             if [ -n "${ARCHIVE:-}" ] && [ -f "release/${ARCHIVE}" ]; then
               echo "- Size: $(du -h "release/${ARCHIVE}" | cut -f1)"
@@ -701,6 +762,8 @@ jobs:
           TAG: ${{ needs.verify-and-package.outputs.tag }}
           VERSION: ${{ needs.verify-and-package.outputs.version }}
           ARCHIVE: ${{ needs.verify-and-package.outputs.archive }}
+          FULL_PACKAGE: ${{ needs.verify-and-package.outputs.full_package }}
+          FULL_PACKAGE_NOTICE: ${{ needs.verify-and-package.outputs.full_package_notice }}
           TARGET_SHA: ${{ github.sha }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release_id }}
@@ -857,6 +920,15 @@ jobs:
             },
           });
           if (typeof notes?.body !== "string") throw new Error("GitHub did not return generated release notes");
+          // A reader who scrolls straight to the assets has to meet this first, so the notice goes
+          // above the generated notes rather than after them. Publishing a release that cannot be
+          // applied in place without saying so would be worse than not publishing it, so a missing
+          // notice fails the job rather than quietly shipping notes that omit it.
+          const notice = (process.env.FULL_PACKAGE_NOTICE || "").trim();
+          if ((process.env.FULL_PACKAGE === "true") !== Boolean(notice)) {
+            throw new Error("The full-package declaration and its release notice disagree; refusing to publish");
+          }
+          const releaseBody = notice ? `${notice}\n\n${notes.body}` : notes.body;
 
           // Keep the marker until every fallible preparation and upload operation succeeds. This
           // final mutation replaces it with generated notes and publishes the draft. The safety
@@ -869,13 +941,13 @@ jobs:
               tag_name: process.env.TAG,
               target_commitish: process.env.TARGET_SHA,
               name: releaseName,
-              body: notes.body,
+              body: releaseBody,
               draft: false,
               prerelease: false,
               make_latest: "true",
             },
           });
-          if (published.draft || published.tag_name !== process.env.TAG || published.body !== notes.body) {
+          if (published.draft || published.tag_name !== process.env.TAG || published.body !== releaseBody) {
             throw new Error(`GitHub did not confirm publication of release ${draft.id}`);
           }
           console.log(`Published ${process.env.TAG} from authenticated workflow draft ${draft.id}.`);
