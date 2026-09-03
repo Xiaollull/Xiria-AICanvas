@@ -163,3 +163,15 @@ test("prompt and picture columns share the same vertical guides", async () => {
   assert.match(css, /\.i2i-prompt-deck \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);[^}]*gap: 8px 16px/);
   assert.match(css, /\.i2i-compare \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);[^}]*gap: 16px/);
 });
+
+test("the run bar's summary strip and its button share top and bottom edges", async () => {
+  const css = await read("src/styles.css");
+  // The button carries a 58px floor and the strip beside it is a few pixels shorter. Centred, the
+  // button overhung it at both ends; stretched, the two read as one bar.
+  const row = css.match(/^\.i2i-run-actions \{[^}]*\}/m)[0];
+  assert.match(row, /align-items: stretch/);
+  assert.doesNotMatch(row, /align-items: center/);
+  // Stretching the strip is only half of it: without this its labels would sit against the top of
+  // a cell that is now taller than the text it holds.
+  assert.match(css, /\.i2i-run-actions \.generation-info > div \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*justify-content: center/);
+});

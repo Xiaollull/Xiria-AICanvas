@@ -34,6 +34,7 @@
     <ul>
       <li><a href="#configuration">配置</a></li>
       <li><a href="#paths">运行时路径</a></li>
+      <li><a href="#progress">控制台生成进度</a></li>
       <li><a href="#memory">显存模式</a></li>
       <li><a href="#cache">管道缓存</a></li>
       <li><a href="#downloader">模型下载器</a></li>
@@ -71,6 +72,30 @@
 <pre><code>XIRAI_CACHE_DIR=.cache
 XIRAI_OUTPUT_DIR=outputs/my-project</code></pre>
     <p>输出值可以使用自定义文件夹名称或任意嵌套的相对路径。<code>.env</code> 中也接受绝对的本地值；仓库中不会提交任何绝对的用户或系统路径。空白输出路径会被拒绝。</p>
+
+    <h2 id="progress">控制台生成进度</h2>
+    <p>每个阶段都会把自身进度报告给启动 XirAI 的终端窗口，以及应用内的控制台抽屉——两者读取的是同一份输出。模型加载完成后会汇报它的开销，挂载在它之上的 LoRA
+      会连同权重列在下方，采样阶段则包含步数、已用时间、预计剩余时间与每步秒数：</p>
+<pre><code>Anima ready · NORMAL_VRAM             loaded in 6.3s · weights 5.24 GB · VRAM 1.06/8.00 GB · RAM 24.60/31.80 GB
+LoRA · 3 mounted                       0.75 · kazutake-hazano_v2_epoch28.safetensors · 145 MB
+                                       0.15 · anima_lokr_ningen_mame.safetensors · 89 MB
+                                       0.25 · ashima_v4.safetensors · 210 MB
+Batch 1/1 · Sampling 1 images          60%|████████████        |     18/30 [00:50&lt;00:33, 2.81s/it]  job 01:03
+Hires.fix · Upscaling 2176 x 2816     100%|████████████████████|     56/56 [00:03&lt;00:00, 0.07s/tile]  job 02:04
+Hires.fix · Tile 2/4                  100%|████████████████████|     15/15 [00:52&lt;00:00, 3.50s/it]  job 30/60, 03:20
+Complete                              1 image · 60 steps · 05:31 elapsed · 5.52s/it average · XirAI_0002.png</code></pre>
+    <p>每类工作打印多少行是刻意设计的。<strong>一次采样运行拥有固定的行数预算</strong>（默认 12
+      行），均匀分布在它的全部步数上，因此 30 步与 1000 步的运行产生同样多的输出。<strong>以分块计数的工作只就地重绘一行</strong>并在结束时提交，因此
+      56 块的放大只留下 1 行，而不是 56 行。<strong>分块式 Hires.fix 精修则每块一行</strong>，因为它的每一块本身就是一段完整的采样：4
+      个分块最终恰好留下 4 行。</p>
+    <p>括号之前的每个字段都是固定宽度，因此无论由哪个阶段写出，进度条都占据相同的列。</p>
+    <p>速率按阶段测量，分块阶段则按每个分块测量，而非按任务测量：基础采样、每一个 Hires.fix 分块、每一个 ADetailer
+      区域的速度各不相同，把它们平均起来将无法描述其中任何一个。暂停期间的时间不计入。行尾的 <code>job</code>
+      数值是整次任务的步数与已用时间，仅在阶段报告它们时出现。放大与分块 VAE 解码以整块为单位，因此以 <code>s/tile</code> 计量。两个设置可以调整这一行为：</p>
+<pre><code>XIRAI_PROGRESS_LINES=12
+XIRAI_PROGRESS_CONSOLE=1</code></pre>
+    <p><code>XIRAI_PROGRESS_LINES</code> 是一次采样运行可用的行数预算；分块处理的工作不受它约束，始终保持每块一行。
+      <code>XIRAI_PROGRESS_CONSOLE=0</code> 关闭这些输出行。两者都不影响 Web UI 中的进度条，后者直接读取任务记录。</p>
 
     <h2 id="memory">显存模式</h2>
     <p>运行时显存管理默认采用 <code>XIRAI_MEMORY_MODE=auto</code>，遵循 ComfyUI 的内存预算行为，但不导入或依赖
@@ -161,6 +186,7 @@ XIRAI_OUTPUT_DIR=outputs/my-project</code></pre>
 
     <footer class="page-footer">
       <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/blob/main/LICENSE">AGPL-3.0 许可证</a>
       <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
       <a href="../runtime.html">English</a>
     </footer>

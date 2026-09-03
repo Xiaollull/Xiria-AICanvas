@@ -18,6 +18,7 @@
   <a href="https://xiaollull.github.io/Xiria-AICanvas/"><img alt="Documentation" src="https://img.shields.io/badge/docs-xiaollull.github.io-6a55e6"></a>
   <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki"><img alt="Wiki" src="https://img.shields.io/badge/wiki-troubleshooting-6a55e6"></a>
   <a href="https://github.com/Xiaollull/Xiria-AICanvas/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Xiaollull/Xiria-AICanvas"></a>
+  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-6a55e6"></a>
 </p>
 
 XiriaCanvas AI is a local image-generation UI for Stable Diffusion, Illustrious,
@@ -64,6 +65,34 @@ The full manual lives at **[xiaollull.github.io/Xiria-AICanvas](https://xiaollul
 Troubleshooting, the quantization support matrix, the release process, and the
 development and CI notes are in the
 [wiki](https://github.com/Xiaollull/Xiria-AICanvas/wiki).
+
+## License
+
+Copyright © 2026 Xiaollull. Released under the
+[GNU Affero General Public License v3.0](LICENSE).
+
+You may use, study, modify and redistribute this program, provided derivative
+works carry the same licence. The Affero clause adds one condition beyond the
+GPL: if you run a modified version and let other people use it over a network,
+those users must be offered its source.
+
+The licence is not only a preference. XiriaCanvas AI performs ADetailer face and
+hand detection through [Ultralytics](https://github.com/ultralytics/ultralytics)
+YOLO, which is itself AGPL-3.0, so a combined work carrying any other licence
+would need a commercial licence from Ultralytics. The remaining dependencies —
+PyTorch, Diffusers, Transformers, FastAPI, React and the rest — are Apache-2.0,
+MIT, BSD or ISC, all of which this licence can absorb.
+
+There are no additional permissions and no carve-outs: every dependency the build
+ships can be conveyed under this licence, so what you receive is AGPL-3.0 all the
+way through. The one exception that would have been needed — GSAP, whose Standard
+License is free of charge but is not free software — was removed instead; its
+entrance animation now runs on the browser's own Web Animations API.
+
+Model weights are not part of this program and are not covered by this licence.
+Each checkpoint you download keeps the terms of its own publisher, and some of
+the recommended models are gated or non-commercial. Check them before you build
+a product on one.
 
 ## Star History
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { gsap } from "gsap";
+import { countUp, enter, EASE_OUT_CUBIC, riseIn, segmentEnd } from "./entrance-animation.js";
 import {
   BarChart3,
   Check,
@@ -370,24 +370,53 @@ export default function LoraManagerPage() {
   useEffect(() => {
     const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     if (pageLoading || !pageRef.current || document.documentElement.dataset.motion === "off" || reducedMotion) return undefined;
-    const context = gsap.context(() => {
-      const timeline = gsap.timeline({ defaults: { ease: "power3.out" } });
-      timeline.from(".lora-page-command > *", { y: 14, opacity: 0, duration: .42, stagger: .06 });
-      if (activeView === "overview") {
-        timeline.from(".lora-metric-card", { y: 14, opacity: 0, duration: .42, stagger: .05 }, "-=.2")
-          .from(".lora-analysis-panel", { y: 16, opacity: 0, duration: .46, stagger: .06 }, "-=.25");
-      } else {
-        timeline.from(".lora-manager-workspace", { y: 16, opacity: 0, duration: .48 }, "-=.2");
-      }
-      gsap.fromTo(".lora-analysis-bar i", { scaleX: 0 }, { scaleX: 1, duration: .85, stagger: .07, ease: "power3.out", transformOrigin: "left" });
-      gsap.from(".lora-donut-segment", { strokeDasharray: `0 ${DONUT_CIRCUMFERENCE}`, duration: 1.1, stagger: .08, ease: "power2.out" });
-      for (const node of pageRef.current.querySelectorAll("[data-count]")) {
-        const target = Number(node.dataset.count);
-        const counter = { value: 0 };
-        gsap.to(counter, { value: target, duration: .9, ease: "power2.out", onUpdate: () => { node.textContent = Math.round(counter.value).toLocaleString(); } });
-      }
-    }, pageRef);
-    return () => context.revert();
+    const root = pageRef.current;
+    const select = (selector) => root.querySelectorAll(selector);
+    const animations = [];
+
+    // What GSAP expressed as one timeline with relative offsets is a set of independent
+    // animations here, so each run's start is carried forward explicitly. The overlaps are the
+    // ones the timeline used: the cards begin .2s before the command row has finished, and the
+    // panels .25s before the cards have.
+    const command = select(".lora-page-command > *");
+    animations.push(...enter(command, { keyframes: riseIn(14), duration: .42, stagger: .06 }));
+    let cursor = segmentEnd(0, command.length, .42, .06);
+    if (activeView === "overview") {
+      const cards = select(".lora-metric-card");
+      animations.push(...enter(cards, { keyframes: riseIn(14), duration: .42, stagger: .05, delay: cursor - .2 }));
+      cursor = segmentEnd(cursor - .2, cards.length, .42, .05);
+      animations.push(...enter(select(".lora-analysis-panel"), { keyframes: riseIn(16), duration: .46, stagger: .06, delay: cursor - .25 }));
+    } else {
+      animations.push(...enter(select(".lora-manager-workspace"), { keyframes: riseIn(16), duration: .48, delay: cursor - .2 }));
+    }
+
+    // The bars and the donut ran outside the timeline, from time zero, and still do.
+    animations.push(...enter(select(".lora-analysis-bar i"), {
+      keyframes: [
+        { transform: "scaleX(0)", transformOrigin: "left" },
+        { transform: "scaleX(1)", transformOrigin: "left" },
+      ],
+      duration: .85,
+      stagger: .07,
+    }));
+    for (const [index, segment] of select(".lora-donut-segment").entries()) {
+      // Each arc sweeps to its own share of the ring, so the end state is read back from the
+      // element rather than assumed.
+      const dasharray = segment.getAttribute("stroke-dasharray");
+      if (!dasharray) continue;
+      animations.push(...enter([segment], {
+        keyframes: [{ strokeDasharray: `0 ${DONUT_CIRCUMFERENCE}` }, { strokeDasharray: dasharray }],
+        duration: 1.1,
+        delay: .08 * index,
+        easing: EASE_OUT_CUBIC,
+      }));
+    }
+
+    const stopCounters = countUp(select("[data-count]"));
+    return () => {
+      for (const animation of animations) animation.cancel();
+      stopCounters();
+    };
   }, [activeView, pageLoading, libraries, model]);
 
   useEffect(() => {

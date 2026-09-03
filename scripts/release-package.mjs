@@ -6,13 +6,16 @@ export const RELEASE_MANIFEST_FILE = ".xirai-release-manifest.json";
 export const RELEASE_MANIFEST_SCHEMA = 1;
 export const RELEASE_MANAGED_DIRECTORIES = ["src", "backend", "scripts", "public", "assistant"];
 export const RELEASE_MANAGED_FILES = [
+  "LICENSE",
   "index.html", "vite.config.js", "package.json", "package-lock.json", "README.md", "README.zh-CN.md",
   "Start-XirAI.bat", "Start-XirAI.sh", "Setup-XirAI.bat", "Setup-XirAI.sh", "XirAI-Setup.desktop",
   "XirAI-Start.desktop", ".env.example", ".gitattributes", ".gitignore",
   "models/model-paths.json", "models/recommended-models.json", "models/yolo-models.json",
   "models/background-removal-models.json", "models/README.md",
 ];
-export const RELEASE_REQUIRED_FILES = ["package.json", "package-lock.json", "vite.config.js", "index.html", "backend/requirements.txt"];
+// `LICENSE` is required, not merely managed: AGPL-3.0 section 4 obliges every copy conveyed to
+// carry the licence text, so a package built without it is not one we are allowed to publish.
+export const RELEASE_REQUIRED_FILES = ["LICENSE", "package.json", "package-lock.json", "vite.config.js", "index.html", "backend/requirements.txt"];
 export const RELEASE_REQUIRED_DIRECTORIES = ["src", "backend", "scripts", "assistant"];
 
 const ROOT_FILES = new Set(RELEASE_MANAGED_FILES);

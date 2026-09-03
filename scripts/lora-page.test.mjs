@@ -63,7 +63,10 @@ test("LoRA asset page is lazy, opens in a new tab, and shares one sync channel",
   assert.match(page, /new BroadcastChannel\(LORA_SYNC_CHANNEL\)/);
   assert.match(page, /postMessage\(\{ type: "request-workspace-loras" \}\)/);
   assert.match(page, /matchMedia\?\.\("\(prefers-reduced-motion: reduce\)"\)\.matches/);
-  assert.equal(packageJson.dependencies.gsap, "3.15.0");
+  // The entrance animation runs on the platform's own Web Animations API. It used to be GSAP,
+  // whose licence the project's AGPL-3.0 cannot absorb, so no animation dependency is the point.
+  assert.equal(packageJson.dependencies.gsap, undefined);
+  assert.match(page, /from "\.\/entrance-animation\.js"/);
 });
 
 test("LoRA asset page persists only explicit scoped local edits without overwriting workspace state", async () => {

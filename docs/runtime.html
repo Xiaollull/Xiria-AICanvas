@@ -34,6 +34,7 @@
     <ul>
       <li><a href="#configuration">Configuration</a></li>
       <li><a href="#paths">Runtime paths</a></li>
+      <li><a href="#progress">Progress in the console</a></li>
       <li><a href="#memory">VRAM memory modes</a></li>
       <li><a href="#cache">The pipeline cache</a></li>
       <li><a href="#downloader">Model downloader</a></li>
@@ -77,6 +78,40 @@ XIRAI_OUTPUT_DIR=outputs/my-project</code></pre>
     <p>The output value may use a custom folder name or any nested relative path. An absolute local
       value is also accepted in <code>.env</code>; no absolute user or system path is committed to
       the repository. Blank output paths are rejected.</p>
+
+    <h2 id="progress">Progress in the console</h2>
+    <p>Every stage reports itself to the terminal that started XirAI and to the in-app console
+      drawer, which read the same output. A model announces what it cost once it is resident, any
+      LoRA adapters mounted on it are listed beneath it with their weights, and each sampling stage
+      carries its step count, elapsed time, estimated time remaining and seconds per step:</p>
+<pre><code>Anima ready · NORMAL_VRAM             loaded in 6.3s · weights 5.24 GB · VRAM 1.06/8.00 GB · RAM 24.60/31.80 GB
+LoRA · 3 mounted                       0.75 · kazutake-hazano_v2_epoch28.safetensors · 145 MB
+                                       0.15 · anima_lokr_ningen_mame.safetensors · 89 MB
+                                       0.25 · ashima_v4.safetensors · 210 MB
+Batch 1/1 · Sampling 1 images          60%|████████████        |     18/30 [00:50&lt;00:33, 2.81s/it]  job 01:03
+Hires.fix · Upscaling 2176 x 2816     100%|████████████████████|     56/56 [00:03&lt;00:00, 0.07s/tile]  job 02:04
+Hires.fix · Tile 2/4                  100%|████████████████████|     15/15 [00:52&lt;00:00, 3.50s/it]  job 30/60, 03:20
+Complete                              1 image · 60 steps · 05:31 elapsed · 5.52s/it average · XirAI_0002.png</code></pre>
+    <p>How much each kind of work prints is deliberate. <strong>A sampling run gets a fixed budget
+      of lines</strong> — twelve by default — spread evenly across however many steps it has, so a
+      thirty-step run and a thousand-step run produce the same amount of output. <strong>Anything
+      counted in tiles redraws a single line in place</strong> and commits it once, so a fifty-six
+      tile upscale leaves one line rather than fifty-six. <strong>The tiled Hires.fix refinement
+      gets a line per tile</strong>, because each of its tiles is a run of sampling steps in its
+      own right: four tiles leave exactly four lines behind.</p>
+    <p>Every field up to the brackets is fixed width, so the bar occupies the same columns on every
+      line whatever stage wrote it.</p>
+    <p>The rate is measured per stage, and per tile within a tiled stage, rather than per job: base
+      sampling, each Hires.fix tile and each ADetailer region run at different speeds, and a figure
+      averaged across them would describe none of them. Time spent paused is excluded. The trailing
+      <code>job</code> figures are the whole run's step count and elapsed time where a stage reports
+      them. Upscaling and the tiled VAE decode count whole tiles, so they are measured in
+      <code>s/tile</code>. Two settings adjust this:</p>
+<pre><code>XIRAI_PROGRESS_LINES=12
+XIRAI_PROGRESS_CONSOLE=1</code></pre>
+    <p><code>XIRAI_PROGRESS_LINES</code> is the budget one sampling run may spend; tiled work ignores
+      it and keeps its line per tile. <code>XIRAI_PROGRESS_CONSOLE=0</code> turns the lines off.
+      Neither affects the progress bar in the Web UI, which reads the job record directly.</p>
 
     <h2 id="memory">VRAM memory modes</h2>
     <p>Runtime VRAM management defaults to <code>XIRAI_MEMORY_MODE=auto</code> and follows the
@@ -200,6 +235,7 @@ XIRAI_OUTPUT_DIR=outputs/my-project</code></pre>
 
     <footer class="page-footer">
       <a href="https://github.com/Xiaollull/Xiria-AICanvas">Source on GitHub</a>
+      <a href="https://github.com/Xiaollull/Xiria-AICanvas/blob/main/LICENSE">AGPL-3.0</a>
       <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki">Wiki</a>
       <a href="zh/runtime.html">简体中文</a>
     </footer>

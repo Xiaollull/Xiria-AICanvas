@@ -30,9 +30,11 @@ from typing import Literal
 try:
     from .benchmark_lease import HIRES_ARTIFACT_PURPOSE, validate_lease
     from .hires_artifacts import NULL_CAPTURE, StageArtifactCapture, canonical_parameter_digest, capture_gate, prompt_facts
+    from .progress_console import ProgressConsole
 except ImportError:
     from benchmark_lease import HIRES_ARTIFACT_PURPOSE, validate_lease
     from hires_artifacts import NULL_CAPTURE, StageArtifactCapture, canonical_parameter_digest, capture_gate, prompt_facts
+    from progress_console import ProgressConsole
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ANIMA_TOKENIZER_DIRECTORY = PROJECT_ROOT / "backend" / "resources" / "anima-tokenizers"
@@ -216,7 +218,7 @@ try:
         krea2_sampling_diagnostics,
         KREA2_SHIFT,
     )
-    from .hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware
+    from .hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware, read_gpu_memory, read_system_memory
     from .memory_policy import (
         GIB,
         error_looks_like_oom,
@@ -299,7 +301,7 @@ except ImportError:
         krea2_sampling_diagnostics,
         KREA2_SHIFT,
     )
-    from hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware
+    from hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware, read_gpu_memory, read_system_memory
     from memory_policy import (
         GIB,
         error_looks_like_oom,
@@ -482,6 +484,36 @@ shutdown_requested = False
 # caller may hold it.
 gpu_sensor_sampler = NvidiaSmiSampler()
 cpu_sampler = CpuSampler()
+
+def model_memory_snapshot():
+    """Device and system memory as they stand, for the line printed once a model is resident.
+
+    Read at the moment it is asked for rather than sampled in the background: this is called once
+    per model load, and a figure taken seconds earlier would describe the memory before the weights
+    arrived — which is precisely the comparison the line exists to let the reader make.
+    """
+    snapshot = {}
+    try:
+        snapshot.update(read_gpu_memory(torch) or {})
+    except Exception:
+        pass
+    try:
+        psutil = psutil_module()
+        if psutil is not None:
+            snapshot.update(read_system_memory(psutil))
+    except Exception:
+        pass
+    return snapshot
+
+
+# Sampling progress for the terminal and the in-app drawer, which are the same stdout stream. The
+# budget caps how many lines one run may print, however many steps it has; XIRAI_PROGRESS_CONSOLE=0
+# turns the lines off without touching the web UI, which reads the job record directly.
+progress_console = ProgressConsole(
+    enabled=os.environ.get("XIRAI_PROGRESS_CONSOLE", "1").strip() != "0",
+    budget=configured_int("XIRAI_PROGRESS_LINES", 12, 2, 200),
+    memory=model_memory_snapshot,
+)
 
 
 @asynccontextmanager
@@ -1346,9 +1378,19 @@ class GalleryPromptUpdateInput(BaseModel):
 
 
 def update_job(job_id: str, **updates):
+    # Every stage reports its step count through here — base sampling, Hires.fix, ADetailer, the
+    # tiled VAE decode — so this is the one place the consoles have to be fed from. The line is
+    # composed under the lock, where the record is consistent, and printed outside it, so a slow
+    # or blocked console cannot stall a sampler callback that is holding up the whole job.
+    line = None
     with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id].update(updates)
+        job = jobs.get(job_id)
+        if job is None:
+            return
+        job.update(updates)
+        line = progress_console.observe(job_id, job, updates)
+    if line is not None:
+        progress_console.write(line)
 
 
 def history_asset_token(path: Path):
@@ -2576,6 +2618,9 @@ def memory_job_fields(strategy, model_cached=True):
         "model_cached": model_cached,
         "vram_limit_gb": strategy.get("vram_limit_gb"),
         "vram_limit_bytes": strategy.get("vram_limit_bytes"),
+        # The estimated weight footprint, which is what the console reports beside the memory the
+        # model actually took once it was resident.
+        "model_weight_bytes": strategy.get("base_weight_bytes"),
         "cfg_batch": strategy.get("cfg_batch", False),
         "memory_admission": strategy.get("admission"),
         "acceleration": strategy.get("acceleration"),
@@ -4270,6 +4315,25 @@ def configure_scheduler(pipeline, sampler_name: str, scheduler_name: str):
     return "; ".join(warnings) or None
 
 
+def report_mounted_loras(job_id: str, entries):
+    """Record what was mounted on the model, as ``(path, weight)`` pairs.
+
+    Written once the adapters are actually on the pipeline rather than when they were requested,
+    so the record — and the console line the record produces — describes what the sampler will
+    run with. A file whose size cannot be read still counts as mounted; only the size is dropped.
+    """
+    mounted = []
+    for path, weight in entries:
+        path = Path(path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+        mounted.append({"name": path.name, "weight": float(weight), "bytes": size})
+    if mounted:
+        update_job(job_id, mounted_loras=mounted)
+
+
 def configure_loras(pipeline, loras: list[LoraInput], lora_root: Path, job_id: str):
     pipeline.unload_lora_weights()
     if not loras:
@@ -4278,13 +4342,16 @@ def configure_loras(pipeline, loras: list[LoraInput], lora_root: Path, job_id: s
     update_job(job_id, phase="Loading LoRA adapters", progress=21)
     adapter_names = []
     adapter_weights = []
+    mounted = []
     for index, lora in enumerate(loras):
         path = resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA")
         adapter_name = f"lora_{index}"
         pipeline.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter_name)
         adapter_names.append(adapter_name)
         adapter_weights.append(lora.weight)
+        mounted.append((path, lora.weight))
     pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
+    report_mounted_loras(job_id, mounted)
 
 
 def append_warning(current: str | None, message: str):
@@ -4870,8 +4937,10 @@ def _apply_hires_fix_stages(
             stage_total = tile_count * settings.steps
             update_job(
                 job_id,
-                phase=f"Hires.fix · Tile 1/{tile_count} Step 0/{settings.steps}",
+                phase=f"Hires.fix · Tile 1/{tile_count}",
                 stage="hires_sampling", stage_step=0, stage_total=stage_total,
+                stage_unit_index=1, stage_unit_total=tile_count,
+                stage_unit_step=0, stage_unit_steps=settings.steps,
                 progress=upscale_end, step=0, total_steps=stage_total,
             )
             previous_metrics = dict(getattr(pipeline, "last_generation_metrics", {}) or {})
@@ -4895,9 +4964,14 @@ def _apply_hires_fix_stages(
                 def on_anima_tile_step(step, total, _latents, index=tile_index):
                     stage_step = index * settings.steps + step
                     progress = upscale_end + round((progress_end - upscale_end) * stage_step / max(1, stage_total))
-                    tile_phase = f"Hires.fix · Tile {index + 1}/{tile_count} Step {step}/{total}"
                     update_job(
-                        job_id, phase=tile_phase, stage="hires_sampling", stage_step=stage_step,
+                        job_id, phase=f"Hires.fix · Tile {index + 1}/{tile_count}", stage="hires_sampling",
+                        stage_step=stage_step,
+                        # The tile is the unit a reader waits on, so it is reported as one rather
+                        # than left to be recovered from the phase text: the console gives each
+                        # tile a line of its own and times it separately.
+                        stage_unit_index=index + 1, stage_unit_total=tile_count,
+                        stage_unit_step=step, stage_unit_steps=total,
                         stage_total=stage_total, progress=min(progress, progress_end), step=stage_step,
                         total_steps=stage_total, elapsed_seconds=round(control.active_elapsed(started_at), 1),
                         paused_seconds=round(control.total_paused(), 1),
@@ -6498,6 +6572,10 @@ def run_generation(job_id: str, request: GenerateInput):
                 memory_batch,
                 request.guidance,
             )
+        # The native loaders fuse their adapters into the weights as the pipeline is built, so this
+        # is the point at which they are mounted. The diffusers families report from
+        # `configure_loras`, which runs a little further down for the same reason.
+        report_mounted_loras(job_id, native_loras)
         control.checkpoint(job_id, "Preparing prompt")
         if family == "anima":
             sampling_diagnostics = anima_sampling_diagnostics(request.sampler, request.scheduler)

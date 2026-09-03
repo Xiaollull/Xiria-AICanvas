@@ -95,6 +95,9 @@ async function createProjectRoot(root) {
     writeFile(path.join(root, "package.json"), JSON.stringify({ name: "xiriacanvas-ai" })),
     writeFile(path.join(root, "package-lock.json"), JSON.stringify({ packages: { "": {} } })),
     writeFile(path.join(root, "vite.config.js"), "export default {};\n"),
+    // AGPL-3.0 section 4 obliges every conveyed copy to carry the licence, so packaging refuses
+    // to build without it.
+    writeFile(path.join(root, "LICENSE"), "GNU AFFERO GENERAL PUBLIC LICENSE\n"),
     writeFile(path.join(root, "backend", "requirements.txt"), "fastapi==1\n"),
   ]);
 }

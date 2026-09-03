@@ -42,6 +42,9 @@ async function createReleaseSource(root) {
     await mkdir(path.join(root, directory), { recursive: true });
   }
   const files = {
+    // AGPL-3.0 section 4 obliges every conveyed copy to carry the licence, so packaging refuses
+    // to build without it.
+    "LICENSE": "GNU AFFERO GENERAL PUBLIC LICENSE\n",
     "package.json": JSON.stringify({ name: "xiriacanvas-ai" }), "package-lock.json": "{}", "vite.config.js": "export default {};\n",
     "index.html": "<main></main>", "backend/requirements.txt": "fastapi==1\n", "src/App.jsx": "export default null;\n",
     "scripts/start.mjs": "export {};\n", "public/logo.svg": "<svg/>", "assistant/personas/builtin.json": "{}",

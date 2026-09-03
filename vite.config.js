@@ -386,7 +386,10 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
   const consoleEntries = [];
 
   const appendConsoleEntry = (source, stream, message) => {
-    const text = String(message || "").replace(/\r\n/g, "\n");
+    // A lone carriage return moves a terminal's cursor; the drawer has no cursor, and rendering
+    // one inside a <pre> costs a blank line. Progress redraws arrive separated by exactly that
+    // character, so it becomes the newline it stands in for rather than being dropped.
+    const text = String(message || "").replace(/\r\n?/g, "\n");
     if (!text) return;
     consoleEntries.push({ id: ++consoleSequence, at: new Date().toISOString(), source, stream, message: text.slice(0, 12000) });
     if (consoleEntries.length > 1200) consoleEntries.splice(0, consoleEntries.length - 1200);
@@ -663,6 +666,11 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
       INFERENCE_SHUTDOWN_TOKEN: shutdownToken,
       INFERENCE_WORKSPACE_ID: workspaceId,
       PYTHONUNBUFFERED: "1",
+      // Piped, Python encodes stdout with the system code page — gbk on a Chinese Windows — while
+      // this end decodes every chunk as UTF-8. Anything outside ASCII then arrives as replacement
+      // characters, and a multi-byte one eats more columns than it draws, which is what pushed the
+      // progress bar's closing edge further right the fuller it got.
+      PYTHONIOENCODING: "utf-8",
     };
     environment.XIRAI_CACHE_DIR ||= cacheDirectory;
     environment.HF_HOME ||= path.join(cacheDirectory, "huggingface");
@@ -699,8 +707,12 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
     inferenceProcess.shutdownToken = shutdownToken;
     registerSignalHandlers();
     inferenceProcess.stdout.on("data", (data) => {
-      process.stdout.write(`[inference] ${data}`);
-      appendConsoleEntry("inference", "stdout", data.toString("utf8"));
+      const text = data.toString("utf8");
+      // A progress redraw opens with a carriage return so it lands back at column zero and paints
+      // over the line it is replacing. Prefixing that chunk would leave the label sitting exactly
+      // where the bar is about to be drawn, so it is forwarded as the backend wrote it.
+      process.stdout.write(text.startsWith("\r") ? text : `[inference] ${text}`);
+      appendConsoleEntry("inference", "stdout", text);
     });
     inferenceProcess.stderr.on("data", (data) => {
       process.stderr.write(`[inference] ${data}`);

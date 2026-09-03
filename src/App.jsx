@@ -4,6 +4,7 @@ import { createViewerRafScheduler, ViewerAsyncSession, viewerOpenPlan } from "./
 import { VIEWER_TOOLBAR_POPOVER_LAYOUT, VIEWER_TOOLBAR_POPOVER_TEMPLATES, viewerEscapeAction, viewerToolbarPopoverTransition } from "./viewer-toolbar.js";
 import { pluginDiagnosticMessage, pluginRegistrySummary, pluginRemoveConfirmation, pluginStatePresentation, pluginToggleAvailable } from "./plugin-presentation.js";
 import { appendHardwareSample, EMPTY_HARDWARE_HISTORY, formatMib, HARDWARE_POLL_MS, sensorAgeLabel, sparklineSegments, vramWallPercent } from "./hardware-monitor.js";
+import { collapseConsoleEntries, progressFigures } from "./console-progress.js";
 import {
   ArrowDown,
   ArrowLeft,
@@ -1495,7 +1496,10 @@ function App() {
         if (stopped) return;
         if (payload.entries?.length) {
           consoleLatest.current = payload.latest || consoleLatest.current;
-          setConsoleEntries((current) => [...current, ...payload.entries].slice(-1200));
+          // Collapsed on the way in rather than at render time, so a long batch's progress lines
+          // occupy one row instead of hundreds — and stop evicting real log output from the
+          // thousand-entry window they would otherwise fill on their own.
+          setConsoleEntries((current) => collapseConsoleEntries([...current, ...payload.entries]).slice(-1200));
         }
         setConsoleRunning(payload.command_running === true);
         setConsoleError("");
@@ -6284,7 +6288,9 @@ function App() {
         <header className="console-head"><div><Terminal size={15} /><span>LOCAL CONSOLE</span><small>推理日志 · 错误输出 · 本机命令</small></div><div><button type="button" title="清空当前视图" onClick={clearConsole}><Trash2 size={14} />清空</button><button type="button" className="console-hide" title="隐藏控制台" onClick={() => setConsoleOpen(false)}><X size={14} />隐藏</button></div></header>
         <div className="console-output" ref={consoleOutputRef} aria-live="polite">
           {consoleEntries.length === 0 && <p className="console-empty">等待本地推理日志。输入命令可在项目根目录执行。</p>}
-          {consoleEntries.map((entry) => <div className={`console-entry ${entry.stream}`} key={entry.id}><time>{new Date(entry.at).toLocaleTimeString("zh-CN", { hour12: false })}</time><b>{entry.source === "inference" ? "INFERENCE" : "TERMINAL"}</b><pre>{entry.message}</pre></div>)}
+          {consoleEntries.map((entry) => <div className={`console-entry ${entry.progress ? "progress" : entry.stream}`} key={entry.id}><time>{new Date(entry.at).toLocaleTimeString("zh-CN", { hour12: false })}</time><b>{entry.source === "inference" ? "INFERENCE" : "TERMINAL"}</b>{entry.progress
+            ? <div className="console-progress"><span className="console-progress-phase" title={entry.progress.phase}>{entry.progress.phase}</span><span className="console-progress-track" role="progressbar" aria-valuenow={entry.progress.step} aria-valuemax={entry.progress.total}><i style={{ width: `${entry.progress.percent}%` }} /></span><span className="console-progress-figures">{progressFigures(entry.progress)}</span></div>
+            : <pre>{entry.message}</pre>}</div>)}
         </div>
         {consoleError && <p className="console-error">{consoleError}</p>}
         <form className="console-command" onSubmit={submitConsoleCommand}><span>&gt;</span><input value={consoleCommand} onChange={(event) => setConsoleCommand(event.target.value)} placeholder="输入本机终端命令，例如：dir /a" spellCheck="false" disabled={consoleRunning} /><button type="submit" disabled={!consoleCommand.trim() || consoleRunning}>{consoleRunning ? <RefreshCw className="spin" size={15} /> : <Send size={15} />}{consoleRunning ? "执行中" : "执行"}</button></form>

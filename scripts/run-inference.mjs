@@ -19,6 +19,9 @@ if (verifiedVenv.ok) {
   console.warn(`${verifiedVenv.error}; the project may not be fully isolated from other Python installations.`);
 }
 const environment = isolatedPythonEnv({ ...process.env, ...loadLocalEnv(projectRoot) });
+// The progress bar is drawn with block characters, and Windows consoles accept them only as
+// UTF-8; left to the system code page they arrive as replacement characters here too.
+environment.PYTHONIOENCODING ||= "utf-8";
 environment.INFERENCE_WORKSPACE_ID ||= createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
