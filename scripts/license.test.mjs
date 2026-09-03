@@ -23,7 +23,10 @@ const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 const DOC_PAGES = ["index", "setup", "models", "usage", "runtime"];
 
 test("LICENSE is the unmodified AGPL-3.0 text", async () => {
-  const license = await read("LICENSE");
+  // Compared with line endings normalised: the claim is about the licence's words, and a checkout
+  // that hands back CRLF has not modified them. `.gitattributes` pins the file to LF so the copy
+  // conveyed with the program is byte-identical to the FSF's, which is the part that must not drift.
+  const license = (await read("LICENSE")).replace(/\r\n/g, "\n");
   assert.match(license, /^ {20}GNU AFFERO GENERAL PUBLIC LICENSE\n {23}Version 3, 19 November 2007\n/);
   // Section 13 is the whole reason this licence rather than the GPL: a user who reaches a
   // modified copy over the network has to be offered its source.

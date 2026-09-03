@@ -1,4 +1,11 @@
 * text=auto
+
+# Every rule below matches an extension, so a file without one falls back to `text=auto` and is
+# checked out with CRLF on Windows. LICENSE must stay byte-identical to the FSF text the AGPL
+# requires be conveyed with every copy, and the release declaration is parsed by the workflow.
+LICENSE text eol=lf
+.github/full-package-release text eol=lf
+
 *.css text eol=lf
 *.html text eol=lf
 *.js text eol=lf

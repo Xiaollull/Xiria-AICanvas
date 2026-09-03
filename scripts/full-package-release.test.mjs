@@ -148,6 +148,15 @@ test("this release declares itself a full package, and says why", async () => {
   assert.match(contents, /GSAP/i);
 });
 
+test("the extensionless files this release adds are pinned to LF", async () => {
+  // Both miss every extension rule in .gitattributes and would otherwise be checked out with CRLF
+  // on Windows, which is what broke the licence comparison on the windows-latest runner while
+  // ubuntu-latest passed.
+  const attributes = await read(".gitattributes");
+  assert.match(attributes, /^LICENSE text eol=lf$/m);
+  assert.match(attributes, /^\.github\/full-package-release text eol=lf$/m);
+});
+
 test("the release workflow reads the declaration and refuses to publish without its notice", async () => {
   const workflow = await read(path.join(".github", "workflows", "release.yml"));
   assert.match(workflow, /import \{ FULL_PACKAGE_NOTICE, isFullPackageRelease \} from "\.\/scripts\/full-package-release\.mjs"/);
