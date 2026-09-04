@@ -139,13 +139,23 @@ test("a genuine dependency change satisfies the declaration", async () => {
   });
 });
 
-test("this release declares itself a full package, and says why", async () => {
+test("this release either declares itself a full package and says why, or updates in place", async () => {
+  // Written as the invariant rather than as one release's answer. 1.0.4 declared itself, because
+  // removing GSAP changed package-lock.json; 1.0.5 does not, because its dependencies are
+  // untouched. Asserting the declaration exists would fail every ordinary release after it, and
+  // asserting it does not would fail the next one that needs it.
   const declared = await readFullPackageDeclaration(projectRoot);
   const manifest = JSON.parse(await read("package.json"));
+  if (declared === null) {
+    await assert.rejects(
+      () => read(FULL_PACKAGE_DECLARATION),
+      "an in-place release carries no declaration file at all",
+    );
+    return;
+  }
   assert.equal(declared, manifest.version, "the declaration names the version being released");
   const contents = await read(FULL_PACKAGE_DECLARATION);
   assert.match(contents, /^#/m, "a reviewer reading the file learns why the release needs it");
-  assert.match(contents, /GSAP/i);
 });
 
 test("the extensionless files this release adds are pinned to LF", async () => {

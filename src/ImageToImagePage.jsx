@@ -37,6 +37,8 @@ import { normalizePostprocessOrder, postprocessTargetSize } from "./postprocessi
 import WorkspaceSelect from "./WorkspaceSelect";
 import { hiresEffectiveSteps, secureRandomUint64Seed } from "./hires-settings";
 import { formatWeight } from "./lora-weight";
+import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
+import { loraCardPresentation } from "./lora-cards.js";
 import {
   DEFAULT_IMAGE_WORKSPACE_LAYOUT,
   imageWorkspaceLayoutClassName,
@@ -279,6 +281,11 @@ export default function ImageToImagePage({
   onSelectOutput,
   onOpenViewer,
   onOpenLoraManager,
+  // The mounted library is shared with the generate page, and so is what a LoRA
+  // looks like: the card behind a row is composed once there and read here. The
+  // fallback is what a LoRA with no card looks like, so a page rendered without
+  // the store still lists the mounts instead of failing to render at all.
+  loraPresentationFor = (lora) => loraCardPresentation({ item: lora }),
   onAddToGallery,
   onNotice,
   postprocess = {},
@@ -290,6 +297,7 @@ export default function ImageToImagePage({
   const dimensions = postprocessTargetSize(canvas, order, config);
   const selectedUpscaler = postprocess.upscalers?.find((item) => item.id === config.hires.model);
   const hiresSteps = hiresEffectiveSteps(config.hires, engine.name);
+  const loraSummaryHover = useLoraHoverPreview();
   // Mirrors the generate page: a guidance-distilled engine encodes no negative prompt, so the box
   // is disabled and the request drops the text while the text itself survives an engine switch.
   const pageAllowsNegativePrompt = !DISTILLED_GUIDANCE_ENGINES.includes(engine.name);
@@ -656,12 +664,20 @@ export default function ImageToImagePage({
           <div className="section-heading lora-title"><span>05</span><h2>LoRA 挂载</h2><small className="lora-count">已挂载 {engine.loras.length}</small><button onClick={onOpenLoraManager}><Layers3 size={14} />管理</button></div>
           {engine.loras.length === 0 ? <button className="empty-lora" onClick={onOpenLoraManager}><Layers3 size={16} /><span>尚未挂载 LoRA<small>点击管理，从分类库中选择</small></span></button> : <div className="lora-summary">
             <div className="lora-summary-table">
-              {engine.loras.map((lora) => (
-                <div key={lora.value} className={`lora-summary-row ${lora.enabled === false ? "disabled" : ""}`} title={`${lora.name} · 分类 ${lora.category}`}>
-                  <span className="lora-summary-name">{lora.enabled === false && <Square size={8} />}{lora.name}</span>
+              {engine.loras.map((lora) => {
+                const presentation = loraPresentationFor(lora);
+                return (
+                <div
+                  key={lora.value}
+                  className={`lora-summary-row ${lora.enabled === false ? "disabled" : ""} ${presentation.coverUrl ? "has-cover" : ""}`}
+                  title={`${lora.name} · 分类 ${lora.category}`}
+                  {...loraSummaryHover.bind(presentation)}
+                >
+                  <span className="lora-summary-name">{lora.enabled === false && <Square size={8} />}{presentation.title}</span>
                   <b>{formatWeight(lora.weight)}</b>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>}
           <p className="i2i-note">切换引擎或底模会同步到文生图；LoRA 挂载按引擎隔离并随之切换。</p>
@@ -669,6 +685,7 @@ export default function ImageToImagePage({
           <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={running} dimensions={dimensions} updateStage={updateStage} moveStage={moveStage} order={order} postprocessOnly={postprocessOnly} />
         </div>
       </aside>
+      <LoraHoverPreview preview={loraSummaryHover.preview} />
     </section>
   );
 }

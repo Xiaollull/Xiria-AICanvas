@@ -175,17 +175,47 @@
       <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">wiki matrix</a>
       lists the current state.</p>
 
-    <div class="note">
-      <span class="label">A quantized file is a smaller download, not a smaller model</span>
-      <p>It takes far less disk, but it is not a smaller model in memory. Every format — fp8, mxfp8
-        and GGUF alike — is expanded to the compute dtype while loading, because the Diffusers
-        modules this runtime builds have no quantized linear op to hand packed weights to. VRAM is
-        bought by the <a href="runtime.html#memory">memory mode</a> and block-level offload, not by
-        the file format.</p>
+    <p>Whether a quantized file is also smaller <em>in memory</em> depends on the engine, because it
+      depends on whether there is a linear op to hand the stored weight to.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Engine</th><th>What a quantized weight costs once loaded</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Krea 2</td>
+            <td>Its stored size. The weight stays in the checkpoint's own type and the scale is
+              applied inside the linear, so an fp8 diffusion model occupies about 12 GB rather than
+              the 24 GB it expands to — the difference between resident on a 24 GB card and not.</td>
+          </tr>
+          <tr>
+            <td>Anima, FLUX.1, FLUX.2</td>
+            <td>The compute dtype. These mount Diffusers transformer classes through a key
+              conversion, and the scales have no route through it yet, so the scale is folded in at
+              load and an fp8 file costs twice what it occupies on disk.</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
-    <p>The loaded size is measured from the tensor shapes rather than the file size, so a Q4_K model
-      is budgeted as what it becomes rather than as what it weighs on disk.</p>
+    <p>Krea 2 reads the two layouts ComfyUI writes — a per-tensor scale beside an fp8 or int8 weight,
+      under either spelling of the key, and the newer per-layer <code>comfy_quant</code> marker.
+      Applying that scale at compute time is not an approximation: for every format whose weight is
+      an ordinary matrix scaled by one number, it lands on the same bits as folding it at load, which
+      is what makes deferring it free rather than a trade. A quantized layer a LoRA patches keeps its
+      storage too — the adapter is carried beside the weight instead of being fused into it.</p>
+
+    <div class="note">
+      <span class="label">GGUF is always expanded</span>
+      <p>A GGUF block format has no compute-time form to keep, so it is expanded to the compute dtype
+        while loading whichever engine reads it: a Q4_K file is a much smaller download and the same
+        size in memory as bf16. VRAM there is bought by the
+        <a href="runtime.html#memory">memory mode</a> and block-level offload, not by the file
+        format.</p>
+    </div>
+
+    <p>The loaded size is measured from the tensor shapes and their stored types rather than the file
+      size, so a Q4_K model is budgeted as what it becomes and an fp8 Krea 2 model as what it stays.</p>
 
     <footer class="page-footer">
       <a href="https://github.com/Xiaollull/Xiria-AICanvas">Source on GitHub</a>

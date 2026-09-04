@@ -238,7 +238,10 @@ test("both mounted surfaces render one shared panel and one shared group editor"
   for (const [name, source] of [["App.jsx", app], ["LoraManagerPage.jsx", page]]) {
     assert.match(source, /<LoraMountPanel[\s\S]*groups=\{activeLoraGroups\}/, `${name} passes groups to the shared panel`);
     assert.match(source, /<LoraGroupPanel/, `${name} exposes the group editor`);
-    assert.match(source, /previewUrlFor=\{loraPreviewUrlFor\}/, `${name} supplies its own preview resolver`);
+    // One bundle of card controls rather than a prop per capability, and the same
+    // one for both panels, so the two surfaces cannot resolve a cover differently.
+    assert.match(source, /<LoraMountPanel[\s\S]*cards=\{loraCardControls\}/, `${name} supplies the shared card controls`);
+    assert.match(source, /<LoraGroupPanel[\s\S]*cards=\{loraCardControls\}/, `${name} lets the group editor reach its effect images`);
   }
   // Every mounted edit routes through one place, so a change to a grouped entry
   // always reaches its group definition.

@@ -22,6 +22,11 @@ DEFAULT_PERFORMANCE_SETTINGS = {
     # it needs Triton, costs a one-off compile per latent shape, and changes the
     # image a fixed Seed produces.
     "compile_transformer": False,
+    # Evict the diffusion model before the autoencoder decodes. The decoder works at full
+    # resolution and is the one stage that wants the whole card, while the transformer has nothing
+    # left to do once the last step is taken — so holding both is what forces a large canvas into
+    # tiled decoding. On by default.
+    "unload_before_decode": True,
     # Zero means automatic: use real free memory with the platform reserve applied by admission.
     "vram_limit_gb": 0.0,
 }
@@ -45,7 +50,10 @@ def normalize_performance_settings(value):
         candidate = source.get(key)
         if isinstance(candidate, str) and candidate in choices:
             normalized[key] = candidate
-    for key in ("keep_model_cached", "allow_shared_memory", "calculate_model_hash", "staged_vae_decode", "compile_transformer"):
+    for key in (
+        "keep_model_cached", "allow_shared_memory", "calculate_model_hash", "staged_vae_decode",
+        "compile_transformer", "unload_before_decode",
+    ):
         if isinstance(source.get(key), bool):
             normalized[key] = source[key]
     candidate_limit = source.get("vram_limit_gb")
@@ -69,6 +77,7 @@ def normalize_performance_settings(value):
             # Ultra-low is a survival mode: it spends memory nowhere, and a
             # compiled graph holds workspace the sequential offload path needs.
             "compile_transformer": False,
+            "unload_before_decode": True,
         })
     return normalized
 

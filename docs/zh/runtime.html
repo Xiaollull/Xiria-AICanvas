@@ -97,6 +97,15 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
     <p><code>XIRAI_PROGRESS_LINES</code> 是一次采样运行可用的行数预算；分块处理的工作不受它约束，始终保持每块一行。
       <code>XIRAI_PROGRESS_CONSOLE=0</code> 关闭这些输出行。两者都不影响 Web UI 中的进度条，后者直接读取任务记录。</p>
 
+    <h3>谁可以在其中执行命令</h3>
+    <p>读取控制台与在其中输入是两种不同的权限。日志跟随应用：它就是生成页面已经在推送的任务输出，因此在任何打开 Web UI
+      的设备上都能看到。执行 shell 命令则不同——它仅限于运行 XirAI 的那台机器，输入框会直接说明这一点，而不是先接受命令再拒绝。</p>
+    <p>要在其他设备上执行命令，请在运行 XirAI 的机器上设置以下变量并重启：</p>
+<pre><code>XIRAI_REMOTE_CONSOLE=1</code></pre>
+    <p>它会把 shell 权限——以运行该应用的用户身份——开放给所有能访问该端口的人，因为 Web UI
+      本身没有密码。因此它只适合部署在端口仅对可信网络开放的主机上。使用 SSH 隧道则完全不需要这个设置：转发端口后访问
+      <code>localhost</code>，请求就来自这台机器本身。</p>
+
     <h2 id="memory">显存模式</h2>
     <p>运行时显存管理默认采用 <code>XIRAI_MEMORY_MODE=auto</code>，遵循 ComfyUI 的内存预算行为，但不导入或依赖
       ComfyUI。在第一次加载检查点之前，XirAI 会测量当前可用/总显存，根据张量元数据估算检查点的 FP16
@@ -132,8 +141,9 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
       <code>low_vram</code>；不安全的强制模式会自动降级。设置 <code>XIRAI_RESERVE_VRAM_GB</code> 以覆盖默认的操作系统/应用预留量。</p>
 
     <div class="note">
-      <span class="label">量化文件不会降低显存占用</span>
-      <p>所有权重格式都会在加载时展开为计算精度，预算按张量形状而非文件大小计算。参见<a href="models.html#quantization">关于量化，说实话</a>。</p>
+      <span class="label">量化文件的占用取决于引擎</span>
+      <p>Krea 2 会让逐张量缩放的 fp8 或 int8 权重保持存储形式，并在线性算子内部施加缩放，因此这类文件按其存储大小计入预算并占用显存。其余引擎，以及所有引擎读取的
+        GGUF，都会在加载时展开为计算精度。无论哪种情况，预算都按张量形状及其存储类型计算，而非按文件大小计算。参见<a href="models.html#quantization">关于量化，说实话</a>。</p>
     </div>
 
     <h2 id="cache">管道缓存</h2>

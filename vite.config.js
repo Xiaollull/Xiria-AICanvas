@@ -56,6 +56,7 @@ import { PLUGIN_DIAGNOSTIC_CODES, createPluginRegistry, pluginsRootFor, servesPl
 import { applyPluginEnabled, pluginStatePathFor, pluginToggleAdmission, readPluginState, writePluginState } from "./scripts/plugin-state.mjs";
 import { removePluginFolder, revealPluginFolder } from "./scripts/plugin-actions.mjs";
 import { descriptionNeedsVersionIdentity, loraMetadataCacheValid, plainTextFromHtml, readLoraFileMetadata, reviewLoraPrompts, TRIGGER_REVIEW_SCHEMA } from "./scripts/lora-metadata.mjs";
+import { pruneCardAssets, readCardAsset, readLoraCardStore, writeCardAsset, writeLoraCardStore } from "./scripts/lora-cards.mjs";
 import { appendDownloadQueueState, filterPendingRecommendedArtifacts, itemStatusIsTerminal } from "./scripts/model-download-queue.mjs";
 import { assistantReadiness, mergeAssistantSettings, readAssistantProfileStore, readAssistantSettings, redactAssistantProfileStore, redactAssistantSettings, assistantSettingsPath, writeAssistantProfileStore, writeAssistantSettings } from "./scripts/assistant-settings.mjs";
 import {
@@ -395,10 +396,34 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
     if (consoleEntries.length > 1200) consoleEntries.splice(0, consoleEntries.length - 1200);
   };
 
-  const requireLocalConsoleRequest = (request) => {
+  // Reading the console and running a command are not the same permission, and treating them as
+  // one is what left the drawer blank on every device except the host: a phone or a second machine
+  // on the LAN could not even see the inference log it exists to show, while the reason given was
+  // about commands. The log is the same job progress the generate page already streams to whoever
+  // it is served to, so it follows the app; running a shell command does not.
+  const consoleCommandsAllowedRemotely = () => process.env.XIRAI_REMOTE_CONSOLE === "1";
+
+  const consoleRequestIsLocal = (request) => {
     const address = request.socket.remoteAddress || "";
-    if (!new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]).has(address)) {
-      throw Object.assign(new Error("Console commands are available only from this computer"), { statusCode: 403 });
+    return new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]).has(address);
+  };
+
+  const consoleCommandsPermitted = (request) => consoleRequestIsLocal(request) || consoleCommandsAllowedRemotely();
+
+  const requireConsoleReadRequest = (request) => {
+    requireSameOrigin(request);
+  };
+
+  const requireConsoleCommandRequest = (request) => {
+    if (!consoleCommandsPermitted(request)) {
+      throw Object.assign(
+        new Error(
+          "Console commands are available only from this computer. To allow them from another "
+          + "device, set XIRAI_REMOTE_CONSOLE=1 in .env on the machine running XiriaCanvas and "
+          + "restart it — this grants shell access to anyone who can reach the port."
+        ),
+        { statusCode: 403 },
+      );
     }
     requireSameOrigin(request);
   };
@@ -444,8 +469,8 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
       response.setHeader("Content-Type", "application/json; charset=utf-8");
       response.setHeader("Cache-Control", "no-store");
       try {
-        requireLocalConsoleRequest(request);
         if (url.pathname === "/api/console") {
+          requireConsoleReadRequest(request);
           if (request.method !== "GET") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
           const after = Math.max(0, Number(url.searchParams.get("after") || 0) || 0);
           response.statusCode = 200;
@@ -453,9 +478,13 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
             entries: consoleEntries.filter((entry) => entry.id > after),
             latest: consoleSequence,
             command_running: Boolean(consoleCommand),
+            // So the input can say why it is disabled instead of accepting a command and
+            // refusing it afterwards.
+            commands_allowed: consoleCommandsPermitted(request),
           }));
           return;
         }
+        requireConsoleCommandRequest(request);
         if (request.method !== "POST") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
         if (consoleCommand) throw Object.assign(new Error("Another console command is still running"), { statusCode: 409 });
         const payload = await readJsonRequest(request);
@@ -1890,6 +1919,91 @@ function uiStateApiPlugin() {
     name: "local-ui-state-api",
     configureServer(server) { server.middlewares.use(uiStateApi); },
     configurePreviewServer(server) { server.middlewares.use(uiStateApi); },
+  };
+}
+
+// LoRA card store.
+//
+// Deliberately a separate route from `/api/ui-state`: the workspace state is
+// rewritten on almost every interaction and is synchronised between the modal
+// and the standalone page, while a card is edited rarely and holds images. Kept
+// together, one autosave of a slider would rewrite the user's artwork index, and
+// a single oversized picture would put the whole workspace over the request cap.
+//
+// The pictures never leave `state-cache/lora-cards/assets`. They arrive as data
+// URLs, are re-encoded from their own bytes, and are served back under a name
+// derived from a content hash, so nothing a page sends decides a file name.
+
+async function loraCardsApi(request, response, next) {
+  const url = new URL(request.url, "http://localhost");
+  if (url.pathname !== "/api/lora-cards" && url.pathname !== "/api/lora-cards/asset") {
+    next();
+    return;
+  }
+  try {
+    requireSameOrigin(request);
+    if (url.pathname === "/api/lora-cards/asset") {
+      await loraCardAssetRequest(request, response, url);
+      return;
+    }
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Cache-Control", "no-store");
+    if (request.method === "GET") {
+      const { store, rejected, reset } = await readLoraCardStore(stateDirectory);
+      response.statusCode = 200;
+      response.end(JSON.stringify({ store, rejected, reset }));
+      return;
+    }
+    if (request.method === "PUT") {
+      // The whole store is small — a few hundred bytes per customised card — and
+      // sending it whole keeps the two windows from having to merge patches.
+      const payload = await readJsonRequest(request, 512 * 1024);
+      const store = await writeLoraCardStore(stateDirectory, payload?.store);
+      const removed = await pruneCardAssets(stateDirectory, store);
+      response.statusCode = 200;
+      response.end(JSON.stringify({ store, removed: removed.length }));
+      return;
+    }
+    throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+  } catch (error) {
+    if (response.headersSent) {
+      response.end();
+      return;
+    }
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.statusCode = error.statusCode || 500;
+    response.end(JSON.stringify({ error: error.message || "LoRA 卡片请求失败" }));
+  }
+}
+
+async function loraCardAssetRequest(request, response, url) {
+  if (request.method === "GET") {
+    const asset = await readCardAsset(stateDirectory, url.searchParams.get("id"));
+    response.statusCode = 200;
+    response.setHeader("Content-Type", asset.contentType);
+    // The name is the content hash, so a stored image is immutable and an
+    // updated cover arrives under a different id rather than a stale cache.
+    response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    response.end(asset.buffer);
+    return;
+  }
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.setHeader("Cache-Control", "no-store");
+  if (request.method === "POST") {
+    const payload = await readJsonRequest(request, 8 * 1024 * 1024);
+    const asset = await writeCardAsset(stateDirectory, payload?.dataUrl);
+    response.statusCode = 200;
+    response.end(JSON.stringify({ id: asset.id, url: `/api/lora-cards/asset?id=${asset.id}`, bytes: asset.bytes }));
+    return;
+  }
+  throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+}
+
+function loraCardsApiPlugin() {
+  return {
+    name: "local-lora-cards-api",
+    configureServer(server) { server.middlewares.use(loraCardsApi); },
+    configurePreviewServer(server) { server.middlewares.use(loraCardsApi); },
   };
 }
 
@@ -5070,7 +5184,7 @@ function systemApiPlugin() {
 }
 
 export default defineConfig({
-  plugins: [setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
+  plugins: [setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), loraCardsApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
   cacheDir: path.join(cacheDirectory, "vite"),
   define: {
     // The browser may be on a different machine than the folders the user is

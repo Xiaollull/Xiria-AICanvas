@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, GripVertical, ImageOff, Images, Layers3, MessageSquareText, Target, X } from "lucide-react";
+import { ChevronDown, ChevronUp, GripVertical, ImageOff, Images, Layers3, MessageSquareText, Palette, Target, X } from "lucide-react";
 
 import { normalizeMountedLoras } from "./lora-state.js";
 import { collectingGroupId, groupIdOfMountedLora, partitionMountedByGroup, syncMountedIntoGroups } from "./lora-groups.js";
+import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
+import { groupCardPresentation } from "./lora-cards.js";
+import { useDraftField } from "./lora-draft-field.js";
 import {
   formatWeight,
   WEIGHT_MAXIMUM,
@@ -93,12 +96,11 @@ function WeightField({ item, disabled, onCommit }) {
   );
 }
 
-function MountedPreview({ item, previewUrlFor }) {
+function MountedPreview({ url }) {
   const [failed, setFailed] = useState(false);
-  const url = failed ? "" : (previewUrlFor?.(item) || "");
   return (
     <div className="mounted-preview">
-      {url
+      {url && !failed
         ? <img src={url} alt="" loading="lazy" onError={() => setFailed(true)} />
         : <span className="mounted-preview-empty"><ImageOff size={13} />无图片</span>}
     </div>
@@ -108,6 +110,10 @@ function MountedPreview({ item, previewUrlFor }) {
 function GroupPromptBox({ group, disabled, onChange }) {
   const [open, setOpen] = useState(false);
   const length = group.presetPrompt.length;
+  // The store trims what it is given, so the box has to hold a draft: bound
+  // straight to the stored value it would swallow every space typed at the end
+  // and the second word could never be started.
+  const field = useDraftField(group.presetPrompt, onChange, { multiline: true });
   return (
     <div className={`mounted-group-prompt ${open ? "open" : ""}`}>
       <button type="button" className="mounted-group-prompt-toggle" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
@@ -121,10 +127,12 @@ function GroupPromptBox({ group, disabled, onChange }) {
           rows={3}
           spellCheck={false}
           disabled={disabled}
-          value={group.presetPrompt}
           placeholder="该组启用时，这段提示词会加在正向提示词最前面"
           aria-label={`${group.name} 预设正向提示词`}
-          onChange={(event) => onChange(event.target.value)}
+          value={field.value}
+          onChange={field.onChange}
+          onBlur={field.onBlur}
+          onKeyDown={field.onKeyDown}
         />
         <small>不会改写生成页的提示词输入框，仅在提交生成时拼接到最前面。</small>
       </>}
@@ -136,9 +144,10 @@ export default function LoraMountPanel({
   loras,
   groups = [],
   locked = false,
-  previewUrlFor,
+  cards,
   onUpdateLoras,
   onUpdateGroups,
+  onNotice,
   variant = "modal",
 }) {
   const [dragIndex, setDragIndex] = useState(null);
@@ -148,6 +157,9 @@ export default function LoraMountPanel({
   const sessionRef = useRef(null);
   const lorasRef = useRef(loras);
   lorasRef.current = loras;
+  // A drag is a pointer gesture over these same rows, so the preview has to get
+  // out of the way for it or it would sit under the cursor being dropped.
+  const hover = useLoraHoverPreview({ enabled: dragIndex === null });
 
   useEffect(() => {
     const down = (event) => { if (event.key === "Shift") setShiftPressed(true); };
@@ -220,10 +232,12 @@ export default function LoraMountPanel({
     const index = indexOf(item.value);
     const position = ((item.weight + 5) / 10) * 100;
     const grouped = Boolean(groupIdOfMountedLora(item, groups));
+    const presentation = cards?.presentationFor?.(item) || null;
     return (
       <div
         className={`lora-mounted-item ${!locked && dragIndex === index && sessionRef.current?.sourceValue === item.value ? "dragging" : ""} ${!locked && dropTarget === index && hasLiveDropAt(index) ? "drop-target" : ""} ${showPreviews ? "with-preview" : ""}`}
         key={item.value}
+        {...(presentation ? hover.bind(presentation) : {})}
         onDragOver={(event) => {
           if (!acceptsDropAt(event, index)) { clearSession(); return; }
           event.preventDefault();
@@ -257,6 +271,9 @@ export default function LoraMountPanel({
             onDragStart={(event) => {
               const session = establishLoraDragSession({ event, index, sourceValue: item.value, items: lorasRef.current, locked });
               if (!session) { event.preventDefault(); clearSession(); return; }
+              // The preview sits where the row is about to be dropped, so it goes
+              // now rather than after the state that disables it has landed.
+              hover.hide();
               sessionRef.current = session;
               setDragIndex(index);
               setDropTarget(null);
@@ -272,12 +289,21 @@ export default function LoraMountPanel({
             title={item.enabled !== false ? "已启用" : "已停用"}
             onClick={() => patchLora(item.value, { enabled: item.enabled === false })}
           ><i /></button>
-          {showPreviews && <MountedPreview item={item} previewUrlFor={previewUrlFor} />}
+          {showPreviews && <MountedPreview url={presentation?.coverUrl || ""} />}
           <div className="mounted-item-info">
-            <strong title={item.name}>{item.name}</strong>
+            <strong title={presentation?.renamed ? `${presentation.title}（${item.name}）` : item.name}>{presentation?.title || item.name}</strong>
             <small>{item.category} · {weightPrecisionLabel(item, shiftPressed)}</small>
           </div>
           <WeightField item={item} disabled={locked} onCommit={(changes) => patchLora(item.value, changes)} />
+          {cards?.onEditLora && (
+            <button
+              type="button"
+              className={`mounted-card-edit ${presentation?.customized ? "customized" : ""}`}
+              title="自定义封面、提示词和显示信息"
+              aria-label={`自定义 ${item.name} 的卡片`}
+              onClick={() => { hover.hide(); cards.onEditLora(item); }}
+            ><Palette size={13} /></button>
+          )}
           <button
             type="button"
             className="remove"
@@ -331,10 +357,13 @@ export default function LoraMountPanel({
         </div>
       )}
 
-      {blocks.map(({ group, items }) => (
+      {blocks.map(({ group, items }) => {
+        const groupCard = cards?.groupCardFor?.(group.id) || null;
+        const coverUrl = groupCard ? groupCardPresentation({ group, card: groupCard }).coverUrl : "";
+        return (
         <section className={`lora-mount-group ${collecting === group.id ? "collecting" : ""}`} key={group.id}>
           <header>
-            <span className="lora-mount-group-mark" />
+            {coverUrl ? <img className="lora-mount-group-cover" src={coverUrl} alt="" loading="lazy" /> : <span className="lora-mount-group-mark" />}
             <strong title={group.name}>{group.name}</strong>
             <small>{items.length} 个 LoRA</small>
             {collecting === group.id && <em className="lora-mount-collecting"><Target size={11} />收集中</em>}
@@ -350,7 +379,8 @@ export default function LoraMountPanel({
             ? <div className="lora-mounted-list">{items.map(renderRow)}</div>
             : <p className="lora-mount-group-waiting">去分类里挂载 LoRA，它们会加入这个组合。</p>}
         </section>
-      ))}
+        );
+      })}
 
       {standalone.length > 0 && (
         blocks.length > 0
@@ -360,6 +390,8 @@ export default function LoraMountPanel({
           </section>
           : <div className="lora-mounted-list">{standalone.map(renderRow)}</div>
       )}
+
+      <LoraHoverPreview preview={hover.preview} />
     </div>
   );
 }

@@ -113,6 +113,19 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
       it and keeps its line per tile. <code>XIRAI_PROGRESS_CONSOLE=0</code> turns the lines off.
       Neither affects the progress bar in the Web UI, which reads the job record directly.</p>
 
+    <h3>Who may run a command in it</h3>
+    <p>Reading the drawer and typing into it are separate permissions. The log follows the app: it is
+      the same job output the generate page already streams, so it appears on every device the Web UI
+      is opened from. Running a shell command in it does not — that stays limited to the machine
+      XirAI itself runs on, and the input says so rather than accepting a command and refusing it
+      afterwards.</p>
+    <p>To run commands from another device, set this on the machine running XirAI and restart it:</p>
+<pre><code>XIRAI_REMOTE_CONSOLE=1</code></pre>
+    <p>It grants a shell, as the user running the app, to anyone who can reach the port — the Web UI
+      has no password of its own — so it belongs on a host whose port is reachable only from a
+      network you trust. An SSH tunnel needs no setting at all: forward the port and browse
+      <code>localhost</code>, and the request arrives from the machine itself.</p>
+
     <h2 id="memory">VRAM memory modes</h2>
     <p>Runtime VRAM management defaults to <code>XIRAI_MEMORY_MODE=auto</code> and follows the
       memory-budgeting behavior of ComfyUI without importing or depending on ComfyUI. Before the
@@ -158,9 +171,11 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
       and application reserve.</p>
 
     <div class="note">
-      <span class="label">Quantized files do not lower VRAM</span>
-      <p>Every weight format is expanded to the compute dtype while loading, and the budget is
-        computed from tensor shapes rather than file size. See
+      <span class="label">What a quantized file costs depends on the engine</span>
+      <p>Krea 2 keeps a scalar-scaled fp8 or int8 weight in its stored form and applies the scale
+        inside the linear, so such a file is budgeted and held at its stored size. Every other
+        engine, and GGUF everywhere, expands to the compute dtype while loading. Either way the
+        budget is computed from tensor shapes and stored types rather than file size. See
         <a href="models.html#quantization">quantization, honestly</a>.</p>
     </div>
 

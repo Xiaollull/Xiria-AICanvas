@@ -129,16 +129,29 @@ class Krea2EngineWiringTests(unittest.TestCase):
         self.assertEqual(inference_server.base_sampling_steps(request, "krea2"), request.steps)
         self.assertLess(inference_server.base_sampling_steps(request, "sdxl"), request.steps)
 
-    def test_the_memory_estimate_treats_krea2_as_its_own_family(self):
-        # A 6144-wide single-stream DiT costs more per megapixel than FLUX.1's 3072-wide one, and
-        # the twelve-tap text refinement adds a little on top of FLUX.2's per-branch cost.
+    def test_the_memory_estimate_covers_the_measured_peak_at_every_canvas(self):
+        # Krea 2's slope is the one that has been measured rather than reasoned about. A resident
+        # transformer's peak allocation was recorded on a 24 GB card with a 256-token conditioning
+        # sequence, and the estimate has to stay above each of those without running away from
+        # them — an estimate three times the truth is what sent a 2048x2944 Hires pass onto block
+        # streaming, and one below the truth would admit a pass that cannot fit.
+        measured_gib = {
+            (1024, 1024): 0.69,
+            (1536, 1536): 1.39,
+            (2048, 2048): 2.42,
+            (2048, 2944): 3.46,
+        }
+        for (width, height), measured in measured_gib.items():
+            estimate = estimate_inference_bytes("krea2", width, height, 4.0, 1, guidance_copies=1) / 1024**3
+            self.assertGreater(estimate, measured * 1.25, f"{width}x{height} leaves too little headroom")
+            self.assertLess(estimate, measured * 2.2, f"{width}x{height} over-budgets the measured peak")
+
+        # The other families' slopes are still the unmeasured, deliberately generous ones, so this
+        # says nothing about them beyond keeping the comparison honest: Krea 2 is no longer sized
+        # by analogy to FLUX.2, it is sized by what it was seen to allocate.
         self.assertGreater(
+            estimate_inference_bytes("krea2", 1024, 1024, 4.0, 1, guidance_copies=2),
             estimate_inference_bytes("krea2", 1024, 1024, 4.0, 1, guidance_copies=1),
-            estimate_inference_bytes("flux", 1024, 1024, 3.5, 1, guidance_copies=1),
-        )
-        self.assertGreater(
-            estimate_inference_bytes("krea2", 1024, 1024, 4.0, 1, guidance_copies=1),
-            estimate_inference_bytes("flux2", 1024, 1024, 4.0, 1, guidance_copies=1),
         )
         # The published mount is a 26 GB transformer beside an 8.9 GB encoder, so the transformer
         # is a larger share than FLUX.2's and a smaller one than Anima's.
@@ -150,6 +163,45 @@ class Krea2EngineWiringTests(unittest.TestCase):
             estimate_largest_component_bytes(10 * 1024**3, "krea2"),
             estimate_largest_component_bytes(10 * 1024**3, "anima"),
         )
+
+    def test_the_transformer_is_held_between_jobs_when_the_hold_itself_fits(self):
+        # Holding it has to survive the next job's conditioning, which runs with the transformer
+        # still on the card — every weight plus the encoder's activations, and not the sampling
+        # tensors. HIGH_VRAM also budgets those, so requiring it parked models that fit.
+        strategy = self._strategy_with(mode="normal_vram", free_gib=22.6, total_weight_gib=17.4)
+        self.assertTrue(strategy["keep_transformer_resident"])
+        self.assertFalse(strategy["transformer_group_offload"])
+
+    def test_the_transformer_is_not_held_when_the_next_conditioning_would_not_fit(self):
+        strategy = self._strategy_with(mode="normal_vram", free_gib=14.0, total_weight_gib=17.4)
+        self.assertFalse(strategy["keep_transformer_resident"])
+
+    def test_group_offload_never_holds_the_transformer(self):
+        strategy = self._strategy_with(mode="low_vram", free_gib=22.6, total_weight_gib=17.4)
+        self.assertFalse(strategy["keep_transformer_resident"])
+        self.assertTrue(strategy["transformer_group_offload"])
+
+    def _strategy_with(self, mode, free_gib, total_weight_gib):
+        gib = 1024**3
+        stub = {
+            "mode": mode,
+            "label": mode.upper(),
+            "weight_gb": total_weight_gib,
+            "inference_gb": 5.5,
+            "reserved_gb": 0.4,
+            "free_gb": free_gib,
+            "free_bytes": int(free_gib * gib),
+            "reserved_bytes": int(0.4 * gib),
+            "inference_bytes": int(5.5 * gib),
+            "normal_required_bytes": int(19.4 * gib),
+        }
+        with patch.object(inference_server, "choose_memory_strategy", return_value=dict(stub)), \
+             patch.dict(inference_server.performance_settings, {"keep_model_cached": True}):
+            return inference_server.choose_flux_memory_strategy(
+                Path("krea2.safetensors"), 2048, 2944, 1.0, 1,
+                int(total_weight_gib * gib), int(12.24 * gib),
+                family="krea2", guidance_copies=2,
+            )
 
     def test_the_admission_budget_is_one_branch_even_with_two_guidance_copies(self):
         # The conditioned and unconditional forwards run one after the other, so budgeting two

@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Check, CircleStop, FolderPlus, Layers3, MessageSquareText, Pencil, Plus, Target, Trash2, X } from "lucide-react";
+import { Check, CircleStop, FolderPlus, Images, Layers3, MessageSquareText, Pencil, Plus, StickyNote, Target, Trash2, X } from "lucide-react";
 
+import LoraGroupArtwork from "./LoraGroupArtwork.jsx";
+import { MAXIMUM_CARD_NOTE, groupCardPresentation } from "./lora-cards.js";
+import { useDraftField } from "./lora-draft-field.js";
 import { normalizeMountedLoras } from "./lora-state.js";
 import {
   MAXIMUM_GROUPS,
@@ -19,7 +22,32 @@ import {
 // still what generation reads, so nothing here is on the inference path except
 // the preset prompt.
 
-export default function LoraGroupPanel({ groups = [], loras = [], locked = false, onUpdateGroups, onUpdateLoras, onNotice }) {
+/**
+ * Both boxes in a group's body write into stores that trim what they are given,
+ * so each holds a draft until it loses focus. Bound straight to the stored value
+ * a trailing space is removed before the next render and the next word can never
+ * be started.
+ */
+function GroupTextArea({ label, icon, rows, limit, placeholder, hint, disabled, value, onCommit, className = "" }) {
+  const field = useDraftField(value, onCommit, { multiline: true });
+  return <label className={`lora-group-prompt ${className}`.trim()}>
+    <span>{icon}{label}</span>
+    <textarea
+      rows={rows}
+      spellCheck={false}
+      maxLength={limit}
+      disabled={disabled}
+      placeholder={placeholder}
+      value={field.value}
+      onChange={field.onChange}
+      onBlur={field.onBlur}
+      onKeyDown={field.onKeyDown}
+    />
+    {hint && <small>{hint}</small>}
+  </label>;
+}
+
+export default function LoraGroupPanel({ groups = [], loras = [], locked = false, cards, onUpdateGroups, onUpdateLoras, onNotice }) {
   const [renaming, setRenaming] = useState("");
   const [nameDraft, setNameDraft] = useState("");
   const [expanded, setExpanded] = useState("");
@@ -117,6 +145,9 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
     // otherwise its LoRAs stay mounted carrying a tag that no longer resolves.
     if (group.enabled) onUpdateLoras?.(() => applyGroupEnabled(mounted, group, false).loras);
     onUpdateGroups?.((current) => current.filter((entry) => entry.id !== group.id));
+    // Group ids are never reused, so a card left behind would keep its effect
+    // images alive under an id nothing can reach or delete.
+    cards?.onRemoveGroup?.(group.id);
     onNotice?.(`已删除组合「${group.name}」`);
   };
 
@@ -193,9 +224,13 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
       )}
 
       <div className="lora-group-list">
-        {groups.map((group) => (
+        {groups.map((group) => {
+          const card = cards?.groupCardFor?.(group.id) || null;
+          const presentation = card ? groupCardPresentation({ group, card }) : null;
+          return (
           <article className={`lora-group-card ${group.enabled ? "enabled" : ""} ${collecting === group.id ? "collecting" : ""}`} key={group.id}>
             <header>
+              {presentation?.coverUrl && <img className="lora-group-cover" src={presentation.coverUrl} alt="" loading="lazy" />}
               <button
                 type="button"
                 className={`mounted-toggle ${group.enabled ? "active" : ""}`}
@@ -222,7 +257,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
               ) : (
                 <strong title={group.name}>{group.name}</strong>
               )}
-              <small>{group.members.length} 个 LoRA{group.presetPrompt ? " · 含预设提示词" : ""}</small>
+              <small>{group.members.length} 个 LoRA{group.presetPrompt ? " · 含预设提示词" : ""}{presentation?.showcase.length ? ` · ${presentation.showcase.length} 张效果图` : ""}</small>
               <span className="lora-mount-spacer" />
               <button
                 type="button"
@@ -233,6 +268,18 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
                 aria-label={collecting === group.id ? `停止向 ${group.name} 收集` : `向 ${group.name} 收集新挂载的 LoRA`}
                 onClick={() => toggleCollecting(group)}
               >{collecting === group.id ? <CircleStop size={13} /> : <Target size={13} />}</button>
+              {cards?.onPatchGroup && (
+                // The effect images used to be reachable only by opening the
+                // body first, which made the group cover impossible to find.
+                <button
+                  type="button"
+                  className={`lora-group-artwork-open ${presentation?.showcase.length ? "customized" : ""}`}
+                  disabled={locked}
+                  title="封面与效果图"
+                  aria-label={`设置 ${group.name} 的封面与效果图`}
+                  onClick={() => setExpanded(group.id)}
+                ><Images size={13} /></button>
+              )}
               <button type="button" disabled={locked} title="重命名" aria-label={`重命名 ${group.name}`} onClick={() => { setRenaming(group.id); setNameDraft(group.name); }}><Pencil size={13} /></button>
               <button type="button" disabled={locked} title="编辑内容" aria-expanded={expanded === group.id} aria-label={`编辑 ${group.name}`} onClick={() => setExpanded((current) => current === group.id ? "" : group.id)}>{expanded === group.id ? <Check size={13} /> : <Layers3 size={13} />}</button>
               <button type="button" className="remove" disabled={locked} title="删除组合" aria-label={`删除 ${group.name}`} onClick={() => removeGroup(group)}><Trash2 size={13} /></button>
@@ -240,18 +287,41 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
 
             {expanded === group.id && (
               <div className="lora-group-body">
-                <label className="lora-group-prompt">
-                  <span><MessageSquareText size={12} />预设正向提示词</span>
-                  <textarea
-                    rows={3}
-                    spellCheck={false}
+                {/* First in the body: the header's artwork button opens the card
+                    to set a cover, so that is what has to be under the pointer. */}
+                {card && cards?.onPatchGroup && <>
+                  <LoraGroupArtwork
+                    group={group}
+                    card={card}
                     disabled={locked}
-                    value={group.presetPrompt}
-                    placeholder="启用该组合时，这段提示词会加在正向提示词最前面"
-                    onChange={(event) => patchGroup(group.id, { presetPrompt: event.target.value })}
+                    onPatch={(patch) => cards.onPatchGroup(group.id, patch)}
+                    onUploadImage={cards.onUploadImage}
+                    onNotice={onNotice}
                   />
-                  <small>生成页的提示词输入框不会被改写；多个组合按此列表顺序依次拼接。</small>
-                </label>
+                  <GroupTextArea
+                    className="lora-group-note"
+                    label="组合备注"
+                    icon={<StickyNote size={12} />}
+                    rows={2}
+                    limit={MAXIMUM_CARD_NOTE}
+                    disabled={locked}
+                    value={card.note}
+                    placeholder="记下这套搭配适合什么，只给自己看"
+                    hint="只给自己看的说明，不会进入生成请求。"
+                    onCommit={(note) => cards.onPatchGroup(group.id, { note })}
+                  />
+                </>}
+
+                <GroupTextArea
+                  label="预设正向提示词"
+                  icon={<MessageSquareText size={12} />}
+                  rows={3}
+                  disabled={locked}
+                  value={group.presetPrompt}
+                  placeholder="启用该组合时，这段提示词会加在正向提示词最前面"
+                  hint="生成页的提示词输入框不会被改写；多个组合按此列表顺序依次拼接。"
+                  onCommit={(presetPrompt) => patchGroup(group.id, { presetPrompt })}
+                />
 
                 <div className="lora-group-members">
                   {!group.members.length && <p className="lora-group-empty-members">{collecting === group.id ? "该组合还是空的 — 去分类里挂载 LoRA，它们会自动加进来。" : "该组合还没有 LoRA。"}</p>}
@@ -271,7 +341,8 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
               </div>
             )}
           </article>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

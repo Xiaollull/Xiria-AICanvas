@@ -84,12 +84,22 @@ def estimate_inference_bytes(family, width, height, guidance_scale=7.5, images_p
         # wide. The slope doubles with it, and stays deliberately generous for the same reason.
         estimate_gb = 1.1 + 1.7 * megapixels * batch_factor
     elif family == "krea2":
-        # Krea 2 is 6144 wide over the same 4096-token sequence, so its per-branch activation cost
-        # tracks FLUX.2's. What differs is that a Krea 2 step runs two branches where FLUX.2 runs
-        # one — and that already reaches this function through `batch_factor`, so the slope stays
-        # per-branch rather than being doubled a second time. The text sequence adds a little on
-        # top: twelve tapped hidden states are refined before the streams are concatenated.
-        estimate_gb = 1.2 + 1.7 * megapixels * batch_factor
+        # Krea 2 is 6144 wide over the same 4096-token sequence, and a step runs two branches where
+        # FLUX.2 runs one — which reaches this function through `batch_factor`, so the slope stays
+        # per-branch rather than being doubled a second time.
+        #
+        # The slope is measured rather than inherited. A resident transformer's peak allocation was
+        # recorded on a 24 GB card at four canvases, with a 256-token conditioning sequence:
+        #
+        #     1024x1024 (1.0 MP)  0.69 GiB      2048x2048 (4.0 MP)  2.42 GiB
+        #     1536x1536 (2.3 MP)  1.39 GiB      2048x2944 (5.8 MP)  3.46 GiB
+        #
+        # which is 0.11 + 0.58/MP. The figures below keep about 60% headroom over that for the
+        # sampler's own latents, allocator fragmentation and the refinement stages. The slope this
+        # replaced was 1.7/MP, three times the truth, and it was enough on its own to send a
+        # 2048x2944 Hires pass — 15.7 GiB of a 23.5 GiB card, measured — down the block-streaming
+        # path, where it took 690 seconds instead of running resident.
+        estimate_gb = 0.35 + 0.90 * megapixels * batch_factor
     else:
         estimate_gb = 0.65 + 0.40 * megapixels * batch_factor
     return max(int(0.8 * GIB), int(estimate_gb * GIB))

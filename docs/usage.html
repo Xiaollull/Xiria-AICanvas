@@ -35,6 +35,7 @@
       <li><a href="#prompt">Prompt weights</a></li>
       <li><a href="#guidance">Guidance</a></li>
       <li><a href="#adapters">Adapter fusion</a></li>
+      <li><a href="#lora-cards">LoRA cards</a></li>
       <li><a href="#samplers">Samplers and schedulers</a></li>
       <li><a href="#batches">Image batches</a></li>
       <li><a href="#workspace">Image viewer workspace</a></li>
@@ -91,6 +92,31 @@
     <p>Tucker and convolution forms, decomposed LoKr first factors, PEFT
       <code>lora_magnitude_vector</code> and <code>lora_mid.weight</code> fail closed rather than
       being silently approximated.</p>
+
+    <h2 id="lora-cards">LoRA cards</h2>
+    <p>A card is what you save about a LoRA yourself, on top of what the source lookup found: a
+      cover image, a display name, the prompt you keep for it, tags and a private note.</p>
+    <p><strong>Where to find it.</strong> Open <em>Manage</em> beside the LoRA mount section. On the
+      <em>Mounted</em> tab each row carries a palette button on its right; in any category the
+      <em>Customise</em> button sits under the picture, next to <em>Look up source</em>. For a saved
+      combination, the <em>Cover and effect images</em> button in its header opens the card.</p>
+    <ul>
+      <li><strong>Cover</strong> replaces the preview downloaded from the source page. Pick an image
+        you generated here, or upload a PNG, JPEG or WebP file. Either way it is downscaled to 1024
+        pixels on its longest edge and saved as a separate copy, so the original is untouched.
+        Clearing the cover falls back to the downloaded preview.</li>
+      <li><strong>Prompt</strong> is displayed and copyable, and can be appended to the positive
+        prompt with one click. It is never added to a request on its own.</li>
+      <li><strong>Combinations</strong> take effect images instead of a single cover, up to twelve.
+        The first image in the strip is the combination's cover; “set as cover” reorders the strip.</li>
+    </ul>
+    <p>Hovering a mounted LoRA — on Generate, on Image to image, or in the manager — opens the card
+      at full size beside the row, or above and below it when the window is too narrow for either
+      side. It is drawn over the page and takes no layout space of its own. A LoRA you have not
+      customised yet still opens a card; it just says so, and points at the button that fills it in.</p>
+    <p>Cards live in <code>state-cache/lora-cards/</code>, beside the workspace rather than in the
+      metadata cache, so re-running the source lookup never overwrites them and an in-place update
+      preserves them. Images no card points at any more are deleted on the next save.</p>
 
     <h2 id="samplers">Samplers and schedulers</h2>
     <p>All four native engines offer the same 44 sampler and nine scheduler names in Generate and

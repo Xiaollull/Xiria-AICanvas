@@ -9,6 +9,7 @@ import {
   FileText,
   HardDrive,
   Layers3,
+  Palette,
   Plus,
   RefreshCw,
   Search,
@@ -27,6 +28,9 @@ import {
 import LoraDetailsDialog from "./LoraDetailsDialog";
 import LoraMountPanel from "./LoraMountPanel.jsx";
 import LoraGroupPanel from "./LoraGroupPanel.jsx";
+import LoraCardEditor from "./LoraCardEditor.jsx";
+import { groupCardFor, loraCardFor, loraCardPresentation } from "./lora-cards.js";
+import { useLoraCards } from "./use-lora-cards.js";
 import {
   emptyLoraGroupMap,
   loraGroupsForScope,
@@ -116,6 +120,8 @@ export default function LoraManagerPage() {
   const [lookups, setLookups] = useState({});
   const [collapsedSharedFolders, setCollapsedSharedFolders] = useState({});
   const [detail, setDetail] = useState(null);
+  const [cardEdit, setCardEdit] = useState(null);
+  const loraCards = useLoraCards();
   modelRef.current = model;
   lorasRef.current = loras;
   workspaceLockedRef.current = workspaceLocked;
@@ -358,13 +364,22 @@ export default function LoraManagerPage() {
   const mountedValues = new Set(loras.map((item) => item.value));
   const activeLoraGroups = loraGroupsForScope(loraGroupsByEngine, scopeKeyRef.current || model);
   activeLoraGroupsRef.current = activeLoraGroups;
-  // Mounted rows carry no metadata; the preview belongs to the library listing,
-  // so an asset whose source was never looked up simply has no image.
-  const loraPreviewUrlFor = (item) => {
-    const metadata = (currentLibrary?.categories || []).flatMap((entry) => entry.models).find((entry) => entry.value === item.value)?.metadata;
-    return metadata?.status === "found"
-      ? `/api/lora-preview?engine=${encodeURIComponent(model)}&path=${encodeURIComponent(item.value)}&v=${encodeURIComponent(metadata.queriedAt)}`
-      : "";
+  // Mounted rows carry no metadata; the lookup belongs to the library listing, so
+  // the presentation is composed from the saved card, the lookup and the file.
+  const loraMetadataFor = (value) => (currentLibrary?.categories || []).flatMap((entry) => entry.models).find((entry) => entry.value === value)?.metadata;
+  const loraPresentationFor = (item) => loraCardPresentation({
+    engine: model,
+    item,
+    card: loraCardFor(loraCards.store, model, item.value),
+    metadata: loraMetadataFor(item.value),
+  });
+  const loraCardControls = {
+    presentationFor: loraPresentationFor,
+    groupCardFor: (groupId) => groupCardFor(loraCards.store, model, groupId),
+    onEditLora: (item) => setCardEdit({ value: item.value, name: item.name, categoryId: category }),
+    onPatchGroup: (groupId, patch) => loraCards.patchGroupCard(model, groupId, patch),
+    onRemoveGroup: (groupId) => loraCards.removeGroupCard(model, groupId),
+    onUploadImage: loraCards.uploadCardImage,
   };
 
   useEffect(() => {
@@ -425,6 +440,10 @@ export default function LoraManagerPage() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    if (loraCards.error) setNotice(loraCards.error);
+  }, [loraCards.error]);
+
   const toggleLora = (item, categoryData) => {
     let next = null;
     updateMountedLoras((current) => {
@@ -472,10 +491,10 @@ export default function LoraManagerPage() {
     const mounted = mountedValues.has(item.value);
     const metadata = item.metadata;
     const lookup = lookups[item.value];
-    const previewUrl = metadata?.status === "found" ? `/api/lora-preview?engine=${encodeURIComponent(model)}&path=${encodeURIComponent(item.value)}&v=${encodeURIComponent(metadata.queriedAt)}` : "";
-    return <article aria-disabled={loraDragLocked} className={`lora-library-card lora-page-library-card ${mounted ? "mounted" : ""} ${loraDragLocked ? "locked" : ""}`} key={item.value} role="button" tabIndex="0" onClick={() => toggleLora(item, activeCategory)} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggleLora(item, activeCategory); } }}>
-      <div className="lora-card-preview"><span>NO PREVIEW</span>{previewUrl && <img src={previewUrl} alt="" onError={(event) => event.currentTarget.remove()} />}<button type="button" className="lora-card-query" disabled={lookup?.loading} onClick={(event) => { event.stopPropagation(); void lookupLora(item, false, activeCategory?.id); }}>{lookup?.loading ? <RefreshCw className="spin" size={13} /> : <Search size={13} />}{lookup?.loading ? "查询中" : "查询"}</button><span className="lora-card-state">{mounted ? <><Check size={13} />已挂载</> : <><Plus size={13} />挂载</>}</span></div>
-      <div className="lora-card-copy"><strong title={item.name}>{item.name}</strong><small>{formatBytes(item.size)} · {categoryLabel}</small>{metadata?.status === "found" && <div className="lora-card-metadata"><span>{metadata.modelName || metadata.versionName || "已识别模型"}</span><small>{metadata.baseModel || "来源元数据已载入"}</small></div>}{lookup?.error && <span className="lora-card-error">{lookup.error}</span>}<button type="button" className="lora-card-detail" onClick={(event) => { event.stopPropagation(); openDetails(item, activeCategory?.id); }}><FileText size={12} />查看详细信息</button></div>
+    const presentation = loraPresentationFor(item);
+    return <article aria-disabled={loraDragLocked} className={`lora-library-card lora-page-library-card ${mounted ? "mounted" : ""} ${presentation.customized ? "customized" : ""} ${loraDragLocked ? "locked" : ""}`} key={item.value} role="button" tabIndex="0" onClick={() => toggleLora(item, activeCategory)} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggleLora(item, activeCategory); } }}>
+      <div className="lora-card-preview"><span>NO PREVIEW</span>{presentation.coverUrl && <img src={presentation.coverUrl} alt="" onError={(event) => event.currentTarget.remove()} />}<button type="button" className="lora-card-query" disabled={lookup?.loading} onClick={(event) => { event.stopPropagation(); void lookupLora(item, false, activeCategory?.id); }}>{lookup?.loading ? <RefreshCw className="spin" size={13} /> : <Search size={13} />}{lookup?.loading ? "查询中" : "查询"}</button><button type="button" className="lora-card-customize" title="自定义封面、提示词和显示信息" aria-label={`自定义 ${item.name} 的卡片`} onClick={(event) => { event.stopPropagation(); setCardEdit({ value: item.value, name: item.name, categoryId: activeCategory?.id }); }}><Palette size={13} />自定义</button><span className="lora-card-state">{mounted ? <><Check size={13} />已挂载</> : <><Plus size={13} />挂载</>}</span></div>
+      <div className="lora-card-copy"><strong title={presentation.renamed ? `${presentation.title}（${item.name}）` : item.name}>{presentation.title}</strong><small>{formatBytes(item.size)} · {categoryLabel}</small>{presentation.tags.length > 0 && <div className="lora-card-tags">{presentation.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}{metadata?.status === "found" && <div className="lora-card-metadata"><span>{metadata.modelName || metadata.versionName || "已识别模型"}</span><small>{metadata.baseModel || "来源元数据已载入"}</small></div>}{lookup?.error && <span className="lora-card-error">{lookup.error}</span>}<button type="button" className="lora-card-detail" onClick={(event) => { event.stopPropagation(); openDetails(item, activeCategory?.id); }}><FileText size={12} />查看详细信息</button></div>
     </article>;
   };
 
@@ -531,9 +550,10 @@ export default function LoraManagerPage() {
                   loras={loras}
                   groups={activeLoraGroups}
                   locked={loraDragLocked}
-                  previewUrlFor={loraPreviewUrlFor}
+                  cards={loraCardControls}
                   onUpdateLoras={updateMountedLoras}
                   onUpdateGroups={updateLoraGroups}
+                  onNotice={setNotice}
                 />
               </> : category === "groups" ? <>
                 <header><div><strong>LoRA 组合</strong><span>保存常用搭配 · 启用后挂载到队列</span></div></header>
@@ -541,6 +561,7 @@ export default function LoraManagerPage() {
                   groups={activeLoraGroups}
                   loras={loras}
                   locked={loraDragLocked}
+                  cards={loraCardControls}
                   onUpdateGroups={updateLoraGroups}
                   onUpdateLoras={updateMountedLoras}
                   onNotice={setNotice}
@@ -584,6 +605,19 @@ export default function LoraManagerPage() {
       const item = (libraries[model]?.categories || []).flatMap((categoryData) => categoryData.models).find((modelItem) => modelItem.value === detail.value) || detail;
       const lookup = lookups[detail.value];
       return <LoraDetailsDialog item={item} metadata={item.metadata} loading={lookup?.loading} error={lookup?.error} onRefresh={() => void lookupLora(item, true, detail.categoryId)} onClose={() => setDetail(null)} />;
+    })()}
+    {cardEdit && (() => {
+      const item = (libraries[model]?.categories || []).flatMap((categoryData) => categoryData.models).find((modelItem) => modelItem.value === cardEdit.value) || cardEdit;
+      return <LoraCardEditor
+        engine={model}
+        item={item}
+        card={loraCardFor(loraCards.store, model, cardEdit.value)}
+        metadata={item.metadata}
+        loading={lookups[cardEdit.value]?.loading}
+        onPatch={(patch) => loraCards.patchLoraCard(model, cardEdit.value, patch)}
+        onUploadImage={loraCards.uploadCardImage}
+        onClose={() => setCardEdit(null)}
+      />;
     })()}
   </main>;
 }

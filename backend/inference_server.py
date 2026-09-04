@@ -1153,6 +1153,11 @@ class PerformanceInput(BaseModel):
     calculate_model_hash: bool = False
     staged_vae_decode: bool = False
     compile_transformer: bool = False
+    # The decoder is the one stage that wants the whole card: it works at full resolution while
+    # the transformer, which has nothing left to do once the last step is taken, is still holding
+    # its weights. Evicting it first is what lets a large canvas decode in one piece instead of in
+    # tiles, so it is the default rather than an opt-in.
+    unload_before_decode: bool = True
     vram_limit_gb: float = Field(default=0.0, ge=0.0, le=1024.0)
 
 
@@ -3488,25 +3493,36 @@ def anima_memory_strategy(
 
 
 @lru_cache(maxsize=16)
-def flux_component_weight_bytes(component_path: str, file_size: int, modified_ns: int):
-    """Loaded size of one Flux or Flux2 component, which is not its size on disk.
+def flux_component_weight_bytes(component_path: str, file_size: int, modified_ns: int, family: str = "flux"):
+    """Loaded size of one component, which is not its size on disk.
 
-    Everything is expanded to BF16, so an fp8 file costs twice what it occupies. Budgeting from
-    the file size would under-admit an fp8 checkpoint by half and let it OOM mid-load.
+    The Flux engines expand every quantisation to BF16, so an fp8 file costs twice what it
+    occupies; budgeting from the file size would under-admit one by half and let it OOM mid-load.
+    Krea 2 no longer expands anything — :mod:`quantized_linear` applies the scales inside the
+    linear — so its fp8 components cost what they occupy. Budgeting the expansion that stopped
+    happening overstated its transformer by 11.6 GiB, which was enough on its own to send a model
+    that fits comfortably down the block-streaming path.
     """
     del modified_ns
     try:
+        if family == "krea2":
+            return krea2_component_bytes([component_path])
         return flux_component_bytes([component_path])
     except Exception:
         return file_size
 
 
-def flux_weight_estimates(assets):
+def flux_weight_estimates(assets, family="flux"):
     estimates = []
     for path in assets.values():
         stat = path.stat()
-        estimates.append(flux_component_weight_bytes(str(path), stat.st_size, stat.st_mtime_ns))
+        estimates.append(flux_component_weight_bytes(str(path), stat.st_size, stat.st_mtime_ns, family))
     return sum(estimates), max(estimates)
+
+
+# What a text-encoding pass allocates beyond the weights themselves. Conditioning is a few hundred
+# tokens through a 4B decoder, so this is headroom rather than a measurement of a large tensor.
+RESIDENT_HOLD_ENCODE_HEADROOM_BYTES = 1024**3
 
 
 def choose_flux_memory_strategy(
@@ -3576,10 +3592,23 @@ def choose_flux_memory_strategy(
         )
     if group_offload:
         strategy.update(mode="low_vram", label="LOW_VRAM 低显存")
+    # Holding the transformer between jobs is admitted on its own terms rather than by requiring
+    # HIGH_VRAM. What the hold has to survive is the *next* job's conditioning, which runs with the
+    # transformer still on the card: the peak is every weight plus the encoder's own activations,
+    # and not the sampling tensors, because the encoder is parked again before sampling starts.
+    # HIGH_VRAM is a strictly stronger condition — it also budgets the sampling tensors alongside
+    # every weight — so requiring it sent the transformer back to host memory between jobs in cases
+    # that fit perfectly well, which is a PCIe round trip per job bought for nothing.
+    resident_hold_bytes = (
+        int(total_weight_bytes * 1.02)
+        + int(strategy.get("reserved_bytes", 0))
+        + RESIDENT_HOLD_ENCODE_HEADROOM_BYTES
+    )
+    resident_hold_admitted = strategy.get("free_bytes", 0) >= resident_hold_bytes
     keep_transformer_resident = bool(
         not group_offload
         and performance_settings["keep_model_cached"]
-        and strategy["mode"] == "high_vram"
+        and (strategy["mode"] == "high_vram" or (strategy["mode"] == "normal_vram" and resident_hold_admitted))
     )
     offload_mode = (
         "staged_transformer_group_offload" if group_offload else "staged_transformer_resident"
@@ -3639,7 +3668,7 @@ def flux_memory_strategy(
     family="flux",
     guidance_copies=1,
 ):
-    total_weight_bytes, largest_component_bytes = flux_weight_estimates(assets)
+    total_weight_bytes, largest_component_bytes = flux_weight_estimates(assets, family)
     return choose_flux_memory_strategy(
         diffusion_model,
         width,
@@ -3653,6 +3682,19 @@ def flux_memory_strategy(
         family=family,
         guidance_copies=guidance_copies,
     )
+
+
+def configure_decode_residency(runtime):
+    """Tell a native runtime whether to evict the transformer before the autoencoder runs.
+
+    The decoder is the one stage that wants the card to itself, and by the time it runs the
+    transformer has nothing left to do. Runtimes that do not offer the hook simply keep their own
+    behaviour, which is what makes this safe to call for every engine.
+    """
+    configure = getattr(runtime, "configure_decode_residency", None)
+    if configure is None:
+        return None
+    return configure(performance_settings["unload_before_decode"])
 
 
 def configure_flux_vae(runtime, strategy):
@@ -4074,6 +4116,7 @@ def load_flux_pipeline(
             active_memory_strategy = strategy
             configure_anima_attention_backend(loaded_pipeline)
             loaded_pipeline.configure_transformer_residency(strategy.get("keep_transformer_resident", False))
+            configure_decode_residency(loaded_pipeline)
             active_compute_dtype = "bf16"
             active_vae_mode = configure_flux_vae(loaded_pipeline, strategy)
             pipeline_cpu_parked = False
@@ -4169,6 +4212,7 @@ def load_flux_pipeline(
                 runtime.enable_transformer_group_offload(strategy["transformer_blocks_per_group"])
             configure_anima_attention_backend(runtime)
             runtime.configure_transformer_residency(strategy.get("keep_transformer_resident", False))
+            configure_decode_residency(runtime)
             loaded_pipeline = runtime
             loaded_checkpoint = str(diffusion_model)
             loaded_family = family

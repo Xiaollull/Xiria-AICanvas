@@ -72,6 +72,18 @@ try:
         KREA2_TEXT_FUSION_REFINER_BLOCKS,
         Krea2Transformer2DModel,
     )
+    from .gguf_loader import GGUF_SUFFIX
+    from .quantized_linear import (
+        QuantizedLinear,
+        UnsupportedQuantization,
+        apply_quantized_linears,
+        checkpoint_runtime_bytes,
+        combine_lora_adapters,
+        expand_quantized_layers,
+        logical_shape_view,
+        quantized_state_dict,
+        scan_quantized_layers,
+    )
     from .krea2_sampling import (
         KREA2_SAMPLERS,
         KREA2_SCHEDULERS,
@@ -113,6 +125,18 @@ except ImportError:
         KREA2_TEXT_FUSION_REFINER_BLOCKS,
         Krea2Transformer2DModel,
     )
+    from gguf_loader import GGUF_SUFFIX
+    from quantized_linear import (
+        QuantizedLinear,
+        UnsupportedQuantization,
+        apply_quantized_linears,
+        checkpoint_runtime_bytes,
+        combine_lora_adapters,
+        expand_quantized_layers,
+        logical_shape_view,
+        quantized_state_dict,
+        scan_quantized_layers,
+    )
     from krea2_sampling import (
         KREA2_SAMPLERS,
         KREA2_SCHEDULERS,
@@ -133,6 +157,9 @@ KREA2_VAE_SCALE_FACTOR = 8
 KREA2_LATENT_PATCH = 2
 KREA2_PIXEL_ALIGNMENT = KREA2_VAE_SCALE_FACTOR * KREA2_LATENT_PATCH
 KREA2_MAX_EDGE = 4096
+# Where tiled decoding starts. Measured to be the faster path above it as well as the smaller one.
+KREA2_TILED_DECODE_EDGE = 1536
+
 
 # `comfy/latent_formats.py::Wan21`. `scale_factor` is 1.0, so `process_in` is a plain
 # (latent - mean) / std and `process_out` its inverse.
@@ -439,13 +466,37 @@ def convert_krea2_lora_state_dict(
 
 
 def _load_krea2_transformer(path: Path, dtype: torch.dtype, deps, loras=(), state_dict=None):
+    """Build the transformer, keeping every quantised weight in the form the file stores it in.
+
+    Expanding the quantisation here instead — which is what this did — cost 78 seconds of CPU
+    arithmetic and produced a 23.9 GiB model that cannot be resident on a 24 GB card, so every
+    step then streamed blocks across PCIe.  The scales are applied inside the linear instead, on
+    the same numbers: see :mod:`quantized_linear`.
+    """
     if state_dict is None:
         state_dict = _load_diffusion_state_dict(path, dtype, deps, "Krea 2 diffusion model")
     state_dict = normalize_flux_checkpoint_keys(state_dict)
-    state_dict = resolve_quantized_state_dict(state_dict, dtype, "Krea 2 diffusion model")
-    config = infer_krea2_transformer_config(state_dict)
+
+    quantized = scan_quantized_layers(state_dict, "Krea 2 diffusion model")
+    config = infer_krea2_transformer_config(logical_shape_view(state_dict, quantized))
+
+    lora_states = []
+    for lora_path, multiplier in _lora_descriptors(loras, "Krea2 LoRA"):
+        label = f"Krea2 LoRA {lora_path.name}"
+        lora_state = convert_krea2_lora_state_dict(
+            deps["load_file"](str(lora_path), device="cpu"), config, label
+        )
+        lora_states.append((lora_path, multiplier, label, lora_state))
+
     with deps["init_empty_weights"]():
         transformer = Krea2Transformer2DModel(**config)
+    kept, deferred = apply_quantized_linears(
+        transformer, quantized, state_dict, dtype, "Krea 2 diffusion model"
+    )
+    replaced = set(kept)
+    if deferred:
+        state_dict = expand_quantized_layers(state_dict, quantized, set(deferred), dtype)
+    state_dict = quantized_state_dict(state_dict, quantized, replaced)
 
     # The transformer keeps ComfyUI's naming, so there is no conversion table to claim tensors
     # through — the module's own key set is what separates the model from anything a publisher
@@ -459,31 +510,94 @@ def _load_krea2_transformer(path: Path, dtype: torch.dtype, deps, loras=(), stat
         else:
             unclaimed.append(key)
     del state_dict
-    weights = _cast_state_dict(weights, dtype)
+    # A quantised weight is already in the dtype its module declares; casting is for the rest.
+    weights = _cast_quantized_state_dict(weights, replaced, dtype)
 
+    # A LoRA reaches a full-precision layer by being fused into its weight, which is the cheaper
+    # arrangement and what the other engines do. A quantised layer takes it as an adapter instead:
+    # fusing would have to round the patched weight back into fp8, and expanding the layer to avoid
+    # that expanded nearly the whole transformer, because a Krea 2 LoRA names nearly every linear.
     lora_report = []
-    for lora_path, multiplier in _lora_descriptors(loras, "Krea2 LoRA"):
-        label = f"Krea2 LoRA {lora_path.name}"
-        lora_state = convert_krea2_lora_state_dict(
-            deps["load_file"](str(lora_path), device="cpu"), config, label
-        )
+    adapters: dict[str, list] = {}
+    for lora_path, multiplier, label, lora_state in lora_states:
         skipped = unmatched_lora_targets(lora_state, weights)
-        patched = fuse_flux_lora_state_dict(weights, lora_state, multiplier, label)
+        fusable, adapted = _split_lora_by_storage(lora_state, replaced)
+        patched = fuse_flux_lora_state_dict(weights, fusable, multiplier, label) if fusable else 0
+        for target, (down, up) in adapted.items():
+            adapters.setdefault(target, []).append((down, up, multiplier))
         lora_report.append({
             "name": lora_path.name,
             "multiplier": multiplier,
-            "patched_modules": patched,
+            "patched_modules": patched + len(adapted),
+            "fused_modules": patched,
+            "adapted_modules": len(adapted),
             "skipped_modules": skipped,
         })
-        del lora_state
+    del lora_states
 
     _strict_assign(transformer, weights, "Krea 2 transformer")
     del weights
+    for target, stack in adapters.items():
+        module = transformer.get_submodule(target)
+        module.set_lora_adapter(*combine_lora_adapters(stack, dtype))
     return (
         transformer.eval().requires_grad_(False),
         config,
-        {"loras": lora_report, "unclaimed_tensors": sorted(unclaimed)},
+        {
+            "loras": lora_report,
+            "unclaimed_tensors": sorted(unclaimed),
+            "quantized_layers": sorted(replaced),
+            "adapted_layers": sorted(adapters),
+            "quantization": sorted({spec.format for layer, spec in quantized.items() if layer in replaced}),
+        },
     )
+
+
+def _split_lora_by_storage(lora_state, quantized_layers):
+    """Separate a converted LoRA into the part that can be fused and the part that cannot.
+
+    Returns ``(fusable_state, {target: (down, up)})``. A pair whose target is a quantised layer is
+    handed back whole rather than added into a weight, because that weight has nowhere to keep the
+    sum at full precision.
+    """
+    fusable, adapted = {}, {}
+    for key, value in lora_state.items():
+        if key.endswith(".lora_A.weight"):
+            target = key[: -len(".lora_A.weight")]
+        elif key.endswith(".lora_B.weight"):
+            target = key[: -len(".lora_B.weight")]
+        else:
+            fusable[key] = value
+            continue
+        if target in quantized_layers:
+            down = lora_state.get(f"{target}.lora_A.weight")
+            up = lora_state.get(f"{target}.lora_B.weight")
+            if down is None or up is None:
+                raise ValueError(f"Krea2 LoRA has an unpaired tensor for {target}")
+            adapted[target] = (down, up)
+        else:
+            fusable[key] = value
+    return fusable, adapted
+
+
+def _cast_quantized_state_dict(weights, quantized_layers, dtype: torch.dtype):
+    """Cast everything to the compute dtype except the tensors a quantised layer owns.
+
+    A quantised weight and its scale are the two things that must keep their stored types: casting
+    the weight would undo the point, and casting the scale to bfloat16 changes the result for most
+    tensors — measurably, unlike deferring the multiply, which changes none.
+    """
+    protected = set()
+    for layer in quantized_layers:
+        protected.add(f"{layer}.weight")
+        protected.add(f"{layer}.scale_weight")
+        protected.add(f"{layer}.scale_weight_2")
+    return {
+        key: value if key in protected else (
+            value.to(dtype=dtype) if value.is_floating_point() and value.dtype != dtype else value
+        )
+        for key, value in weights.items()
+    }
 
 
 # -- text encoder -----------------------------------------------------------------------------
@@ -553,13 +667,21 @@ def _load_krea2_text_encoder(state_dict, dtype: torch.dtype, deps):
         raise ValueError(
             "The selected file is not a Krea 2 text encoder: it carries no Qwen3-VL decoder layers"
         )
-    state_dict = resolve_quantized_state_dict(state_dict, dtype, "Krea 2 text encoder")
     weights = krea2_text_encoder_weights(state_dict)
-    config = infer_krea2_text_encoder_config(weights)
+    quantized = scan_quantized_layers(weights, "Krea 2 text encoder")
+    config = infer_krea2_text_encoder_config(logical_shape_view(weights, quantized))
     model_config = deps["Qwen3VLTextConfig"](**config)
     with deps["init_empty_weights"]():
         encoder = deps["Qwen3VLTextModel"](model_config)
-    _strict_assign(encoder, _cast_state_dict(weights, dtype), "Krea 2 text encoder")
+    # Qwen3-VL's fp8 repackage is quantised the same way the transformer is, and expanding it cost
+    # 11 seconds and 6.8 GiB that the card then has to hold beside the diffusion model.
+    kept, deferred = apply_quantized_linears(encoder, quantized, weights, dtype, "Krea 2 text encoder")
+    replaced = set(kept)
+    if deferred:
+        # A quantised embedding has no matmul to fold the scale into, so it is expanded as before.
+        weights = expand_quantized_layers(weights, quantized, set(deferred), dtype)
+    weights = quantized_state_dict(weights, quantized, replaced)
+    _strict_assign(encoder, _cast_quantized_state_dict(weights, replaced, dtype), "Krea 2 text encoder")
     encoder.config.use_cache = False
     return encoder.eval().requires_grad_(False)
 
@@ -691,6 +813,10 @@ class Krea2Runtime:
         # is what the Anima benchmark suite settled on for the same trade.
         self.batch_cfg = False
         self.keep_transformer_resident = False
+        # The autoencoder decodes at full resolution, and by then the transformer has nothing left
+        # to do but hold 12 GiB. Evicting it first is what lets a large canvas decode in one piece
+        # rather than in tiles; the next job's sampling pulls it back.
+        self.unload_before_decode = True
         self.noise_device = "cpu"
         self._closed = False
         self._poisoned = False
@@ -743,6 +869,21 @@ class Krea2Runtime:
         if not self.keep_transformer_resident and self.transformer_resident:
             self._park_transformer_on_cpu()
             _empty_cuda_cache()
+
+    def configure_decode_residency(self, unload=True):
+        """Whether the transformer is evicted before the autoencoder runs."""
+        self.unload_before_decode = bool(unload)
+        return self.unload_before_decode
+
+    def _release_transformer_for_decode(self):
+        """Give the decoder the card. Group offload already holds nothing, so it is left alone."""
+        if not self.unload_before_decode or self.transformer_group_offload_enabled:
+            return False
+        if not self._transformer_resident:
+            return False
+        self._park_transformer_on_cpu()
+        _empty_cuda_cache()
+        return True
 
     def enable_transformer_group_offload(self, blocks_per_group=1):
         self._require_open()
@@ -940,9 +1081,18 @@ class Krea2Runtime:
             _empty_cuda_cache()
 
     def _resolved_tiled_decode(self, height: int, width: int, force_tiled_decode: bool):
+        """Tiling above 1536 stands, and evicting the transformer first does not change it.
+
+        Measured on a 24 GB card with nothing else resident: a 1024x1472 decode costs 6.18 GiB in
+        one pass and 1.29 GiB in tiles, and the tiled pass is also the faster of the two (0.81s
+        against 2.92s). Whatever room eviction frees, there is nothing here to spend it on — the
+        untiled path is slower and quadratic in area, so the threshold is a speed choice as much
+        as a memory one. A 2048x2944 decode takes 1.7 seconds tiled, which is noise beside
+        sampling; this is documented because it is where the room went, not to invite raising it.
+        """
         if force_tiled_decode or self._vae_tiling_required:
             return True
-        return max(height, width) > 1536
+        return max(height, width) > KREA2_TILED_DECODE_EDGE
 
     def _configure_vae_tiling(self, tiled: bool) -> None:
         """Point the autoencoder's tiling at ComfyUI's VAEDecodeTiled geometry.
@@ -964,6 +1114,7 @@ class Krea2Runtime:
         device = self.device
         height = latents.shape[2] * KREA2_VAE_SCALE_FACTOR
         width = latents.shape[3] * KREA2_VAE_SCALE_FACTOR
+        self._release_transformer_for_decode()
         tiled = self._resolved_tiled_decode(height, width, force_tiled_decode)
         try:
             self.vae.to(device=device, dtype=self.dtype)
@@ -1371,8 +1522,24 @@ def krea2_template_end(ids) -> int:
 
 
 def krea2_component_bytes(paths) -> int:
-    """Host memory a Krea 2 load will hold, read from the files' headers rather than their size."""
-    return flux_component_bytes(paths)
+    """Host memory a Krea 2 load will hold, read from the files' headers rather than their size.
+
+    Krea 2 keeps a quantised weight in its stored form, so — unlike the Flux engines beside it —
+    an fp8 component costs what it occupies rather than twice that.  Budgeting the expansion that
+    no longer happens overstated the transformer by 11.6 GiB, which was enough on its own to send
+    a model that fits comfortably down the block-streaming path.
+
+    A GGUF is the exception and still counts double: it has no compute-time form, so
+    :func:`_load_diffusion_state_dict` expands it to the compute dtype before anything else runs.
+    """
+    total = 0
+    for path in paths:
+        path = Path(path)
+        if path.suffix.lower() == GGUF_SUFFIX:
+            total += flux_component_bytes([path])
+        else:
+            total += checkpoint_runtime_bytes(path)
+    return total
 
 
 def load_krea2_runtime(

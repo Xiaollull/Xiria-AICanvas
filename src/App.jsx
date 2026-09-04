@@ -122,6 +122,10 @@ import {
 } from "./lora-groups";
 import LoraMountPanel from "./LoraMountPanel.jsx";
 import LoraGroupPanel from "./LoraGroupPanel.jsx";
+import LoraCardEditor from "./LoraCardEditor.jsx";
+import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
+import { groupCardFor, loraCardFor, loraCardPresentation } from "./lora-cards.js";
+import { useLoraCards } from "./use-lora-cards.js";
 import {
   createPromptPreset,
   deletePromptPreset,
@@ -1106,6 +1110,12 @@ function App() {
   const [collapsedModalSharedFolders, setCollapsedModalSharedFolders] = useState({});
   const [loraLookups, setLoraLookups] = useState({});
   const [loraDetail, setLoraDetail] = useState(null);
+  const [loraCardEdit, setLoraCardEdit] = useState(null);
+  // The card store is separate from the workspace state on purpose: it holds
+  // pictures, it is edited by hand rather than by every slider, and nothing in it
+  // reaches a generation request.
+  const loraCards = useLoraCards();
+  const loraSummaryHover = useLoraHoverPreview();
   const [hardwareMonitorOpen, setHardwareMonitorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Layout of the generate page, held apart from every creation parameter so that resetting it
@@ -1198,6 +1208,9 @@ function App() {
   const [consoleCommand, setConsoleCommand] = useState("");
   const [consoleRunning, setConsoleRunning] = useState(false);
   const [consoleError, setConsoleError] = useState("");
+  // Reading the log and running a command are separate permissions; the drawer opens on any device
+  // the app is served to, and only the input is held back when the host has not allowed it.
+  const [consoleCommandsAllowed, setConsoleCommandsAllowed] = useState(true);
   const viewerDrag = useRef(null);
   const viewerNudge = useRef(null);
   const viewerUndo = useRef([]);
@@ -1502,6 +1515,7 @@ function App() {
           setConsoleEntries((current) => collapseConsoleEntries([...current, ...payload.entries]).slice(-1200));
         }
         setConsoleRunning(payload.command_running === true);
+        setConsoleCommandsAllowed(payload.commands_allowed !== false);
         setConsoleError("");
       } catch (error) {
         if (!stopped) setConsoleError(error.message);
@@ -1917,6 +1931,10 @@ function App() {
   useEffect(() => {
     if (mountedLorasWarning) setAppNotice({ message: mountedLorasWarning, error: true });
   }, [mountedLorasWarning]);
+
+  useEffect(() => {
+    if (loraCards.error) setAppNotice({ message: loraCards.error, error: true });
+  }, [loraCards.error]);
 
   useEffect(() => {
     if (!imageViewerOpen) return undefined;
@@ -4918,14 +4936,23 @@ function App() {
   });
 
   const activeLoraCategory = loraCategory === "mounted" || loraCategory === "groups" ? { id: loraCategory, label: loraCategory === "groups" ? "组合" : "已挂载", directory: "", models: [] } : loraLibrary.find((category) => category.id === loraCategory);
-  // A mounted entry carries no metadata of its own; the preview belongs to the
-  // library listing, so an asset whose source was never looked up simply has no
-  // image and the row says so rather than showing a broken frame.
-  const loraPreviewUrlFor = (item) => {
-    const metadata = loraLibrary.flatMap((category) => category.models).find((entry) => entry.value === item.value)?.metadata;
-    return metadata?.status === "found"
-      ? `/api/lora-preview?engine=${encodeURIComponent(model)}&path=${encodeURIComponent(item.value)}&v=${encodeURIComponent(metadata.queriedAt)}`
-      : "";
+  // A mounted entry carries no metadata of its own; the lookup belongs to the
+  // library listing, so the presentation is composed here from three sources —
+  // what the user saved on the card, what the lookup found, and the file itself.
+  const loraMetadataFor = (value) => loraLibrary.flatMap((category) => category.models).find((entry) => entry.value === value)?.metadata;
+  const loraPresentationFor = (item) => loraCardPresentation({
+    engine: model,
+    item,
+    card: loraCardFor(loraCards.store, model, item.value),
+    metadata: loraMetadataFor(item.value),
+  });
+  const loraCardControls = {
+    presentationFor: loraPresentationFor,
+    groupCardFor: (groupId) => groupCardFor(loraCards.store, model, groupId),
+    onEditLora: (item) => setLoraCardEdit({ value: item.value, name: item.name, categoryId: loraCategory }),
+    onPatchGroup: (groupId, patch) => loraCards.patchGroupCard(model, groupId, patch),
+    onRemoveGroup: (groupId) => loraCards.removeGroupCard(model, groupId),
+    onUploadImage: loraCards.uploadCardImage,
   };
   const matchesLoraSearch = (item) => item.name.toLowerCase().includes(loraSearch.trim().toLowerCase());
   const visibleLoras = loraCategory === "mounted" ? [] : activeLoraCategory?.models.filter(matchesLoraSearch) ?? [];
@@ -5197,11 +5224,10 @@ function App() {
     const mounted = loras.some((lora) => lora.value === item.value);
     const lookup = loraLookups[item.value];
     const metadata = item.metadata;
-    const hasPreview = metadata?.status === "found";
-    const previewUrl = hasPreview ? `/api/lora-preview?engine=${encodeURIComponent(model)}&path=${encodeURIComponent(item.value)}&v=${encodeURIComponent(metadata.queriedAt)}` : "";
+    const presentation = loraPresentationFor(item);
     return <article
       aria-disabled={status === "running" || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras}
-      className={`lora-library-card ${mounted ? "mounted" : ""} ${status === "running" || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras ? "locked" : ""}`}
+      className={`lora-library-card ${mounted ? "mounted" : ""} ${presentation.customized ? "customized" : ""} ${status === "running" || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras ? "locked" : ""}`}
       key={item.value}
       role="button"
       tabIndex="0"
@@ -5216,15 +5242,19 @@ function App() {
     >
       <div className="lora-card-preview">
         <span>No image</span>
-        {hasPreview && <img src={previewUrl} alt={`${metadata.modelName} 预览`} onError={(event) => event.currentTarget.remove()} />}
+        {presentation.coverUrl && <img src={presentation.coverUrl} alt="" onError={(event) => event.currentTarget.remove()} />}
         <button className="lora-card-query" disabled={lookup?.loading} title="使用文件 SHA-256 在 Civitai.com 和 Civitai.red 查询" onClick={(event) => { event.stopPropagation(); lookupLora(item, false, activeLoraCategory.id); }}>
           {lookup?.loading ? <RefreshCw className="spin" size={13} /> : <Search size={13} />}{lookup?.loading ? "查询中" : "查询来源"}
+        </button>
+        <button className="lora-card-customize" title="自定义封面、提示词和显示信息" aria-label={`自定义 ${item.name} 的卡片`} onClick={(event) => { event.stopPropagation(); setLoraCardEdit({ value: item.value, name: item.name, categoryId: activeLoraCategory?.id }); }}>
+          <Palette size={13} />自定义
         </button>
         <span className="lora-card-state">{mounted ? <><Check size={14} />已挂载</> : <><Plus size={14} />挂载</>}</span>
       </div>
       <div className="lora-card-copy">
-        <strong title={item.name}>{item.name}</strong>
+        <strong title={presentation.renamed ? `${presentation.title}（${item.name}）` : item.name}>{presentation.title}</strong>
         <small>{(item.size / 1024 / 1024).toFixed(1)} MB · {categoryLabel}</small>
+        {presentation.tags.length > 0 && <div className="lora-card-tags">{presentation.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}
         {metadata?.status === "found" && <div className="lora-card-metadata"><span title={`${metadata.modelName} · ${metadata.versionName}`}>{metadata.modelName} · {metadata.versionName}</span><small>{metadata.baseModel}{metadata.triggerGroups?.length ? ` · ${metadata.triggerGroups.flatMap((group) => group.words).slice(0, 3).join(", ")}` : ""}</small><a href={metadata.sourceUrl} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>{metadata.sourceDomain}<ExternalLink size={11} /></a></div>}
         {(metadata?.status === "not_found" || lookup?.error) && <span className="lora-card-error">{lookup?.error || "未找到来源"}</span>}
         <button type="button" className="lora-card-detail" onClick={(event) => { event.stopPropagation(); openLoraDetails(item, activeLoraCategory.id, activeLoraCategory.label); }}><FileText size={12} />查看详细信息</button>
@@ -5314,12 +5344,20 @@ function App() {
             <div className="section-heading lora-title"><span>02</span><h2>LoRA 挂载</h2><small className="lora-count">已挂载 {loras.length}</small><button onClick={() => { setLoraCategory("mounted"); setLoraManagerOpen(true); }}><Layers3 size={14} />管理</button></div>
             {loras.length === 0 ? <button className="empty-lora" onClick={() => setLoraManagerOpen(true)}><Layers3 size={16} /><span>尚未挂载 LoRA<small>点击管理，从分类库中选择</small></span></button> : <div className="lora-summary">
               <div className="lora-summary-table">
-                {loras.map((lora) => (
-                  <div key={lora.value} className={`lora-summary-row ${lora.enabled === false ? "disabled" : ""}`} title={`${lora.name} · 分类 ${lora.category}`}>
-                    <span className="lora-summary-name">{lora.enabled === false && <Square size={8} />}{lora.name}</span>
+                {loras.map((lora) => {
+                  const presentation = loraPresentationFor(lora);
+                  return (
+                  <div
+                    key={lora.value}
+                    className={`lora-summary-row ${lora.enabled === false ? "disabled" : ""} ${presentation.coverUrl ? "has-cover" : ""}`}
+                    title={`${lora.name} · 分类 ${lora.category}`}
+                    {...loraSummaryHover.bind(presentation)}
+                  >
+                    <span className="lora-summary-name">{lora.enabled === false && <Square size={8} />}{presentation.title}</span>
                     <b>{formatWeight(lora.weight)}</b>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>}
             {isSplitModel && !engineAllowsLora && <p className="guidance-unavailable" role="status">当前推理服务未声明 {engineLabel} LoRA 能力；可管理现有组合，但启用后不能生成。</p>}
@@ -5714,6 +5752,7 @@ function App() {
         onSelectOutput={selectGeneratedOutput}
         onOpenViewer={openImageViewer}
         onOpenLoraManager={() => { setLoraCategory("mounted"); setLoraManagerOpen(true); }}
+        loraPresentationFor={loraPresentationFor}
          onAddToGallery={() => setGalleryAddOpen(true)}
          onNotice={(message, error = false) => setAppNotice({ message, error })}
          postprocess={{
@@ -5789,15 +5828,17 @@ function App() {
                       loras={loras}
                       groups={activeLoraGroups}
                       locked={loraDragLocked}
-                      previewUrlFor={loraPreviewUrlFor}
+                      cards={loraCardControls}
                       onUpdateLoras={commitMountedLoras}
                       onUpdateGroups={commitLoraGroups}
+                      onNotice={(message) => setAppNotice({ message, error: false })}
                     />
                 </div> : loraCategory === "groups" ? <div className="lora-mounted-manager">
                     <LoraGroupPanel
                       groups={activeLoraGroups}
                       loras={loras}
                       locked={loraDragLocked}
+                      cards={loraCardControls}
                       onUpdateGroups={commitLoraGroups}
                       onUpdateLoras={commitMountedLoras}
                       onNotice={(message) => setAppNotice({ message, error: false })}
@@ -5839,6 +5880,26 @@ function App() {
         const lookup = loraLookups[loraDetail.value];
         return <LoraDetailsDialog item={item} metadata={item.metadata} loading={lookup?.loading} error={lookup?.error} onRefresh={() => void lookupLora(item, true, loraDetail.categoryId)} onClose={() => setLoraDetail(null)} />;
       })()}
+      {loraCardEdit && (() => {
+        const item = loraLibrary.flatMap((category) => category.models).find((modelItem) => modelItem.value === loraCardEdit.value) || loraCardEdit;
+        return <LoraCardEditor
+          engine={model}
+          item={item}
+          card={loraCardFor(loraCards.store, model, loraCardEdit.value)}
+          metadata={item.metadata}
+          loading={loraLookups[loraCardEdit.value]?.loading}
+          onPatch={(patch) => loraCards.patchLoraCard(model, loraCardEdit.value, patch)}
+          onUploadImage={loraCards.uploadCardImage}
+          // Only this window owns the prompt box, so the standalone asset page
+          // shows the prompt without offering to insert it anywhere.
+          onInsertPrompt={(text) => {
+            setPositive((current) => current.trim() ? `${current.replace(/[,\s]+$/, "")}, ${text}` : text);
+            setAppNotice({ message: "已把卡片提示词追加到正向提示词", error: false });
+          }}
+          onClose={() => setLoraCardEdit(null)}
+        />;
+      })()}
+      <LoraHoverPreview preview={loraSummaryHover.preview} />
       {settingsOpen && <div className="settings-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !reconfiguring && setSettingsOpen(false)}>
         <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
           <header className="settings-head">
@@ -6293,7 +6354,8 @@ function App() {
             : <pre>{entry.message}</pre>}</div>)}
         </div>
         {consoleError && <p className="console-error">{consoleError}</p>}
-        <form className="console-command" onSubmit={submitConsoleCommand}><span>&gt;</span><input value={consoleCommand} onChange={(event) => setConsoleCommand(event.target.value)} placeholder="输入本机终端命令，例如：dir /a" spellCheck="false" disabled={consoleRunning} /><button type="submit" disabled={!consoleCommand.trim() || consoleRunning}>{consoleRunning ? <RefreshCw className="spin" size={15} /> : <Send size={15} />}{consoleRunning ? "执行中" : "执行"}</button></form>
+        {!consoleCommandsAllowed && <p className="console-note">本机命令仅限运行 XiriaCanvas 的那台机器执行。要在其他设备上执行，请在该机器的 <code>.env</code> 中设置 <code>XIRAI_REMOTE_CONSOLE=1</code> 后重启——这会把 shell 权限开放给所有能访问该端口的人。</p>}
+        <form className="console-command" onSubmit={submitConsoleCommand}><span>&gt;</span><input value={consoleCommand} onChange={(event) => setConsoleCommand(event.target.value)} placeholder={consoleCommandsAllowed ? "输入本机终端命令，例如：dir /a" : "本机命令未对远程设备开放"} spellCheck="false" disabled={consoleRunning || !consoleCommandsAllowed} /><button type="submit" disabled={!consoleCommand.trim() || consoleRunning || !consoleCommandsAllowed}>{consoleRunning ? <RefreshCw className="spin" size={15} /> : <Send size={15} />}{consoleRunning ? "执行中" : "执行"}</button></form>
       </section>}
     </main>
   );

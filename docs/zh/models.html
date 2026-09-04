@@ -147,14 +147,37 @@
       Q4-Q8。并非全部都能加载；选择器会隐藏运行时无法读取的文件，当前状态列在
       <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">Wiki 的支持矩阵</a>中。</p>
 
-    <div class="note">
-      <span class="label">量化文件只是更小的下载，不是更小的模型</span>
-      <p>它占用的磁盘小得多，但在内存中并不是一个更小的模型。fp8、mxfp8 与 GGUF
-        等所有格式都会在加载时展开为计算精度，因为本运行时构建的 Diffusers
-        模块没有可以接收压缩权重的量化线性算子。显存由<a href="runtime.html#memory">显存模式</a>与块级卸载决定，而不是由文件格式决定。</p>
+    <p>量化文件在<em>内存中</em>是否也更小，取决于引擎——取决于是否有一个线性算子可以接收它存储的权重。</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>引擎</th><th>量化权重加载后的占用</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Krea 2</td>
+            <td>就是它存储的大小。权重保持检查点自身的类型，缩放在线性算子内部完成，因此一个 fp8
+              扩散模型占用约 12 GB，而不是展开后的 24 GB——这正是能否常驻 24 GB 显卡的分界线。</td>
+          </tr>
+          <tr>
+            <td>Anima、FLUX.1、FLUX.2</td>
+            <td>计算精度。它们通过键名转换挂载 Diffusers 的 transformer
+              类，缩放尚无路径穿过该转换，因此在加载时就被折算进权重，fp8 文件占用是磁盘体积的两倍。</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
-    <p>加载体积按张量形状计算而非按文件大小计算，因此 Q4_K 模型是按展开后的大小计入预算，而不是按磁盘上的大小。</p>
+    <p>Krea 2 能读取 ComfyUI 写出的两种布局：fp8 或 int8 权重旁的逐张量缩放（两种键名拼写都接受），以及较新的逐层
+      <code>comfy_quant</code> 标记。把缩放推迟到计算时并不是近似：对于权重仍是一个普通矩阵、只乘一个数的格式，它与在加载时折算得到的比特完全一致——这正是推迟它不需要付出代价的原因。被
+      LoRA 修改的量化层同样保持其存储形式，适配器挂在权重旁边，而不是融合进去。</p>
+
+    <div class="note">
+      <span class="label">GGUF 始终会展开</span>
+      <p>GGUF 的分块格式没有可以保留的计算时形态，因此无论哪个引擎读取它，都会在加载时展开为计算精度：Q4_K
+        文件的下载体积小得多，在内存中却与 bf16 一样大。那里的显存由<a href="runtime.html#memory">显存模式</a>与块级卸载决定，而不是由文件格式决定。</p>
+    </div>
+
+    <p>加载体积按张量形状及其存储类型计算，而非按文件大小计算，因此 Q4_K 模型按展开后的大小计入预算，fp8 的 Krea 2 模型则按它保持的大小计入。</p>
 
     <footer class="page-footer">
       <a href="https://github.com/Xiaollull/Xiria-AICanvas">GitHub 源码</a>

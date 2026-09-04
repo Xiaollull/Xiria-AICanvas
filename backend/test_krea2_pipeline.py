@@ -37,6 +37,11 @@ from krea2_pipeline import (
     krea2_vae_layout,
     load_krea2_runtime,
 )
+from safetensors.torch import save_file
+
+from flux_pipeline import flux_component_bytes
+from krea2_pipeline import krea2_component_bytes
+from quantized_linear import QuantizedLinear
 from gguf_loader import gguf_quantization_summary, read_gguf_header
 from test_gguf_loader import write_checkpoint_gguf
 
@@ -235,6 +240,246 @@ class Krea2GgufCheckpointTests(unittest.TestCase):
         self.assertEqual(sorted(produced), sorted(name for name, _ in expected.named_parameters()))
         for name, parameter in expected.named_parameters():
             self.assertTrue(torch.allclose(produced[name], parameter, atol=1e-3), name)
+
+
+def scaled_fp8_checkpoint(state, spelling=".weight_scale"):
+    """Rewrite every linear weight in ComfyUI's scaled fp8, the way the published files are.
+
+    The scale is chosen the way a quantiser chooses it — the largest magnitude mapped onto fp8's
+    448 — so the fixture exercises real scales rather than ones that happen to be powers of two.
+    """
+    quantised = {}
+    for key, value in state.items():
+        if key.endswith(".weight") and value.ndim == 2 and value.dtype.is_floating_point:
+            scale = float(value.abs().max()) / 448.0 or 1.0
+            layer = key[: -len(".weight")]
+            quantised[key] = (value / scale).to(torch.float8_e4m3fn)
+            quantised[f"{layer}{spelling}"] = torch.tensor(scale, dtype=torch.float32)
+        else:
+            quantised[key] = value
+    return quantised
+
+
+def folded_checkpoint(quantised, dtype=torch.float32):
+    """The same checkpoint with every scale multiplied in, which is what the loader used to build."""
+    from quantized_linear import scan_quantized_layers, expand_quantized_layers
+
+    layers = scan_quantized_layers(quantised)
+    return expand_quantized_layers(quantised, layers, set(layers), dtype)
+
+
+class QuantizedTransformerTests(unittest.TestCase):
+    """A scaled-fp8 checkpoint has to load without being expanded, and produce the same image.
+
+    Expanding it is what cost 78 seconds of CPU arithmetic and doubled the model past what a 24 GB
+    card can hold, so these pin both halves: that the storage survives the load, and that keeping
+    it changes nothing about the result.
+    """
+
+    def test_the_weights_stay_in_the_checkpoints_own_type(self):
+        state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=2))
+        transformer, _config, report = _load_krea2_transformer(
+            None, torch.float32, _runtime_dependencies(), state_dict=state
+        )
+        quantised = [m for m in transformer.modules() if isinstance(m, QuantizedLinear)]
+        self.assertGreater(len(quantised), 0)
+        self.assertEqual(report["quantization"], ["float8_e4m3fn"])
+        self.assertEqual(quantised[0].weight.dtype, torch.float8_e4m3fn)
+        # The scale is the one thing that must not be narrowed: rounding it to the compute dtype
+        # changes most tensors, unlike deferring the multiply, which changes none.
+        self.assertEqual(quantised[0].scale_weight.dtype, torch.float32)
+
+    def test_both_spellings_of_the_scale_are_read(self):
+        for spelling in (".weight_scale", ".scale_weight"):
+            state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=1), spelling=spelling)
+            transformer, _config, report = _load_krea2_transformer(
+                None, torch.float32, _runtime_dependencies(), state_dict=state
+            )
+            self.assertEqual(report["unclaimed_tensors"], [], spelling)
+            self.assertTrue(any(isinstance(m, QuantizedLinear) for m in transformer.modules()), spelling)
+
+    def test_the_forward_matches_the_expanded_load_exactly(self):
+        torch.manual_seed(0)
+        state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=2))
+        deps = _runtime_dependencies()
+        quantised, _config, _report = _load_krea2_transformer(None, torch.float32, deps, state_dict=dict(state))
+        expanded, _config, _report = _load_krea2_transformer(
+            None, torch.float32, deps, state_dict=folded_checkpoint(state)
+        )
+        latents = torch.randn(1, CHANNELS, 4, 6)
+        context = torch.randn(1, 5, KREA2_TAP_COUNT * TXTDIM)
+        timestep = torch.tensor([1.0])
+        with torch.inference_mode():
+            kept = quantised(latents, timestep, context)
+            folded = expanded(latents, timestep, context)
+        self.assertTrue(torch.equal(kept, folded))
+
+    def _lora_file(self, directory, targets, rank=4):
+        lora = {}
+        for target, (out_features, in_features) in targets.items():
+            lora[f"diffusion_model.{target}.lora_A.weight"] = torch.randn(rank, in_features) * 0.02
+            lora[f"diffusion_model.{target}.lora_B.weight"] = torch.randn(out_features, rank) * 0.02
+        path = Path(directory) / f"adapter-{len(targets)}.safetensors"
+        save_file(lora, str(path))
+        return path
+
+    def test_a_lora_does_not_expand_the_layers_it_patches(self):
+        # A Krea 2 LoRA names nearly every linear in the model, so expanding what it touches
+        # expanded the whole transformer: 12.2 GiB of fp8 became 23.9 GiB of bf16, took 255
+        # seconds to load, and stopped fitting on the card.
+        state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=2))
+        target = "blocks.0.attn.wq"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._lora_file(directory, {target: (HEAD_DIM * HEADS, FEATURES)})
+            transformer, _config, report = _load_krea2_transformer(
+                None, torch.float32, _runtime_dependencies(),
+                loras=[{"path": path, "multiplier": 1.0}], state_dict=state,
+            )
+        self.assertIn(target, report["quantized_layers"])
+        self.assertEqual(report["adapted_layers"], [target])
+        self.assertEqual(report["loras"][0]["patched_modules"], 1)
+        self.assertEqual(report["loras"][0]["adapted_modules"], 1)
+        self.assertIsInstance(transformer.blocks[0].attn.wq, QuantizedLinear)
+        self.assertEqual(transformer.blocks[0].attn.wq.weight.dtype, torch.float8_e4m3fn)
+        self.assertTrue(transformer.blocks[0].attn.wq.has_lora_adapter)
+        self.assertFalse(transformer.blocks[1].attn.wq.has_lora_adapter)
+
+    def test_the_adapter_computes_what_fusing_would_have_produced(self):
+        torch.manual_seed(1)
+        state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=1))
+        target = "blocks.0.mlp.down"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._lora_file(directory, {target: (FEATURES, BLOCK_MLP)})
+            descriptors = [{"path": path, "multiplier": 0.8}]
+            deps = _runtime_dependencies()
+            kept, _c, _r = _load_krea2_transformer(None, torch.float32, deps, loras=descriptors, state_dict=dict(state))
+            folded, _c, _r = _load_krea2_transformer(
+                None, torch.float32, deps, loras=descriptors, state_dict=folded_checkpoint(state)
+            )
+        x = torch.randn(3, BLOCK_MLP)
+        with torch.inference_mode():
+            self.assertTrue(torch.allclose(kept.blocks[0].mlp.down(x), folded.blocks[0].mlp.down(x), atol=1e-5))
+
+    def test_several_loras_on_one_layer_become_one_adapter(self):
+        # Four mounted LoRAs is the reported configuration; each one costing its own pair of
+        # matmuls per layer would put the overhead back where the expansion was.
+        torch.manual_seed(3)
+        state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=1))
+        target = "blocks.0.mlp.down"
+        with tempfile.TemporaryDirectory() as directory:
+            deps = _runtime_dependencies()
+            descriptors = []
+            for index, multiplier in enumerate((0.8, 0.4, 0.6, 1.0)):
+                lora = {
+                    f"diffusion_model.{target}.lora_A.weight": torch.randn(4, BLOCK_MLP) * 0.02,
+                    f"diffusion_model.{target}.lora_B.weight": torch.randn(FEATURES, 4) * 0.02,
+                }
+                path = Path(directory) / f"stack-{index}.safetensors"
+                save_file(lora, str(path))
+                descriptors.append({"path": path, "multiplier": multiplier})
+            kept, _c, report = _load_krea2_transformer(
+                None, torch.float32, deps, loras=descriptors, state_dict=dict(state)
+            )
+            folded, _c, _r = _load_krea2_transformer(
+                None, torch.float32, deps, loras=descriptors, state_dict=folded_checkpoint(state)
+            )
+        module = kept.blocks[0].mlp.down
+        self.assertIsInstance(module, QuantizedLinear)
+        # One pair of matmuls at the summed rank, not four pairs.
+        self.assertEqual(tuple(module.lora_down.shape), (16, BLOCK_MLP))
+        self.assertEqual(tuple(module.lora_up.shape), (FEATURES, 16))
+        self.assertEqual(len(report["loras"]), 4)
+        x = torch.randn(3, BLOCK_MLP)
+        with torch.inference_mode():
+            self.assertTrue(torch.allclose(module(x), folded.blocks[0].mlp.down(x), atol=1e-5))
+
+    def test_a_lora_reaching_an_unquantised_layer_is_still_fused(self):
+        # Nothing changes for a full-precision checkpoint: fusing stays the cheaper arrangement.
+        torch.manual_seed(4)
+        state = comfy_krea2_checkpoint(layers=1)
+        target = "blocks.0.mlp.down"
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._lora_file(directory, {target: (FEATURES, BLOCK_MLP)})
+            transformer, _config, report = _load_krea2_transformer(
+                None, torch.float32, _runtime_dependencies(),
+                loras=[{"path": path, "multiplier": 1.0}], state_dict=state,
+            )
+        self.assertEqual(report["adapted_layers"], [])
+        self.assertEqual(report["loras"][0]["fused_modules"], 1)
+        self.assertNotIsInstance(transformer.blocks[0].mlp.down, QuantizedLinear)
+
+
+class QuantizedTextEncoderTests(unittest.TestCase):
+    def test_the_encoder_keeps_its_quantisation_and_answers_the_same(self):
+        torch.manual_seed(2)
+        state = scaled_fp8_checkpoint(qwen3vl_text_encoder_state())
+        deps = _runtime_dependencies()
+        kept = _load_krea2_text_encoder(dict(state), torch.float32, deps)
+        folded = _load_krea2_text_encoder(folded_checkpoint(state), torch.float32, deps)
+        self.assertTrue(any(isinstance(m, QuantizedLinear) for m in kept.modules()))
+        self.assertFalse(any(isinstance(m, QuantizedLinear) for m in folded.modules()))
+        # The fixture quantises the token embedding too, which no matmul can carry a scale for;
+        # it is expanded rather than refused, and the linears around it stay quantised.
+        self.assertEqual(kept.embed_tokens.weight.dtype, torch.float32)
+        ids = torch.tensor([[1, 2, 3, 4]])
+        with torch.inference_mode():
+            arguments = dict(input_ids=ids, attention_mask=torch.ones_like(ids), output_hidden_states=True, use_cache=False)
+            self.assertTrue(torch.equal(
+                kept(**arguments).hidden_states[max(KREA2_TAP_LAYERS)],
+                folded(**arguments).hidden_states[max(KREA2_TAP_LAYERS)],
+            ))
+
+
+class ComponentBytesTests(unittest.TestCase):
+    def test_a_quantised_component_is_counted_in_its_stored_form(self):
+        # Budgeting the expansion that no longer happens overstated Krea 2's transformer by
+        # 11.6 GiB, which on its own was enough to pick the block-streaming path for a model that
+        # fits resident.
+        state = scaled_fp8_checkpoint(comfy_krea2_checkpoint(layers=2))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.safetensors"
+            save_file(state, str(path))
+            stored = krea2_component_bytes([path])
+            expanded = flux_component_bytes([path])
+        self.assertLess(stored, expanded)
+        # Every fp8 weight is one byte where the expansion would have made it two.
+        fp8_elements = sum(v.numel() for k, v in state.items() if v.dtype == torch.float8_e4m3fn)
+        self.assertAlmostEqual(expanded - stored, fp8_elements, delta=fp8_elements * 0.02)
+
+    def test_an_unquantised_component_is_counted_at_the_compute_dtype(self):
+        state = comfy_krea2_checkpoint(layers=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.safetensors"
+            save_file(state, str(path))
+            self.assertEqual(krea2_component_bytes([path]), flux_component_bytes([path]))
+
+
+class DecodeResidencyTests(unittest.TestCase):
+    def test_the_transformer_is_evicted_before_the_autoencoder_runs(self):
+        runtime = Krea2Runtime.__new__(Krea2Runtime)
+        runtime.unload_before_decode = True
+        runtime._transformer_resident = True
+        runtime._transformer_group_offload = False
+        parked = []
+        runtime._park_transformer_on_cpu = lambda: parked.append(True)
+        self.assertTrue(runtime._release_transformer_for_decode())
+        self.assertEqual(parked, [True])
+
+    def test_group_offload_holds_nothing_to_evict(self):
+        runtime = Krea2Runtime.__new__(Krea2Runtime)
+        runtime.unload_before_decode = True
+        runtime._transformer_resident = True
+        runtime._transformer_group_offload = True
+        runtime._park_transformer_on_cpu = lambda: self.fail("group offload has no resident weights")
+        self.assertFalse(runtime._release_transformer_for_decode())
+
+    def test_the_eviction_can_be_turned_off(self):
+        runtime = Krea2Runtime.__new__(Krea2Runtime)
+        runtime._transformer_resident = True
+        runtime._transformer_group_offload = False
+        runtime._park_transformer_on_cpu = lambda: self.fail("eviction was disabled")
+        self.assertFalse(runtime.configure_decode_residency(False))
+        self.assertFalse(runtime._release_transformer_for_decode())
 
 
 class TransformerModuleTests(unittest.TestCase):

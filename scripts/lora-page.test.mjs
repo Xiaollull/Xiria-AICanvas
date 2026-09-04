@@ -176,3 +176,59 @@ test("LoRA metadata lookup reuses file-identity cache and keeps preview download
   assert.match(app, /item\.metadata\?\.triggerReviewSchema !== 4/);
   assert.match(page, /item\.metadata\?\.triggerReviewSchema !== 4/);
 });
+
+test("both LoRA surfaces compose a card the same way, from one shared presentation", async () => {
+  const [app, page, mount, group] = await Promise.all([
+    readSource("src/App.jsx"),
+    readSource("src/LoraManagerPage.jsx"),
+    readSource("src/LoraMountPanel.jsx"),
+    readSource("src/LoraGroupPanel.jsx"),
+  ]);
+  // Both used to build the preview URL themselves and had to be kept in step by
+  // hand; that expression now exists once, in `lora-cards.js`.
+  for (const source of [app, page]) {
+    assert.match(source, /loraCardPresentation\(\{\s*engine: model,/);
+    assert.match(source, /card: loraCardFor\(loraCards\.store, model, item\.value\)/);
+    assert.doesNotMatch(source, /`\/api\/lora-preview\?engine=/);
+    assert.match(source, /cards=\{loraCardControls\}/);
+  }
+  // The shared panels read the card through the host's controls rather than
+  // holding their own copy of the store.
+  assert.match(mount, /cards\?\.presentationFor\?\.\(item\)/);
+  assert.match(group, /cards\?\.groupCardFor\?\.\(group\.id\)/);
+});
+
+test("a deleted combination does not strand its effect images", async () => {
+  const group = await readSource("src/LoraGroupPanel.jsx");
+  const removal = group.slice(group.indexOf("const removeGroup"), group.indexOf("const addStandaloneTo"));
+  // Group ids are never reused, so a card left behind would keep its images
+  // alive under an id nothing can reach or delete.
+  assert.match(removal, /cards\?\.onRemoveGroup\?\.\(group\.id\)/);
+});
+
+test("nothing a user saves on a card reaches a generation request", async () => {
+  const app = await readSource("src/App.jsx");
+  const body = app.slice(app.indexOf("const requestBody"), app.indexOf("const requestBody") + 6000);
+  for (const field of ["loraCards", "cardAssetUrl", "presentationFor"]) {
+    assert.ok(!body.includes(field), `${field} is presentation only and must not be serialised into a job`);
+  }
+  // The prompt on a card is inserted only when the user asks for it.
+  assert.match(app, /onInsertPrompt=\{\(text\) => \{/);
+  assert.match(await readSource("src/LoraCardEditor.jsx"), /它不会被自动加入生成请求/);
+});
+
+test("the card store rides its own route and its own broadcast, not the workspace autosave", async () => {
+  const [hook, state] = await Promise.all([
+    readSource("src/use-lora-cards.js"),
+    readSource("src/lora-state.js"),
+  ]);
+  assert.match(hook, /fetch\("\/api\/lora-cards"/);
+  assert.match(hook, /new BroadcastChannel\(LORA_SYNC_CHANNEL\)/);
+  assert.match(hook, /type: LORA_CARDS_MESSAGE/);
+  assert.match(state, /LORA_SYNC_CHANNEL = "xirai-lora-workspace-v1"/);
+  // A message for the card store must not be mistaken for a mounted-list sync by
+  // the pages that listen to the same channel.
+  for (const source of await Promise.all([readSource("src/App.jsx"), readSource("src/LoraManagerPage.jsx")])) {
+    assert.match(source, /payload\?\.type !== "workspace-loras"/);
+  }
+});
