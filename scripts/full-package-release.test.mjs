@@ -188,3 +188,16 @@ test("the notice tells a reader what to do and what survives", async () => {
     assert.ok(FULL_PACKAGE_NOTICE.includes(kept), `${kept} is named as surviving the reinstall`);
   }
 });
+
+test("the three version fields the release gate compares are in step", async () => {
+  // The tag job reads package.json, package-lock.json's root version and its packages[""] entry,
+  // and refuses the release if any disagrees with the tag. Bumping the manifest without the lock
+  // passes every local suite and then fails the workflow after the tag is already public, which is
+  // the expensive place to find out.
+  const manifest = JSON.parse(await read("package.json"));
+  const lock = JSON.parse(await read("package-lock.json"));
+  assert.equal(lock.version, manifest.version, "package-lock.json root version");
+  assert.equal(lock.packages?.[""]?.version, manifest.version, "package-lock.json packages['']");
+  assert.match(manifest.version, /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/,
+    "the gate's tag regex allows no leading zeroes, prerelease or build metadata");
+});
