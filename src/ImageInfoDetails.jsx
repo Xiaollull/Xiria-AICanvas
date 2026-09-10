@@ -12,6 +12,7 @@ import {
   jsonSummary,
   matchesQuery,
 } from "./metadata-explorer";
+import { useDialogLifecycle } from "./gallery-core";
 
 // The full record, in blocks.
 //
@@ -133,11 +134,10 @@ export default function ImageInfoDetails({ info, onClose }) {
     [modules, category, query],
   );
 
-  useEffect(() => {
-    const onKey = (event) => { if (event.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  // This dialog listened for Escape and nothing else: no focus trap, so Tab left it for the page
+  // behind, and no focus return, so closing dropped focus on <body>. The shared lifecycle is the
+  // one the Gallery dialogs use.
+  const dialogRef = useDialogLifecycle(true, onClose);
 
   // Arrow keys page through a batch with this dialog open, so a filter typed
   // for one picture must not silently hide the next one's nodes.
@@ -174,7 +174,7 @@ export default function ImageInfoDetails({ info, onClose }) {
   const active = tabs.some((entry) => entry.id === tab) ? tab : "summary";
 
   return <div className="image-info-details-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <section className="image-info-details-dialog" role="dialog" aria-modal="true" aria-labelledby="image-info-details-title">
+    <section className="image-info-details-dialog" ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="image-info-details-title">
       <header className="image-info-details-head">
         <div>
           <span className="eyebrow">FULL METADATA RECORD</span>

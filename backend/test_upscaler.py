@@ -141,7 +141,7 @@ class UpscalerTests(unittest.TestCase):
 
     def test_anima_usdu_memory_admission_uses_processing_tile_not_full_target(self):
         request = generation_request(
-            engine="Anima", checkpoint=None, diffusion_model="a.safetensors", text_encoder="b.safetensors", vae="c.safetensors", preview_enabled=False, width=1088, height=1472, images_per_batch=1,
+            engine="Anima", checkpoint=None, diffusion_model="a.safetensors", text_encoder="b.safetensors", vae="c.safetensors", width=1088, height=1472, images_per_batch=1,
             hires={"enabled": True, "model": "model.pth", "scale": 2, "cfg": 7,
                    "execution_mode": "usdu_tiled", "padding": 32},
         )
@@ -155,7 +155,7 @@ class UpscalerTests(unittest.TestCase):
 
     def test_anima_full_frame_memory_admission_keeps_target_and_non_two_x_tiles_round(self):
         request = generation_request(
-            engine="Anima", checkpoint=None, diffusion_model="a.safetensors", text_encoder="b.safetensors", vae="c.safetensors", preview_enabled=False, width=704, height=960,
+            engine="Anima", checkpoint=None, diffusion_model="a.safetensors", text_encoder="b.safetensors", vae="c.safetensors", width=704, height=960,
             hires={"enabled": True, "model": "model.pth", "scale": 1.5, "cfg": 7,
                    "execution_mode": "full_frame"},
         )
@@ -166,7 +166,7 @@ class UpscalerTests(unittest.TestCase):
 
     def test_anima_usdu_rtx_before_hires_uses_rtx_canvas_as_auto_core(self):
         request = generation_request(
-            engine="Anima", checkpoint=None, diffusion_model="a.safetensors", text_encoder="b.safetensors", vae="c.safetensors", preview_enabled=False,
+            engine="Anima", checkpoint=None, diffusion_model="a.safetensors", text_encoder="b.safetensors", vae="c.safetensors",
             width=512, height=768, postprocess_order=["rtx", "hires", "adetailer"],
             rtx={"enabled": True, "scale": 2},
             hires={"enabled": True, "model": "model.pth", "scale": 2, "cfg": 7,
@@ -392,7 +392,6 @@ class UpscalerTests(unittest.TestCase):
             scheduler="simple",
             guidance="pag",
             pag={"scale": 0.8, "applied_layers": "all"},
-            preview_enabled=False,
             hires={"enabled": True, "model": "model.pth", "mode": "fixed", "seed": "885289963651097", "scale": 2, "steps": 20, "denoise": 0.5, "cfg": 4},
         )
         source = Image.new("RGB", (64, 64), "red")
@@ -459,7 +458,11 @@ class UpscalerTests(unittest.TestCase):
                     source, runtime, "anima", request, "anima-hires", Control(), 0,
                     image_seed=17, effective_hires_seed=885289963651097,
                 )
-            park.assert_called_once_with(runtime, "anima")
+            # The upscale pass is tiled, so it never needed the diffusion model's room. Parking
+            # for it cost a round trip of the whole model — 10.1s out and 2.4s back on a 24 GB
+            # card, around a 2.0s upscale — and the refinement that follows wants it straight
+            # back. Running out of memory is what asks for the room now.
+            park.assert_not_called()
             restore.assert_not_called()
             self.assertEqual(result.getpixel((0, 0)), (0, 0, 255))
             self.assertEqual(runtime.kwargs["images"][0].size, (128, 128))
@@ -492,11 +495,78 @@ class UpscalerTests(unittest.TestCase):
         finally:
             inference_server.jobs.pop("anima-hires", None)
 
+    def test_an_upscaler_that_runs_out_of_room_parks_the_model_and_tries_the_gpu_again(self):
+        """Not parking up front is a bet that the tiled pass fits, and a bet has to be settled.
+
+        The old guarantee — the upscaler always had the whole card — is what the retry restores,
+        and it is worth taking before the CPU fallback because a CPU ESRGAN pass over a 2x canvas
+        is minutes, not seconds.
+        """
+        request = GenerateInput(
+            engine="Anima",
+            diffusion_model="diffusion.safetensors",
+            text_encoder="text.safetensors",
+            vae="vae.safetensors",
+            prompt="p", negative_prompt="n", width=512, height=512, steps=20, cfg=6,
+            denoise=1, seed=5, sampler="euler_ancestral", scheduler="simple",
+            hires={"enabled": True, "model": "model.pth", "mode": "fixed",
+                   "seed": "885289963651097", "scale": 2, "steps": 20, "denoise": 0.5, "cfg": 4},
+        )
+        source = Image.new("RGB", (64, 64), "red")
+        upscaled = Image.new("RGB", (128, 128), "green")
+        refined = Image.new("RGB", (128, 128), "blue")
+
+        class Runtime:
+            last_generation_metrics = {"sampling": {"seconds": 1.0}}
+
+            def refine_batch(self, **kwargs):
+                kwargs["on_step"](20, 20, None)
+                return [refined]
+
+        class Control:
+            cancelled = False
+
+            def checkpoint(self, *_args):
+                pass
+
+            def active_elapsed(self, _started_at):
+                return 0
+
+            def total_paused(self):
+                return 0
+
+        devices = []
+
+        def upscale(*args, **kwargs):
+            devices.append(kwargs["device"])
+            if len(devices) == 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+            return upscaled, {"model": "model.pth"}
+
+        inference_server.jobs["anima-oom"] = {"runtime_metrics": {}}
+        try:
+            with (
+                patch.object(inference_server, "pipeline_cpu_parked", False),
+                patch.object(inference_server.torch.cuda, "is_available", return_value=True),
+                patch.object(inference_server, "upscale_image", side_effect=upscale),
+                patch.object(inference_server, "park_pipeline_for_external_stage") as park,
+            ):
+                inference_server.apply_hires_fix(
+                    source, Runtime(), "anima", request, "anima-oom", Control(), 0,
+                    image_seed=17, effective_hires_seed=885289963651097,
+                )
+            park.assert_called_once()
+            # The second attempt is still the GPU one: the CPU pass is the last resort, not the
+            # answer to the first failure.
+            self.assertEqual(devices, ["cuda", "cuda"])
+        finally:
+            inference_server.jobs.pop("anima-oom", None)
+
     def test_anima_hires_propagates_refinement_schedule_limit_error(self):
         request = GenerateInput(
             engine="Anima", diffusion_model="diffusion.safetensors", text_encoder="text.safetensors", vae="vae.safetensors",
             prompt="test", width=512, height=512, steps=20, cfg=7, denoise=1, seed=1,
-            sampler="euler_ancestral", scheduler="normal", preview_enabled=False,
+            sampler="euler_ancestral", scheduler="normal",
             hires={"enabled": True, "model": "model.pth", "scale": 1, "steps": 100, "denoise": 100 / 4097},
         )
         image = Image.new("RGB", (64, 64), "red")
@@ -531,7 +601,7 @@ class UpscalerTests(unittest.TestCase):
         request = GenerateInput(
             engine="Anima", diffusion_model="diffusion.safetensors", text_encoder="text.safetensors", vae="vae.safetensors",
             prompt="parent", width=1088, height=1472, steps=30, cfg=5, denoise=1, seed=9,
-            sampler="euler", scheduler="simple", preview_enabled=False,
+            sampler="euler", scheduler="simple",
             hires={"enabled": True, "model": "model.pth", "mode": "fixed", "seed": "885289963651097", "scale": 2, "steps": 12, "denoise": .2, "cfg": 5,
                    "execution_mode": "usdu_tiled", "sampler": "euler_ancestral", "scheduler": "normal"},
         )

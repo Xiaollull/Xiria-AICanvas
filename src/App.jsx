@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { fitViewerZoom, inverseViewerHandleScale, intrinsicDimensions, viewerLayerBounds, viewerResizeGestureMove, viewerResizeDisableDecision, viewerZoomAtPoint, VIEWER_MAX_ZOOM, VIEWER_MIN_ZOOM } from "./viewer-geometry.js";
 import { createViewerRafScheduler, ViewerAsyncSession, viewerOpenPlan } from "./viewer-async-session.js";
 import { VIEWER_TOOLBAR_POPOVER_LAYOUT, VIEWER_TOOLBAR_POPOVER_TEMPLATES, viewerEscapeAction, viewerToolbarPopoverTransition } from "./viewer-toolbar.js";
@@ -20,12 +20,16 @@ import {
   Cpu,
   Download,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileText,
   FolderOpen,
   ImageIcon,
   ImagePlus,
   LayoutTemplate,
   Layers3,
+  ListChecks,
+  ListPlus,
   Maximize2,
   Minimize2,
   Move,
@@ -66,7 +70,7 @@ import { formatFileSize } from "./format-size";
 import { DEFAULT_THEME, applyThemeToDocument, deriveLogoTheme, loadThemeState, normalizeHex } from "./theme";
 import { AddToGalleryDialog } from "./Gallery";
 import { useDialogLifecycle } from "./gallery-core";
-import { generationHiresSeedSettings, hiresEffectiveSteps as hiresEffectiveStepCount, hiresSeedPayload, normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed } from "./hires-settings";
+import { generationHiresSeedSettings, hiresEffectiveSteps as hiresEffectiveStepCount, hiresSeedPayload, normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
 import LoraDetailsDialog from "./LoraDetailsDialog";
 import { appLoraDragLocked } from "./lora-drag-handle";
 import { formatWeight } from "./lora-weight";
@@ -138,6 +142,17 @@ import {
 } from "./prompt-presets";
 import { SAMPLER_NAMES as samplerNames, SCHEDULER_NAMES as schedulerNames } from "./sampling-options";
 import {
+  ADETAILER_DEFAULTS,
+  HIRES_DEFAULTS,
+  PAG_DEFAULTS,
+  RTX_DEFAULTS,
+  SETTINGS_ENGINES,
+  emptyEngineSettingsMap,
+  engineSettingsFor,
+  normalizeEngineSettingsMap,
+  withEngineSettings,
+} from "./engine-settings";
+import {
   ADETAILER_UNIT_LIMIT,
   DISTILLED_GUIDANCE_ENGINES,
   activeADetailerUnits,
@@ -199,7 +214,84 @@ const guidanceOptions = [
   { id: "pag", label: "PAG（扰动注意力引导）", detail: "强度可调 · 默认仅作用于 Mid 层" },
   { id: "cfg_zero_star", label: "CFG-Zero*（零星 CFG）", detail: "优化缩放 · 前 4% 步零初始化", flowMatching: true },
 ];
-const PAG_DEFAULTS = { scale: 0.3, appliedLayers: "mid" };
+
+// The queue as the service reports it, newest last. Every job this session submitted appears here
+// whatever became of it, so the list doubles as a short history: restarting the package empties it
+// and the numbering starts again at one.
+const QUEUE_STATUS_TEXT = {
+  queued: "等待中",
+  running: "生成中",
+  pausing: "正在暂停",
+  paused: "已暂停",
+  cancelling: "正在终止",
+  complete: "已完成",
+  error: "失败",
+  cancelled: "已取消",
+};
+
+function queueDuration(job) {
+  if (typeof job.elapsed_seconds === "number") return `${job.elapsed_seconds.toFixed(1)} 秒`;
+  if (job.started_at && job.completed_at) return `${(job.completed_at - job.started_at).toFixed(1)} 秒`;
+  return "";
+}
+
+function QueueList({ jobs, counts, error, watching, onCancel, onSelect, onClose }) {
+  const ordered = [...jobs].reverse();
+  return (
+    <div className="queue-dropdown" role="dialog" aria-label="任务队列">
+      <header>
+        <div><strong>任务队列</strong><small>本次会话共 {jobs.length} 个任务</small></div>
+        <button type="button" className="icon-button" title="关闭队列" onClick={onClose}><X size={15} /></button>
+      </header>
+      {counts && <div className="queue-counts">
+        <span className="waiting">等待 {counts.queued}</span>
+        <span className="running">生成中 {counts.running}</span>
+        <span className="done">完成 {counts.complete}</span>
+        <span className="failed">失败 {counts.error}</span>
+        <span className="stopped">取消 {counts.cancelled}</span>
+      </div>}
+      {error && <p className="queue-error">{error}</p>}
+      {ordered.length === 0 && <p className="queue-empty">还没有提交过任务。提交后即使正在生成，也可以继续排队。</p>}
+      <ul className="queue-items">
+        {ordered.map((job) => {
+          const status = job.status;
+          const finished = status === "complete";
+          const thumbnail = finished && job.outputs?.[0]?.image_url ? `${job.outputs[0].image_url}?v=${job.completed_at || 0}` : "";
+          return (
+            <li key={job.id} className={`queue-item ${status} ${job.id === watching ? "watching" : ""}`}>
+              <button
+                type="button"
+                className="queue-item-main"
+                disabled={!finished}
+                title={finished ? "查看这张结果" : QUEUE_STATUS_TEXT[status] || status}
+                onClick={() => finished && onSelect(job)}
+              >
+                <span className="queue-index">#{job.sequence}</span>
+                {thumbnail ? <img className="queue-thumb" src={thumbnail} alt="" /> : <span className={`queue-dot ${status}`} />}
+                <span className="queue-item-text">
+                  <b>{QUEUE_STATUS_TEXT[status] || status}{job.engine ? ` · ${job.engine}` : ""}</b>
+                  <small>
+                    {finished
+                      ? `${job.outputs?.[0]?.output_name || "已生成"}${queueDuration(job) ? ` · ${queueDuration(job)}` : ""}`
+                      : status === "error"
+                        ? job.error || "生成失败"
+                        : status === "cancelled"
+                          ? "已取消，未保存图片"
+                          : status === "queued"
+                            ? `${job.width || "?"} × ${job.height || "?"} · 等待前面的任务完成`
+                            : job.phase || "正在生成"}
+                  </small>
+                </span>
+                {!finished && status !== "error" && status !== "cancelled" && <span className="queue-progress">{job.progress || 0}%</span>}
+              </button>
+              {job.active && <button type="button" className="queue-item-cancel" title="取消这个任务" onClick={() => onCancel(job.id)}><X size={13} /></button>}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 function pagAvailableForEngine(health, engine) {
   const pagHealth = health?.guidance?.pag;
@@ -375,36 +467,6 @@ const seedModes = [
 ];
 // The stage is an ordered list of detail passes; `adetailer-units.js` owns what
 // a unit is, so this page and the image-to-image page cannot drift apart.
-const ADETAILER_DEFAULTS = normalizeADetailerStage({ enabled: false, expanded: false });
-const HIRES_DEFAULTS = {
-  enabled: false,
-  expanded: false,
-  model: "",
-  seedMode: "inherit",
-  seed: "",
-  scale: 1,
-  denoise: 0.35,
-  steps: 20,
-  cfg: 7,
-  tileSize: 192,
-  tileOverlap: 16,
-  executionMode: "full_frame",
-  sampler: null,
-  scheduler: null,
-  tileWidth: "auto",
-  tileHeight: "auto",
-  padding: 32,
-  maskBlur: 8,
-  seamMode: "none",
-  uniformTiles: true,
-  tiledDecode: true,
-};
-const RTX_DEFAULTS = {
-  enabled: false,
-  expanded: false,
-  scale: 2,
-  quality: "ultra",
-};
 const RTX_QUALITY_LEVELS = ["low", "medium", "high", "ultra"];
 
 function normalizeSeed(value) {
@@ -548,6 +610,7 @@ function loadWorkspaceState(saved) {
     if (!saved || typeof saved !== "object") return null;
     const savedModel = READY_ENGINES.includes(saved.model) ? saved.model : "SD";
     const isAnima = savedModel === "Anima";
+    const savedModelTilesHires = supportsUsduTiled(savedModel);
     const isSplitModel = SPLIT_MODEL_ENGINES.includes(savedModel);
     const numberInRange = (value, fallback, minimum, maximum) => {
       const number = Number(value);
@@ -565,9 +628,9 @@ function loadWorkspaceState(saved) {
       Math.round(numberInRange(savedHires.tileOverlap, 16, 0, 512)),
       Math.floor(savedHiresTileSize / 2),
     );
-    const hiresExecutionMode = isAnima && !["full_frame", "usdu_tiled"].includes(savedHires.executionMode)
+    const hiresExecutionMode = savedModelTilesHires && !["full_frame", "usdu_tiled"].includes(savedHires.executionMode)
       ? "usdu_tiled"
-      : savedHires.executionMode === "usdu_tiled" && isAnima ? "usdu_tiled" : "full_frame";
+      : savedHires.executionMode === "usdu_tiled" && savedModelTilesHires ? "usdu_tiled" : "full_frame";
     const normalizeHiresTileDimension = (value) => value === "auto" || value === undefined || value === null
       ? "auto"
       : Math.round(numberInRange(value, 0, 1, 8192));
@@ -591,7 +654,17 @@ function loadWorkspaceState(saved) {
     const loraGroupMap = normalizeLoraGroupMap(saved.loraGroupsByEngine, {
       fieldMissing: !Object.prototype.hasOwnProperty.call(saved, "loraGroupsByEngine"),
     });
+    // A workspace written before the parameters were split holds one flat set at the top level.
+    // Passing it as `legacy` seeds every engine from it, so the first launch after upgrading finds
+    // the settings where they were left under whichever engine is opened, instead of finding them
+    // under one engine and defaults everywhere else.
+    const engineSettingsMap = normalizeEngineSettingsMap(saved.engineSettingsByEngine, {
+      fieldMissing: !Object.prototype.hasOwnProperty.call(saved, "engineSettingsByEngine"),
+      legacy: saved,
+    });
     return {
+      engineSettingsByEngine: engineSettingsMap.container,
+      engineSettingsWarning: engineSettingsMap.warning,
       model: savedModel,
       checkpoint: modelIdentity.checkpoint,
       diffusionModel: modelIdentity.diffusionModel,
@@ -623,9 +696,9 @@ function loadWorkspaceState(saved) {
         width: Math.round(numberInRange(saved.size?.width, 1024, 0, 2048) / 64) * 64,
         height: Math.round(numberInRange(saved.size?.height, 1024, 0, 2048) / 64) * 64,
       },
-      processPreview: isSplitModel ? false : saved.processPreview !== false,
       backgroundRemovalModel: typeof saved.backgroundRemovalModel === "string" ? saved.backgroundRemovalModel : "",
       samplingExpanded: saved.samplingExpanded !== false,
+      runInfoVisible: saved.runInfoVisible !== false,
       hires: {
         enabled: savedHires.enabled === true,
         expanded: savedHires.expanded === true,
@@ -692,7 +765,9 @@ function gallerySettingsWithoutPromptPresets(settings) {
   // definitions describe the whole workspace, so copying them into every image
   // record would both bloat the gallery and let a restore rewrite combinations
   // the user never asked to change.
-  const { promptPresets: _promptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, ...gallerySettings } = settings;
+  // The per-engine parameter library joins the other workspace-wide libraries here. A card records
+  // one run; carrying every engine's parameters in it would let applying the card rewrite them all.
+  const { promptPresets: _promptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, ...gallerySettings } = settings;
   return gallerySettings;
 }
 
@@ -901,7 +976,7 @@ function PromptPresetDialog({ dialog, records, running, onSave, onRequestClose }
         {running && <p className="prompt-preset-readonly" role="status">生成任务运行期间只能查看；编辑项与保存操作已锁定。</p>}
         {operationError && <p className="prompt-preset-error" role="alert">{operationError}</p>}
         <label className={validation.errors.name ? "invalid" : ""}><span>预设名称 <small>{draft.name.length} / 48</small></span><input autoFocus data-dialog-autofocus value={draft.name} maxLength={48} disabled={running} aria-invalid={Boolean(validation.errors.name)} onChange={(event) => update("name", event.target.value)} />{validation.errors.name && <em>{validation.errors.name}</em>}</label>
-        <label className={`prompt-preset-content-field ${validation.errors.content ? "invalid" : ""}`}><span>Prompt 内容 <small>{draft.content.length} / 2000</small></span><textarea value={draft.content} maxLength={2000} disabled={running} aria-invalid={Boolean(validation.errors.content)} onChange={(event) => update("content", event.target.value)} placeholder="保留权重、括号与内部换行" />{validation.errors.content && <em>{validation.errors.content}</em>}</label>
+        <label className={`prompt-preset-content-field ${validation.errors.content ? "invalid" : ""}`}><span>Prompt 内容 <small>{draft.content.length} 字符</small></span><textarea value={draft.content} disabled={running} aria-invalid={Boolean(validation.errors.content)} onChange={(event) => update("content", event.target.value)} placeholder="保留权重、括号与内部换行" />{validation.errors.content && <em>{validation.errors.content}</em>}</label>
         <fieldset><legend>Prompt 类型</legend><div className="prompt-preset-segmented two">{[["positive", "正向"], ["negative", "负向"]].map(([value, label]) => <button type="button" className={draft.type === value ? "active" : ""} aria-pressed={draft.type === value} disabled={running} key={value} onClick={() => update("type", value)}>{label}</button>)}</div><small>切换类型后，预设会移动到目标分区末尾。</small></fieldset>
         <fieldset><legend>默认插入位置</legend><div className="prompt-preset-segmented three">{[["start", "开头"], ["middle", "中间"], ["end", "结尾"]].map(([value, label]) => <button type="button" className={draft.position === value ? "active" : ""} aria-pressed={draft.position === value} disabled={running} key={value} onClick={() => update("position", value)}>{label}</button>)}</div><small>中间优先替换当前选区或插入光标处；没有有效选区时使用文本逻辑中点。</small></fieldset>
       </div>
@@ -1003,6 +1078,10 @@ function App() {
   const [loras, setLoras] = useState([]);
   const [mountedLorasByEngine, setMountedLorasByEngine] = useState(emptyMountedLoraMap);
   const [loraGroupsByEngine, setLoraGroupsByEngine] = useState(emptyLoraGroupMap);
+  // Every engine's own parameters. The hooks below hold the selected engine's working copy; this
+  // map holds the rest, and switching engines swaps one for the other. Nothing an engine's controls
+  // write can reach another engine's record.
+  const [engineSettingsByEngine, setEngineSettingsByEngine] = useState(emptyEngineSettingsMap);
   // Session-only rescan signal. It intentionally is not part of the workspace
   // snapshot, and scan-prune commits do not change it, preventing a response
   // from continuously scheduling another automatic request.
@@ -1051,11 +1130,9 @@ function App() {
   const [galleryAddOpen, setGalleryAddOpen] = useState(false);
   const [galleryFocus, setGalleryFocus] = useState(null);
   const [appNotice, setAppNotice] = useState(null);
-  const [livePreview, setLivePreview] = useState("");
   const [generationStage, setGenerationStage] = useState("queued");
   const [generationStageStep, setGenerationStageStep] = useState(0);
   const [generationStageTotal, setGenerationStageTotal] = useState(0);
-  const [previewKind, setPreviewKind] = useState("");
   const [generationDetail, setGenerationDetail] = useState(null);
   const [generationStep, setGenerationStep] = useState(0);
   const [generationTotal, setGenerationTotal] = useState(0);
@@ -1068,8 +1145,18 @@ function App() {
   const [generationPausedTime, setGenerationPausedTime] = useState(0);
   const [generationControlBusy, setGenerationControlBusy] = useState("");
   const [generationProgressCollapsed, setGenerationProgressCollapsed] = useState(true);
-  const [processPreview, setProcessPreview] = useState(true);
   const [generationJob, setGenerationJob] = useState("");
+  // Every job this session has submitted, newest last, as the service reports it. The service owns
+  // the queue — it is the thing that runs them — so this is a view of that list rather than a
+  // second copy the page tries to keep in step.
+  const [queue, setQueue] = useState([]);
+  const [queueCounts, setQueueCounts] = useState(null);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [queueError, setQueueError] = useState("");
+  // The stage pictures of the job being watched: the base sample, then the Hires result, then the
+  // ADetailer result, each staying on screen for the whole of the stage that follows it.
+  const [stagePreviews, setStagePreviews] = useState([]);
+  const [enlargedStage, setEnlargedStage] = useState(null);
   const [inferenceHealth, setInferenceHealth] = useState(null);
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [checkpoints, setCheckpoints] = useState([]);
@@ -1149,6 +1236,10 @@ function App() {
   const [pluginsError, setPluginsError] = useState("");
   const [pluginPendingId, setPluginPendingId] = useState("");
   const [samplingExpanded, setSamplingExpanded] = useState(true);
+  // The run diagnostics under the preview: which model is loaded, the VRAM tier, the cache state,
+  // the tokenizer conditioning count and the engine's sampling notice. Useful while setting a run
+  // up and pure noise once it is settled, so it is the user's call whether to keep it on screen.
+  const [runInfoVisible, setRunInfoVisible] = useState(true);
   const [hires, setHires] = useState(HIRES_DEFAULTS);
   const [upscalersRefreshing, setUpscalersRefreshing] = useState(false);
   const [adetailer, setADetailer] = useState(ADETAILER_DEFAULTS);
@@ -1215,6 +1306,18 @@ function App() {
   const viewerNudge = useRef(null);
   const viewerUndo = useRef([]);
   const viewerClipboard = useRef(null);
+  // Over plain HTTP a page cannot put a picture on the clipboard at all: no clipboard API exists
+  // outside a secure context. The browser's own right-click menu still can -- that is how filecat's
+  // enlarged preview copies -- so on such a page a plain right-click on a layer is left to the
+  // browser, on the real <img>, and this app's menu moves to Shift+right-click. The browser copies
+  // the decoded picture rather than the file, so its copy carries no generation metadata either.
+  const nativeImageCopy = globalThis.isSecureContext === false;
+  const viewerNativeCopyHinted = useRef(false);
+  const hintNativeImageCopy = () => {
+    if (viewerNativeCopyHinted.current) return;
+    viewerNativeCopyHinted.current = true;
+    setViewerNotice("HTTP 访问：请用浏览器菜单的「复制图片」复制（不含生成元数据）；Shift + 右键打开删除等操作");
+  };
   const viewerCanvasRef = useRef(null);
   const viewerToolbarRef = useRef(null);
   const viewerEdgeTriggerRef = useRef(null);
@@ -1225,6 +1328,9 @@ function App() {
   const viewerHistoryScroll = useRef(0);
   const loaderStartedAt = useRef(Date.now());
   const generationLocked = useRef(false);
+  // Guards the submit request itself, so a double click sends one job rather than two. It is
+  // released as soon as the service has the job, not when the job finishes.
+  const submissionInFlight = useRef(false);
   const completedModelDownloadJob = useRef("");
   const inferenceHealthRef = useRef(inferenceHealth);
   const currentModel = useRef(model);
@@ -1244,6 +1350,9 @@ function App() {
   // the persisted mountedLorasByEngine v2 schema.
   const mountedLoraRevisionRef = useRef(0);
   const loraGroupsMapRef = useRef(emptyLoraGroupMap());
+  // Read during an engine switch, which happens in an event handler rather than in render, so the
+  // map has to be readable without waiting for a re-render.
+  const engineSettingsMapRef = useRef(emptyEngineSettingsMap());
   const activeLoraGroupsRef = useRef([]);
   const activeLoraScopeRef = useRef(null);
   const loraScanToken = useRef(0);
@@ -1306,10 +1415,69 @@ function App() {
     };
   };
   const loraDragLocked = appLoraDragLocked({ status, modelSwitching, loraWorkspaceLocked, shouldPersistMountedLoras });
+  // The selected engine's live values, as one record. Read when leaving an engine so that what is
+  // on screen is what gets stored for it.
+  const captureEngineSettings = () => ({
+    checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
+    steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
+    sampler, scheduler, guidance, pag, size,
+    hires, adetailer, rtx, postprocessOrder, backgroundRemovalModel,
+  });
+
+  // The reverse: an engine's stored record becomes the working copy. Every field is written, with
+  // no "keep what was there" branch anywhere -- that branch is precisely how a value used to leak
+  // from the engine being left into the engine being opened.
+  const applyEngineSettings = (settings) => {
+    setCheckpoint(settings.checkpoint);
+    setDiffusionModel(settings.diffusionModel);
+    setTextEncoder(settings.textEncoder);
+    setTextEncoder2(settings.textEncoder2);
+    setVae(settings.vae);
+    setCheckpointMissing(false);
+    setDiffusionModelMissing(false);
+    setTextEncoderMissing(false);
+    setTextEncoder2Missing(false);
+    setVaeMissing(false);
+    setSteps(settings.steps);
+    setCfg(settings.cfg);
+    setDenoise(settings.denoise);
+    setImagesPerBatch(settings.imagesPerBatch);
+    setBatchCount(settings.batchCount);
+    setSeed(settings.seed);
+    setSeedMode(settings.seedMode);
+    setSampler(settings.sampler);
+    setScheduler(settings.scheduler);
+    setGuidance(settings.guidance);
+    setPag(settings.pag);
+    setSize(settings.size);
+    setHires(settings.hires);
+    setADetailer(settings.adetailer);
+    setRtx(settings.rtx);
+    setPostprocessOrder(settings.postprocessOrder);
+    setBackgroundRemovalModel(settings.backgroundRemovalModel);
+  };
+
+  /** Stores the selected engine's live values without disturbing any other engine's record. */
+  const commitEngineSettings = (engine, settings) => {
+    const next = withEngineSettings(engineSettingsMapRef.current, engine, settings);
+    engineSettingsMapRef.current = next;
+    setEngineSettingsByEngine(next);
+    return next;
+  };
+
   workspaceSnapshot.current = {
     model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     promptPresets: persistedPromptPresets,
-    sampler, scheduler, guidance, pag, size, processPreview, samplingExpanded, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch,
+    sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch,
+    // The selected engine's record is the live hooks, which have not been written back to the map
+    // yet -- that happens on the way out of an engine. Folding them in here is what makes a reload
+    // in the middle of a session come back to what was on screen rather than to the last switch.
+    engineSettingsByEngine: withEngineSettings(engineSettingsByEngine, model, {
+      checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
+      steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
+      sampler, scheduler, guidance, pag, size,
+      hires, adetailer, rtx, postprocessOrder, backgroundRemovalModel,
+    }),
     mountedLorasByEngine: shouldPersistMountedLoras ? mountedLorasByEngine : mountedLorasRaw,
     loraGroupsByEngine,
     // Compatibility mirror for existing consumers. It is always derived from
@@ -1448,32 +1616,18 @@ function App() {
           setPromptPresetLibraryWarning(workspace.promptPresetLibraryWarning);
           setPromptPresetLibraryRaw(workspace.promptPresetLibraryRaw);
           setShouldPersistPromptPresets(workspace.shouldPersistPromptPresets);
-          setSteps(workspace.steps);
-          setCfg(workspace.cfg);
-          setDenoise(workspace.denoise);
-          setImagesPerBatch(workspace.imagesPerBatch);
-          setBatchCount(workspace.batchCount);
-          setSeed(workspace.seed);
-          setSeedMode(workspace.seedMode);
-          setSampler(workspace.sampler);
-          setScheduler(workspace.scheduler);
-          setGuidance(workspace.guidance);
-          setPag(workspace.pag);
-          setSize(workspace.size);
-          setProcessPreview(workspace.processPreview);
-          setBackgroundRemovalModel(workspace.backgroundRemovalModel);
-          setCheckpoint(workspace.checkpoint);
-          setDiffusionModel(workspace.diffusionModel);
-          setTextEncoder(workspace.textEncoder);
-          setTextEncoder2(workspace.textEncoder2);
-          setVae(workspace.vae);
+          // Every generation parameter comes from the selected engine's own record. The flat
+          // fields beside it in the document describe the same engine and are kept for consumers
+          // that still read them, but the map is what the workspace is restored from, so a value
+          // that is not valid for this engine is corrected on the way in rather than carried.
+          engineSettingsMapRef.current = workspace.engineSettingsByEngine;
+          setEngineSettingsByEngine(workspace.engineSettingsByEngine);
+          if (workspace.engineSettingsWarning) setAppNotice({ message: workspace.engineSettingsWarning, error: true });
+          applyEngineSettings(engineSettingsFor(workspace.engineSettingsByEngine, workspace.model));
           setLoraCategory(workspace.loraCategory);
           setLoraSearch(workspace.loraSearch);
           setSamplingExpanded(workspace.samplingExpanded);
-          setHires({ ...HIRES_DEFAULTS, ...workspace.hires });
-          setADetailer({ ...ADETAILER_DEFAULTS, ...workspace.adetailer });
-          setRtx({ ...RTX_DEFAULTS, ...workspace.rtx });
-          setPostprocessOrder(workspace.postprocessOrder);
+          setRunInfoVisible(workspace.runInfoVisible);
           setImageToImage(workspace.imageToImage);
         }
         setTheme(loadThemeState(saved?.theme));
@@ -1538,7 +1692,7 @@ function App() {
     if (!uiStateReady) return undefined;
     const timer = window.setTimeout(persistUiState, 300);
     return () => window.clearTimeout(timer);
-  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, processPreview, samplingExpanded, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
+  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
 
   useEffect(() => {
     const saveBeforeExit = () => persistUiState(true);
@@ -1852,18 +2006,6 @@ function App() {
   }, [modelLoading, loraLoading, inferenceHealth?.status, initialLoading]);
 
   useEffect(() => {
-    if (!loraManagerOpen) return undefined;
-    const handleEscape = (event) => event.key === "Escape" && !loraDetail && setLoraManagerOpen(false);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", handleEscape);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", handleEscape);
-    };
-  }, [loraManagerOpen, loraDetail]);
-
-  useEffect(() => {
     if (!uiStateReady || typeof BroadcastChannel === "undefined") return undefined;
     const channel = new BroadcastChannel(LORA_SYNC_CHANNEL);
     loraSyncChannel.current = channel;
@@ -2021,17 +2163,13 @@ function App() {
     };
   }, [hardwareMonitorOpen]);
 
-  useEffect(() => {
-    if (!settingsOpen) return undefined;
-    const handleEscape = (event) => event.key === "Escape" && !reconfiguring && setSettingsOpen(false);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", handleEscape);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", handleEscape);
-    };
-  }, [settingsOpen, reconfiguring]);
+  // Settings used to hand-roll half of this: an Escape listener and a body-overflow save/restore,
+  // with no focus trap and no focus return. Tab walked straight out of the dialog into the page
+  // behind it, and closing left focus on <body>. The shared hook is what every Gallery dialog
+  // already used; `reconfiguring` is passed as `canClose` so a run in progress still blocks Escape.
+  const settingsDialogRef = useDialogLifecycle(settingsOpen, () => setSettingsOpen(false), "", !reconfiguring);
+  const loraManagerDialogRef = useDialogLifecycle(loraManagerOpen, () => setLoraManagerOpen(false));
+  const updateConfirmDialogRef = useDialogLifecycle(updateConfirmOpen, () => setUpdateConfirmOpen(false), "", !onlineUpdate.checking);
 
   useEffect(() => {
     if (!settingsOpen || settingsTab !== "logs") return;
@@ -2050,12 +2188,14 @@ function App() {
 
   useEffect(() => {
     if (!uiStateReady || inferenceHealth?.performance_settings?.memory_mode !== "ultra_low_vram") return;
-    setProcessPreview(false);
     setHires((current) => current.enabled ? { ...current, enabled: false } : current);
     setADetailer((current) => current.enabled ? { ...current, enabled: false } : current);
     setRtx((current) => current.enabled ? { ...current, enabled: false } : current);
     commitMountedLoras(() => []);
-  }, [uiStateReady, inferenceHealth?.performance_settings?.memory_mode]);
+    // `model` is a dependency because the parameters are per-engine now: the mode is a property of
+    // the machine rather than of one engine, so an engine opened later with its own Hires chain
+    // still enabled has to be brought into line the same way the engine open at the time was.
+  }, [uiStateReady, model, inferenceHealth?.performance_settings?.memory_mode]);
 
   useEffect(() => {
     const models = inferenceHealth?.upscalers?.models || [];
@@ -2101,7 +2241,6 @@ function App() {
         setInferenceHealth(health);
         attempts = health.status === "ready" ? 0 : attempts + 1;
         if (health.performance_settings?.memory_mode === "ultra_low_vram") {
-          setProcessPreview(false);
           setHires((current) => current.enabled ? { ...current, enabled: false } : current);
           setADetailer((current) => current.enabled ? { ...current, enabled: false } : current);
           setRtx((current) => current.enabled ? { ...current, enabled: false } : current);
@@ -2218,7 +2357,6 @@ function App() {
         setGenerationStage(job.stage || "");
         setGenerationStageStep(job.stage_step ?? 0);
         setGenerationStageTotal(job.stage_total ?? 0);
-        setPreviewKind(job.preview_kind || "");
         setGenerationDetail(job.adetailer_state || null);
         setGenerationWarning(job.warning || "");
         if (job.prompt_tokens !== null && job.prompt_tokens !== undefined) {
@@ -2257,8 +2395,10 @@ function App() {
             loaded_engine: job.loaded_engine,
           }));
         }
-        if (job.preview_url && job.preview_version) {
-          setLivePreview(`${job.preview_url}?v=${job.preview_version}`);
+        // Each finished stage stays on screen for the whole of the stage that follows it, so the
+        // base sample is what is shown while Hires runs and the Hires result while ADetailer runs.
+        if (Array.isArray(job.stage_previews)) {
+          setStagePreviews(job.stage_previews);
         }
         if (job.status === "complete") {
           generationLocked.current = false;
@@ -2275,7 +2415,6 @@ function App() {
           setSelectedOutputIndex(0);
           setGeneratedImage(outputs[0]?.url || "");
           setGeneratedName(outputs[0]?.output_name || `XirAI-${generationJob}.png`);
-          setLivePreview("");
           setStatus("complete");
           setProgress(100);
           setGenerationPhase(`完成 · ${job.elapsed_seconds ?? 0}s`);
@@ -2295,7 +2434,6 @@ function App() {
           setStatus("cancelled");
           setGenerationTaskStatus("cancelled");
           setGenerationPhase("生成已终止");
-          setLivePreview("");
           return;
         }
         window.setTimeout(poll, 500);
@@ -2319,11 +2457,81 @@ function App() {
     return () => { stopped = true; };
   }, [generationJob, status]);
 
+  // The queue is read from the service rather than assembled here: it is the thing that decides
+  // what runs next, and a second copy kept by the page would disagree with it the moment a job
+  // failed or was cancelled from somewhere else.
+  const refreshQueue = useCallback(async () => {
+    try {
+      const response = await fetch("/api/inference/jobs", { cache: "no-store" });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      setQueue(Array.isArray(payload.jobs) ? payload.jobs : []);
+      setQueueCounts(payload.counts || null);
+      setQueueError("");
+      return payload;
+    } catch {
+      // A queue that cannot be read is not a generation failure; the panel keeps whatever it has.
+      return null;
+    }
+  }, []);
+
+  // Poll while anything is outstanding, and while the list is open so a watching user sees jobs
+  // finish. Otherwise the queue is static and there is nothing to ask about.
+  //
+  // The dependency is the derived flag, never the queue itself: depending on the array would
+  // restart this effect on every refresh, and each restart fires an immediate poll, which is a
+  // request loop rather than an interval.
+  const queueOutstanding = queue.some((job) => job.active);
+  useEffect(() => {
+    if (!queueOutstanding && !queueOpen) return undefined;
+    let stopped = false;
+    const tick = () => { if (!stopped) refreshQueue(); };
+    tick();
+    const timer = setInterval(tick, queueOutstanding ? 1200 : 4000);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [queueOutstanding, queueOpen, refreshQueue]);
+
+  // One read at startup, so a page opened while the service is already working shows the queue it
+  // walked into rather than an empty list.
+  useEffect(() => { refreshQueue(); }, [refreshQueue]);
+
+  // How many jobs are still waiting to start — what a user about to submit actually wants to know.
+  const queuePendingCount = queue.filter((job) => job.waiting).length;
+  // The most recent finished stage. It is what the panel shows while the next stage runs.
+  const latestStagePreview = stagePreviews.length ? stagePreviews[stagePreviews.length - 1] : null;
+  const cancelQueuedJob = async (jobId) => {
+    try {
+      await fetch(`/api/inference/jobs/${jobId}/cancel`, { method: "POST" });
+    } catch {
+      // The refresh below reports the real state either way.
+    }
+    refreshQueue();
+  };
+
+  // When the watched job ends, follow whatever the service moved on to. Without this the panel
+  // would sit on a finished result while the next queued job ran unobserved.
+  useEffect(() => {
+    if (status === "running") return;
+    const next = queue.find((job) => job.active && job.id !== generationJob);
+    if (!next) return;
+    setGenerationJob(next.id);
+    setStagePreviews([]);
+    setEnlargedStage(null);
+    setStatus("running");
+    setGenerationTaskStatus(next.status || "running");
+    setGenerationPhase(next.phase || "正在生成");
+    setGenerationProgressCollapsed(false);
+    generationLocked.current = true;
+  }, [queue, status, generationJob]);
+
   // Every run starts from the same cleared board, whichever page asked for it. Both pages share one
-  // set of job state because the inference service runs one job at a time: two independent copies
-  // would let a page display progress for a run it did not start.
+  // set of job state because the panel watches one job at a time — the one the service is actually
+  // working on. Submitting while that job runs queues the new one instead of taking the panel over,
+  // so this only clears the board when there is nothing already being watched.
   const beginGenerationRun = ({ totalSteps, batches, totalImages }) => {
     generationLocked.current = true;
+    setStagePreviews([]);
+    setEnlargedStage(null);
     setProgress(0);
     setStatus("running");
     setGenerationPhase("正在提交任务");
@@ -2334,11 +2542,9 @@ function App() {
     setGeneratedName("");
     setGeneratedOutputs([]);
     setSelectedOutputIndex(0);
-    setLivePreview("");
     setGenerationStage("queued");
     setGenerationStageStep(0);
     setGenerationStageTotal(0);
-    setPreviewKind("");
     setGenerationDetail(null);
     setGenerationStep(0);
     setGenerationTotal(totalSteps);
@@ -2355,8 +2561,13 @@ function App() {
   };
 
   const generate = async () => {
-    if (generationLocked.current || generationDisabledReason) return;
+    // `generationDisabledReason` still applies — it covers a missing model or an unreachable
+    // service, which queuing does not fix. What no longer blocks a submission is another job being
+    // in flight: that one queues behind whatever is running.
+    if (submissionInFlight.current || generationDisabledReason) return;
+    const watching = generationJob && status === "running";
     const animaGeneration = model === "Anima";
+    const tiledHiresGeneration = supportsUsduTiled(model);
     const fluxGeneration = model === "Flux";
     const flux2Generation = model === "Flux2";
     const krea2Generation = model === "Krea2";
@@ -2364,7 +2575,10 @@ function App() {
     const nativeGeneration = animaGeneration || fluxGeneration || flux2Generation || krea2Generation;
     // Both Flux generations are guidance distilled: no negative branch, no enhancement.
     const distilledGeneration = DISTILLED_GUIDANCE_ENGINES.includes(model);
-    beginGenerationRun({ totalSteps: steps, batches: batchCount, totalImages: imagesPerBatch * batchCount });
+    submissionInFlight.current = true;
+    if (!watching) {
+      beginGenerationRun({ totalSteps: steps, batches: batchCount, totalImages: imagesPerBatch * batchCount });
+    }
     const generationSeed = seedMode === "random" ? randomSeed() : normalizeSeed(seed);
     const generationLoras = frozenMountedLorasForScope(mountedLorasMapRef.current, activeLoraScopeRef.current);
     // Which combinations were on, and the exact prefix they contributed. Recorded
@@ -2381,7 +2595,6 @@ function App() {
       sampler: nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
       scheduler: nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
       guidance: distilledGeneration ? "none" : guidance,
-      processPreview: nativeGeneration ? false : processPreview,
       hires: generationHires,
       adetailer,
       rtx,
@@ -2420,7 +2633,6 @@ function App() {
           scheduler: nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
           guidance: distilledGeneration ? "none" : guidance,
           pag: { scale: pag.scale, applied_layers: pag.appliedLayers },
-          preview_enabled: nativeGeneration ? false : processPreview,
           background_removal_model: transparentPromptEnabled ? backgroundRemovalModel : null,
           hires: {
             // Protocol 27 carries strict execution and lossless Hires seed contracts.
@@ -2433,7 +2645,7 @@ function App() {
             cfg: hires.cfg,
             tile_size: hires.tileSize,
             tile_overlap: hires.tileOverlap,
-            execution_mode: animaGeneration && hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
+            execution_mode: tiledHiresGeneration && hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
             ...(hires.sampler ? { sampler: hires.sampler } : {}),
             ...(hires.scheduler ? { scheduler: hires.scheduler } : {}),
             tile_width: hires.tileWidth,
@@ -2459,9 +2671,15 @@ function App() {
         const detail = Array.isArray(job.detail) ? job.detail.map((item) => item.msg || String(item)).join("；") : job.detail;
         throw new Error(detail || job.error || "任务提交失败");
       }
-      setGenerationJob(job.id);
-      setGenerationTaskStatus(job.status || "queued");
-      setGenerationPhase(job.phase || "已进入队列");
+      submissionInFlight.current = false;
+      refreshQueue();
+      // Only follow the new job if the panel was free. If a job is already being watched, this one
+      // waits its turn and the panel switches to it when its turn comes.
+      if (!watching) {
+        setGenerationJob(job.id);
+        setGenerationTaskStatus(job.status || "queued");
+        setGenerationPhase(job.phase || "已进入队列");
+      }
       if (seedMode === "increment") {
         setSeed(((BigInt(generationSeed) + BigInt(imagesPerBatch * batchCount)) & MAX_SEED).toString());
       } else if (seedMode === "decrement") {
@@ -2469,10 +2687,16 @@ function App() {
         setSeed(((BigInt(generationSeed) - decrement + MAX_SEED + 1n) & MAX_SEED).toString());
       }
     } catch (error) {
-      generationLocked.current = false;
-      setStatus("error");
-      setGenerationError(error.message);
-      setGenerationPhase("任务提交失败");
+      submissionInFlight.current = false;
+      // A submission that never reached the service leaves the running job alone: reporting the
+      // failure by taking over the panel would hide a run that is still going fine.
+      if (!watching) {
+        generationLocked.current = false;
+        setStatus("error");
+        setGenerationError(error.message);
+        setGenerationPhase("任务提交失败");
+      }
+      setQueueError(error.message);
       logClientGenerationFailure("job-submission", error.message);
     }
   };
@@ -2517,7 +2741,6 @@ function App() {
       size: outputSize(imageSource, settings),
       imagesPerBatch: settings.imagesPerBatch,
       batchCount: settings.batchCount,
-      processPreview: model !== "Anima",
       imageToImage: { ...settings, hires: { ...settings.hires, ...runHiresSeed } },
       hires: { ...settings.hires, ...runHiresSeed },
       adetailer: settings.adetailer,
@@ -2603,7 +2826,7 @@ function App() {
     setModelSwitching(false);
   };
 
-  const applyGallerySettings = async (savedSettings, groups, { page = "generate", label = "精选参数" } = {}) => {
+  const applyGallerySettings = async (savedSettings, groups, { page = "generate", label = "精选参数", fillMissingAssets = false } = {}) => {
     if (status === "running" || modelSwitching || modelLoading) throw new Error(`生成或模型切换期间不能应用${label}`);
     const selectedGroups = new Set(groups);
     const current = workspaceSnapshot.current;
@@ -2611,6 +2834,7 @@ function App() {
     delete source.promptPresets;
     delete source.mountedLorasByEngine;
     delete source.loraGroupsByEngine;
+    delete source.engineSettingsByEngine;
     const sourceModel = READY_ENGINES.includes(source.model) ? source.model : current.model;
     const targetModel = selectedGroups.has("model") ? sourceModel : current.model;
     let targetHealthPayload = targetModel === model ? inferenceHealth : null;
@@ -2632,11 +2856,17 @@ function App() {
       rtx: { ...current.rtx, ...source.rtx },
       loras: Array.isArray(source.loras) ? source.loras : current.loras,
     });
-    if (!normalized) throw new Error("精选卡片参数格式无效");
+    if (!normalized) throw new Error(`${label}格式无效`);
     if (selectedGroups.has("loras") && !selectedGroups.has("model") && sourceModel !== model) {
       throw new Error("该 LoRA 组合属于其他模型引擎，请同时选择“底模”参数");
     }
     const engineChanged = selectedGroups.has("model") && normalized.model !== model;
+    // Applying a card that names a different engine leaves the current one, so its parameters are
+    // put down first, exactly as a manual switch does. This reads the values of the render this
+    // handler was called in, so it captures what the outgoing engine had rather than what the card
+    // is about to write. Everything below sets the incoming engine's values into the live hooks,
+    // and the workspace snapshot folds those into the incoming engine's record.
+    if (engineChanged) commitEngineSettings(model, captureEngineSettings());
     const checkpointChanged = selectedGroups.has("model") && normalized.checkpoint !== checkpoint;
     const splitAssetsChanged = selectedGroups.has("model") && (
       normalized.diffusionModel !== diffusionModel
@@ -2650,7 +2880,7 @@ function App() {
         SPLIT_MODEL_ENGINES.includes(normalized.model) ? fetch("/api/inference/health", { cache: "no-store" }) : Promise.resolve(null),
       ]);
       const modelsPayload = await modelsResponse.json().catch(() => ({}));
-      if (!modelsResponse.ok) throw new Error(modelsPayload.error || "无法验证精选卡片的模型目录");
+      if (!modelsResponse.ok) throw new Error(modelsPayload.error || `无法验证${label}的模型目录`);
       if (SPLIT_MODEL_ENGINES.includes(normalized.model)) {
         const required = [
           ["diffusionModel", "扩散模型", modelsPayload.assets?.diffusion_model?.models || []],
@@ -2658,9 +2888,19 @@ function App() {
           ...(normalized.model === "Flux" ? [["textEncoder2", "T5-XXL 文本编码器", modelsPayload.assets?.text_encoder_2?.models || []]] : []),
           ["vae", "VAE", modelsPayload.assets?.vae?.models || []],
         ];
-        for (const [field, label, catalog] of required) {
+        for (const [field, assetLabel, catalog] of required) {
+          // A picture that names only its diffusion model leaves the encoder and VAE to this engine's
+          // own record, which is empty for an engine never opened here. With exactly one candidate
+          // installed there is nothing to choose between, so it is taken rather than refused.
+          if (!normalized[field] && catalog.length === 1) normalized[field] = catalog[0].value;
+          // A picture read from disk names its diffusion model and nothing else, so its encoder and
+          // VAE were borrowed from the target engine's saved record, which can hold a file this
+          // engine cannot load. With one installed candidate that is the only possible answer. The
+          // diffusion model itself is never swapped: it is the one thing the picture actually said.
+          // Gallery cards do not pass the flag, so a card's own recorded files are still checked as-is.
+          else if (fillMissingAssets && field !== "diffusionModel" && catalog.length === 1 && !catalog.some((item) => item.value === normalized[field])) normalized[field] = catalog[0].value;
           if (!normalized[field] || !catalog.some((item) => item.value === normalized[field])) {
-            throw new Error(`精选卡片的 ${normalized.model} ${label}未安装或已移动，当前模型缓存保持不变`);
+            throw new Error(`${label}的 ${normalized.model} ${assetLabel}未安装或已移动，当前模型缓存保持不变`);
           }
         }
         const healthPayload = await healthResponse.json().catch(() => ({}));
@@ -2670,7 +2910,7 @@ function App() {
         }
         targetHealthPayload = healthPayload;
       } else if (!normalized.checkpoint || !modelsPayload.models?.some((item) => item.value === normalized.checkpoint)) {
-        throw new Error("精选卡片的底模未安装或已移动，当前模型缓存保持不变");
+        throw new Error(`${label}的底模未安装或已移动，当前模型缓存保持不变`);
       }
     }
     const targetLoraIdentity = selectedGroups.has("model")
@@ -2699,31 +2939,31 @@ function App() {
         [(engineChanged || selectedGroups.has("rtx")) && effectiveRtx.enabled, "rtx", "RTX VSR"],
       ];
       const unsupported = requestedFeatures.find(([enabled, feature]) => enabled && features[feature] !== true);
-      if (unsupported) throw new Error(`当前推理服务未声明 ${targetModel} ${unsupported[2]} 能力，精选参数尚未应用`);
+      if (unsupported) throw new Error(`当前推理服务未声明 ${targetModel} ${unsupported[2]} 能力，${label}尚未应用`);
       const enabledLoras = effectiveLoras.filter((item) => item.enabled !== false);
       if ((engineChanged || selectedGroups.has("loras")) && enabledLoras.length) {
         const loraResponse = await fetch(`/api/loras?engine=${encodeURIComponent(targetModel)}`, { cache: "no-store" });
         const loraPayload = await loraResponse.json().catch(() => ({}));
-        if (!loraResponse.ok) throw new Error(loraPayload.error || `无法验证精选卡片的 ${targetModel} LoRA 目录`);
+        if (!loraResponse.ok) throw new Error(loraPayload.error || `无法验证${label}的 ${targetModel} LoRA 目录`);
         const available = new Set((loraPayload.categories || []).flatMap((category) => category.models || []).map((item) => item.value));
-        if (enabledLoras.some((item) => !available.has(item.value))) throw new Error(`精选卡片的 ${targetModel} LoRA 文件未安装或已移动`);
+        if (enabledLoras.some((item) => !available.has(item.value))) throw new Error(`${label}的 ${targetModel} LoRA 文件未安装或已移动`);
       }
       if ((engineChanged || selectedGroups.has("hires")) && effectiveHires.enabled) {
         const upscalers = targetHealthPayload?.upscalers || {};
         const selected = (upscalers.models || []).find((item) => item.id === effectiveHires.model);
-        if (!upscalers.runtime_available || !selected?.compatible) throw new Error("精选卡片的 Hires.fix 超分模型尚未就绪");
+        if (!upscalers.runtime_available || !selected?.compatible) throw new Error(`${label}的 Hires.fix 超分模型尚未就绪`);
         if (Math.floor(effectiveHires.steps * effectiveHires.denoise) < 1 || effectiveHires.tileOverlap > Math.floor(effectiveHires.tileSize / 2)) {
-          throw new Error("精选卡片的 Hires.fix 参数无效");
+          throw new Error(`${label}的 Hires.fix 参数无效`);
         }
       }
       if ((engineChanged || selectedGroups.has("adetailer")) && effectiveADetailer.enabled) {
         const detectorReady = adetailerInfo.available && adetailerModels.some((item) => item.value === effectiveADetailer.detector);
         const baseSteps = selectedGroups.has("sampling") ? normalized.steps : current.steps;
         const effectiveSteps = Math.floor((effectiveADetailer.useSteps ? effectiveADetailer.steps : baseSteps) * effectiveADetailer.denoise);
-        if (!detectorReady || effectiveSteps < 1) throw new Error("精选卡片的 ADetailer 检测模型或重绘参数尚未就绪");
+        if (!detectorReady || effectiveSteps < 1) throw new Error(`${label}的 ADetailer 检测模型或重绘参数尚未就绪`);
       }
       if ((engineChanged || selectedGroups.has("rtx")) && effectiveRtx.enabled && targetHealthPayload?.rtx_vsr?.available !== true) {
-        throw new Error(targetHealthPayload?.rtx_vsr?.reason || "精选卡片需要的 RTX VSR 运行时尚未就绪");
+        throw new Error(targetHealthPayload?.rtx_vsr?.reason || `${label}需要的 RTX VSR 运行时尚未就绪`);
       }
     }
     const modelIdentityChanged = engineChanged || checkpointChanged || splitAssetsChanged;
@@ -2776,7 +3016,6 @@ function App() {
       setPostprocessOrder(normalized.postprocessOrder);
     }
     if (selectedGroups.has("auxiliary")) {
-      setProcessPreview(normalized.processPreview);
       setBackgroundRemovalModel(normalized.backgroundRemovalModel);
     }
 
@@ -2797,10 +3036,8 @@ function App() {
         if (!selectedGroups.has("sampling")) {
           setGuidance((currentGuidance) => currentGuidance === "pag" && !pagAvailableForEngine(targetHealthPayload, normalized.model) ? "none" : currentGuidance);
         }
-        setProcessPreview(false);
       } else if (normalized.model === "Flux") {
         setGuidance("none");
-        setProcessPreview(false);
       } else if (!selectedGroups.has("sampling")) {
         setGuidance((currentGuidance) => currentGuidance === "cfg_zero_star" ? "none" : currentGuidance);
       }
@@ -2863,6 +3100,20 @@ function App() {
     const snapshot = gallerySettingsWithoutPromptPresets(workspaceSnapshot.current);
     const overlay = { ...plan.overlay };
     const targetEngine = overlay.model || snapshot.model;
+    if (targetEngine !== snapshot.model) {
+      // The picture belongs to another engine. A ComfyUI graph does not tell the reader which text
+      // encoder and VAE it ran with, so they come from that engine's own saved record -- not from the
+      // engine that happens to be selected, whose encoder is the wrong model outright (Anima's Qwen3
+      // 0.6B under a Krea 2 diffusion model, say).
+      const record = engineSettingsFor(workspaceSnapshot.current.engineSettingsByEngine, targetEngine);
+      Object.assign(snapshot, {
+        checkpoint: record.checkpoint,
+        diffusionModel: record.diffusionModel,
+        textEncoder: record.textEncoder,
+        textEncoder2: record.textEncoder2,
+        vae: record.vae,
+      });
+    }
     if (Array.isArray(overlay.loras)) {
       // A LoRA found under another engine's root cannot be mounted here: the
       // catalogue scan would prune it moments later. Dropping the whole group
@@ -2876,7 +3127,7 @@ function App() {
       }
     }
     if (!workspaceGroups.length) return;
-    await applyGallerySettings({ ...snapshot, ...overlay }, workspaceGroups, { page: null, label: "图片参数" });
+    await applyGallerySettings({ ...snapshot, ...overlay }, workspaceGroups, { page: null, label: "图片参数", fillMissingAssets: true });
   };
 
   // Choosing a different engine, checkpoint or component is a change of *selection*. It used to tear
@@ -2891,40 +3142,16 @@ function App() {
     // Engine changes restore that engine's independent list; asset changes
     // below deliberately leave it untouched.
     transitionActiveLoraScope(nextModel);
-    setCheckpoint("");
-    setDiffusionModel("");
-    setTextEncoder("");
-    setTextEncoder2("");
-    setVae("");
-    if (nextModel === "Anima") {
-      setSampler((current) => ANIMA_SAMPLERS.includes(current) ? current : "euler");
-      setScheduler((current) => ANIMA_SCHEDULERS.includes(current) ? current : "simple");
-      setGuidance((currentGuidance) => currentGuidance === "pag" && !pagAvailableForEngine(inferenceHealthRef.current, nextModel) ? "none" : currentGuidance);
-      setProcessPreview(false);
-    } else if (nextModel === "Flux") {
-      setSampler((current) => FLUX_SAMPLERS.includes(current) ? current : "euler");
-      setScheduler((current) => FLUX_SCHEDULERS.includes(current) ? current : "simple");
-      // Guidance distillation removes the unconditional branch, so neither enhancement has
-      // anything to work against and the process preview has no latent stream to draw from.
-      setGuidance("none");
-      setProcessPreview(false);
-    } else if (nextModel === "Flux2") {
-      setSampler((current) => FLUX2_SAMPLERS.includes(current) ? current : "euler");
-      setScheduler((current) => FLUX2_SCHEDULERS.includes(current) ? current : "simple");
-      setGuidance("none");
-      setProcessPreview(false);
-    } else if (nextModel === "Krea2") {
-      setSampler((current) => KREA2_SAMPLERS.includes(current) ? current : "euler");
-      setScheduler((current) => KREA2_SCHEDULERS.includes(current) ? current : "simple");
-      // Krea 2 keeps its unconditional branch, so CFG-Zero* survives the switch. PAG does not:
-      // this runtime installs no attention override for the single-stream blocks.
-      setGuidance((currentGuidance) => currentGuidance === "pag" ? "none" : currentGuidance);
-      setProcessPreview(false);
-    } else {
-      setSampler((current) => samplerNames.includes(current) ? current : "dpmpp_2m");
-      setScheduler((current) => schedulerNames.includes(current) ? current : "karras");
-      setGuidance((currentGuidance) => currentGuidance === "cfg_zero_star" ? "none" : currentGuidance);
-    }
+    // Put down what the engine being left was holding, then pick up what the engine being opened
+    // was holding. Neither step edits the other engine's record, which is what makes the two
+    // independent: the old code mutated one shared set on the way past and could not put back what
+    // it had overwritten.
+    const stored = commitEngineSettings(model, captureEngineSettings());
+    const restored = engineSettingsFor(stored, nextModel);
+    applyEngineSettings(restored);
+    // PAG is the one setting whose availability the store cannot decide, because it depends on what
+    // the installed runtime reports rather than on the engine alone.
+    if (restored.guidance === "pag" && !pagAvailableForEngine(inferenceHealthRef.current, nextModel)) setGuidance("none");
     setModel(nextModel);
   };
 
@@ -3503,6 +3730,12 @@ function App() {
       const mimeType = blob.type === "image/gif" ? "image/gif" : "image/png";
       const contents = { [mimeType]: blob };
       if (includeLayerMarker) contents["text/plain"] = new Blob([`XIRAI_LAYER:${layer.id}`], { type: "text/plain" });
+      // A picture has no fallback the way text does: `execCommand("copy")` copies a selection, never
+      // an image. Outside a secure context the API is simply absent, so say why rather than
+      // surfacing "cannot read properties of undefined".
+      if (!globalThis.isSecureContext || !navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+        throw new Error("浏览器只在 HTTPS 或 localhost 页面允许复制图片，请改用下载");
+      }
       await navigator.clipboard.write([new ClipboardItem(contents)]);
       if (viewerSession.current.isCurrent(token)) setViewerNotice(mimeType === "image/gif" ? "已复制 GIF 动画" : "已复制无生成元数据的 PNG 图片");
     } catch (error) {
@@ -4245,6 +4478,26 @@ function App() {
     void copyViewerLayer(activeViewerLayerItem, true);
   };
 
+  // Over plain HTTP, Ctrl+C cannot put the picture on the clipboard, but a trusted copy event may
+  // still carry text. The layer's marker goes there, so Ctrl+V pastes this layer deterministically --
+  // rather than falling back to whatever external picture the clipboard held -- and nothing reports
+  // a failure for what is, inside the canvas, a working copy. A real text selection keeps its copy.
+  const copyViewerLayerMarker = (event) => {
+    if (!nativeImageCopy || !imageViewerOpen || activeCollage || !activeViewerLayerItem || isEditableTarget(event.target)) return;
+    if (window.getSelection?.()?.toString()) return;
+    viewerClipboard.current = { layer: { ...activeViewerLayerItem }, copiedAt: Date.now() };
+    event.clipboardData?.setData("text/plain", `XIRAI_LAYER:${activeViewerLayerItem.id}`);
+    event.preventDefault();
+    setViewerNotice("已复制到画布：HTTP 访问下只能在本页粘贴，复制到其他软件请右键用浏览器菜单「复制图片」");
+  };
+  // No dependency list: the handler reads the current layer and viewer state, so it is subscribed
+  // fresh on every render rather than capturing a stale one.
+  useEffect(() => {
+    if (!nativeImageCopy || !imageViewerOpen) return undefined;
+    window.addEventListener("copy", copyViewerLayerMarker);
+    return () => window.removeEventListener("copy", copyViewerLayerMarker);
+  });
+
   const pasteViewerLayer = (event) => {
     if (!imageViewerOpen || activeCollage || isEditableTarget(event.target)) return;
     const copied = viewerClipboard.current;
@@ -4611,7 +4864,6 @@ function App() {
       if (!response.ok) throw new Error(payload.detail || "无法保存性能配置");
       applyPerformancePayload(payload);
       if (payload.settings?.memory_mode === "ultra_low_vram") {
-        setProcessPreview(false);
         setHires((current) => ({ ...current, enabled: false }));
         setADetailer((current) => ({ ...current, enabled: false }));
         setRtx((current) => ({ ...current, enabled: false }));
@@ -4903,6 +5155,9 @@ function App() {
           return;
         }
         if (event.key.toLowerCase() === "c" && activeViewerLayerItem && !activeCollage) {
+          // Over plain HTTP the picture cannot be written, so the key is left to the browser, and the
+          // copy event it raises carries the layer's marker instead (copyViewerLayerMarker).
+          if (nativeImageCopy) return;
           event.preventDefault();
           copyActiveViewerLayer();
           return;
@@ -5021,6 +5276,7 @@ function App() {
     && size.width <= 2048 && size.height <= 2048
     && size.width % 64 === 0 && size.height % 64 === 0;
   const isAnima = model === "Anima";
+  const tilesHires = supportsUsduTiled(model);
   const isFlux = model === "Flux";
   const isFlux2 = model === "Flux2";
   const isKrea2 = model === "Krea2";
@@ -5041,7 +5297,6 @@ function App() {
   const engineAllowsHires = isSplitModel ? selectedEngineFeatures.hires === true : selectedEngineFeatures.hires !== false;
   const engineAllowsADetailer = isSplitModel ? selectedEngineFeatures.adetailer === true : selectedEngineFeatures.adetailer !== false;
   const engineAllowsRtx = isSplitModel ? selectedEngineFeatures.rtx === true : selectedEngineFeatures.rtx !== false;
-  const engineAllowsProcessPreview = !isSplitModel && selectedEngineFeatures.process_preview !== false;
   // Both Flux generations steer with a distilled guidance embedding instead of classifier-free
   // guidance, so the CFG control means something different and the negative prompt has nothing to
   // encode into.
@@ -5112,7 +5367,6 @@ function App() {
   const animaSettingsUnsupported = isSplitModel && (
     !activeSamplerNames.includes(sampler)
     || !activeSchedulerNames.includes(scheduler)
-    || processPreview
     || (isDistilledGuidance && guidance !== "none")
   );
   const splitModelAssetsReady = isFlux
@@ -5143,7 +5397,7 @@ function App() {
                   : isSplitModel && vaeMissing ? `当前 ${engineLabel} VAE 文件已不存在`
                      : isSplitModel && animaTokenizerMissing.length ? `${animaTokenizerMissing.join(" / ")} 运行资源缺失或损坏，请修复或重新运行环境配置器`
                        : isSplitModel && ultraLowMode ? `${engineLabel} 原生运行时暂不支持极限省存模式`
-                        : isSplitModel && animaSettingsUnsupported ? `当前 ${engineLabel} 参数包含不受支持的采样、引导或过程预览设置`
+                        : isSplitModel && animaSettingsUnsupported ? `当前 ${engineLabel} 参数包含不受支持的采样或引导设置`
                          : !loraReady ? `当前推理服务未声明 ${engineLabel} LoRA 能力`
                            : !loraResourcesReady ? "已启用的 LoRA 文件未安装、已移动或目录尚未就绪"
                              : hires.enabled && !engineAllowsHires ? `当前推理服务未声明 ${engineLabel} Hires.fix 能力`
@@ -5418,13 +5672,13 @@ function App() {
                  <small>{hires.seedMode === "inherit" ? "每张结果继承该张首轮 Seed" : hires.seedMode === "fixed" ? "所有结果使用同一个无损 uint64 Hires Seed" : "每张结果在后端独立解析一次安全 uint64 Hires Seed"}</small>
                </div>
                {hires.enabled && hiresEffectiveSteps < 1 && <p className="hires-unavailable">当前步数与重绘强度不会产生有效扩散步骤，请提高其中一项。</p>}
-               {model === "Anima" && <label className="hires-model">重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame"} disabled={hiresControlsLocked} onChange={(executionMode) => updateHires({ executionMode })} options={[{ value: "usdu_tiled", label: "USDU 分块重绘（推荐）" }, { value: "full_frame", label: "整图重绘（兼容）" }]} /></label>}
+               {tilesHires && <label className="hires-model">重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame"} disabled={hiresControlsLocked} onChange={(executionMode) => updateHires({ executionMode })} options={[{ value: "usdu_tiled", label: "USDU 分块重绘（推荐）" }, { value: "full_frame", label: "整图重绘（兼容）" }]} /></label>}
                <div className="hires-tile-grid">
                  <label>Hires 采样器<WorkspaceSelect ariaLabel="Hires 采样器" value={hires.sampler || ""} disabled={hiresControlsLocked} onChange={(samplerValue) => updateHires({ sampler: samplerValue || null })} options={[{ value: "", label: "跟随首轮" }, ...(model === "Anima" ? ANIMA_SAMPLERS : samplerNames).map((item) => ({ value: item, label: item }))]} /></label>
                  <label>Hires 调度器<WorkspaceSelect ariaLabel="Hires 调度器" value={hires.scheduler || ""} disabled={hiresControlsLocked} onChange={(schedulerValue) => updateHires({ scheduler: schedulerValue || null })} options={[{ value: "", label: "跟随首轮" }, ...(model === "Anima" ? ANIMA_SCHEDULERS : schedulerNames).map((item) => ({ value: item, label: item }))]} /></label>
                </div>
-              {model === "Anima" && hires.executionMode === "usdu_tiled" && <div className="hires-tile-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div>}
-              {model === "Anima" && hires.executionMode === "usdu_tiled" && <p className="hires-incompatible">Auto = 首轮源图宽高（当前 {size.width} × {size.height}），本轮 2x 会形成 2 × 2；padding 32；mask blur 8；uniform tiles；per-tile VAE tiled decode；seam None；每 tile 执行 Hires steps。</p>}
+              {tilesHires && hires.executionMode === "usdu_tiled" && <div className="hires-tile-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div>}
+              {tilesHires && hires.executionMode === "usdu_tiled" && <p className="hires-incompatible">Auto = 首轮源图宽高（当前 {size.width} × {size.height}），本轮 2x 会形成 2 × 2；padding 32；mask blur 8；uniform tiles；per-tile VAE tiled decode；seam None；每 tile 执行 Hires steps。</p>}
               <div className="hires-tile-grid">
                 <label>RealESRGAN / SR 像素放大分块<BoundedNumberInput value={hires.tileSize} min={32} max={2048} integer disabled={hiresControlsLocked} onCommit={(tileSize) => updateHires({ tileSize, tileOverlap: Math.min(hires.tileOverlap, Math.floor(tileSize / 2)) })} /></label>
                 <label>RealESRGAN / SR 像素放大分块重叠<BoundedNumberInput value={hires.tileOverlap} min={0} max={Math.min(512, Math.floor(hires.tileSize / 2))} integer disabled={hiresControlsLocked} onCommit={(tileOverlap) => updateHires({ tileOverlap })} /></label>
@@ -5595,7 +5849,7 @@ function App() {
           </div>
 
           <label className={`prompt-field positive-field ${transparentPromptEnabled ? "transparent-enabled" : ""}`}>
-            <div><span>正向提示词{transparentPromptEnabled && <b className="special-tag-mark">TRANSPARENT PNG</b>}</span><small>{positive.length} / 2000</small></div>
+            <div><span>正向提示词{transparentPromptEnabled && <b className="special-tag-mark">TRANSPARENT PNG</b>}</span><small>{positive.length} 字符</small></div>
             <textarea ref={positivePromptRef} value={positive} onChange={(event) => changePromptText("positive", event)} onSelect={(event) => recordPromptSelection("positive", event)} onClick={(event) => recordPromptSelection("positive", event)} onKeyUp={(event) => recordPromptSelection("positive", event)} onFocus={(event) => recordPromptSelection("positive", event)} placeholder="描述画面主体、环境、光线与风格..." spellCheck={false} />
             <Sparkles className="field-watermark" size={46} />
           </label>
@@ -5621,7 +5875,7 @@ function App() {
           <PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />
 
           <label className="prompt-field negative-field">
-            <div><span>负向提示词</span><small>{engineAllowsNegativePrompt ? `${negative.length} / 1000` : "当前引擎不使用"}</small></div>
+            <div><span>负向提示词</span><small>{engineAllowsNegativePrompt ? `${negative.length} 字符` : "当前引擎不使用"}</small></div>
             <textarea ref={negativePromptRef} value={negative} disabled={!engineAllowsNegativePrompt} onChange={(event) => changePromptText("negative", event)} onSelect={(event) => recordPromptSelection("negative", event)} onClick={(event) => recordPromptSelection("negative", event)} onKeyUp={(event) => recordPromptSelection("negative", event)} onFocus={(event) => recordPromptSelection("negative", event)} placeholder={engineAllowsNegativePrompt ? "描述需要避免的内容..." : "FLUX.1 没有无条件分支，负向提示词不会参与生成"} spellCheck={false} />
           </label>
           {/* The text is kept, not cleared: switching back to another engine should find it intact. */}
@@ -5642,14 +5896,17 @@ function App() {
         </section>
 
         <aside className="preview-panel panel">
-          <div className="preview-head"><div><span className="eyebrow">{generatedOutputs.length ? `OUTPUT ${String(selectedOutputIndex + 1).padStart(2, "0")}${generatedOutputs.length > 1 ? ` / ${String(generatedOutputs.length).padStart(2, "0")}` : ""}` : "OUTPUT WORKSPACE"}</span><div className="preview-title-row"><h2>生成预览</h2><button className={`preview-toggle ${processPreview ? "active" : ""}`} role="switch" aria-checked={processPreview} disabled={status === "running" || !engineAllowsProcessPreview} title={!engineAllowsProcessPreview ? `${model} 不支持过程预览` : ""} onClick={() => engineAllowsProcessPreview && setProcessPreview((current) => !current)}><i /><span>过程预览</span></button></div></div><div><button type="button" className="unload-model-button" title="释放已加载底模占用的 GPU/内存" disabled={status === "running" || modelSwitching || !inferenceHealth?.model_cached} onClick={unloadLoadedModel}><Trash2 size={13} /><span>{modelSwitching ? "正在卸载" : "卸载模型"}</span></button><button type="button" className="unload-model-button gallery-preview-add" title="把一张或多张生成结果加入画廊" disabled={!generatedOutputs.some((output) => output.asset_id)} onClick={() => setGalleryAddOpen(true)}><ImagePlus size={13} /><span>加入画廊</span></button><button className="icon-button" title="打开图片预览与拼图工作区" onClick={openImageViewer}><Maximize2 size={17} /></button><button className="icon-button" disabled={!generatedImage} onClick={() => { if (!generatedImage) return; const link = document.createElement("a"); link.href = generatedImage; link.download = generatedName || `XirAI-${generationJob}.png`; link.click(); }}><Download size={17} /></button></div></div>
+          <div className="preview-head"><span className="eyebrow">OUTPUT</span><div><button type="button" className="unload-model-button" title="释放已加载底模占用的 GPU/内存" disabled={status === "running" || modelSwitching || !inferenceHealth?.model_cached} onClick={unloadLoadedModel}><Trash2 size={13} /><span>{modelSwitching ? "正在卸载" : "卸载模型"}</span></button><button type="button" className="unload-model-button gallery-preview-add" title="把一张或多张生成结果加入画廊" disabled={!generatedOutputs.some((output) => output.asset_id)} onClick={() => setGalleryAddOpen(true)}><ImagePlus size={13} /><span>加入画廊</span></button><div className="queue-control"><button type="button" className={`unload-model-button queue-button ${queueOutstanding ? "busy" : ""}`} aria-expanded={queueOpen} title="查看本次会话的任务队列" onClick={() => setQueueOpen((current) => !current)}><ListChecks size={13} /><span>队列</span>{queue.length > 0 && <b className="queue-badge">{queuePendingCount > 0 ? `${queuePendingCount} 等待` : queue.length}</b>}</button>{queueOpen && <QueueList jobs={queue} counts={queueCounts} error={queueError} watching={generationJob} onCancel={cancelQueuedJob} onClose={() => setQueueOpen(false)} onSelect={(job) => { if (job.outputs?.[0]?.image_url) { setGeneratedOutputs(job.outputs.map((output, index) => ({ ...output, index: output.index ?? index, url: `${output.image_url}?v=${job.completed_at || 0}` }))); setSelectedOutputIndex(0); setGeneratedImage(`${job.outputs[0].image_url}?v=${job.completed_at || 0}`); setGeneratedName(job.outputs[0].output_name || ""); setStatus("complete"); setQueueOpen(false); } }} />}</div><button type="button" className={`icon-button ${runInfoVisible ? "active" : ""}`} aria-pressed={runInfoVisible} aria-controls="generation-run-info" title={runInfoVisible ? "隐藏模型、显存与条件信息" : "显示模型、显存与条件信息"} onClick={() => setRunInfoVisible((current) => !current)}>{runInfoVisible ? <Eye size={17} /> : <EyeOff size={17} />}</button><button className="icon-button" title="打开图片预览与拼图工作区" onClick={openImageViewer}><Maximize2 size={17} /></button><button className="icon-button" disabled={!generatedImage} onClick={() => { if (!generatedImage) return; const link = document.createElement("a"); link.href = generatedImage; link.download = generatedName || `XirAI-${generationJob}.png`; link.click(); }}><Download size={17} /></button></div></div>
           <div className={`preview-stage ${status}`}>
             <div className="preview-grid" />
             {status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>等待生成</strong><p>也可以直接打开 outputs 图片<br />进入预览与拼图工作区</p><button type="button" onClick={openImageViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
-            {status === "running" && <div className={`generating-preview ${previewKind || generationStage}`}>
-              <div className="step-preview-empty">{livePreview ? null : <><ImageIcon size={28} /><span>{processPreview ? "等待首帧异步预览" : "过程预览已关闭，完成后显示"}</span></>}</div>
-              {livePreview && <img className="step-preview-image" src={livePreview} alt={`${stageLabel} 实时预览`} />}
-              {previewKind === "adetailer_detection" && <div className="preview-stage-badge"><span>YOLO</span><b>检测完成 · {generationDetail?.selected_count || 0} 个区域</b></div>}
+            {status === "running" && <div className={`generating-preview ${generationStage}`}>
+              <div className="step-preview-empty">{latestStagePreview ? null : <><ImageIcon size={28} /><span>正在生成，完成后显示结果</span></>}</div>
+              {/* Once a stage has finished, its picture is what the panel shows for the whole of the
+                  stage that follows: the base sample through Hires, the Hires result through
+                  ADetailer. */}
+              {latestStagePreview
+                && <button type="button" className="stage-preview-image" title={`${latestStagePreview.label} · 点击放大`} onClick={() => setEnlargedStage(latestStagePreview)}><img src={latestStagePreview.url} alt={`${latestStagePreview.label} 阶段结果`} /><span className="stage-preview-tag">{latestStagePreview.label} 已完成 · 正在进行{stageLabel}</span></button>}
               {generationStage === "adetailer_inpaint" && <div className="preview-stage-badge detail"><span>局部放大</span><b>{activeDetail?.class_name || "区域"} · {(activeDetail?.confidence * 100 || 0).toFixed(0)}%</b></div>}
             </div>}
             {status === "complete" && <button className={`completed-preview ${selectedOutput?.transparent_background ? "transparent-preview" : ""}`} onClick={openImageViewer} title="点击放大预览"><img className="generated-image" src={generatedImage} alt={`第 ${selectedOutputIndex + 1} 张 AI 生成结果`} />{selectedOutput?.transparent_background && <div className="transparent-output-badge">RGBA · {selectedOutput.background_removal?.method === "birefnet-lite-fp16" ? "BIREFNET LITE" : selectedOutput.background_removal?.method === "bria-rmbg-2-fp16" ? "RMBG 2.0" : selectedOutput.background_removal?.method === "u2netp-onnx" ? "U-2-NETP" : selectedOutput.background_removal?.method?.startsWith("local:") ? "LOCAL ONNX" : "ALGORITHM"}</div>}<div className="image-caption"><span>{selectedOutput?.width || size.width} × {selectedOutput?.height || size.height} · 批 {selectedOutput?.batch_index || 1} / 图 {selectedOutput?.image_index || 1}</span><span>Seed {selectedOutput?.seed ?? seed} · {generationElapsed.toFixed(1)} 秒</span></div></button>}
@@ -5666,12 +5923,21 @@ function App() {
             <div className="generation-progress-line"><i style={{ width: `${displayedGenerationProgress}%` }} /></div>
             <div className="generation-progress-detail"><span>{generationStageTotal > 0 ? `${generationStageStep} / ${generationStageTotal}` : generationStage === "adetailer_detect" ? "ANALYZING" : "WAIT"}</span><span>{generationStage === "adetailer_inpaint" ? `REGION ${generationDetail?.region_index || 1} / ${generationDetail?.region_total || 1}` : generationStage === "rtx_upscale" ? "NVIDIA VFX" : generationStep > 0 ? `STEP ${generationStep} / ${generationTotal || steps}` : "MODEL LOADING"} · BATCH {generationBatchIndex || 1}/{generationBatchCount} · {generationCompletedImages}/{generationTotalImages} IMAGES</span></div>
           </div>}
+          {stagePreviews.length > 0 && <div className="stage-strip" aria-label="各阶段结果">
+            <div className="stage-strip-head"><span>阶段结果</span><b>{stagePreviews.length} 个阶段</b></div>
+            <div className="stage-strip-items">{stagePreviews.map((stage) => <button type="button" key={`${stage.index}-${stage.stage}`} className="stage-strip-item" title={`${stage.label} · ${stage.width} × ${stage.height} · 点击放大`} onClick={() => setEnlargedStage(stage)}><img src={stage.url} alt={`${stage.label} 阶段结果`} /><span>{stage.label}</span></button>)}</div>
+          </div>}
           {status === "complete" && generatedOutputs.length > 1 && <div className="output-selector" aria-label="生成结果选择器">
             <div className="output-selector-head"><span>结果浏览</span><b>第 {selectedOutputIndex + 1} / {generatedOutputs.length} 张</b></div>
             {outputBatches.length > 1 && <div className="output-batch-tabs">{outputBatches.map((batch) => <button type="button" key={batch} className={selectedOutput?.batch_index === batch ? "active" : ""} onClick={() => selectGeneratedOutput(generatedOutputs.findIndex((output) => output.batch_index === batch))}>批次 {batch}</button>)}</div>}
             <div className="output-image-tabs">{selectedBatchOutputs.map((output) => <button type="button" key={output.index} className={`${selectedOutputIndex === output.index ? "active" : ""} ${output.transparent_background ? "transparent-preview" : ""}`} title={`批次 ${output.batch_index} · 图片 ${output.image_index} · Seed ${output.seed}`} onClick={() => selectGeneratedOutput(output.index)}><img src={output.url} alt="" /><span>{output.image_index}</span></button>)}</div>
           </div>}
           {status === "running" && <div className="generation-controls"><button className="pause-control" disabled={generationControlBusy === "cancel" || generationTaskStatus === "cancelling" || generationTaskStatus === "pausing"} onClick={() => controlGeneration(generationTaskStatus === "paused" ? "resume" : "pause")}>{generationTaskStatus === "paused" ? <Play size={15} /> : <Pause size={15} />}<span>{generationTaskStatus === "paused" ? "继续生成" : generationTaskStatus === "pausing" ? "正在暂停" : "暂停生成"}</span></button><button className="cancel-control" disabled={generationControlBusy === "cancel" || generationTaskStatus === "cancelling"} onClick={() => controlGeneration("cancel")}><Square size={14} /><span>{generationTaskStatus === "cancelling" ? "正在终止" : "终止生成"}</span></button></div>}
+          {/* Model, VRAM tier, cache state, tokenizer conditioning and the engine notice: one
+              block, hidden together, because they answer the same question and it is the whole
+              strip that is in the way once a run is set up. The warning is inside the block by
+              intent -- it is diagnostic, and hiding it is the user's decision to make. */}
+          <div id="generation-run-info" hidden={!runInfoVisible}>
           <div className="generation-info">
             <div title={isSplitModel ? [diffusionModel, textEncoder, textEncoder2, vae].filter(Boolean).join(" · ") : checkpoint}><span>当前模型</span><strong>{isSplitModel ? `${engineLabel} · ${diffusionModel ? diffusionModel.split(/[\\/]/).pop() : "未选择扩散模型"}` : engineLabel}</strong>{isSplitModel && <small>{textEncoder ? textEncoder.split(/[\\/]/).pop() : "未选择编码器"} · {vae ? vae.split(/[\\/]/).pop() : "未选择 VAE"}</small>}</div>
             <div title={inferenceHealth?.memory_reason || "首次生成加载模型时自动评估"}><span>显存档位</span><strong>{inferenceHealth?.memory_label || "AUTO 待评估"}</strong></div>
@@ -5679,9 +5945,10 @@ function App() {
           </div>
           {promptConditioning && <p className="conditioning-info">{isAnima ? "Qwen3 + T5 Tokenizer 条件" : isFlux ? "T5-XXL + CLIP-L 条件" : isFlux2 ? "大语言模型三层取样条件" : isKrea2 ? "Qwen3-VL 十二层取样条件" : "CLIP 条件"}：正向 {promptConditioning.tokens} tokens / {promptConditioning.blocks} blocks{promptConditioning.weightedTokens ? ` / ${promptConditioning.weightedTokens} 加权` : ""}；负向 {promptConditioning.negativeTokens} tokens / {promptConditioning.negativeBlocks} blocks{promptConditioning.negativeWeightedTokens ? ` / ${promptConditioning.negativeWeightedTokens} 加权` : ""}</p>}
           {generationWarning && <p className="generation-warning">{generationWarning}</p>}
-          <button className="generate-button" title={generationDisabledReason || "开始生成"} onClick={generate} disabled={status === "running" || Boolean(generationDisabledReason)}>
-            <span className="generate-icon">{status === "running" ? <RefreshCw className="spin" size={18} /> : <Zap size={18} />}</span>
-            <span><strong>{status === "running" ? "正在生成" : generationDisabledReason ? "暂时无法生成" : "开始生成"}</strong><small>{status === "running" ? `批次 ${generationBatchIndex || 1}/${generationBatchCount} · ${generationCompletedImages}/${generationTotalImages} 张` : generationDisabledReason || `${imagesPerBatch} 张 × ${batchCount} 批 · 共 ${imagesPerBatch * batchCount} 张`}</small></span>
+          </div>
+          <button className={`generate-button ${status === "running" ? "queueing" : ""}`} title={generationDisabledReason || (status === "running" ? "按当前参数排队一个新任务" : "开始生成")} onClick={generate} disabled={Boolean(generationDisabledReason)}>
+            <span className="generate-icon">{status === "running" ? <ListPlus size={18} /> : <Zap size={18} />}</span>
+            <span><strong>{generationDisabledReason ? "暂时无法生成" : status === "running" ? "加入队列" : "开始生成"}</strong><small>{generationDisabledReason || (status === "running" ? `使用当前参数排队 · 前面还有 ${queuePendingCount} 个任务` : `${imagesPerBatch} 张 × ${batchCount} 批 · 共 ${imagesPerBatch * batchCount} 张`)}</small></span>
             <kbd>Ctrl/⌘ ↵</kbd>
           </button>
           <p className={`backend-note ${inferenceHealth?.status === "ready" && inferenceHealth.cuda ? "online" : ""}`}><span />项目内推理服务 · <b>{inferenceHealth?.status === "ready" ? inferenceHealth.cuda ? inferenceHealth.device : "CUDA 不可用" : inferenceHealth?.status === "error" ? `启动失败：${inferenceHealth.error}` : inferenceHealth?.status === "offline" ? "离线" : "正在启动"}</b></p>
@@ -5730,7 +5997,6 @@ function App() {
           phase: generationPhase,
           error: generationError,
           warning: generationWarning,
-          livePreview,
           outputs: generatedOutputs,
           selectedIndex: selectedOutputIndex,
           step: generationStep,
@@ -5776,6 +6042,12 @@ function App() {
         if (targets.some((target) => target.kind === "yolo")) void refreshADetailerModels();
         if (targets.some((target) => target.kind === "upscaler")) void refreshUpscalers();
       }} /></Suspense>}
+      {enlargedStage && <div className="stage-enlarge" role="dialog" aria-modal="true" aria-label={`${enlargedStage.label} 阶段结果`} onClick={() => setEnlargedStage(null)}>
+        <figure onClick={(event) => event.stopPropagation()}>
+          <img src={enlargedStage.url} alt={`${enlargedStage.label} 阶段结果`} />
+          <figcaption><span>{enlargedStage.label}</span><b>{enlargedStage.width} × {enlargedStage.height}</b><button type="button" className="icon-button" title="关闭" onClick={() => setEnlargedStage(null)}><X size={16} /></button></figcaption>
+        </figure>
+      </div>}
       {galleryAddOpen && <AddToGalleryDialog
         outputs={generatedOutputs}
         selectedOutputIndex={selectedOutputIndex}
@@ -5791,7 +6063,7 @@ function App() {
       {promptPresetDelete && <PromptPresetDeleteDialog record={promptPresetDelete} running={status === "running"} onConfirm={confirmDeletePromptPreset} onClose={() => setPromptPresetDelete(null)} />}
       {loraManagerOpen && (
         <div className="lora-modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setLoraManagerOpen(false)}>
-          <section className={`lora-modal ${loraManagerMaximized ? "maximized" : ""}`} role="dialog" aria-modal="true" aria-labelledby="lora-manager-title">
+          <section className={`lora-modal ${loraManagerMaximized ? "maximized" : ""}`} ref={loraManagerDialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="lora-manager-title">
             <header className="lora-modal-head">
               <div><span className="eyebrow">MODEL ASSET LIBRARY</span><h2 id="lora-manager-title">LoRA 管理</h2><p>{model} 引擎 · 已挂载 {loras.length} 个</p></div>
               <div className="lora-modal-actions">
@@ -5901,7 +6173,7 @@ function App() {
       })()}
       <LoraHoverPreview preview={loraSummaryHover.preview} />
       {settingsOpen && <div className="settings-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !reconfiguring && setSettingsOpen(false)}>
-        <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <section className="settings-modal" ref={settingsDialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="settings-title">
           <header className="settings-head">
             <div><span className="eyebrow">WORKSPACE CONTROL</span><h2 id="settings-title">设置</h2><p>本地工作区、运行环境与应用信息</p></div>
             <button className="modal-close" disabled={reconfiguring} onClick={() => setSettingsOpen(false)}><X size={20} /></button>
@@ -5961,7 +6233,7 @@ function App() {
                     <i />
                   </button>)}
                 </div>}
-                {performanceEditorMode === "recommended" && activePerformancePreset === "ultra-low" && <div className="ultra-low-notice"><strong>1024 大型模型生存模式</strong><p>应用后会关闭过程预览、Hires.fix、ADetailer、RTX VSR 和已挂载 LoRA；正负条件改为串行计算，单张耗时可能明显增加。建议系统分页文件至少保留 24 GB 可用空间。</p></div>}
+                {performanceEditorMode === "recommended" && activePerformancePreset === "ultra-low" && <div className="ultra-low-notice"><strong>1024 大型模型生存模式</strong><p>应用后会关闭 Hires.fix、ADetailer、RTX VSR 和已挂载 LoRA；正负条件改为串行计算，单张耗时可能明显增加。建议系统分页文件至少保留 24 GB 可用空间。</p></div>}
                 {performanceEditorMode === "manual" && <div className="performance-manual-panel">{[
                   ["memory_mode", "显存调度", "按任务峰值预算决定模型驻留和 CPU 卸载方式"],
                   ["attention_backend", "注意力内核", "新显卡优先使用当前 PyTorch 原生 SDPA，不套用旧架构白名单"],
@@ -6121,7 +6393,7 @@ function App() {
         </section>
       </div>}
       {updateConfirmOpen && onlineUpdate.release && <div className="update-confirm-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !onlineUpdate.checking && setUpdateConfirmOpen(false)}>
-        <div className="update-confirm" role="dialog" aria-label="发现新版本">
+        <div className="update-confirm" ref={updateConfirmDialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="发现新版本">
           <header><span className="eyebrow">UPDATE AVAILABLE</span><strong>发现新版本</strong></header>
           <div className="update-confirm-versions">
             <div><span>当前版本</span><strong>{APP_VERSION}</strong></div>
@@ -6216,7 +6488,7 @@ function App() {
         <div className={`image-viewer-backdrop ${viewerExpanded ? "expanded" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && closeImageViewer()}>
           <section className={`image-viewer ${viewerExpanded ? "expanded" : ""} ${viewerSidebarOpen ? "sidebar-open" : ""}`} role="dialog" aria-modal="true" aria-label="图片预览工作区">
             <header className="image-viewer-head">
-              <div className="viewer-title"><strong>{activeViewerLayerItem?.name || generatedName || "图片预览工作区"}</strong><span>{Math.round(viewerZoom * 100)}% · 滚轮仅缩放预览 · 拖动角点改变实际图片尺寸 · Ctrl+C / Ctrl+V 复制 · Ctrl+Z 撤销</span></div>
+              <div className="viewer-title"><strong>{activeViewerLayerItem?.name || generatedName || "图片预览工作区"}</strong><span>{Math.round(viewerZoom * 100)}% · 滚轮仅缩放预览 · 拖动角点改变实际图片尺寸 · {nativeImageCopy ? "Ctrl+C / Ctrl+V 画布内复制 · 右键用浏览器菜单复制图片 · Shift+右键更多操作" : "Ctrl+C / Ctrl+V 复制"} · Ctrl+Z 撤销</span></div>
               <div className="viewer-head-actions">
                 <button className={viewerSidebarOpen ? "active" : ""} onClick={() => setViewerSidebarOpen((current) => !current)} title="展开启动以来的图片历史"><PanelLeft size={15} />图片栏</button>
                  <button onClick={() => { setViewerZoom(1); setViewerPan({ x: 0, y: 0 }); }} title="100%：一个源像素对应一个 CSS 像素"><RefreshCw size={15} />100%</button><button onClick={fitViewerToCanvas}>适应窗口</button>
@@ -6297,7 +6569,7 @@ function App() {
                 >
                   <div className="viewer-scene" style={{ transform: `translate(${viewerPan.x}px, ${viewerPan.y}px) scale(${viewerZoom})` }}>
                     {!activeCollage && viewerLayers.map((layer) => <div
-                      className={`viewer-image-layer ${activeViewerLayer === layer.id ? "active" : ""} ${viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : ""}`}
+                      className={`viewer-image-layer ${nativeImageCopy ? "native-copy " : ""}${activeViewerLayer === layer.id ? "active" : ""} ${viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : ""}`}
                       key={layer.id}
                       data-viewer-layer-id={layer.id}
                        style={{ width: `${layer.naturalWidth}px`, height: `${layer.naturalHeight}px`, transform: `translate(${layer.x}px, ${layer.y}px) scale(${layer.scale})` }}
@@ -6305,7 +6577,7 @@ function App() {
                       onPointerMove={moveViewerLayer}
                       onPointerUp={finishViewerPointer}
                       onPointerCancel={finishViewerPointer}
-                       onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setActiveViewerLayer(layer.id); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "layer", layer }); }}
+                       onContextMenu={(event) => { event.stopPropagation(); setActiveViewerLayer(layer.id); if (nativeImageCopy && !event.shiftKey) { hintNativeImageCopy(); return; } event.preventDefault(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "layer", layer }); }}
                      ><img src={layer.url} alt={layer.name} draggable="false" />{viewerEdgeLine.enabled && ["top", "right", "bottom", "left"].filter((side) => !viewerLayerEdges[layer.id]?.includes(side)).map((side) => <i className={`layer-edge ${side}`} key={side} />)}{viewerLayerResizeEnabled && activeViewerLayer === layer.id && ["tl", "tr", "bl", "br", "top", "right", "bottom", "left"].map((handle) => <i className={`layer-corner-anchor ${handle}`} key={handle} style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className={`layer-corner ${handle}`} /></i>)}</div>)}
                     {activeCollage && activeCollageTemplate && activeCollageLayout && <div className={`collage-board ${activeCollageLayout.aspect > 1.35 ? "wide" : "square"}`} style={{ "--collage-aspect": activeCollageLayout.aspect }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "collage-draft" }); }}>
                       {activeCollageLayout.slots.map((slot, index) => <div
@@ -6328,7 +6600,7 @@ function App() {
           </section>
           {viewerMenu && <div className="viewer-context-menu" style={{ left: Math.min(viewerMenu.x, window.innerWidth - 230), top: Math.min(viewerMenu.y, window.innerHeight - 180) }} onPointerDown={(event) => event.stopPropagation()}>
             {viewerMenu.kind === "history" && <><button onClick={() => focusViewerAsset(viewerMenu.asset)}><ImageIcon size={14} />切换当前预览</button><button onClick={() => addViewerAsset(viewerMenu.asset)}><ImagePlus size={14} />添加到预览窗口</button>{viewerMenu.asset.manual_layout && <button onClick={() => editCollage({ manualLayout: viewerMenu.asset.manual_layout })}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => requestHistoryDelete(viewerMenu.files, viewerMenu.label)}><Trash2 size={14} />删除{viewerMenu.files.length > 1 ? "本批次" : "图片"}</button></>}
-            {viewerMenu.kind === "layer" && <><button onClick={() => copyViewerLayer(viewerMenu.layer)}><Copy size={14} />复制干净 PNG</button>{viewerMenu.layer.isCollage && <button onClick={() => editCollage(viewerMenu.layer)}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => removeViewerLayer(viewerMenu.layer.id)}><Trash2 size={14} />删除当前预览图片</button></>}
+            {viewerMenu.kind === "layer" && <>{nativeImageCopy ? <p className="viewer-context-hint"><Copy size={13} />复制请直接右键，用浏览器菜单「复制图片」</p> : <button onClick={() => copyViewerLayer(viewerMenu.layer)}><Copy size={14} />复制干净 PNG</button>}{viewerMenu.layer.isCollage && <button onClick={() => editCollage(viewerMenu.layer)}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => removeViewerLayer(viewerMenu.layer.id)}><Trash2 size={14} />删除当前预览图片</button></>}
             {viewerMenu.kind === "collage-draft" && <button className="danger" onClick={cancelCollageDraft}><X size={14} />取消拼图</button>}
           </div>}
           {historyDelete && <div className="viewer-confirm-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setHistoryDelete(null)}><section className="viewer-delete-dialog"><Trash2 size={23} /><strong>删除{historyDelete.count > 1 ? "整组批次" : "图片"}？</strong><p>{historyDelete.label}<br />请选择仅从本次启动的左侧历史中隐藏，或同时永久删除 outputs 中的 {historyDelete.count} 个 PNG 源文件。</p><div><button onClick={() => finishHistoryDelete(false)}>只删除预览卡片</button><button className="danger" onClick={() => finishHistoryDelete(true)}>同时删除源文件</button><button onClick={() => setHistoryDelete(null)}>取消</button></div></section></div>}

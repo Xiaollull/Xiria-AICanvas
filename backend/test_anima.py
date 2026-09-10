@@ -32,7 +32,6 @@ def anima_request(**overrides):
         "seed": 1,
         "sampler": "euler",
         "scheduler": "simple",
-        "preview_enabled": False,
     }
     values.update(overrides)
     return inference_server.GenerateInput(**values)
@@ -76,7 +75,6 @@ class AnimaSchemaTests(unittest.TestCase):
         rejected = (
             ({"sampler": "unknown"}, "sampler"),
             ({"scheduler": "unknown"}, "scheduler"),
-            ({"preview_enabled": True}, "previews"),
         )
         for overrides, message in rejected:
             with self.subTest(overrides=overrides), self.assertRaisesRegex(ValidationError, message):
@@ -301,7 +299,6 @@ class AnimaPathAndHealthTests(unittest.TestCase):
                 "hires": True,
                 "adetailer": True,
                 "rtx": True,
-                "process_preview": False,
                 "staged_vae_decode": False,
                 "lora": True,
                 "transparent_background": True,

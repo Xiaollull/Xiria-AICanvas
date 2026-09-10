@@ -12,6 +12,7 @@ import {
   normalizeUint64Seed,
   resolvedGalleryOutputHiresSeed,
   secureRandomUint64Seed,
+  supportsUsduTiled,
 } from "../src/hires-settings.js";
 
 const readSource = (file) => readFile(new URL(`../${file}`, import.meta.url), "utf8");
@@ -204,9 +205,11 @@ test("workspace and Gallery Hires seed controls stay locked and frozen through g
   ]);
   const generate = sourceBetween(app, "  const generate = async () => {", "  const releaseLoadedModel = async () => {");
   const restore = sourceBetween(app, "function loadWorkspaceState(saved)", "function reconcileModels");
+  const engineSettingsSource = await readFile(new URL("../src/engine-settings.js", import.meta.url), "utf8");
 
   assert.match(app, /import \{[^}]*\bgenerationHiresSeedSettings\b[^}]*\bhiresSeedPayload\b[^}]*\} from "\.\/hires-settings"/);
-  assert.match(app, /seedMode: "inherit"/);
+  // HIRES_DEFAULTS now lives beside the per-engine store that has to reason about it.
+  assert.match(engineSettingsSource, /seedMode: "inherit"/);
   assert.match(restore, /const savedHiresSeed = normalizeHiresSeed\(savedHires\.seedMode, savedHires\.seed\)/);
 
   // The payload carries the frozen resolution, and generated settings are deep-cloned at job start.
@@ -244,4 +247,44 @@ test("the Hires pass is counted the way the family actually runs it", () => {
   // Nothing configured yet is zero, not NaN: the caller compares it against 1 to block a run.
   assert.equal(hiresEffectiveSteps(undefined, "SD"), 0);
   assert.equal(hiresEffectiveSteps({ steps: 20 }, "SD"), 0);
+});
+
+test("tiled Hires is offered by engine capability, not by naming one engine", () => {
+  // Both engines prepare their conditioning and sigma schedule once and hand the same pair to
+  // every tile. The Flux engines are guidance distilled and expose no such surface.
+  assert.equal(supportsUsduTiled("Anima"), true);
+  assert.equal(supportsUsduTiled("Krea2"), true);
+  for (const engine of ["SD", "iL", "Flux", "Flux2", "", null, undefined]) {
+    assert.equal(supportsUsduTiled(engine), false, `${engine} must not offer tiled Hires`);
+  }
+});
+
+test("a Krea2 card keeps its tiled execution mode, and a Flux card cannot acquire one", () => {
+  const tiled = { executionMode: "usdu_tiled" };
+  assert.equal(normalizeGalleryHires("Krea2", tiled, {}, {}).executionMode, "usdu_tiled");
+  assert.equal(normalizeGalleryHires("Anima", tiled, {}, {}).executionMode, "usdu_tiled");
+  assert.equal(normalizeGalleryHires("Flux2", tiled, {}, {}).executionMode, "full_frame");
+  assert.equal(normalizeGalleryHires("SD", tiled, {}, {}).executionMode, "full_frame");
+  // An explicit full-frame choice is still honoured on an engine that could tile.
+  assert.equal(
+    normalizeGalleryHires("Krea2", { executionMode: "full_frame" }, {}, {}).executionMode,
+    "full_frame",
+  );
+});
+
+test("the workspace, the gallery and image-to-image all ask the same predicate", async () => {
+  const [app, gallery, i2iPage, i2i] = await Promise.all([
+    readSource("src/App.jsx"),
+    readSource("src/GalleryPage.jsx"),
+    readSource("src/ImageToImagePage.jsx"),
+    readSource("src/image-to-image.js"),
+  ]);
+  for (const [name, source] of [["App", app], ["GalleryPage", gallery], ["ImageToImagePage", i2iPage], ["image-to-image", i2i]]) {
+    assert.match(source, /supportsUsduTiled/, `${name} must derive tiled Hires from the shared predicate`);
+  }
+  // The capability must never be re-derived from an engine name beside a usdu_tiled decision.
+  assert.doesNotMatch(app, /=== "Anima"[^\n]*usdu_tiled/);
+  assert.doesNotMatch(gallery, /isAnima[^\n]{0,40}usdu_tiled/);
+  assert.doesNotMatch(i2iPage, /=== "Anima"[^\n]*usdu_tiled/);
+  assert.doesNotMatch(i2i, /\banima\b[^\n]{0,20}executionMode === "usdu_tiled"/);
 });

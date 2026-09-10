@@ -72,8 +72,13 @@ test("LoRA asset page is lazy, opens in a new tab, and shares one sync channel",
 test("LoRA asset page persists only explicit scoped local edits without overwriting workspace state", async () => {
   const page = await readSource("src/LoraManagerPage.jsx");
 
-  assert.match(page, /const ENGINES = \["SD", "iL", "Anima"\]/);
-  assert.match(page, /useState\(\{ SD: null, iL: null, Anima: null \}\)/);
+  // The page lists every engine the mounted library can hold. A hard-coded three once hid every
+  // FLUX.1, FLUX.2 and Krea 2 LoRA from it, including ones the workspace already had mounted.
+  const { READY_LORA_ENGINES } = await import("../src/lora-model-scope.js");
+  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.match(page, /const ENGINES = READY_LORA_ENGINES;/);
+  assert.match(page, /useState\(\(\) => Object\.fromEntries\(ENGINES\.map\(\(engine\) => \[engine, null\]\)\)\)/);
+  assert.doesNotMatch(page, /SD、iL 与 Anima|SD \+ iL \+ Anima/);
   assert.match(page, /ENGINES\.map\(async \(engine\) =>/);
   assert.match(page, /engineScopeKey\(engine\)/);
   assert.match(page, /normalizeMountedLoraMap\(workspace\.mountedLorasByEngine/);
@@ -145,7 +150,9 @@ test("LoRA cards open a shared layered metadata and trigger-word dialog", async 
   assert.match(details, /自动审查摘要/);
   assert.match(details, /promptReview\?\.versionScope/);
   assert.match(details, /复制全部/);
-  assert.match(styles, /\.lora-detail-backdrop \{ position: fixed; z-index: 340;/);
+  // The dialog is on the shared modal contract now: a nested level, because it opens from the
+  // LoRA manager and has to sit over it.
+  assert.match(styles, /\.lora-detail-backdrop \{[^}]*z-index: var\(--z-modal-nested\)/);
   assert.match(vite, /detailSchema = 1/);
   assert.match(vite, /reviewLoraPrompts/);
   assert.match(vite, /readLoraFileMetadata/);

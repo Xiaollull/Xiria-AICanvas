@@ -19,6 +19,7 @@ from krea2_pipeline import (
     KREA2_PIXEL_ALIGNMENT,
     KREA2_TAP_COUNT,
     KREA2_TAP_LAYERS,
+    KREA2_TILED_DECODE_EDGE,
     KREA2_TEMPLATE,
     KREA2_VAE_LATENT_CHANNELS,
     KREA2_VAE_SCALE_FACTOR,
@@ -454,6 +455,20 @@ class ComponentBytesTests(unittest.TestCase):
             self.assertEqual(krea2_component_bytes([path]), flux_component_bytes([path]))
 
 
+class _StubVae:
+    """Enough autoencoder for `_decode` to reach its residency decision and its metrics."""
+
+    tile_sample_min_height = 512
+    tile_sample_stride_height = 448
+
+    def to(self, *args, **kwargs):
+        return self
+
+    def decode(self, sample, return_dict=False):
+        batch, _channels, frames, height, width = sample.shape
+        return (torch.zeros((batch, 3, frames, height, width), dtype=torch.float32),)
+
+
 class DecodeResidencyTests(unittest.TestCase):
     def test_the_transformer_is_evicted_before_the_autoencoder_runs(self):
         runtime = Krea2Runtime.__new__(Krea2Runtime)
@@ -480,6 +495,90 @@ class DecodeResidencyTests(unittest.TestCase):
         runtime._park_transformer_on_cpu = lambda: self.fail("eviction was disabled")
         self.assertFalse(runtime.configure_decode_residency(False))
         self.assertFalse(runtime._release_transformer_for_decode())
+
+    def decoding_runtime(self, tiled_edge_exceeded):
+        """A runtime with just enough surface for `_decode` to reach its residency decision."""
+        runtime = Krea2Runtime.__new__(Krea2Runtime)
+        runtime.unload_before_decode = True
+        runtime._transformer_resident = True
+        runtime._transformer_group_offload = False
+        runtime._vae_tiling_required = False
+        runtime.device = torch.device("cpu")
+        runtime.dtype = torch.float32
+        runtime.last_generation_metrics = {}
+        runtime.parked = []
+        runtime._park_transformer_on_cpu = lambda: runtime.parked.append(True)
+        runtime._configure_vae_tiling = lambda tiled: runtime.__dict__.setdefault("tiling", []).append(tiled)
+        runtime._process_out = lambda latents: latents
+        runtime.vae = _StubVae()
+        # `_resolved_tiled_decode` tiles above 1536 pixels on the longest edge.
+        edge = (KREA2_TILED_DECODE_EDGE + 64) if tiled_edge_exceeded else 512
+        return runtime, torch.zeros((1, 16, edge // KREA2_VAE_SCALE_FACTOR, edge // KREA2_VAE_SCALE_FACTOR))
+
+    def test_a_tiled_decode_keeps_the_transformer_where_it_is(self):
+        """A tiled decode peaks well under the sampling that just ran with the transformer
+        resident, so it never needed that room. Evicting for it costs a round trip of the whole
+        transformer, which a USDU pass then pays again on the next tile."""
+        runtime, latents = self.decoding_runtime(tiled_edge_exceeded=True)
+        runtime._decode(latents)
+        self.assertEqual(runtime.parked, [], "a tiled decode must not evict the transformer")
+        self.assertEqual(runtime.last_generation_metrics["vae_decode"]["actual_vae_mode"], "tiled")
+        self.assertIs(runtime.last_generation_metrics["vae_decode"]["transformer_evicted_for_decode"], False)
+
+    def test_a_full_frame_decode_that_fits_moves_nothing(self):
+        """The eviction used to be unconditional, so a decode with the room to spare still sent
+        the transformer to system memory and fetched it back. Measured on a 24 GB card that is
+        8.02s out and 2.38s back, bought for nothing."""
+        runtime, latents = self.decoding_runtime(tiled_edge_exceeded=False)
+        runtime._full_decode_fits = lambda height, width: True
+        runtime._decode(latents)
+        self.assertEqual(runtime.parked, [], "a decode that fits must not move the transformer")
+        self.assertEqual(runtime.last_generation_metrics["vae_decode"]["actual_vae_mode"], "full")
+        self.assertIs(runtime.last_generation_metrics["vae_decode"]["transformer_evicted_for_decode"], False)
+
+    def test_a_full_frame_decode_that_does_not_fit_is_tiled_rather_than_paid_for(self):
+        """Below the tiling edge the full frame is the more faithful pass, but only while it is
+        free. When it would cost a transformer round trip the tiled pass is both cheaper and
+        faster — 1.13s against 1.8s of decode wrapped in 10.4s of transfers."""
+        runtime, latents = self.decoding_runtime(tiled_edge_exceeded=False)
+        runtime._full_decode_fits = lambda height, width: False
+        runtime._decode(latents)
+        self.assertEqual(runtime.parked, [], "tiling is the answer to no room, not eviction")
+        self.assertEqual(runtime.last_generation_metrics["vae_decode"]["actual_vae_mode"], "tiled")
+
+    def test_running_out_of_room_anyway_falls_back_to_the_eviction(self):
+        """The sizing decision is an estimate, so it can be beaten. When it is, the old guarantee
+        has to still be there: evict once and run the same decode again."""
+        runtime, latents = self.decoding_runtime(tiled_edge_exceeded=False)
+        runtime._full_decode_fits = lambda height, width: True
+        attempts = []
+        original = runtime._run_decode
+
+        def failing_once(restored):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise torch.OutOfMemoryError("CUDA out of memory")
+            return original(restored)
+
+        runtime._run_decode = failing_once
+        runtime._decode(latents)
+        self.assertEqual(len(attempts), 2, "the decode must be retried once after the eviction")
+        self.assertEqual(runtime.parked, [True])
+        self.assertIs(runtime.last_generation_metrics["vae_decode"]["transformer_evicted_for_decode"], True)
+
+    def test_an_estimate_that_cannot_be_taken_leaves_the_sizing_alone(self):
+        """A CPU runtime has no memory API to ask, and answering "no room" there would tile every
+        decode on a machine that never had the problem."""
+        runtime, _latents = self.decoding_runtime(tiled_edge_exceeded=False)
+        self.assertTrue(runtime._full_decode_fits(1536, 1152))
+
+    def test_the_refinement_stage_reports_its_own_decode_mode(self):
+        """Written under the base stage's key, a tile's decode mode was invisible to the USDU
+        report, which is why every tile read `decode_mode=None`."""
+        runtime, latents = self.decoding_runtime(tiled_edge_exceeded=True)
+        runtime._decode(latents, metrics_key="refinement.vae_decode")
+        self.assertIn("refinement.vae_decode", runtime.last_generation_metrics)
+        self.assertNotIn("vae_decode", runtime.last_generation_metrics)
 
 
 class TransformerModuleTests(unittest.TestCase):

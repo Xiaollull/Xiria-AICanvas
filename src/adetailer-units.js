@@ -71,8 +71,10 @@ export function normalizeADetailerUnit(source) {
     steps: Math.round(bounded(entry.steps, ADETAILER_UNIT_DEFAULTS.steps, 1, 100)),
     useCfg: entry.useCfg === true,
     cfg: bounded(entry.cfg, ADETAILER_UNIT_DEFAULTS.cfg, 0, 30),
-    prompt: text(entry.prompt, 8000),
-    negativePrompt: text(entry.negativePrompt, 8000),
+    // A unit's prompts reach the same encoders the main prompt does, and those hold it to no
+    // length, so normalising must not quietly cut one short either.
+    prompt: typeof entry.prompt === "string" ? entry.prompt : "",
+    negativePrompt: typeof entry.negativePrompt === "string" ? entry.negativePrompt : "",
   };
 }
 

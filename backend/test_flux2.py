@@ -26,7 +26,6 @@ def flux2_request(**overrides):
         seed=1,
         sampler="euler",
         scheduler="simple",
-        preview_enabled=False,
     )
     fields.update(overrides)
     return GenerateInput(**fields)
@@ -74,10 +73,6 @@ class Flux2RequestContractTests(unittest.TestCase):
         self.assertIn("ADetailer negative prompts must be empty", str(error.exception))
         self.assertEqual(flux2_request(adetailer={"enabled": False, "units": [unit]}).adetailer.active_units, [])
         flux2_request(adetailer={"enabled": True, "units": [{"detector": "face_yolov8n.pt"}]})
-
-    def test_process_previews_are_refused(self):
-        with self.assertRaises(ValidationError):
-            flux2_request(preview_enabled=True)
 
     def test_usdu_tiled_hires_remains_anima_only(self):
         with self.assertRaises(ValidationError) as error:
@@ -163,7 +158,6 @@ class Flux2EngineWiringTests(unittest.TestCase):
         self.assertFalse(features["pag"])
         self.assertFalse(features["cfg_zero_star"])
         self.assertFalse(features["negative_prompt"])
-        self.assertFalse(features["process_preview"])
         # ComfyUI runs both FLUX.2 tokenisers with weighting disabled.
         self.assertFalse(features["prompt_weights"])
         self.assertTrue(features["distilled_guidance"])

@@ -1,29 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { Copy, ExternalLink, FileText, RefreshCw, X } from "lucide-react";
+import { copyText } from "./clipboard";
 
 function formatBytes(value) {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
   return `${(value / 1024 ** index).toFixed(index < 2 ? 0 : 2)} ${units[index]}`;
-}
-
-async function copyText(value) {
-  if (!value) return false;
-  try {
-    await navigator.clipboard.writeText(value);
-    return true;
-  } catch {
-    const textarea = document.createElement("textarea");
-    textarea.value = value;
-    textarea.style.position = "fixed";
-    textarea.style.opacity = "0";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    return copied;
-  }
 }
 
 function metadataRows(metadata) {

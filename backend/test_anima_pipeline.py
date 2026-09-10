@@ -10,7 +10,7 @@ from PIL import Image
 
 from backend import anima_pipeline
 from backend.anima_pipeline import (
-    ANIMA_MAX_SEQUENCE_LENGTH,
+    ANIMA_TEXT_SEQUENCE_LENGTH,
     AnimaCosmosAttnProcessor,
     _discard_module_storage,
     AnimaRuntime,
@@ -2081,6 +2081,71 @@ class AnimaRuntimeContractTests(unittest.TestCase):
         self.assertEqual(diagnostics["qwen"]["weighted_token_count"], 0)
         self.assertEqual(diagnostics["t5"]["token_count"], len("  raw prompt  ") * 2 + 2)
         self.assertEqual(diagnostics["t5"]["weighted_token_count"], 6)
+        # Short prompts are padded up to the trained context rather than measured against it.
+        self.assertEqual(diagnostics["qwen"]["context_length"], ANIMA_TEXT_SEQUENCE_LENGTH)
+        self.assertEqual(diagnostics["qwen"]["sequence_length"], ANIMA_TEXT_SEQUENCE_LENGTH)
+
+    def test_a_prompt_past_the_trained_context_runs_at_its_own_length(self):
+        class Tokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+
+            def __call__(self, text, add_special_tokens=False, truncation=False):
+                return {"input_ids": [ord(character) for character in text]}
+
+            def build_inputs_with_special_tokens(self, token_ids):
+                return [1, *token_ids, 2]
+
+            def get_special_tokens_mask(self, token_ids, already_has_special_tokens=False):
+                if already_has_special_tokens:
+                    return [int(token in {1, 2}) for token in token_ids]
+                return [1, *([0] * len(token_ids)), 1]
+
+        runtime = AnimaRuntime.__new__(AnimaRuntime)
+        runtime._closed = False
+        runtime.qwen_tokenizer = Tokenizer()
+        runtime.t5_tokenizer = Tokenizer()
+        long_prompt = "a" * (ANIMA_TEXT_SEQUENCE_LENGTH + 100)
+
+        diagnostics = runtime.token_diagnostics(long_prompt)
+
+        expected = ANIMA_TEXT_SEQUENCE_LENGTH + 102  # the prompt plus its two special tokens
+        self.assertEqual(diagnostics["t5"]["token_count"], expected)
+        self.assertEqual(diagnostics["t5"]["sequence_length"], expected)
+
+    def test_a_prompt_and_its_negative_share_one_length_without_either_being_cut(self):
+        # The batch has to be rectangular. It is squared up by padding the shorter member, so the
+        # longer prompt keeps every token whichever of the two it is.
+        class Tokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+
+            def __call__(self, text, add_special_tokens=False, truncation=False):
+                return {"input_ids": [ord(character) for character in text]}
+
+            def build_inputs_with_special_tokens(self, token_ids):
+                return [1, *token_ids, 2]
+
+            def get_special_tokens_mask(self, token_ids, already_has_special_tokens=False):
+                if already_has_special_tokens:
+                    return [int(token in {1, 2}) for token in token_ids]
+                return [1, *([0] * len(token_ids)), 1]
+
+        runtime = AnimaRuntime.__new__(AnimaRuntime)
+        runtime._closed = False
+        runtime.qwen_tokenizer = Tokenizer()
+        runtime.t5_tokenizer = Tokenizer()
+        long_prompt = "a" * (ANIMA_TEXT_SEQUENCE_LENGTH + 100)
+
+        qwen, t5 = runtime._tokenize_texts([long_prompt, "short"])
+
+        expected = ANIMA_TEXT_SEQUENCE_LENGTH + 102
+        for encoding in (qwen, t5):
+            self.assertEqual(tuple(encoding["input_ids"].shape), (2, expected))
+            self.assertEqual(encoding["token_count"], [expected, 7])
+            # The padding on the short member is masked, so it conditions on nothing extra.
+            self.assertEqual(int(encoding["attention_mask"][0].sum()), expected)
+            self.assertEqual(int(encoding["attention_mask"][1].sum()), 7)
 
     def test_prompt_encoding_applies_t5_weights_once_after_adapter_and_masks_padding(self):
         runtime = AnimaRuntime.__new__(AnimaRuntime)

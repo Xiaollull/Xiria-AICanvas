@@ -27,7 +27,6 @@ def krea2_request(**overrides):
         seed=1,
         sampler="euler",
         scheduler="simple",
-        preview_enabled=False,
     )
     fields.update(overrides)
     return GenerateInput(**fields)
@@ -71,17 +70,25 @@ class Krea2RequestContractTests(unittest.TestCase):
             krea2_request(guidance="pag")
         self.assertIn("Krea2 does not support PAG", str(error.exception))
 
-    def test_process_previews_are_refused(self):
-        with self.assertRaises(ValidationError):
-            krea2_request(preview_enabled=True)
+    def test_usdu_tiled_hires_is_accepted(self):
+        """Krea 2 prepares conditioning and sigmas once and hands the same pair to every tile, so it
+        qualifies for the tiled Hires path Anima has always had."""
+        request = krea2_request(hires={
+            "enabled": True, "model": "RealESRGAN_x4plus_anime_6B.pth", "execution_mode": "usdu_tiled",
+            "uniform_tiles": True, "tiled_decode": True,
+        })
+        self.assertEqual(request.hires.execution_mode, "usdu_tiled")
 
-    def test_usdu_tiled_hires_remains_anima_only(self):
-        with self.assertRaises(ValidationError) as error:
-            krea2_request(hires={
-                "enabled": True, "model": "RealESRGAN_x4plus_anime_6B.pth", "execution_mode": "usdu_tiled",
-                "uniform_tiles": True, "tiled_decode": True,
-            })
-        self.assertIn("only by Anima", str(error.exception))
+    def test_usdu_tiled_hires_still_requires_uniform_tiles_and_tiled_decode(self):
+        for field in ("uniform_tiles", "tiled_decode"):
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError) as error:
+                    krea2_request(hires={
+                        "enabled": True, "model": "RealESRGAN_x4plus_anime_6B.pth",
+                        "execution_mode": "usdu_tiled", "uniform_tiles": True, "tiled_decode": True,
+                        field: False,
+                    })
+                self.assertIn("uniform_tiles and tiled_decode", str(error.exception))
 
     def test_the_sampler_and_scheduler_come_from_the_krea2_vocabulary(self):
         self.assertIn("euler", KREA2_SAMPLERS)
@@ -230,7 +237,6 @@ class Krea2EngineWiringTests(unittest.TestCase):
         self.assertFalse(features["distilled_guidance"])
         # PAG needs an identity-self-attention override of the native blocks, which is not installed.
         self.assertFalse(features["pag"])
-        self.assertFalse(features["process_preview"])
         # `Qwen3VLTokenizer` passes `disable_weights=True`.
         self.assertFalse(features["prompt_weights"])
         for stage in ("hires", "adetailer", "rtx", "lora"):

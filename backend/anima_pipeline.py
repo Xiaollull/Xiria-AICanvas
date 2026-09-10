@@ -31,7 +31,7 @@ try:
         validate_prepared_anima_refinement_sigmas,
     )
     from .gguf_loader import GGUF_SUFFIX, load_gguf_state_dict
-    from .prompt_encoding import tokenize_weighted_prompt
+    from .prompt_encoding import pad_weighted_encodings, tokenize_weighted_prompt
 except ImportError:
     from anima_sampling import (
         ANIMA_SAMPLERS,
@@ -44,7 +44,7 @@ except ImportError:
         validate_prepared_anima_refinement_sigmas,
     )
     from gguf_loader import GGUF_SUFFIX, load_gguf_state_dict
-    from prompt_encoding import tokenize_weighted_prompt
+    from prompt_encoding import pad_weighted_encodings, tokenize_weighted_prompt
 
 
 # ComfyUI's UltimateSDUpscale decodes every tile through VAEDecodeTiled(tile_size=512, overlap=64).
@@ -53,7 +53,13 @@ COMFY_VAE_TILE_PIXELS = 512
 COMFY_VAE_OVERLAP_PIXELS = 64
 COMFY_VAE_STRIDE_PIXELS = COMFY_VAE_TILE_PIXELS - COMFY_VAE_OVERLAP_PIXELS
 ANIMA_CHECKPOINT_PREFIXES = ("net.", "model.diffusion_model.", "diffusion_model.")
-ANIMA_MAX_SEQUENCE_LENGTH = 512
+# The trained text context. It is a floor, not a ceiling: a shorter prompt is padded up to it and a
+# longer one is encoded at its own length, which is what ComfyUI's `min_length` tokenizer option
+# means everywhere it appears.
+ANIMA_TEXT_SEQUENCE_LENGTH = 512
+# The canvas granularity the runtime accepts. Named so a tile planner can ask for it rather
+# than rediscover it from a rejected tile.
+ANIMA_PIXEL_ALIGNMENT = 32
 
 
 class _GroupCfgBatchOom(RuntimeError):
@@ -2166,17 +2172,24 @@ class AnimaRuntime:
 
     def _tokenize_texts(self, texts: Sequence[str]):
         def tokenize_batch(tokenizer, *, keep_weights):
-            encoded = [
-                tokenize_weighted_prompt(
-                    tokenizer,
-                    text,
-                    max_length=ANIMA_MAX_SEQUENCE_LENGTH,
-                    truncation=True,
-                    padding="max_length",
-                    add_special_tokens=True,
-                )
-                for text in texts
-            ]
+            # Neither encoder has an architectural ceiling — the adapter's rotary embedding is built
+            # from `arange(sequence)` and T5 uses relative position bias — so a long prompt runs at
+            # its own length instead of losing its tail. The batch pads to the longest member,
+            # raised to the trained context, and the padding is masked out of attention.
+            encoded = pad_weighted_encodings(
+                tokenizer,
+                [
+                    tokenize_weighted_prompt(
+                        tokenizer,
+                        text,
+                        truncation=False,
+                        padding=None,
+                        add_special_tokens=True,
+                    )
+                    for text in texts
+                ],
+                min_length=ANIMA_TEXT_SEQUENCE_LENGTH,
+            )
             weights = torch.stack([item["weights"] for item in encoded])
             if not keep_weights:
                 weights = torch.ones_like(weights)
@@ -2235,7 +2248,8 @@ class AnimaRuntime:
             return {
                 "token_count": int(encoding["token_count"][0]),
                 "weighted_token_count": int(encoding["weighted_token_count"][0]),
-                "max_length": ANIMA_MAX_SEQUENCE_LENGTH,
+                "sequence_length": int(encoding["input_ids"].shape[1]),
+                "context_length": ANIMA_TEXT_SEQUENCE_LENGTH,
             }
 
         return {"qwen": diagnostics(qwen), "t5": diagnostics(t5)}
@@ -2268,8 +2282,8 @@ class AnimaRuntime:
             raise ValueError("pag_applied_layers must be 'mid' or 'all'")
         if not isinstance(width, int) or isinstance(width, bool) or not isinstance(height, int) or isinstance(height, bool):
             raise ValueError("width and height must be integers")
-        if width <= 0 or height <= 0 or width % 32 or height % 32:
-            raise ValueError("width and height must be positive and divisible by 32")
+        if width <= 0 or height <= 0 or width % ANIMA_PIXEL_ALIGNMENT or height % ANIMA_PIXEL_ALIGNMENT:
+            raise ValueError(f"width and height must be positive and divisible by {ANIMA_PIXEL_ALIGNMENT}")
         if width > 4096 or height > 4096:
             raise ValueError("width and height cannot exceed the Anima maximum of 4096")
         if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:

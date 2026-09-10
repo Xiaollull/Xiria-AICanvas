@@ -169,14 +169,14 @@ test("the panel keeps its marks on screen and the workspace writes go through on
 
   // The reader threads the callback through, and offers the button only when
   // the host supplied one — the tool renders standalone in its own chunk.
-  assert.match(toolbox, /<ImageInfoReader onApplyParameters=\{onApplyImageParameters\} \/>/);
+  assert.match(toolbox, /<ImageInfoReader onApplyParameters=\{onApplyImageParameters\} savedState=/);
   assert.match(reader, /onApplyParameters &&/);
   assert.match(reader, /disabled=\{!applicableFields\.length\}/);
 
   // Model writes reuse the gallery apply path rather than a second copy of the
   // engine-switch, catalogue-validation and missing-checkpoint logic.
   assert.match(app, /const applyImageInfoParameters = async \(plan\) => \{/);
-  assert.match(app, /await applyGallerySettings\(\{ \.\.\.snapshot, \.\.\.overlay \}, workspaceGroups, \{ page: null, label: "图片参数" \}\)/);
+  assert.match(app, /await applyGallerySettings\(\{ \.\.\.snapshot, \.\.\.overlay \}, workspaceGroups, \{ page: null, label: "图片参数", fillMissingAssets: true \}\)/);
   // Staying put is what keeps the panel's marks visible after applying.
   assert.match(app, /if \(page\) \{\s*\n\s*setActivePage\(page\);/);
   assert.match(app, /onApplyImageParameters=\{applyImageInfoParameters\}/);
@@ -191,4 +191,28 @@ test("the panel keeps its marks on screen and the workspace writes go through on
   assert.match(styles, /\.info-identity-model > \.info-identity-model-name \{[^}]*font-size: 14px/);
   assert.match(styles, /\.info-identity-model > \.model-name-found\.info-identity-model-name \{ color: var\(--lime\)/);
   assert.match(styles, /html\[data-theme-mode="light"\] \.image-info-apply-fields > li\.missing/);
+});
+
+test("a split engine's model lands in the diffusion model field, not the checkpoint", () => {
+  // The reported failure: a Krea 2 picture's model was written into `checkpoint`, so the apply path
+  // validated whatever diffusion model the workspace already had and refused the picture.
+  const krea = record({
+    checkpoint: "krea2_turbo_fp8_scaled.safetensors",
+    checkpointMatch: found("krea2_turbo_fp8_scaled.safetensors", "Krea2"),
+  });
+  const plan = buildImageInfoApplyPlan(krea, ["model"], "t2i");
+  assert.equal(plan.overlay.model, "Krea2");
+  assert.equal(plan.overlay.diffusionModel, "krea2_turbo_fp8_scaled.safetensors");
+  assert.equal("checkpoint" in plan.overlay, false);
+  assert.deepEqual(plan.groups, ["model"]);
+
+  for (const engine of ["Anima", "Flux", "Flux2"]) {
+    const other = buildImageInfoApplyPlan(record({ checkpointMatch: found("model.safetensors", engine) }), ["model"], "t2i");
+    assert.equal(other.overlay.diffusionModel, "model.safetensors", engine);
+    assert.equal("checkpoint" in other.overlay, false, engine);
+  }
+  // A single-file engine still takes a checkpoint.
+  const illustrious = buildImageInfoApplyPlan(record(), ["model"], "t2i");
+  assert.equal(illustrious.overlay.checkpoint, "iL/waiIllustrious_v17.safetensors");
+  assert.equal("diffusionModel" in illustrious.overlay, false);
 });

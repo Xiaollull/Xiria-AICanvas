@@ -33,6 +33,7 @@ shift Krea 2's own model config declares.
 
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -56,15 +57,21 @@ try:
     from .flux_pipeline import (
         COMFY_VAE_OVERLAP_PIXELS,
         COMFY_VAE_TILE_PIXELS,
+        CUDA_OOM_ERRORS,
         _count_blocks,
         _decoded_tensor_to_image,
         _lora_descriptors,
         _scale_diffusers_lora_alphas,
         _shape_of,
+        cached_conditioning,
+        discard_conditioning_cache,
+        note_conditioning_reuse,
         flux_component_bytes,
         fuse_flux_lora_state_dict,
         normalize_flux_checkpoint_keys,
         resolve_quantized_state_dict,
+        sample_or_stream,
+        text_encoder_resident,
         unmatched_lora_targets,
     )
     from .krea2_model import (
@@ -90,7 +97,9 @@ try:
         KREA2_SHIFT,
         krea2_refinement_sigma_schedule,
         krea2_sigma_schedule,
+        prepare_krea2_refinement_sigmas,
         resolve_krea2_sampler,
+        validate_prepared_krea2_refinement_sigmas,
     )
 except ImportError:
     from anima_pipeline import (
@@ -109,15 +118,21 @@ except ImportError:
     from flux_pipeline import (
         COMFY_VAE_OVERLAP_PIXELS,
         COMFY_VAE_TILE_PIXELS,
+        CUDA_OOM_ERRORS,
         _count_blocks,
         _decoded_tensor_to_image,
         _lora_descriptors,
         _scale_diffusers_lora_alphas,
         _shape_of,
+        cached_conditioning,
+        discard_conditioning_cache,
+        note_conditioning_reuse,
         flux_component_bytes,
         fuse_flux_lora_state_dict,
         normalize_flux_checkpoint_keys,
         resolve_quantized_state_dict,
+        sample_or_stream,
+        text_encoder_resident,
         unmatched_lora_targets,
     )
     from krea2_model import (
@@ -143,7 +158,9 @@ except ImportError:
         KREA2_SHIFT,
         krea2_refinement_sigma_schedule,
         krea2_sigma_schedule,
+        prepare_krea2_refinement_sigmas,
         resolve_krea2_sampler,
+        validate_prepared_krea2_refinement_sigmas,
     )
 
 
@@ -159,6 +176,16 @@ KREA2_PIXEL_ALIGNMENT = KREA2_VAE_SCALE_FACTOR * KREA2_LATENT_PATCH
 KREA2_MAX_EDGE = 4096
 # Where tiled decoding starts. Measured to be the faster path above it as well as the smaller one.
 KREA2_TILED_DECODE_EDGE = 1536
+# What one pixel of a full-frame decode costs at its peak. Measured on a 24 GB card: a 1536x1152
+# decode peaks at 12.34 GiB, which is 7489 bytes per pixel; the margin rounds that up rather than
+# risking the estimate that decides whether the transformer has to move. It is only ever used to
+# answer "would this fit beside what is already resident", and answering "no" costs nothing but a
+# tiled decode, which is the faster pass anyway.
+KREA2_FULL_DECODE_BYTES_PER_PIXEL = 9000
+# Krea 2 runs a real unconditional branch, so CFG-Zero* applies. PAG does not: it needs an
+# identity-self-attention override of the transformer's own blocks, which this runtime does not
+# install.
+KREA2_GUIDANCE_MODES = frozenset({"none", "cfg_zero_star"})
 
 
 # `comfy/latent_formats.py::Wan21`. `scale_factor` is 1.0, so `process_in` is a plain
@@ -191,9 +218,8 @@ KREA2_USER_TOKEN = 872
 KREA2_NEWLINE_TOKEN = 198
 
 # Krea 2 pads nothing — `Qwen3VLSDTokenizer` sets `pad_to_max_length=False` and `min_length=1`, so
-# a prompt occupies exactly its own tokens and no attention mask is ever needed. The ceiling below
-# only exists so a pathological prompt fails with a sentence instead of an allocation.
-KREA2_MAX_TEXT_TOKENS = 4096
+# a prompt occupies exactly its own tokens, no attention mask is ever needed, and there is no
+# length for it to be measured against: it runs at whatever length it tokenises to.
 
 # Qwen3-VL-4B, as `comfy/text_encoders/llama.py::Qwen3VL_4BConfig` declares it. Every dimension
 # that can be read off the checkpoint is; these are the ones that leave no trace in the tensors.
@@ -771,6 +797,22 @@ def _load_krea2_tokenizer(qwen_tokenizer_path, deps):
     return tokenizer
 
 
+@dataclass(frozen=True)
+class PreparedKrea2Conditioning:
+    """CPU-only reusable conditioning for repeated refinement calls.
+
+    Krea 2 keeps the two branches apart rather than stacking them the way Anima does, because its
+    unconditional branch is evaluated sequentially and is absent entirely at CFG 1.
+    """
+
+    prompt: str
+    negative_prompt: str
+    cfg: float
+    guidance: str
+    positive: torch.Tensor
+    negative: Optional[torch.Tensor]
+
+
 class Krea2Runtime:
     """A loaded Krea 2 model, driven through the surface every native engine exposes."""
 
@@ -960,6 +1002,7 @@ class Krea2Runtime:
                 self._remove_transformer_group_offload()
         except BaseException:
             self._poisoned = True
+        discard_conditioning_cache(self)
         for name in ("transformer", "text_encoder", "vae"):
             module = getattr(self, name, None)
             if module is None:
@@ -978,11 +1021,6 @@ class Krea2Runtime:
         here rather than an emphasis instruction.
         """
         ids = self.tokenizer(self.prompt_template.format(prompt), add_special_tokens=False)["input_ids"]
-        if len(ids) > KREA2_MAX_TEXT_TOKENS:
-            raise ValueError(
-                f"This prompt tokenises to {len(ids)} Krea 2 text tokens, beyond the "
-                f"{KREA2_MAX_TEXT_TOKENS}-token ceiling; shorten it"
-            )
         return torch.tensor([list(ids)], dtype=torch.long), krea2_template_end(ids)
 
     def token_diagnostics(self, prompt: str):
@@ -996,7 +1034,7 @@ class Krea2Runtime:
                 "conditioning_token_count": int(ids.shape[1] - template_end),
                 "weighted_token_count": 0,
                 "template_tokens": int(template_end),
-                "ceiling": KREA2_MAX_TEXT_TOKENS,
+                "sequence_length": int(ids.shape[1]),
                 "family": "qwen3vl_4b",
                 "tap_layers": list(self.tap_layers),
             }
@@ -1009,32 +1047,31 @@ class Krea2Runtime:
         prefix, and folds the tap axis into the channel dimension.  All three happen here so the
         transformer sees exactly what ComfyUI hands it.
         """
+        return cached_conditioning(self, prompt, lambda: self._encode_prompt_uncached(prompt))
+
+    def _encode_prompt_uncached(self, prompt: str) -> torch.Tensor:
+        """One encoder pass. The caller owns the encoder's residency and the cache."""
         ids, template_end = self._encode_tokens(prompt)
         device = self.device
-        try:
-            self.text_encoder.to(device=device, dtype=self.dtype)
-            with torch.inference_mode():
-                output = self.text_encoder(
-                    input_ids=ids.to(device),
-                    attention_mask=torch.ones_like(ids, device=device),
-                    output_hidden_states=True,
-                    use_cache=False,
+        with torch.inference_mode():
+            output = self.text_encoder(
+                input_ids=ids.to(device),
+                attention_mask=torch.ones_like(ids, device=device),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            states = output.hidden_states
+            if len(states) <= max(self.tap_layers):
+                raise RuntimeError(
+                    f"Krea 2 text encoder produced {len(states)} hidden states, too few for taps {self.tap_layers}"
                 )
-                states = output.hidden_states
-                if len(states) <= max(self.tap_layers):
-                    raise RuntimeError(
-                        f"Krea 2 text encoder produced {len(states)} hidden states, too few for taps {self.tap_layers}"
-                    )
-                stacked = torch.stack([states[index] for index in self.tap_layers], dim=1)
-                stacked = stacked[:, :, template_end:]
-                batch, taps, sequence, width = stacked.shape
-                if sequence < 1:
-                    raise RuntimeError("Krea 2 prompt encoding left no conditioning tokens after the template prefix")
-                embeddings = stacked.permute(0, 2, 1, 3).reshape(batch, sequence, taps * width)
-            return embeddings.to(device="cpu", dtype=self.dtype)
-        finally:
-            self.text_encoder.to("cpu")
-            _empty_cuda_cache()
+            stacked = torch.stack([states[index] for index in self.tap_layers], dim=1)
+            stacked = stacked[:, :, template_end:]
+            batch, taps, sequence, width = stacked.shape
+            if sequence < 1:
+                raise RuntimeError("Krea 2 prompt encoding left no conditioning tokens after the template prefix")
+            embeddings = stacked.permute(0, 2, 1, 3).reshape(batch, sequence, taps * width)
+        return embeddings.to(device="cpu", dtype=self.dtype)
 
     # -- latents -----------------------------------------------------------------------------
 
@@ -1080,6 +1117,25 @@ class Krea2Runtime:
             self.vae.to("cpu")
             _empty_cuda_cache()
 
+    def _full_decode_fits(self, height: int, width: int) -> bool:
+        """Whether a full-frame decode has the room it needs without anything being moved.
+
+        Room is the driver's free memory plus whatever the caching allocator is holding but not
+        using, because the decode can reuse the second without asking the driver for it. When the
+        device cannot be asked — a CPU runtime, or a build without the CUDA memory API — the
+        answer is yes, which leaves the sizing decision exactly where it was.
+        """
+        if self.device.type != "cuda":
+            return True
+        try:
+            free_bytes, _total = torch.cuda.mem_get_info(self.device)
+            reserved = torch.cuda.memory_reserved(self.device)
+            allocated = torch.cuda.memory_allocated(self.device)
+        except (AttributeError, RuntimeError):
+            return True
+        room = int(free_bytes) + max(0, int(reserved) - int(allocated))
+        return room >= int(height) * int(width) * KREA2_FULL_DECODE_BYTES_PER_PIXEL
+
     def _resolved_tiled_decode(self, height: int, width: int, force_tiled_decode: bool):
         """Tiling above 1536 stands, and evicting the transformer first does not change it.
 
@@ -1092,7 +1148,16 @@ class Krea2Runtime:
         """
         if force_tiled_decode or self._vae_tiling_required:
             return True
-        return max(height, width) > KREA2_TILED_DECODE_EDGE
+        if max(height, width) > KREA2_TILED_DECODE_EDGE:
+            return True
+        # Below the edge a full frame is still the more faithful pass, but only while it can be
+        # had for free. When it does not fit beside what is already on the card the only way to
+        # run it is to send the transformer to system memory and fetch it back, and that round
+        # trip costs far more than the decode it buys: measured here at 1536x1152, 8.02s to park
+        # and 2.38s to restore around a 1.8s decode, against 1.13s tiled with nothing moved. So
+        # the choice is between two decodes, not between a decode and its memory: take the tiled
+        # one whenever the full one would move the transformer.
+        return not self._full_decode_fits(height, width)
 
     def _configure_vae_tiling(self, tiled: bool) -> None:
         """Point the autoencoder's tiling at ComfyUI's VAEDecodeTiled geometry.
@@ -1110,21 +1175,61 @@ class Krea2Runtime:
             tile_sample_stride_width=COMFY_VAE_TILE_PIXELS - COMFY_VAE_OVERLAP_PIXELS,
         )
 
-    def _decode(self, latents: torch.Tensor, force_tiled_decode: bool = False) -> list[Image.Image]:
+    def _run_decode(self, restored: torch.Tensor) -> list[Image.Image]:
+        with torch.inference_mode():
+            decoded = self.vae.decode(restored.to(self.dtype), return_dict=False)[0]
+            return [_decoded_tensor_to_image(frame[:, 0].float()) for frame in decoded]
+
+    def _decode_frames(self, restored: torch.Tensor, tiled: bool, evicted: bool):
+        """Decode, and buy the room the hard way only if the estimate turns out to be wrong.
+
+        The sizing decision is an estimate against free memory, so it can be beaten — by a
+        fragmented allocator, or by anything that arrived on the card after it was taken. Running
+        out of memory here used to be impossible because the transformer was always evicted first;
+        now that it is not, this is where that guarantee lives. The retry is the old behaviour,
+        paid once, only when it is actually needed, and the caller reports the eviction it caused
+        rather than the one it planned.
+        """
+        try:
+            return self._run_decode(restored), evicted
+        except CUDA_OOM_ERRORS:
+            if evicted or not self._release_transformer_for_decode():
+                raise
+            return self._run_decode(restored), True
+
+    def _decode(
+        self, latents: torch.Tensor, force_tiled_decode: bool = False, metrics_key: str = "vae_decode"
+    ) -> list[Image.Image]:
         device = self.device
         height = latents.shape[2] * KREA2_VAE_SCALE_FACTOR
         width = latents.shape[3] * KREA2_VAE_SCALE_FACTOR
-        self._release_transformer_for_decode()
         tiled = self._resolved_tiled_decode(height, width, force_tiled_decode)
+        # Only a decode that cannot otherwise fit needs the transformer's room. A tiled one peaks
+        # around 1.3 GiB — far less than the sampling that just finished with the transformer
+        # resident — so evicting for it buys nothing and costs a round trip of the whole
+        # transformer across the bus. That is invisible in a full-frame job, where the eviction
+        # happens once after the last thing that wanted the card; in a USDU pass it happens per
+        # tile, and every following tile drags the transformer back to sample. On a four-tile 2x
+        # pass that was eight transfers.
+        #
+        # A full frame was evicting unconditionally, including at sizes that had the room all
+        # along, which is a 10.4s round trip on this card bought for nothing. `_resolved_tiled_
+        # decode` has already refused the full pass when it would not fit, so reaching here with
+        # `tiled` false means it does; the eviction stays only as the answer to being wrong, and
+        # `_decode_with_retry` pays it exactly then.
+        evicted = False
+        if not tiled and not self._full_decode_fits(height, width):
+            evicted = self._release_transformer_for_decode()
         try:
             self.vae.to(device=device, dtype=self.dtype)
             self._configure_vae_tiling(tiled)
             restored = self._process_out(latents.to(device=device, dtype=torch.float32)).unsqueeze(2)
-            with torch.inference_mode():
-                decoded = self.vae.decode(restored.to(self.dtype), return_dict=False)[0]
-                images = [_decoded_tensor_to_image(frame[:, 0].float()) for frame in decoded]
-            self.last_generation_metrics.setdefault("vae_decode", {}).update({
+            images, evicted = self._decode_frames(restored, tiled, evicted)
+            # Under the stage's own name, so a refinement decode reports its mode instead of
+            # writing it to the base stage's key where nothing reads it.
+            self.last_generation_metrics.setdefault(metrics_key, {}).update({
                 "actual_vae_mode": "tiled" if tiled else "full",
+                "transformer_evicted_for_decode": evicted,
                 "requested_tiled_decode": {"tile": COMFY_VAE_TILE_PIXELS, "overlap": COMFY_VAE_OVERLAP_PIXELS},
                 "resolved_tiled_decode": {
                     "tile": int(getattr(self.vae, "tile_sample_min_height", COMFY_VAE_TILE_PIXELS)),
@@ -1354,15 +1459,89 @@ class Krea2Runtime:
         })
 
     def _conditioning(self, prompt: str, negative_prompt: str, cfg: float, guidance: str, stage: str):
-        positive = self._run_cuda_stage(f"{stage}prompt_encode", lambda: self._encode_prompt(prompt))
-        if float(cfg) == 1.0 and guidance != "cfg_zero_star":
-            # No unconditional branch will be evaluated, so encoding one would cost a full language
-            # model pass for a tensor nothing reads.
-            return positive, None
-        negative = self._run_cuda_stage(
-            f"{stage}negative_prompt_encode", lambda: self._encode_prompt(negative_prompt)
-        )
+        # One residency covers both encodes, so a CFG generation moves the encoder onto the card
+        # once rather than once per prompt — and moves it not at all when both are already cached,
+        # which is every stage after the first.
+        with text_encoder_resident(self):
+            positive = self._encode_stage(f"{stage}prompt_encode", prompt)
+            if float(cfg) == 1.0 and guidance != "cfg_zero_star":
+                # No unconditional branch will be evaluated, so encoding one would cost a full
+                # language model pass for a tensor nothing reads.
+                return positive, None
+            negative = self._encode_stage(f"{stage}negative_prompt_encode", negative_prompt)
         return positive, negative
+
+    def _encode_stage(self, name: str, prompt: str):
+        """Time the encode and say whether it ran, so a stage that cost nothing reads as reused
+        rather than as a suspiciously fast encoder."""
+        embeddings = self._run_cuda_stage(name, lambda: self._encode_prompt(prompt))
+        note_conditioning_reuse(self, name)
+        return embeddings
+
+    def prepare_refinement_conditioning(self, prompt, negative_prompt, cfg, guidance):
+        """Encode once into a CPU-only object safe to reuse across tiled refinement calls.
+
+        USDU refines one tile at a time, so without this the caller would hand the same two strings
+        to `refine_batch` a few dozen times. The in-runtime cache already makes those repeats free,
+        but a prepared object is a stronger promise: the tiles are checked against one another's
+        conditioning rather than trusting that nothing evicted it in between.
+        """
+        self._require_open()
+        if not isinstance(prompt, str) or not isinstance(negative_prompt, str):
+            raise TypeError("prompt and negative_prompt must be strings")
+        if isinstance(cfg, bool) or not isinstance(cfg, (int, float)) or not math.isfinite(float(cfg)):
+            raise ValueError("cfg must be finite")
+        if guidance not in KREA2_GUIDANCE_MODES:
+            raise ValueError(f"guidance must be one of {sorted(KREA2_GUIDANCE_MODES)}")
+        positive, negative = self._conditioning(prompt, negative_prompt, cfg, guidance, "refinement.")
+        return PreparedKrea2Conditioning(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            cfg=float(cfg),
+            guidance=guidance,
+            positive=positive.detach().to(device="cpu", dtype=self.dtype).contiguous().clone(),
+            negative=(
+                None if negative is None
+                else negative.detach().to(device="cpu", dtype=self.dtype).contiguous().clone()
+            ),
+        )
+
+    def _validate_prepared_conditioning(self, prepared, prompt, negative_prompt, cfg, guidance):
+        """Fail closed unless the prepared conditioning is exactly this request's.
+
+        Every tile in a USDU pass shares one conditioning, so conditioning that belonged to a
+        different request would not fail loudly — it would quietly render a different picture in
+        every tile of the seam it sits on.
+        """
+        if not isinstance(prepared, PreparedKrea2Conditioning):
+            raise ValueError("prepared_conditioning must be PreparedKrea2Conditioning")
+        if (prepared.prompt, prepared.negative_prompt, prepared.cfg, prepared.guidance) != (
+            prompt, negative_prompt, float(cfg), guidance
+        ):
+            raise ValueError("prepared_conditioning does not match prompt, negative_prompt, cfg, and guidance")
+        expects_negative = not (float(cfg) == 1.0 and guidance != "cfg_zero_star")
+        if expects_negative != (prepared.negative is not None):
+            raise ValueError("prepared_conditioning's unconditional branch does not match cfg and guidance")
+        for name, tensor in (("positive", prepared.positive), ("negative", prepared.negative)):
+            if tensor is None:
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"prepared_conditioning {name} must be a torch.Tensor")
+            if tensor.device.type != "cpu":
+                raise ValueError(f"prepared_conditioning {name} must be a CPU tensor")
+            if tensor.dtype != self.dtype:
+                raise ValueError(f"prepared_conditioning {name} dtype does not match runtime dtype")
+            if tensor.ndim != 3 or tensor.shape[0] != 1:
+                raise ValueError(f"prepared_conditioning {name} must have shape [1, sequence, width]")
+            if not tensor.is_contiguous():
+                raise ValueError(f"prepared_conditioning {name} must be contiguous")
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"prepared_conditioning {name} must be finite")
+        return prepared.positive.clone(), None if prepared.negative is None else prepared.negative.clone()
+
+    @staticmethod
+    def prepare_refinement_sigmas(steps, denoise, scheduler):
+        return prepare_krea2_refinement_sigmas(steps, denoise, scheduler)
 
     def generate_batch(
         self,
@@ -1407,8 +1586,9 @@ class Krea2Runtime:
                 return lambda step, _total, latents: callback(offset + step, total, latents)
 
             initial = self._initial_latents(chunk, height, width, sigmas[0])
-            latents = self._run_cuda_stage(
-                "sampling",
+            latents = sample_or_stream(
+                self,
+                chunk,
                 lambda initial=initial, chunk=chunk: self._sample(
                     conditioning, initial, sigmas, sampler, cfg, chunk,
                     chunked(on_step), chunked(on_step_checkpoint), guidance=guidance,
@@ -1468,7 +1648,7 @@ class Krea2Runtime:
         if float(denoise) <= 0.0 or float(denoise) > 1.0:
             raise ValueError("denoise must be greater than 0 and at most 1")
         self._require_cuda()
-        del pag_scale, pag_applied_layers, prepared_conditioning, prepared_sigmas
+        del pag_scale, pag_applied_layers
 
         mask_tensor = None
         if masks is not None:
@@ -1482,8 +1662,21 @@ class Krea2Runtime:
                 values.append(data.view(1, 1, height, width).float() / 255.0)
             mask_tensor = torch.cat(values)
 
-        sigmas, schedule_diagnostics = krea2_refinement_sigma_schedule(steps, float(denoise), scheduler)
-        conditioning = self._conditioning(prompt, negative_prompt, cfg, guidance, "refinement.")
+        # The schedule and the conditioning are the two things every tile of a USDU pass shares.
+        # Both are validated rather than trusted: a mismatch would not fail loudly, it would render
+        # a different picture on one side of a seam.
+        _expected, schedule_diagnostics = krea2_refinement_sigma_schedule(steps, float(denoise), scheduler)
+        if prepared_sigmas is None:
+            sigmas = _expected
+        else:
+            sigmas = validate_prepared_krea2_refinement_sigmas(prepared_sigmas, steps, float(denoise), scheduler)
+        conditioning_reused = prepared_conditioning is not None
+        if conditioning_reused:
+            conditioning = self._validate_prepared_conditioning(
+                prepared_conditioning, prompt, negative_prompt, cfg, guidance
+            )
+        else:
+            conditioning = self._conditioning(prompt, negative_prompt, cfg, guidance, "refinement.")
         source = self._run_cuda_stage("refinement.vae_encode", lambda: self._encode_images(images))
         noise = _cpu_noise_like_batch(source, generators)
         start_sigma = float(sigmas[0].item())
@@ -1497,8 +1690,17 @@ class Krea2Runtime:
             ),
         )
         self._record_sampling_metrics("refinement.sampling", len(sigmas) - 1, schedule_diagnostics, guidance, cfg)
+        # USDU reports per tile whether each shared input was actually reused, so a pass that
+        # silently fell back to re-encoding every tile is visible rather than merely slow.
+        self.last_generation_metrics.setdefault("refinement.sampling", {}).update({
+            "conditioning_reused": conditioning_reused,
+            "sigmas_reused": prepared_sigmas is not None,
+        })
         return self._run_cuda_stage(
-            "refinement.vae_decode", lambda: self._decode(latents, force_tiled_decode=force_tiled_decode)
+            "refinement.vae_decode",
+            lambda: self._decode(
+                latents, force_tiled_decode=force_tiled_decode, metrics_key="refinement.vae_decode"
+            ),
         )
 
 

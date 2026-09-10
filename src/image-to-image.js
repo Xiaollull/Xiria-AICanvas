@@ -18,7 +18,7 @@
 import { POSTPROCESS_STAGE_IDS, normalizePostprocessOrder, postprocessTargetSize } from "./postprocessing.js";
 import { formatFileSize } from "./format-size.js";
 import { DISTILLED_GUIDANCE_ENGINES, adetailerPayload, adetailerStageIssue, normalizeADetailerStage } from "./adetailer-units.js";
-import { generationHiresSeedSettings, hiresSeedPayload, normalizeUint64Seed } from "./hires-settings.js";
+import { generationHiresSeedSettings, hiresSeedPayload, normalizeUint64Seed, supportsUsduTiled } from "./hires-settings.js";
 
 export const IMAGE_TO_IMAGE_SCHEMA_VERSION = 1;
 
@@ -379,8 +379,6 @@ export function imageToImageRequestBody({
     sampler: config.sampler,
     scheduler: config.scheduler,
     guidance: "none",
-    // Neither native engine accepts a process preview, and this page has no toggle for them yet.
-    preview_enabled: !splitModel,
     source_image: {
       enabled: true,
       image_data: source?.dataUrl || "",
@@ -397,7 +395,7 @@ export function imageToImageRequestBody({
       cfg: config.hires.cfg,
       tile_size: config.hires.tileSize,
       tile_overlap: config.hires.tileOverlap,
-      execution_mode: anima && config.hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
+      execution_mode: supportsUsduTiled(engine) && config.hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
       ...(config.hires.sampler ? { sampler: config.hires.sampler } : {}),
       ...(config.hires.scheduler ? { scheduler: config.hires.scheduler } : {}),
       tile_width: "auto",

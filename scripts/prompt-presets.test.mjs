@@ -119,7 +119,10 @@ test("draft validation enforces limits and same-type NFKC/casefold duplicate nam
   assert.equal(validatePromptPresetDraft(draft({ name: "cafe", type: "negative" }), records).valid, true);
   assert.equal(validatePromptPresetDraft(draft({ name: "cafe" }), records, "one").valid, true);
   assert.match(validatePromptPresetDraft(draft({ name: "x".repeat(49) }), []).errors.name, /48/);
-  assert.match(validatePromptPresetDraft(draft({ content: "x".repeat(2001) }), []).errors.content, /2000/);
+  // The name is a label and is limited; the content is prompt text and is not. A preset is
+  // inserted into the prompt, so capping it would cap what the prompt itself can say.
+  assert.equal(validatePromptPresetDraft(draft({ content: "x".repeat(50_000) }), []).valid, true);
+  assert.match(validatePromptPresetDraft(draft({ content: "   " }), []).errors.content, /请输入/);
   assert.equal(validatePromptPresetDraft(draft({ position: "sideways" }), []).valid, false);
   assert.equal(validatePromptPresetDraft(draft({ name: "STRASSE" }), [{ ...records[0], name: "Straße" }]).valid, false);
   assert.equal(validatePromptPresetDraft(draft({ name: "ΟΣ" }), [{ ...records[0], name: "ος" }]).valid, false);

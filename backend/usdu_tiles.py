@@ -67,22 +67,32 @@ def _expand_crop(crop: Rect, canvas: Size, aspect: float) -> Rect:
     return left, top, right, bottom
 
 
-def plan_tiles(canvas: Size, core_tile: Size, padding=32, seam_mode="none") -> TilePlan:
-    """Plan source-derived core tiles and their clamped, aspect-expanded crops."""
+def plan_tiles(canvas: Size, core_tile: Size, padding=32, seam_mode="none", alignment=8) -> TilePlan:
+    """Plan source-derived core tiles and their clamped, aspect-expanded crops.
+
+    `alignment` is the tile size each engine can actually accept: Anima refuses a canvas that is
+    not a multiple of 32, Krea 2 one that is not a multiple of 16. The default of 8 is the latent
+    stride alone and is what a caller gets when it does not say. It matters because the padded core
+    is rounded to the nearest multiple of it, and at most paddings the nearest multiple of 8 is not
+    a multiple of 32 — a plan built without the engine's alignment is rejected tile by tile, at the
+    point of sampling, rather than here.
+    """
     _validate_size("canvas", canvas)
     _validate_size("core_tile", core_tile)
     if isinstance(padding, bool) or not isinstance(padding, int) or padding < 0:
         raise ValueError("padding must be a non-negative integer")
     if seam_mode != "none":
         raise ValueError("only seam_mode='none' is supported")
+    if isinstance(alignment, bool) or not isinstance(alignment, int) or alignment < 1:
+        raise ValueError("alignment must be a positive integer")
 
     canvas_width, canvas_height = canvas
     core_width, core_height = core_tile
     cols = math.ceil(canvas_width / core_width)
     rows = math.ceil(canvas_height / core_height)
     processing_size = (
-        max(8, round((core_width + padding) / 8) * 8),
-        max(8, round((core_height + padding) / 8) * 8),
+        max(alignment, round((core_width + padding) / alignment) * alignment),
+        max(alignment, round((core_height + padding) / alignment) * alignment),
     )
     aspect = processing_size[0] / processing_size[1]
     regions = []

@@ -33,7 +33,7 @@ import { acquireOfflineUpdateLock } from "./scripts/offline-update-lock.mjs";
 import { createOfflineUpdateTemp, removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
 import { configuredModelDirectory, defaultLoraCategories, groupLoraModels, mergeModelPaths } from "./scripts/model-paths.mjs";
 import { readPngMetadataChunks } from "./scripts/png-text-chunks.mjs";
-import { interpretImageMetadata, matchModelName } from "./src/image-metadata.js";
+import { interpretImageMetadata, matchModelName, stripImageInfoMatches } from "./src/image-metadata.js";
 import {
   formatSharedRef,
   inspectSharedDirectory,
@@ -57,6 +57,7 @@ import { applyPluginEnabled, pluginStatePathFor, pluginToggleAdmission, readPlug
 import { removePluginFolder, revealPluginFolder } from "./scripts/plugin-actions.mjs";
 import { descriptionNeedsVersionIdentity, loraMetadataCacheValid, plainTextFromHtml, readLoraFileMetadata, reviewLoraPrompts, TRIGGER_REVIEW_SCHEMA } from "./scripts/lora-metadata.mjs";
 import { pruneCardAssets, readCardAsset, readLoraCardStore, writeCardAsset, writeLoraCardStore } from "./scripts/lora-cards.mjs";
+import { pruneToolboxAssets, readToolboxAsset, readToolboxState, writeToolboxAsset, writeToolboxState } from "./scripts/toolbox-state.mjs";
 import { appendDownloadQueueState, filterPendingRecommendedArtifacts, itemStatusIsTerminal } from "./scripts/model-download-queue.mjs";
 import { assistantReadiness, mergeAssistantSettings, readAssistantProfileStore, readAssistantSettings, redactAssistantProfileStore, redactAssistantSettings, assistantSettingsPath, writeAssistantProfileStore, writeAssistantSettings } from "./scripts/assistant-settings.mjs";
 import {
@@ -185,6 +186,12 @@ const runtimeWatchDirectories = [
   // plugin from churning the dev watcher.
   pluginsRootFor(projectRoot),
 ];
+// Supervised = started by scripts/start.mjs as the user's service, not by a developer running
+// `npm run dev:vite`. The service offers no live-update socket: Vite's browser client reloads the
+// whole page whenever that socket drops and the server answers again -- a network blip to a remote
+// box, a tab the browser put to sleep, a service restart -- which threw users back to the boot
+// screen mid-session. Nobody edits source under a running service, so there is nothing to hot-update.
+const supervisedService = process.env.XIRAI_SERVICE_SUPERVISOR === "1";
 const setupMarkerPath = getSetupMarkerPath(projectRoot);
 const setupComplete = Boolean(readSetupMarker(projectRoot));
 const loraCacheDirectory = path.join(cacheDirectory, "lora-metadata");
@@ -196,6 +203,11 @@ const workspaceId = createHash("sha256")
 const inferenceProtocol = 34;
 export const inferenceWorkspaceId = workspaceId;
 const maximumUpdateArchiveBytes = 4 * 1024 ** 3;
+// The saved workspace carries the prompt, the negative prompt and every prompt preset, none of
+// which has a length limit any more. The default 64 KB body would have started rejecting the save
+// on a long prompt — and the client fires it without reading the reply, so the workspace would
+// have stopped persisting silently.
+const maximumUiStateBytes = 16 * 1024 * 1024;
 let stopInferenceForUpdate = () => Promise.resolve();
 
 function normalizedThemeHex(value, fallback) {
@@ -1891,7 +1903,7 @@ async function uiStateApi(request, response, next) {
       return;
     }
     if (request.method === "PUT") {
-      const state = await readJsonRequest(request);
+      const state = await readJsonRequest(request, maximumUiStateBytes);
       if (!state || typeof state !== "object" || Array.isArray(state)) {
         throw Object.assign(new Error("Saved interface state must be an object"), { statusCode: 400 });
       }
@@ -2004,6 +2016,91 @@ function loraCardsApiPlugin() {
     name: "local-lora-cards-api",
     configureServer(server) { server.middlewares.use(loraCardsApi); },
     configurePreviewServer(server) { server.middlewares.use(loraCardsApi); },
+  };
+}
+
+
+// Toolbox store.
+//
+// The Toolbox page is lazily mounted and unmounted the moment the user leaves it, so the tool they
+// had selected and the picture the image reader had open were lost on every navigation, refresh and
+// restart. This is where that now survives.
+//
+// Separate from `/api/ui-state` for the same reason the LoRA card store is: the workspace document
+// is rewritten constantly and capped for the whole state, and an uploaded picture inside it would
+// be re-encoded as base64 on every autosave. The picture is a file addressed by a hash of its own
+// bytes, and the browser never sees a filesystem path for it.
+
+async function toolboxApi(request, response, next) {
+  const url = new URL(request.url, "http://localhost");
+  if (url.pathname !== "/api/toolbox/state" && url.pathname !== "/api/toolbox/state/asset") {
+    next();
+    return;
+  }
+  try {
+    requireSameOrigin(request);
+    if (url.pathname === "/api/toolbox/state/asset") {
+      await toolboxAssetRequest(request, response, url);
+      return;
+    }
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Cache-Control", "no-store");
+    if (request.method === "GET") {
+      const { state, reset } = await readToolboxState(stateDirectory);
+      response.statusCode = 200;
+      response.end(JSON.stringify({ state, reset }));
+      return;
+    }
+    if (request.method === "PUT") {
+      // Small by construction: the schema keeps images out and bounds the parsed record, so the
+      // whole document is sent rather than patched and the two ends never have to merge.
+      const payload = await readJsonRequest(request, 2 * 1024 * 1024);
+      const state = await writeToolboxState(stateDirectory, payload?.state);
+      const removed = await pruneToolboxAssets(stateDirectory, state);
+      response.statusCode = 200;
+      response.end(JSON.stringify({ state, removed: removed.length }));
+      return;
+    }
+    throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+  } catch (error) {
+    if (response.headersSent) {
+      response.end();
+      return;
+    }
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.statusCode = error.statusCode || 500;
+    response.end(JSON.stringify({ error: error.message || "\u5de5\u5177\u7bb1\u72b6\u6001\u8bf7\u6c42\u5931\u8d25" }));
+  }
+}
+
+async function toolboxAssetRequest(request, response, url) {
+  if (request.method === "GET") {
+    const asset = await readToolboxAsset(stateDirectory, url.searchParams.get("id"));
+    response.statusCode = 200;
+    response.setHeader("Content-Type", asset.contentType);
+    // The name is the content hash, so a stored picture is immutable and a different one arrives
+    // under a different id rather than as a stale cache hit.
+    response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+    response.end(asset.buffer);
+    return;
+  }
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.setHeader("Cache-Control", "no-store");
+  if (request.method === "POST") {
+    const payload = await readJsonRequest(request, 20 * 1024 * 1024);
+    const asset = await writeToolboxAsset(stateDirectory, payload?.dataUrl);
+    response.statusCode = 200;
+    response.end(JSON.stringify({ id: asset.id, url: `/api/toolbox/state/asset?id=${asset.id}`, bytes: asset.bytes }));
+    return;
+  }
+  throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+}
+
+function toolboxApiPlugin() {
+  return {
+    name: "local-toolbox-api",
+    configureServer(server) { server.middlewares.use(toolboxApi); },
+    configurePreviewServer(server) { server.middlewares.use(toolboxApi); },
   };
 }
 
@@ -3844,11 +3941,32 @@ async function buildModelCatalogs() {
       // from answering; the reader degrades to "not found" for that one.
     }
   }
+  // Every split engine keeps its diffusion model in the same shared folder, so the folder cannot say
+  // which engine a file belongs to. This used to tag every file in it as Anima -- written when Anima
+  // was the only split engine -- and the image reader then applied a Krea 2 picture as an Anima one,
+  // which Anima's own model check refused as "not installed". Each engine's discovery reads the
+  // file's tensors, the same test its model picker lists by, so the tag now agrees with the picker.
   try {
     const directory = await getAuxiliaryModelDirectory("diffusion_models");
     const relative = path.relative(projectRoot, directory).split(path.sep).join("/");
+    const discoveries = [["Anima", discoverAnimaModels], ["Flux", discoverFluxModels], ["Flux2", discoverFlux2Models], ["Krea2", discoverKrea2Models]];
+    // Scanned together, claimed in a fixed order, so a file two engines would both accept always
+    // lands on the same one rather than on whichever scan finished first.
+    const scanned = await Promise.all(discoveries.map(([, discover]) => discover({ diffusion_model: directory })
+      .then((found) => found.diffusion_model || [])
+      .catch(() => [])));
+    const claimed = new Set();
+    discoveries.forEach(([engine], index) => {
+      for (const model of scanned[index]) {
+        if (claimed.has(model.value)) continue;
+        claimed.add(model.value);
+        checkpoints.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine }));
+      }
+    });
+    // A file no engine recognises is still on disk, so the reader can say it was found. It names no
+    // engine, which leaves applying it to the engine that is selected instead of guessing one.
     for (const model of await findModels(directory, directory, false, diffusionModelExtensions)) {
-      checkpoints.push(catalogEntry("local", model.value, `${relative} · Anima`, { engine: "Anima" }));
+      if (!claimed.has(model.value)) checkpoints.push(catalogEntry("local", model.value, relative));
     }
   } catch {}
   for (const engine of Object.keys(loraEnginePathKeys)) {
@@ -3994,6 +4112,18 @@ async function imageInfoApi(request, response, url) {
     return;
   }
 
+  if (url.pathname === "/api/image-info/resolve") {
+    // Re-checks the model names of an already parsed record against what is installed now. The
+    // reader calls this when it restores a saved record and again at the moment Apply is pressed,
+    // because a stored match is a claim about the disk at the time it was made: a Krea 2 picture
+    // parsed before the catalogue could tell engines apart kept being applied as Anima.
+    if (request.method !== "POST") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+    const payload = await readJsonRequest(request, 2 * 1024 * 1024);
+    if (payload?.info?.status !== "ok") throw Object.assign(new Error("没有可重新核对的图片信息"), { statusCode: 400 });
+    response.statusCode = 200;
+    response.end(JSON.stringify({ info: await resolveImageInfoModels(stripImageInfoMatches(payload.info)) }));
+    return;
+  }
   if (url.pathname === "/api/image-info/read") {
     const payload = await readJsonRequest(request, IMAGE_INFO_MAX_UPLOAD_BYTES);
     if (payload.directory) {
@@ -4070,7 +4200,7 @@ async function sharedPathsApi(request, response, url) {
 
 async function modelApi(request, response, next) {
   const url = new URL(request.url, "http://localhost");
-  const apiPaths = ["/api/models", "/api/loras", "/api/model-paths", "/api/shared-paths", "/api/shared-paths/inspect", "/api/image-info/scan", "/api/image-info/read", "/api/image-info/preview", "/api/lora-lookup", "/api/lora-preview", "/api/yolo/download", "/api/background-removal/download", "/api/model-download", "/api/model-download/job", "/api/model-download/retry", "/api/recommended-models", "/api/recommended-download"];
+  const apiPaths = ["/api/models", "/api/loras", "/api/model-paths", "/api/shared-paths", "/api/shared-paths/inspect", "/api/image-info/scan", "/api/image-info/read", "/api/image-info/resolve", "/api/image-info/preview", "/api/lora-lookup", "/api/lora-preview", "/api/yolo/download", "/api/background-removal/download", "/api/model-download", "/api/model-download/job", "/api/model-download/retry", "/api/recommended-models", "/api/recommended-download"];
   if (!apiPaths.includes(url.pathname)) {
     next();
     return;
@@ -5184,7 +5314,7 @@ function systemApiPlugin() {
 }
 
 export default defineConfig({
-  plugins: [setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), loraCardsApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
+  plugins: [setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
   cacheDir: path.join(cacheDirectory, "vite"),
   define: {
     // The browser may be on a different machine than the folders the user is
@@ -5218,6 +5348,7 @@ export default defineConfig({
     port: webPort,
     strictPort: true,
     headers: webSecurityHeaders,
+    ...(supervisedService ? { hmr: false, ws: false } : {}),
     watch: {
       ignored: ignoreRuntimeWatchPath,
     },

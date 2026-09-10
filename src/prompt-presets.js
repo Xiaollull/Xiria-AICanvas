@@ -55,8 +55,9 @@ export function validatePromptPresetDraft(draft, records = [], editingId = null)
   const errors = {};
   if (!value.name) errors.name = "请输入预设名称";
   else if (value.name.length > 48) errors.name = "名称不能超过 48 个字符";
+  // A preset is a piece of a prompt and is held to the same rule as the prompt itself: it needs
+  // content, and nothing caps how much. The name is a label and keeps its limit.
   if (!value.content) errors.content = "请输入 Prompt 内容";
-  else if (value.content.length > 2000) errors.content = "Prompt 内容不能超过 2000 个字符";
   if (!PROMPT_PRESET_TYPES.includes(draft?.type)) errors.type = "请选择正向或负向预设";
   if (!PROMPT_PRESET_POSITIONS.includes(draft?.position)) errors.position = "请选择有效的插入位置";
   if (!errors.name) {
@@ -71,7 +72,7 @@ function validRecordShape(record) {
   if (!record || typeof record !== "object" || Array.isArray(record)) return false;
   if (typeof record.id !== "string" || !record.id.trim() || record.id.length > 128) return false;
   if (typeof record.name !== "string" || !record.name.trim() || record.name.trim().length > 48) return false;
-  if (typeof record.content !== "string" || !record.content.trim() || record.content.trim().length > 2000) return false;
+  if (typeof record.content !== "string" || !record.content.trim()) return false;
   if (!PROMPT_PRESET_POSITIONS.includes(record.position) || !PROMPT_PRESET_TYPES.includes(record.type)) return false;
   if (!Number.isSafeInteger(record.order) || record.order < 0) return false;
   return Number.isSafeInteger(record.version) && record.version >= 1;

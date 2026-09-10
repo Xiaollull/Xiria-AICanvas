@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unittest
 import base64
@@ -124,20 +125,6 @@ class ADetailerTests(unittest.TestCase):
         self.assertEqual(preview.size, image.size)
         self.assertTrue(np.any(pixels[25, 25] != 0))
         self.assertTrue(np.all(pixels[50, 50] == 0))
-
-    def test_lossless_detection_preview_keeps_source_resolution(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            original_directory = inference_server.PREVIEW_DIRECTORY
-            inference_server.PREVIEW_DIRECTORY = Path(temporary)
-            try:
-                source = Image.new("RGB", (1024, 768), (32, 64, 96))
-                output = inference_server.save_pil_preview(source, "job", "adetailer_detection", lossless=True)
-                self.assertEqual(output.suffix, ".png")
-                with Image.open(output) as preview:
-                    self.assertEqual(preview.size, source.size)
-                    self.assertEqual(preview.format, "PNG")
-            finally:
-                inference_server.PREVIEW_DIRECTORY = original_directory
 
     def test_prompt_inheritance_and_placeholder(self):
         self.assertEqual(expand_prompt("", "parent"), "parent")
@@ -272,7 +259,6 @@ class ADetailerTests(unittest.TestCase):
             scheduler="simple",
             guidance="pag",
             pag={"scale": 0.7, "applied_layers": "all"},
-            preview_enabled=False,
             adetailer={
                 "enabled": True,
                 "units": [{"detector": "face.pt", "use_cfg": True, "cfg": 20}],
@@ -302,7 +288,6 @@ class ADetailerTests(unittest.TestCase):
             scheduler="simple",
             guidance="pag",
             pag={"scale": 0.7, "applied_layers": "all"},
-            preview_enabled=False,
             adetailer={
                 "enabled": True,
                 "units": [{
@@ -377,7 +362,6 @@ class ADetailerTests(unittest.TestCase):
                     "anima-detail",
                     Control(),
                     0,
-                    schedule_latent_preview=Mock(side_effect=AssertionError("latent preview used")),
                     image_seed=100,
                 )
             self.assertIsNone(warning)
@@ -585,10 +569,8 @@ class ADetailerTests(unittest.TestCase):
     def test_history_directory_listing_supports_nested_mixed_content(self):
         with tempfile.TemporaryDirectory() as temporary:
             original_output = inference_server.OUTPUT_DIRECTORY
-            original_preview = inference_server.PREVIEW_DIRECTORY
             root = Path(temporary)
             inference_server.OUTPUT_DIRECTORY = root
-            inference_server.PREVIEW_DIRECTORY = root / ".previews"
             nested = root / "自定义" / "level-two"
             nested.mkdir(parents=True)
             Image.new("RGB", (8, 8)).save(root / "root.png")
@@ -609,7 +591,6 @@ class ADetailerTests(unittest.TestCase):
                 self.assertEqual(cards[0]["preview"]["name"], "mixed.png")
             finally:
                 inference_server.OUTPUT_DIRECTORY = original_output
-                inference_server.PREVIEW_DIRECTORY = original_preview
 
     def test_saved_manual_collage_layout_is_available_in_history(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -683,7 +664,7 @@ class ADetailerStepAccountingTests(unittest.TestCase):
     def anima_request(self, **overrides):
         return self.request(
             engine="Anima", checkpoint=None, diffusion_model="d.safetensors",
-            text_encoder="t.safetensors", vae="v.safetensors", preview_enabled=False,
+            text_encoder="t.safetensors", vae="v.safetensors",
             sampler="euler", scheduler="simple", **overrides,
         )
 
@@ -731,6 +712,39 @@ class ADetailerStepAccountingTests(unittest.TestCase):
         )
         self.assertEqual(inference_server.base_sampling_steps(request, "sd"), 0)
         self.assertEqual(inference_server.base_sampling_steps(self.request(), "sd"), 30)
+
+
+class DetectorInterpreterTests(unittest.TestCase):
+    """The detector runs in a subprocess, so which interpreter it gets is the whole game."""
+
+    def test_the_detector_runs_the_interpreter_this_server_runs(self):
+        self.assertEqual(inference_server.ADETAILER_PYTHON, Path(sys.executable))
+
+    def test_the_interpreter_is_not_resolved_out_of_its_virtual_environment(self):
+        """On Linux the installer builds `.venv` with uv against a managed CPython, so
+        `.venv/bin/python` is a symlink to an interpreter holding none of the environment's
+        packages. Resolving it handed the worker that interpreter and every detection died on
+        `ModuleNotFoundError: No module named 'PIL'`. Windows copies the executable into the
+        environment instead, which is why resolving looked harmless for so long."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "managed" / "bin"
+            base.mkdir(parents=True)
+            interpreter = base / "python3.12"
+            interpreter.write_text("", encoding="utf-8")
+            venv = root / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            link = venv / "python"
+            try:
+                link.symlink_to(interpreter)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable on this platform")
+
+            # This is the shape the bug had: the two paths differ, and only the unresolved one
+            # still sits inside the environment that carries PIL and ultralytics.
+            self.assertNotEqual(Path(link), Path(link).resolve())
+            self.assertEqual(Path(link).parent.parent.name, ".venv")
+            self.assertNotEqual(Path(link).resolve().parent.parent.name, ".venv")
 
 
 if __name__ == "__main__":

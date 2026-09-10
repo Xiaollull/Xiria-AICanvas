@@ -4,6 +4,7 @@ import binascii
 import copy
 import gc
 import io
+import itertools
 import json
 import math
 import os
@@ -18,7 +19,7 @@ import uuid
 import warnings
 import re
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
@@ -190,12 +191,11 @@ try:
         detection_mask,
         discover_detector_models,
         expand_prompt,
-        render_detection_preview,
         resolve_detector_model,
         run_detector,
         select_detections,
     )
-    from .anima_pipeline import load_anima_runtime
+    from .anima_pipeline import ANIMA_PIXEL_ALIGNMENT, load_anima_runtime
     from .anima_sampling import ANIMA_SAMPLERS, ANIMA_SCHEDULERS, anima_sampling_diagnostics
     from .flux_pipeline import FLUX_MAX_EDGE, flux_component_bytes, load_flux_runtime
     from .flux_sampling import (
@@ -211,7 +211,12 @@ try:
         flux2_resolution_shift,
         flux2_sampling_diagnostics,
     )
-    from .krea2_pipeline import KREA2_MAX_EDGE, krea2_component_bytes, load_krea2_runtime
+    from .krea2_pipeline import (
+        KREA2_MAX_EDGE,
+        KREA2_PIXEL_ALIGNMENT,
+        krea2_component_bytes,
+        load_krea2_runtime,
+    )
     from .krea2_sampling import (
         KREA2_SAMPLERS,
         KREA2_SCHEDULERS,
@@ -273,12 +278,11 @@ except ImportError:
         detection_mask,
         discover_detector_models,
         expand_prompt,
-        render_detection_preview,
         resolve_detector_model,
         run_detector,
         select_detections,
     )
-    from anima_pipeline import load_anima_runtime
+    from anima_pipeline import ANIMA_PIXEL_ALIGNMENT, load_anima_runtime
     from anima_sampling import ANIMA_SAMPLERS, ANIMA_SCHEDULERS, anima_sampling_diagnostics
     from flux_pipeline import FLUX_MAX_EDGE, flux_component_bytes, load_flux_runtime
     from flux_sampling import (
@@ -294,7 +298,12 @@ except ImportError:
         flux2_resolution_shift,
         flux2_sampling_diagnostics,
     )
-    from krea2_pipeline import KREA2_MAX_EDGE, krea2_component_bytes, load_krea2_runtime
+    from krea2_pipeline import (
+        KREA2_MAX_EDGE,
+        KREA2_PIXEL_ALIGNMENT,
+        krea2_component_bytes,
+        load_krea2_runtime,
+    )
     from krea2_sampling import (
         KREA2_SAMPLERS,
         KREA2_SCHEDULERS,
@@ -354,18 +363,50 @@ except ImportError:
 
 
 OUTPUT_DIRECTORY = configured_path("XIRAI_OUTPUT_DIR", "outputs")
-PREVIEW_DIRECTORY = OUTPUT_DIRECTORY / ".previews"
+# Where the withdrawn latent process preview wrote its frames. Nothing writes here any more; the
+# name survives so an installation upgrading from a build that did keeps the leftovers swept and
+# out of the output browser rather than suddenly showing them as a folder full of stray frames.
+LEGACY_PREVIEW_DIRECTORY = OUTPUT_DIRECTORY / ".previews"
+# Stage previews outlive the run that made them — the point of them is to be looked at after a
+# stage finishes, while the next stage is still running.
+STAGE_PREVIEW_DIRECTORY = OUTPUT_DIRECTORY / ".stages"
+# Folders under the output root that hold machinery rather than pictures. `.stages` was missing
+# from the old guard, which was written for `.previews` alone, so the browser listed the stage
+# folder as an empty folder of its own.
+INTERNAL_OUTPUT_FOLDER_NAMES = (".previews", ".stages")
+
+
+def is_internal_output_directory(path: Path) -> bool:
+    """Whether `path` is one of those folders, or sits inside one.
+
+    The roots are derived on each call rather than frozen beside the constants above: tests
+    redirect `OUTPUT_DIRECTORY`, and so does an installation that moves its output folder, and a
+    tuple captured at import time would go on guarding the folder the server started with.
+    """
+    resolved = path.resolve()
+    for name in INTERNAL_OUTPUT_FOLDER_NAMES:
+        root = (OUTPUT_DIRECTORY / name).resolve()
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
 LOG_DIRECTORY = PROJECT_ROOT / "logs"
 STATE_DIRECTORY = configured_path("XIRAI_STATE_DIR", "state-cache")
 PERFORMANCE_SETTINGS_FILE = STATE_DIRECTORY / "performance.json"
 ADETAILER_MODEL_DIRECTORY = resolve_model_directory(PROJECT_ROOT, "yolo")
 UPSCALER_MODEL_DIRECTORY = resolve_model_directory(PROJECT_ROOT, "upscalers")
-ADETAILER_PYTHON = Path(sys.executable).resolve()
+# The interpreter running this server, which inside a virtual environment is that environment's
+# own `python`. It must not be resolved through its symlink: on Linux the installer builds the
+# environment with uv against a managed CPython, so `.venv/bin/python` points at an interpreter
+# that has none of the environment's packages, and the detector worker launched with it dies on
+# `import PIL` before it reaches a model. Windows copies the executable into the environment
+# rather than linking it, which is why resolving only ever broke the Linux installs.
+ADETAILER_PYTHON = Path(sys.executable)
 ADETAILER_WORKER = PROJECT_ROOT / "backend" / "adetailer_detector.py"
 YOLO_CATALOG_PATH = PROJECT_ROOT / "models" / "yolo-models.json"
-PREVIEW_MAX_FRAMES = configured_int("PREVIEW_MAX_FRAMES", 8, 0, 100)
-PREVIEW_MIN_INTERVAL = configured_float("PREVIEW_MIN_INTERVAL", 0.7, 0.0)
-PREVIEW_MAX_EDGE = configured_int("PREVIEW_MAX_EDGE", 384, 128, 4096)
+# A stage preview is a finished picture the user is invited to enlarge and inspect, so it keeps
+# a lot of detail; it is still bounded, because a 3072x2304 Hires result would otherwise be copied
+# in full for every stage of every job in the queue history.
+STAGE_PREVIEW_MAX_EDGE = configured_int("STAGE_PREVIEW_MAX_EDGE", 1536, 384, 4096)
 performance_settings = read_performance_settings(PERFORMANCE_SETTINGS_FILE)
 try:
     performance_settings["memory_mode"] = normalize_memory_mode(
@@ -432,7 +473,7 @@ def open_hires_artifact_capture(job_id, base_seed):
     root = STATE_DIRECTORY / "benchmark" / f"hires-artifacts-{job_id}" / str(base_seed)
     return StageArtifactCapture(root), gate
 OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-PREVIEW_DIRECTORY.mkdir(parents=True, exist_ok=True)
+STAGE_PREVIEW_DIRECTORY.mkdir(parents=True, exist_ok=True)
 LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
 ADETAILER_MODEL_DIRECTORY.mkdir(parents=True, exist_ok=True)
 UPSCALER_MODEL_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -458,10 +499,39 @@ def is_native_family(family):
     return family in NATIVE_FAMILIES
 
 
+# USDU refines one tile at a time and hands every tile the same conditioning and the same sigma
+# suffix, so an engine qualifies once it can prepare and validate both. FLUX.1 and FLUX.2 are
+# guidance distilled and have no unconditional branch to prepare, and neither exposes the prepare
+# surface, so they still run Hires full frame.
+USDU_TILED_FAMILIES = frozenset({"anima", "krea2"})
+
+# The canvas granularity each engine accepts. A tile is sampled at the plan's processing size, so
+# the plan has to be built to the engine's own alignment: rounding the padded core to the nearest
+# multiple of 8 lands off Anima's 32 for most paddings, and off Krea 2's 16 for many of them.
+USDU_PIXEL_ALIGNMENT = {"anima": ANIMA_PIXEL_ALIGNMENT, "krea2": KREA2_PIXEL_ALIGNMENT}
+
+
+def supports_usdu_tiled(family):
+    return family in USDU_TILED_FAMILIES
+
+
+def usdu_pixel_alignment(family):
+    return USDU_PIXEL_ALIGNMENT[family]
+
+
+# One worker, so submitting several jobs queues them rather than running them together: a second
+# generation sharing the card with the first would slow both and could exhaust VRAM outright.
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="inference")
-preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="preview")
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+# Position in this session's queue, counting from one. It numbers what the user submitted rather
+# than what survived: a cancelled job keeps its number so the list reads as a history. The
+# registry lives in memory only, so restarting the package starts the count again at one.
+job_sequence = itertools.count(1)
+# A queue is a history as well as a backlog, and a long session would otherwise hold every job's
+# metadata for as long as the process runs. Finished jobs are trimmed oldest-first past this many;
+# anything still queued or running is never trimmed.
+JOB_HISTORY_LIMIT = 200
 pipeline_lock = threading.Lock()
 job_controls = {}
 loaded_pipeline = None
@@ -535,15 +605,23 @@ async def lifespan(_app):
                 break
         await asyncio.sleep(0.1)
     executor.shutdown(wait=False, cancel_futures=True)
-    preview_executor.shutdown(wait=False, cancel_futures=True)
     with jobs_lock:
         idle = not job_controls
     if idle:
         clear_pipeline()
     clear_background_removal_session()
-    for preview_path in PREVIEW_DIRECTORY.glob("*"):
-        if preview_path.is_file():
-            remove_preview(preview_path)
+    # The queue history resets on restart, so the stage images it referred to are orphans.
+    for stage_path in STAGE_PREVIEW_DIRECTORY.glob("*"):
+        if stage_path.is_file():
+            remove_preview(stage_path)
+    # Frames left behind by the withdrawn latent preview. Sweeping them on the way out means an
+    # installation upgrading from that build reclaims the space without anyone going looking.
+    if LEGACY_PREVIEW_DIRECTORY.is_dir():
+        for preview_path in LEGACY_PREVIEW_DIRECTORY.glob("*"):
+            if preview_path.is_file():
+                remove_preview(preview_path)
+        with suppress(OSError):
+            LEGACY_PREVIEW_DIRECTORY.rmdir()
 
 
 app = FastAPI(title="XiriaCanvas AI Inference", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -692,8 +770,9 @@ class ADetailerUnitInput(BaseModel):
     steps: int = Field(default=28, ge=1, le=100)
     use_cfg: bool = False
     cfg: float = Field(default=7, ge=0, le=30)
-    prompt: str = Field(default="", max_length=8000)
-    negative_prompt: str = Field(default="", max_length=8000)
+    # Uncapped for the same reason the main prompt is: a unit's prompt reaches the same encoders.
+    prompt: str = ""
+    negative_prompt: str = ""
 
     @model_validator(mode="after")
     def validate_configuration(self):
@@ -933,8 +1012,12 @@ class GenerateInput(BaseModel):
     # resolved from the files themselves at load, not from the order they arrive in.
     text_encoder_2: str | None = Field(default=None, min_length=1, max_length=500)
     vae: str | None = Field(default=None, min_length=1, max_length=500)
-    prompt: str = Field(min_length=1, max_length=8000)
-    negative_prompt: str = Field(default="", max_length=8000)
+    # A prompt has a floor and no ceiling. Every engine encodes at whatever length the prompt
+    # tokenises to, so a character count here would be a policy invented by the request model
+    # rather than a limit any model has — and one that refuses the whole generation, which is the
+    # worst possible way to tell someone their prompt is long.
+    prompt: str = Field(min_length=1)
+    negative_prompt: str = ""
     # The ceiling here is the post-processing one. A sampling run is held to 2048 and to 64-pixel
     # alignment by `validate_dimensions`, which is where the two contracts are told apart.
     width: int = Field(ge=64, le=MAX_POSTPROCESS_SOURCE_EDGE)
@@ -949,7 +1032,6 @@ class GenerateInput(BaseModel):
     scheduler: str
     guidance: Literal["none", "pag", "cfg_zero_star"] = "none"
     pag: PagInput = Field(default_factory=PagInput)
-    preview_enabled: bool = True
     background_removal_model: str | None = Field(default=None, max_length=300)
     source_image: SourceImageInput = Field(default_factory=SourceImageInput)
     # Post-processing mode: run the enabled stages on the source picture and nothing else. The base
@@ -1013,7 +1095,7 @@ class GenerateInput(BaseModel):
             if self.guidance == "cfg_zero_star":
                 raise ValueError("CFG-Zero* 仅适用于 Flow Matching 模型；当前 SD / iL 不兼容")
             if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is currently supported only by Anima")
+                raise ValueError("USDU tiled Hires is supported only by Anima and Krea2")
             if self.hires.sampler is not None or self.hires.scheduler is not None:
                 validate_hires_sampling_override(self.hires.sampler, self.hires.scheduler, "sd")
         elif self.engine == "Anima":
@@ -1031,8 +1113,6 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Anima Hires sampler: {self.hires.sampler}")
             if self.hires.scheduler is not None and self.hires.scheduler not in ANIMA_SCHEDULERS:
                 raise ValueError(f"Unsupported Anima Hires scheduler: {self.hires.scheduler}")
-            if self.preview_enabled:
-                raise ValueError("Anima does not support process previews; set preview_enabled=false")
         elif self.engine == "Flux":
             if self.checkpoint is not None:
                 raise ValueError("Flux forbids checkpoint; use diffusion_model, text_encoder, text_encoder_2, and vae")
@@ -1048,10 +1128,8 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Flux Hires sampler: {self.hires.sampler}")
             if self.hires.scheduler is not None and self.hires.scheduler not in FLUX_SCHEDULERS:
                 raise ValueError(f"Unsupported Flux Hires scheduler: {self.hires.scheduler}")
-            if self.preview_enabled:
-                raise ValueError("Flux does not support process previews; set preview_enabled=false")
             if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is currently supported only by Anima")
+                raise ValueError("USDU tiled Hires is supported only by Anima and Krea2")
             # FLUX.1 is guidance distilled: one forward per step, steered by a scalar baked into the
             # timestep embedding. There is no unconditional branch, so a negative prompt would be
             # silently discarded and PAG / CFG-Zero* have nothing to perturb.
@@ -1080,10 +1158,8 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Flux2 Hires sampler: {self.hires.sampler}")
             if self.hires.scheduler is not None and self.hires.scheduler not in FLUX2_SCHEDULERS:
                 raise ValueError(f"Unsupported Flux2 Hires scheduler: {self.hires.scheduler}")
-            if self.preview_enabled:
-                raise ValueError("Flux2 does not support process previews; set preview_enabled=false")
             if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is currently supported only by Anima")
+                raise ValueError("USDU tiled Hires is supported only by Anima and Krea2")
             # FLUX.2 is guidance distilled for the same reason FLUX.1 is, and refuses the same
             # three settings rather than encoding them and throwing the result away.
             if self.guidance != "none":
@@ -1108,10 +1184,6 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Krea2 Hires sampler: {self.hires.sampler}")
             if self.hires.scheduler is not None and self.hires.scheduler not in KREA2_SCHEDULERS:
                 raise ValueError(f"Unsupported Krea2 Hires scheduler: {self.hires.scheduler}")
-            if self.preview_enabled:
-                raise ValueError("Krea2 does not support process previews; set preview_enabled=false")
-            if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is currently supported only by Anima")
             # Unlike the Flux engines, Krea 2 has a real unconditional branch, so the negative
             # prompt and CFG-Zero* both work. PAG does not: it needs an identity-self-attention
             # override of the transformer's own blocks, which this runtime does not install.
@@ -1335,8 +1407,10 @@ class GalleryPromptCreateInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     title: str = Field(min_length=1, max_length=160)
-    positive_prompt: str = Field(default="", max_length=8000)
-    negative_prompt: str = Field(default="", max_length=8000)
+    # The prompts carry no ceiling for the same reason a generation's do not; the title and notes
+    # keep theirs because they are labels rather than prompts.
+    positive_prompt: str = ""
+    negative_prompt: str = ""
     notes: str | None = Field(default=None, max_length=2000)
 
     @field_validator("title")
@@ -1358,8 +1432,8 @@ class GalleryPromptUpdateInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     title: str | None = Field(default=None, min_length=1, max_length=160)
-    positive_prompt: str | None = Field(default=None, max_length=8000)
-    negative_prompt: str | None = Field(default=None, max_length=8000)
+    positive_prompt: str | None = None
+    negative_prompt: str | None = None
     notes: str | None = Field(default=None, max_length=2000)
 
     @field_validator("title")
@@ -1380,6 +1454,80 @@ class GalleryPromptUpdateInput(BaseModel):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
         return self
+
+
+JOB_ACTIVE_STATUSES = frozenset({"queued", "running", "pausing", "paused", "cancelling"})
+JOB_FINISHED_STATUSES = frozenset({"complete", "error", "cancelled"})
+# Fields that name a place on this machine rather than something a client can fetch.
+JOB_PRIVATE_FIELDS = frozenset({
+    "output_path", "output_paths", "stage_preview_paths",
+})
+
+
+def public_job_view(job: dict) -> dict:
+    return {key: value for key, value in job.items() if key not in JOB_PRIVATE_FIELDS}
+
+
+def trim_job_history():
+    """Forget the oldest finished jobs once the queue history outgrows its limit.
+
+    Called with `jobs_lock` held. Only finished jobs are candidates: a queued job trimmed away
+    would still run, with nothing left to report its progress to.
+    """
+    finished = [job for job in jobs.values() if job["status"] in JOB_FINISHED_STATUSES]
+    excess = len(finished) - JOB_HISTORY_LIMIT
+    if excess <= 0:
+        return
+    for job in sorted(finished, key=lambda item: item.get("sequence", 0))[:excess]:
+        jobs.pop(job["id"], None)
+        job_controls.pop(job["id"], None)
+        # The row is gone, so the pictures it pointed at have nothing left to reach them.
+        cleanup_job_stage_previews(job["id"])
+
+
+def job_queue_entry(job: dict, running_seen: bool) -> dict:
+    """One row of the queue list: what it is, where it got to, and what it produced.
+
+    `queued` is reported as its own state rather than folded into `running`, because the two mean
+    different things to someone deciding whether to submit another: one is being worked on, the
+    rest are waiting behind it.
+    """
+    outputs = job.get("outputs") or []
+    return {
+        "id": job["id"],
+        "sequence": job.get("sequence"),
+        "status": job["status"],
+        "phase": job.get("phase") or "",
+        "stage": job.get("stage") or "",
+        "progress": job.get("progress") or 0,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "elapsed_seconds": job.get("elapsed_seconds"),
+        "error": job.get("error"),
+        "engine": job.get("requested_engine"),
+        "checkpoint": job.get("requested_checkpoint"),
+        "model_assets": job.get("requested_model_assets") or {},
+        "width": job.get("width"),
+        "height": job.get("height"),
+        "seed": job.get("seed"),
+        "total_images": job.get("total_images"),
+        "completed_images": job.get("completed_images"),
+        # The image the row identifies itself by, so a completed row can be shown and reopened.
+        "outputs": [
+            {
+                "index": output.get("index"),
+                "output_name": output.get("output_name"),
+                "image_url": output.get("image_url"),
+                "seed": output.get("seed"),
+            }
+            for output in outputs
+        ],
+        # A queued job's place in the line, counting only what is still ahead of it.
+        "waiting": job["status"] == "queued",
+        "active": job["status"] in JOB_ACTIVE_STATUSES,
+        "running_ahead": running_seen,
+    }
 
 
 def update_job(job_id: str, **updates):
@@ -1429,7 +1577,7 @@ def history_folder_path(folder_id: str):
     except (ValueError, UnicodeError, binascii.Error) as error:
         raise HTTPException(status_code=400, detail="Invalid output folder") from error
     output_root = OUTPUT_DIRECTORY.resolve()
-    if (path != output_root and output_root not in path.parents) or not path.is_dir() or path == PREVIEW_DIRECTORY.resolve():
+    if (path != output_root and output_root not in path.parents) or not path.is_dir() or is_internal_output_directory(path):
         raise HTTPException(status_code=404, detail="Output folder is unavailable")
     return path
 
@@ -1487,7 +1635,7 @@ def history_directory_listing(folder: Path | None = None):
         relative = current.relative_to(output_root)
     except ValueError as error:
         raise HTTPException(status_code=404, detail="Output folder is unavailable") from error
-    if current == PREVIEW_DIRECTORY.resolve() or PREVIEW_DIRECTORY.resolve() in current.parents:
+    if is_internal_output_directory(current):
         raise HTTPException(status_code=404, detail="Output folder is unavailable")
 
     directories = []
@@ -1502,10 +1650,10 @@ def history_directory_listing(folder: Path | None = None):
             if entry.is_file() and entry.suffix.lower() in {".png", ".gif"}:
                 image_count += 1
                 continue
-            if not entry.is_dir() or resolved == PREVIEW_DIRECTORY.resolve() or output_root not in resolved.parents:
+            if not entry.is_dir() or is_internal_output_directory(resolved) or output_root not in resolved.parents:
                 continue
             child_images = sum(1 for path in entry.iterdir() if path.is_file() and path.suffix.lower() in {".png", ".gif"})
-            child_folders = sum(1 for path in entry.iterdir() if path.is_dir() and path.resolve() != PREVIEW_DIRECTORY.resolve())
+            child_folders = sum(1 for path in entry.iterdir() if path.is_dir() and not is_internal_output_directory(path))
             directories.append({
                 "id": history_folder_token(resolved),
                 "name": entry.name,
@@ -1535,12 +1683,11 @@ def list_history_folders():
 def list_history_cards(folder: Path | None = None, *, session_only=True):
     records = []
     output_root = OUTPUT_DIRECTORY.resolve()
-    preview_root = PREVIEW_DIRECTORY.resolve()
     candidates = [path for path in (folder.iterdir() if folder else OUTPUT_DIRECTORY.rglob("*")) if path.is_file() and path.suffix.lower() in {".png", ".gif"}]
     for path in candidates:
         try:
             resolved = path.resolve()
-            if output_root not in resolved.parents or resolved == preview_root or preview_root in resolved.parents:
+            if output_root not in resolved.parents or is_internal_output_directory(resolved.parent):
                 continue
             if session_only and resolved.stat().st_mtime < HISTORY_STARTED_AT:
                 continue
@@ -2058,7 +2205,6 @@ def anima_health_fields():
             "hires": True,
             "adetailer": True,
             "rtx": True,
-            "process_preview": False,
             "staged_vae_decode": False,
             "lora": True,
             "transparent_background": True,
@@ -2180,7 +2326,6 @@ def flux_health_fields():
             "hires": True,
             "adetailer": True,
             "rtx": True,
-            "process_preview": False,
             "staged_vae_decode": False,
             "lora": True,
             "transparent_background": True,
@@ -2288,7 +2433,6 @@ def flux2_health_fields():
             "hires": True,
             "adetailer": True,
             "rtx": True,
-            "process_preview": False,
             "staged_vae_decode": False,
             "lora": True,
             "transparent_background": True,
@@ -2383,7 +2527,6 @@ def krea2_health_fields():
             "hires": True,
             "adetailer": True,
             "rtx": True,
-            "process_preview": False,
             "staged_vae_decode": False,
             "lora": True,
             "transparent_background": True,
@@ -2610,6 +2753,44 @@ def choose_memory_strategy(
         }[mode],
         "model_resident": mode == "high_vram",
     }
+
+
+def record_group_offload_fallback(pipeline, strategy):
+    """Make the reported mode the one the run actually used.
+
+    Every native runtime may drop from a resident transformer to block streaming when a resident
+    sampling pass runs out of memory — the prompt is part of the attention sequence and nothing
+    caps its length, so the admission estimate can be beaten by a long enough one. When that
+    happens the run still produces its picture, and saying HIGH_VRAM afterwards would describe a
+    pass that did not occur. Returns whether anything changed, so the caller can publish it.
+    """
+    if strategy is None or not getattr(pipeline, "transformer_group_offload_enabled", False):
+        return False
+    if strategy.get("transformer_group_offload", False):
+        return False
+    strategy.update(
+        mode="low_vram",
+        label="LOW_VRAM 低显存",
+        offload_mode="staged_transformer_group_offload",
+        model_resident=False,
+        transformer_group_offload=True,
+        transformer_blocks_per_group=1,
+        reason=strategy["reason"] + "；完整常驻显存不足，已自动回退单块动态装入",
+    )
+    admission = strategy.get("admission")
+    if isinstance(admission, dict):
+        admission.update(
+            actual_offload_mode="staged_transformer_group_offload",
+            fallback={
+                "stage": "sampling",
+                "reason": "cuda_oom",
+                "from": "staged_transformer_resident",
+                "to": "staged_transformer_group_offload",
+                "attempts": 1,
+                "generator_states_restored": True,
+            },
+        )
+    return True
 
 
 def memory_job_fields(strategy, model_cached=True):
@@ -4694,11 +4875,14 @@ def generation_memory_workload_diagnostics(request: GenerateInput, family: str):
             )
             admission_size = current_size
             reason = "full_frame_target"
-            if family == "anima" and request.hires.execution_mode == "usdu_tiled":
+            if supports_usdu_tiled(family) and request.hires.execution_mode == "usdu_tiled":
                 # Match apply_hires_fix: Auto core is the canvas entering Hires,
                 # which may already have been changed by an earlier RTX stage.
                 core = hires_source_size
-                plan = plan_tiles(current_size, core, padding=request.hires.padding, seam_mode=request.hires.seam_mode)
+                plan = plan_tiles(
+                    current_size, core, padding=request.hires.padding,
+                    seam_mode=request.hires.seam_mode, alignment=usdu_pixel_alignment(family),
+                )
                 admission_size = tuple(max(base, processed) for base, processed in zip(hires_source_size, plan.processing_size))
                 reason = "usdu_tile_processing_target_excluded"
                 diagnostics.update({
@@ -4801,8 +4985,6 @@ def apply_hires_fix(
     job_id: str,
     control: JobControl,
     started_at: float,
-    schedule_latent_preview=None,
-    invalidate_preview=None,
     image_seed=None,
     effective_hires_seed=None,
     progress_start=80,
@@ -4818,7 +5000,6 @@ def apply_hires_fix(
     capture, capture_gate_facts = open_hires_artifact_capture(job_id, base_seed)
     stages = lambda: _apply_hires_fix_stages(
         image, pipeline, family, request, job_id, control, started_at,
-        schedule_latent_preview=schedule_latent_preview, invalidate_preview=invalidate_preview,
         image_seed=image_seed, effective_hires_seed=effective_hires_seed,
         progress_start=progress_start, progress_end=progress_end, capture=capture,
     )
@@ -4875,8 +5056,6 @@ def _apply_hires_fix_stages(
     job_id: str,
     control: JobControl,
     started_at: float,
-    schedule_latent_preview=None,
-    invalidate_preview=None,
     image_seed=None,
     effective_hires_seed=None,
     progress_start=80,
@@ -4920,39 +5099,52 @@ def _apply_hires_fix_stages(
     update_job(job_id, phase="Hires.fix · Loading upscaler", stage="hires_upscale", stage_step=0, stage_total=0, progress=progress_start)
     use_cuda_upscaler = settings.scale > 1 and torch.cuda.is_available()
     upscale_warning = None
+    def run_upscaler(device: str, label: str):
+        return upscale_image(
+            image,
+            UPSCALER_MODEL_DIRECTORY,
+            settings.model,
+            settings.scale,
+            settings.tile_size,
+            settings.tile_overlap,
+            on_upscale_tile,
+            device=device,
+            checkpoint=lambda: control.checkpoint(job_id, label),
+        )
+
     try:
-        if use_cuda_upscaler and not pipeline_cpu_parked:
-            update_job(job_id, phase="Hires.fix · Parking diffusion model", stage="sampler_offload", progress=progress_start)
-            park_pipeline_for_external_stage(pipeline, family)
         try:
-            upscaled, diagnostics = upscale_image(
-                image,
-                UPSCALER_MODEL_DIRECTORY,
-                settings.model,
-                settings.scale,
-                settings.tile_size,
-                settings.tile_overlap,
-                on_upscale_tile,
-                device="cuda" if use_cuda_upscaler else "cpu",
-                checkpoint=lambda: control.checkpoint(job_id, "Hires.fix upscaling"),
-            )
+            # The upscaler used to be given the card unconditionally, which meant parking the
+            # diffusion model before it and fetching it back for the refinement that follows —
+            # 10.1s out and 2.4s back on a 24 GB card, around an upscale that takes 2.0s. It never
+            # needed the room: the pass is tiled, so its footprint is bounded by one tile rather
+            # than by the picture, and an ESRGAN at a 192-pixel tile peaks far below what sampling
+            # just used with the model resident. So the parking is demand-driven now. Running out
+            # of memory is the signal, and it is answered the way it always was, one step later.
+            upscaled, diagnostics = run_upscaler(
+                "cuda" if use_cuda_upscaler else "cpu", "Hires.fix upscaling")
         except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
             if not use_cuda_upscaler or not is_oom_error(error):
                 raise
             torch.cuda.empty_cache()
-            upscale_warning = "Hires.fix upscaler exceeded GPU memory and used CPU fallback"
-            update_job(job_id, phase="Hires.fix · CPU fallback", stage="hires_upscale", warning=append_warning(None, upscale_warning))
-            upscaled, diagnostics = upscale_image(
-                image,
-                UPSCALER_MODEL_DIRECTORY,
-                settings.model,
-                settings.scale,
-                settings.tile_size,
-                settings.tile_overlap,
-                on_upscale_tile,
-                device="cpu",
-                checkpoint=lambda: control.checkpoint(job_id, "Hires.fix CPU upscaling"),
-            )
+            if not pipeline_cpu_parked:
+                # The room the tiled pass turned out to need is exactly what parking frees, and
+                # the GPU pass is worth another attempt before falling back to the CPU one.
+                update_job(job_id, phase="Hires.fix · Parking diffusion model", stage="sampler_offload", progress=progress_start)
+                park_pipeline_for_external_stage(pipeline, family)
+                try:
+                    upscaled, diagnostics = run_upscaler("cuda", "Hires.fix upscaling")
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as retry_error:
+                    if not is_oom_error(retry_error):
+                        raise
+                    torch.cuda.empty_cache()
+                    upscale_warning = "Hires.fix upscaler exceeded GPU memory and used CPU fallback"
+                    update_job(job_id, phase="Hires.fix · CPU fallback", stage="hires_upscale", warning=append_warning(None, upscale_warning))
+                    upscaled, diagnostics = run_upscaler("cpu", "Hires.fix CPU upscaling")
+            else:
+                upscale_warning = "Hires.fix upscaler exceeded GPU memory and used CPU fallback"
+                update_job(job_id, phase="Hires.fix · CPU fallback", stage="hires_upscale", warning=append_warning(None, upscale_warning))
+                upscaled, diagnostics = run_upscaler("cpu", "Hires.fix CPU upscaling")
     finally:
         if not is_native_family(family) and pipeline_cpu_parked and not control.cancelled:
             update_job(job_id, phase="Hires.fix · Restoring diffusion model", stage="model_restore")
@@ -4962,8 +5154,6 @@ def _apply_hires_fix_stages(
     capture.stage("base", image)
     capture.stage("post_sr", upscaled)
     control.checkpoint(job_id, "Hires.fix diffusion refinement")
-    if invalidate_preview:
-        invalidate_preview()
     phase = f"Hires.fix · Diffusion {destination[0]} x {destination[1]}"
     resolved_sampler = settings.sampler or request.sampler
     resolved_scheduler = settings.scheduler or request.scheduler
@@ -4971,12 +5161,15 @@ def _apply_hires_fix_stages(
         validate_hires_sampling_override(resolved_sampler, resolved_scheduler, family)
     hires_seed = effective_hires_seed
     if is_native_family(family):
-        if family == "anima" and settings.execution_mode == "usdu_tiled":
+        if supports_usdu_tiled(family) and settings.execution_mode == "usdu_tiled":
             core_tile = (
                 hires_source_size[0] if settings.tile_width == "auto" else settings.tile_width,
                 hires_source_size[1] if settings.tile_height == "auto" else settings.tile_height,
             )
-            plan = plan_tiles(upscaled.size, core_tile, padding=settings.padding, seam_mode=settings.seam_mode)
+            plan = plan_tiles(
+                upscaled.size, core_tile, padding=settings.padding,
+                seam_mode=settings.seam_mode, alignment=usdu_pixel_alignment(family),
+            )
             tile_count = len(plan.regions)
             stage_total = tile_count * settings.steps
             update_job(
@@ -5033,7 +5226,7 @@ def _apply_hires_fix_stages(
                     on_step_checkpoint=on_anima_tile_checkpoint,
                 )
                 if len(refined) != 1:
-                    raise RuntimeError(f"Anima USDU Hires tile returned {len(refined)} images instead of 1")
+                    raise RuntimeError(f"USDU Hires tile returned {len(refined)} images instead of 1")
                 metrics = serializable_runtime_metrics(getattr(pipeline, "last_generation_metrics", {}) or {})
                 sampling_metrics = metrics.get("refinement.sampling")
                 decode_metrics = metrics.get("refinement.vae_decode")
@@ -5175,12 +5368,10 @@ def _apply_hires_fix_stages(
     if settings.sampler is not None or settings.scheduler is not None:
         configure_scheduler(image_pipeline, resolved_sampler, resolved_scheduler)
     conditioning = prepare_prompt_conditioning(image_pipeline, family, request.prompt, request.negative_prompt)
-    preview_interval = max(1, ceil(effective_steps / PREVIEW_MAX_FRAMES)) if PREVIEW_MAX_FRAMES > 0 else effective_steps + 1
     last_hires_step = [0]
 
     def on_hires_step(_pipeline, step_index, _timestep, callback_kwargs):
         step = logical_diffusion_step(_pipeline, step_index, effective_steps)
-        step_advanced = step > last_hires_step[0]
         last_hires_step[0] = max(last_hires_step[0], step)
         progress = upscale_end + round((sampling_end - upscale_end) * step / effective_steps)
         update_job(
@@ -5196,15 +5387,6 @@ def _apply_hires_fix_stages(
             paused_seconds=round(control.total_paused(), 1),
         )
         control.checkpoint(job_id, phase)
-        if schedule_latent_preview and step_advanced and (step == 1 or step == effective_steps or step % preview_interval == 0):
-            schedule_latent_preview(
-                callback_kwargs["latents"],
-                family=family,
-                step=step,
-                width=destination[0],
-                height=destination[1],
-                kind="hires_sampling",
-            )
         return callback_kwargs
 
     update_job(job_id, phase=phase, stage="hires_sampling", stage_step=0, stage_total=effective_steps, progress=upscale_end, step=0, total_steps=effective_steps)
@@ -5320,9 +5502,6 @@ def apply_adetailer_unit(
     job_id: str,
     control: JobControl,
     started_at: float,
-    publish_image_preview=None,
-    schedule_latent_preview=None,
-    invalidate_preview=None,
     image_seed=None,
     progress_start=94,
     progress_end=98,
@@ -5420,16 +5599,6 @@ def apply_adetailer_unit(
         stage_total=len(detections),
         adetailer_state=detail_state,
     )
-    if detections and publish_image_preview:
-        annotated = render_detection_preview(image, raw_detections)
-        publish_image_preview(
-            annotated,
-            kind="adetailer_detection",
-            source_size=image.size,
-            preserve_as_context=True,
-            invalidate=True,
-            hold_seconds=0.75,
-        )
     if not detections:
         return image, diagnostics, f"{label} did not detect any matching regions"
 
@@ -5456,8 +5625,6 @@ def apply_adetailer_unit(
             diagnostics["detections"][index]["processing_size"] = list(process_size)
             detection_states[index].update(crop_box=list(crop_box), status="active")
             phase = f"{label} · Inpainting {index + 1}/{len(detections)}"
-            if invalidate_preview:
-                invalidate_preview()
             update_job(
                 job_id,
                 phase=phase,
@@ -5470,8 +5637,6 @@ def apply_adetailer_unit(
                     "region_index": index + 1,
                     "detections": [dict(item) for item in detection_states],
                 },
-                preview_crop_box=list(crop_box),
-                preview_region_index=index + 1,
             )
 
             def on_anima_detail_step(detail_step, _total, _latents, *, detection_index=index, running_phase=phase):
@@ -5531,15 +5696,6 @@ def apply_adetailer_unit(
             candidate.paste(replacement, crop_box[:2])
             current_image = Image.composite(candidate, current_image, soft_mask)
             detection_states[index]["status"] = "complete"
-            if publish_image_preview:
-                publish_image_preview(
-                    current_image.crop(crop_box),
-                    kind="adetailer_crop_result",
-                    source_size=(crop_box[2] - crop_box[0], crop_box[3] - crop_box[1]),
-                    crop_box=crop_box,
-                    region_index=index + 1,
-                    invalidate=True,
-                )
             update_job(
                 job_id,
                 stage_step=effective_steps,
@@ -5563,7 +5719,6 @@ def apply_adetailer_unit(
         detail_width = int(sample_size[-1]) * vae_scale
     else:
         detail_width = detail_height = int(sample_size) * vae_scale
-    detail_preview_interval = max(1, ceil(effective_steps / PREVIEW_MAX_FRAMES)) if PREVIEW_MAX_FRAMES > 0 else effective_steps + 1
 
     try:
         for index, detection in enumerate(detections):
@@ -5586,9 +5741,6 @@ def apply_adetailer_unit(
             detection_states[index].update(crop_box=list(crop_box), status="active")
             phase = f"{label} · Inpainting {index + 1}/{len(detections)}"
             control.checkpoint(job_id, phase)
-            if invalidate_preview:
-                invalidate_preview()
-            detail_last_preview_at = [0.0]
             detail_last_step = [0]
             update_job(
                 job_id,
@@ -5602,13 +5754,10 @@ def apply_adetailer_unit(
                     "region_index": index + 1,
                     "detections": [dict(item) for item in detection_states],
                 },
-                preview_crop_box=list(crop_box),
-                preview_region_index=index + 1,
             )
 
             def on_detail_step(_pipeline, step_index, _timestep, callback_kwargs, *, detection_index=index, running_phase=phase):
                 detail_step = logical_diffusion_step(_pipeline, step_index, effective_steps)
-                step_advanced = detail_step > detail_last_step[0]
                 detail_last_step[0] = max(detail_last_step[0], detail_step)
                 completed = base_steps + detection_index * effective_steps + detail_step
                 progress = progress_start + round(
@@ -5628,21 +5777,6 @@ def apply_adetailer_unit(
                     paused_seconds=round(control.total_paused(), 1),
                 )
                 control.checkpoint(job_id, running_phase)
-                now = time.monotonic()
-                scheduled_step = detail_step == 1 or detail_step == effective_steps or detail_step % detail_preview_interval == 0
-                enough_time_passed = now - detail_last_preview_at[0] >= PREVIEW_MIN_INTERVAL
-                if schedule_latent_preview and step_advanced and scheduled_step and enough_time_passed:
-                    detail_last_preview_at[0] = now
-                    schedule_latent_preview(
-                        callback_kwargs["latents"],
-                        family=family,
-                        step=detail_step,
-                        width=detail_width,
-                        height=detail_height,
-                        kind="adetailer_crop",
-                        crop_box=crop_box,
-                        region_index=detection_index + 1,
-                    )
                 return callback_kwargs
 
             generator = torch.Generator(device="cpu").manual_seed(
@@ -5665,15 +5799,6 @@ def apply_adetailer_unit(
             ).images[0].convert("RGB")
             current_image = Image.composite(detailed, current_image, soft_mask)
             detection_states[index]["status"] = "complete"
-            if publish_image_preview:
-                publish_image_preview(
-                    current_image.crop(crop_box),
-                    kind="adetailer_crop_result",
-                    source_size=(crop_box[2] - crop_box[0], crop_box[3] - crop_box[1]),
-                    crop_box=crop_box,
-                    region_index=index + 1,
-                    invalidate=True,
-                )
             update_job(
                 job_id,
                 stage_step=effective_steps,
@@ -5701,9 +5826,6 @@ def apply_adetailer(
     job_id: str,
     control: JobControl,
     started_at: float,
-    publish_image_preview=None,
-    schedule_latent_preview=None,
-    invalidate_preview=None,
     image_seed=None,
     progress_start=94,
     progress_end=98,
@@ -5738,9 +5860,6 @@ def apply_adetailer(
             job_id,
             control,
             started_at,
-            publish_image_preview=publish_image_preview,
-            schedule_latent_preview=schedule_latent_preview,
-            invalidate_preview=invalidate_preview,
             image_seed=image_seed,
             progress_start=progress_start + round(span * index / len(units)),
             progress_end=progress_start + round(span * (index + 1) / len(units)),
@@ -5774,63 +5893,38 @@ def remove_preview(path):
         pass
 
 
-def cleanup_job_previews(job_id: str):
-    for preview_path in PREVIEW_DIRECTORY.glob(f"{job_id}-*"):
-        remove_preview(preview_path)
+STAGE_PREVIEW_LABELS = {
+    "base": "基础采样",
+    "hires": "Hires.fix",
+    "adetailer": "ADetailer",
+    "rtx": "RTX VSR",
+    "background_removal": "透明背景",
+}
 
 
-def save_pil_preview(
-    image: Image.Image,
-    job_id: str,
-    label: str,
-    width: int | None = None,
-    height: int | None = None,
-    *,
-    lossless=False,
-):
+def save_stage_preview(image: Image.Image, job_id: str, stage: str, index: int) -> Path:
+    """Write one finished stage's picture where it will outlive the run."""
     preview = image.convert("RGB")
-    target_width = width or preview.width
-    target_height = height or preview.height
-    scale = 1.0 if lossless else min(PREVIEW_MAX_EDGE / max(target_width, target_height), 1.0)
-    preview_size = (max(1, round(target_width * scale)), max(1, round(target_height * scale)))
-    if preview.size != preview_size:
-        preview = preview.resize(preview_size, Image.Resampling.BILINEAR)
-    suffix = ".png" if lossless else ".jpg"
-    preview_path = PREVIEW_DIRECTORY / f"{job_id}-{label}-{uuid.uuid4().hex}{suffix}"
-    temporary_path = PREVIEW_DIRECTORY / f"{job_id}.{uuid.uuid4().hex}.tmp"
+    scale = min(STAGE_PREVIEW_MAX_EDGE / max(preview.width, preview.height), 1.0)
+    if scale < 1.0:
+        preview = preview.resize(
+            (max(1, round(preview.width * scale)), max(1, round(preview.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    stage_path = STAGE_PREVIEW_DIRECTORY / f"{job_id}-{index:02d}-{stage}-{uuid.uuid4().hex}.jpg"
+    temporary_path = STAGE_PREVIEW_DIRECTORY / f"{job_id}.{uuid.uuid4().hex}.tmp"
     try:
-        preview.save(temporary_path, format="PNG", compress_level=3) if lossless else preview.save(temporary_path, format="JPEG", quality=82)
-        os.replace(temporary_path, preview_path)
+        preview.save(temporary_path, format="JPEG", quality=90)
+        os.replace(temporary_path, stage_path)
     finally:
-        remove_preview(temporary_path)
-    return preview_path
+        Path(temporary_path).unlink(missing_ok=True)
+    return stage_path
 
 
-def save_latent_preview(latents: torch.Tensor, family: str, job_id: str, step: int, width: int, height: int, label: str = "sampling"):
-    if family == "sdxl":
-        factors = [
-            [0.3651, 0.4232, 0.4341],
-            [-0.2533, -0.0042, 0.1068],
-            [0.1076, 0.1111, -0.0362],
-            [-0.3165, -0.2492, -0.2188],
-        ]
-        bias = [0.1084, -0.0175, -0.0011]
-    else:
-        factors = [
-            [0.3512, 0.2297, 0.3227],
-            [0.3250, 0.4974, 0.2350],
-            [-0.2829, 0.1762, 0.2721],
-            [-0.2120, -0.2616, -0.7177],
-        ]
-        bias = None
-
-    latent = latents[0].to(dtype=torch.float32).movedim(0, -1)
-    weight = torch.tensor(factors, dtype=torch.float32).transpose(0, 1)
-    bias_tensor = torch.tensor(bias, dtype=torch.float32) if bias else None
-    rgb = torch.nn.functional.linear(latent, weight, bias_tensor)
-    pixels = (((rgb + 1.0) / 2.0).clamp(0, 1) * 255).to(torch.uint8).numpy()
-    preview = Image.fromarray(pixels, mode="RGB")
-    return save_pil_preview(preview, job_id, f"{label}-{step}", width, height)
+def cleanup_job_stage_previews(job_id: str):
+    for stage_path in STAGE_PREVIEW_DIRECTORY.glob(f"{job_id}-*"):
+        if stage_path.is_file():
+            remove_preview(stage_path)
 
 
 def create_output_path():
@@ -5962,7 +6056,6 @@ def save_image(
             engine=request.engine,
             guidance_scale=request.cfg,
         ),
-        "preview_enabled": request.preview_enabled,
         "background_removal_model": request.background_removal_model,
         # Facts about the source, never the source. A PNG parameter block is read back by the
         # gallery and the history list; embedding the picture would roughly double every output
@@ -6177,7 +6270,6 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                 "scheduler": request.scheduler,
                 "guidance": request.guidance,
                 "pag": request.pag.model_dump(),
-                "preview_enabled": request.preview_enabled,
                 "source_image_enabled": request.source_image.enabled,
                 "source_image_resize_mode": request.source_image.resize_mode if request.source_image.enabled else None,
                 "postprocess_only": request.postprocess_only,
@@ -6275,6 +6367,16 @@ def write_cpu_mode_log():
 
 def run_generation(job_id: str, request: GenerateInput):
     global active_attention_backend, active_vae_mode
+    control = job_controls.get(job_id)
+    # A queued job can be cancelled before the worker ever reaches it. Checking here means it is
+    # dropped without loading a model or claiming the pipeline, rather than running to completion
+    # because nothing looked at the flag until the first sampler callback.
+    if control is not None and control.cancelled:
+        update_job(
+            job_id, status="cancelled", stage="cancelled", phase="Cancelled before starting",
+            progress=0, completed_at=time.time(),
+        )
+        return
     original_request = request
     cleaned_prompt, directives = parse_prompt_directives(request.prompt)
     transparent_background = directives["transparent_background"]
@@ -6282,16 +6384,7 @@ def run_generation(job_id: str, request: GenerateInput):
     request = request.model_copy(update={"prompt": conditioning_prompt})
     started_at = time.time()
     control = job_controls[job_id]
-    preview_busy = threading.Event()
-    preview_finished = threading.Event()
-    preview_lock = threading.Lock()
     ultra_low_memory = performance_settings["memory_mode"] == "ultra_low_vram"
-    previews_enabled = request.preview_enabled and not ultra_low_memory and PREVIEW_MAX_FRAMES > 0
-    preview_interval = max(1, ceil(request.steps / PREVIEW_MAX_FRAMES)) if previews_enabled else request.steps + 1
-    last_preview_at = [0.0]
-    preview_revision = [0]
-    preview_epoch = [0]
-    preview_hold_until = [0.0]
     pipeline = None
     adetailer_result = None
     hires_result = None
@@ -6308,120 +6401,44 @@ def run_generation(job_id: str, request: GenerateInput):
             except OSError:
                 pass
 
-    def invalidate_preview():
-        with preview_lock:
-            preview_epoch[0] += 1
-            return preview_epoch[0]
+    def publish_stage_preview(image: Image.Image, stage: str, image_index: int = 0):
+        """Record one finished stage's picture on the job.
 
-    def publish_preview_path(
-        preview_path: Path,
-        *,
-        expected_epoch: int,
-        kind: str,
-        source_size,
-        crop_box=None,
-        region_index=0,
-        preserve_as_context=False,
-    ):
-        with preview_lock:
-            if preview_finished.is_set() or expected_epoch != preview_epoch[0]:
-                remove_preview(preview_path)
-                return False
-            preview_revision[0] += 1
+        This is the settled result of a stage that has just finished, published while the next
+        stage is already running. It stays until that next stage finishes, which is what puts the
+        base sample on screen for the whole of Hires, and the Hires result on screen for the whole
+        of ADetailer.
+        """
+        try:
             with jobs_lock:
                 job = jobs.get(job_id)
-                if not job:
-                    remove_preview(preview_path)
-                    return False
-                previous_path = job.get("preview_path")
-                job.update(
-                    preview_path=str(preview_path),
-                    preview_url=f"/api/inference/jobs/{job_id}/preview",
-                    preview_version=preview_revision[0],
-                    preview_kind=kind,
-                    preview_source_size=list(source_size),
-                    preview_crop_box=list(crop_box) if crop_box else None,
-                    preview_region_index=region_index,
-                )
-                if preserve_as_context:
-                    job.update(
-                        context_preview_path=str(preview_path),
-                        context_preview_url=f"/api/inference/jobs/{job_id}/preview?kind=context",
-                        context_preview_version=preview_revision[0],
-                    )
-                context_path = job.get("context_preview_path")
-            if previous_path and previous_path != str(preview_path) and previous_path != context_path:
-                remove_preview(previous_path)
-            return True
-
-    def publish_image_preview(
-        image: Image.Image,
-        *,
-        kind: str,
-        source_size,
-        crop_box=None,
-        region_index=0,
-        preserve_as_context=False,
-        invalidate=False,
-        hold_seconds=0.0,
-    ):
-        if not previews_enabled:
-            return False
-        expected_epoch = invalidate_preview() if invalidate else preview_epoch[0]
-        preview_path = save_pil_preview(image, job_id, kind, lossless=kind == "adetailer_detection")
-        published = publish_preview_path(
-            preview_path,
-            expected_epoch=expected_epoch,
-            kind=kind,
-            source_size=source_size,
-            crop_box=crop_box,
-            region_index=region_index,
-            preserve_as_context=preserve_as_context,
-        )
-        if published and hold_seconds > 0:
-            preview_hold_until[0] = time.monotonic() + hold_seconds
-        return published
-
-    def encode_preview(cpu_latents: torch.Tensor, family: str, step: int, width: int, height: int, kind: str, crop_box, region_index: int, expected_epoch: int):
-        try:
-            preview_path = save_latent_preview(cpu_latents, family, job_id, step, width, height, kind)
-            publish_preview_path(
-                preview_path,
-                expected_epoch=expected_epoch,
-                kind=kind,
-                source_size=(width, height),
-                crop_box=crop_box,
-                region_index=region_index,
-            )
+                index = len(job.get("stage_previews") or []) if job else 0
+            stage_path = save_stage_preview(image, job_id, stage, index)
         except Exception:
+            # A stage picture is a convenience. Losing one must never take the generation with it.
             traceback.print_exc()
-        finally:
-            preview_busy.clear()
-
-    def schedule_latent_preview(latents: torch.Tensor, *, family: str, step: int, width: int, height: int, kind: str, crop_box=None, region_index=0):
-        if not previews_enabled or preview_busy.is_set() or time.monotonic() < preview_hold_until[0]:
             return False
-        preview_busy.set()
-        with preview_lock:
-            expected_epoch = preview_epoch[0]
-        cpu_latents = latents[:1].detach().to(device="cpu", dtype=torch.float32)
-        try:
-            preview_executor.submit(
-                encode_preview,
-                cpu_latents,
-                family,
-                step,
-                width,
-                height,
-                kind,
-                crop_box,
-                region_index,
-                expected_epoch,
-            )
-            return True
-        except RuntimeError:
-            preview_busy.clear()
-            return False
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                remove_preview(stage_path)
+                return False
+            entries = list(job.get("stage_previews") or [])
+            paths = list(job.get("stage_preview_paths") or [])
+            entries.append({
+                "index": index,
+                "stage": stage,
+                "label": STAGE_PREVIEW_LABELS.get(stage, stage),
+                "image_index": image_index,
+                "url": f"/api/inference/jobs/{job_id}/stages/{index}",
+                "width": image.width,
+                "height": image.height,
+                "created_at": time.time(),
+            })
+            paths.append(str(stage_path))
+            job["stage_previews"] = entries
+            job["stage_preview_paths"] = paths
+        return True
 
     try:
         control.checkpoint(job_id, "Preparing model")
@@ -6797,8 +6814,6 @@ def run_generation(job_id: str, request: GenerateInput):
             release_prompt_encoders(pipeline)
         total_images = request.images_per_batch * request.batch_count
         sampling_steps = base_sampling_steps(request, family)
-        if sampling_steps != request.steps:
-            preview_interval = max(1, ceil(sampling_steps / PREVIEW_MAX_FRAMES)) if previews_enabled else sampling_steps + 1
         update_job(
             job_id,
             images_per_batch=request.images_per_batch,
@@ -6834,7 +6849,6 @@ def run_generation(job_id: str, request: GenerateInput):
 
             def on_step_end(_pipeline, step_index, _timestep, callback_kwargs, *, running_phase=phase, progress_start=batch_start, progress_end=sampling_end):
                 step = logical_diffusion_step(_pipeline, step_index, sampling_steps)
-                step_advanced = step > last_base_step[0]
                 last_base_step[0] = max(last_base_step[0], step)
                 batch_progress = progress_start + (step / sampling_steps) * (progress_end - progress_start)
                 update_job(
@@ -6851,19 +6865,6 @@ def run_generation(job_id: str, request: GenerateInput):
                     paused_seconds=round(control.total_paused(), 1),
                 )
                 control.checkpoint(job_id, running_phase)
-
-                now = time.monotonic()
-                scheduled_step = step == 1 or step == sampling_steps or step % preview_interval == 0
-                enough_time_passed = now - last_preview_at[0] >= PREVIEW_MIN_INTERVAL
-                if step_advanced and scheduled_step and enough_time_passed and schedule_latent_preview(
-                    callback_kwargs["latents"],
-                    family=family,
-                    step=step,
-                    width=request.width,
-                    height=request.height,
-                    kind="base_sampling",
-                ):
-                    last_preview_at[0] = now
                 return callback_kwargs
 
             def on_anima_step(step, total_steps, _latents, *, running_phase=phase, progress_start=batch_start, progress_end=sampling_end):
@@ -6987,33 +6988,7 @@ def run_generation(job_id: str, request: GenerateInput):
                     active_memory_strategy["physical_inference_bytes"] = int(
                         (admission or {}).get("physical_inference_bytes", active_memory_strategy.get("physical_inference_bytes", 0))
                     )
-                if (
-                    getattr(pipeline, "transformer_group_offload_enabled", False)
-                    and active_memory_strategy is not None
-                    and not active_memory_strategy.get("transformer_group_offload", False)
-                ):
-                    active_memory_strategy.update(
-                        mode="low_vram",
-                        label="LOW_VRAM 低显存",
-                        offload_mode="staged_transformer_group_offload",
-                        model_resident=False,
-                        transformer_group_offload=True,
-                        transformer_blocks_per_group=1,
-                        reason=active_memory_strategy["reason"] + "；完整常驻显存不足，已自动回退单块动态装入",
-                    )
-                    admission = active_memory_strategy.get("admission")
-                    if isinstance(admission, dict):
-                        admission.update(
-                            actual_offload_mode="staged_transformer_group_offload",
-                            fallback={
-                                "stage": "sampling",
-                                "reason": "cuda_oom",
-                                "from": "staged_transformer_resident",
-                                "to": "staged_transformer_group_offload",
-                                "attempts": 1,
-                                "generator_states_restored": True,
-                            },
-                        )
+                if record_group_offload_fallback(pipeline, active_memory_strategy):
                     update_job(job_id, **memory_job_fields(active_memory_strategy))
                 update_job(
                     job_id,
@@ -7075,6 +7050,8 @@ def run_generation(job_id: str, request: GenerateInput):
                     active_attention_backend = anima_attention_backend_label(runtime_attention_backend)
                 if bool(getattr(getattr(pipeline, "vae", None), "use_tiling", False)):
                     active_vae_mode = "tiled"
+                if record_group_offload_fallback(pipeline, active_memory_strategy):
+                    update_job(job_id, **memory_job_fields(active_memory_strategy))
                 update_job(
                     job_id,
                     # Always false: the Flux engines have no second branch at all, and Krea 2 runs
@@ -7129,6 +7106,11 @@ def run_generation(job_id: str, request: GenerateInput):
                 hires_result = None
                 rtx_result = None
                 post_stages = enabled_post_stages
+                # The base sample is a stage in its own right, and publishing it here is what puts a
+                # finished picture on screen for the whole of the first post-processing stage rather
+                # than leaving the panel on the last half-formed latent.
+                if post_stages:
+                    publish_stage_preview(image, "base", image_index)
                 for stage_index, post_stage in enumerate(post_stages):
                     stage_start = detail_start + (detail_end - detail_start) * stage_index / len(post_stages)
                     stage_end = detail_start + (detail_end - detail_start) * (stage_index + 1) / len(post_stages)
@@ -7145,8 +7127,6 @@ def run_generation(job_id: str, request: GenerateInput):
                             job_id,
                             control,
                             started_at,
-                            schedule_latent_preview=schedule_latent_preview,
-                            invalidate_preview=invalidate_preview,
                             image_seed=base_seed,
                             effective_hires_seed=effective_hires_seed,
                             progress_start=round(stage_start),
@@ -7165,9 +7145,6 @@ def run_generation(job_id: str, request: GenerateInput):
                             job_id,
                             control,
                             started_at,
-                            publish_image_preview=publish_image_preview,
-                            schedule_latent_preview=schedule_latent_preview,
-                            invalidate_preview=invalidate_preview,
                             image_seed=base_seed,
                             progress_start=round(stage_start),
                             progress_end=round(stage_end),
@@ -7188,6 +7165,10 @@ def run_generation(job_id: str, request: GenerateInput):
                         )
                     else:
                         raise RuntimeError(f"Unsupported post-processing stage: {post_stage}")
+                    # `image` is now this stage's result, and stays on screen until the next stage
+                    # finishes — so Hires is watched against the base sample, and ADetailer against
+                    # the Hires result.
+                    publish_stage_preview(image, post_stage, image_index)
                 background_removal_result = None
                 if transparent_background:
                     control.checkpoint(job_id, "Removing background")
@@ -7277,30 +7258,23 @@ def run_generation(job_id: str, request: GenerateInput):
         elapsed = max(0.0, wall_elapsed - paused_seconds)
         output_path = output_paths[0]
         release_pipeline_after_job()
-        with preview_lock:
-            preview_finished.set()
-            update_job(
-                job_id,
-                status="complete",
-                phase="Complete",
-                stage="complete",
-                progress=100,
-                output_path=str(output_path),
-                output_paths=[str(path) for path in output_paths],
-                outputs=output_records,
-                output_name=output_path.name,
-                preview_path=None,
-                preview_url=None,
-                context_preview_path=None,
-                context_preview_url=None,
-                image_url=f"/api/inference/jobs/{job_id}/image",
-                elapsed_seconds=round(elapsed, 1),
-                wall_elapsed_seconds=round(wall_elapsed, 1),
-                paused_seconds=round(paused_seconds, 1),
-                completed_at=time.time(),
-                **pipeline_status_fields(),
-            )
-            cleanup_job_previews(job_id)
+        update_job(
+            job_id,
+            status="complete",
+            phase="Complete",
+            stage="complete",
+            progress=100,
+            output_path=str(output_path),
+            output_paths=[str(path) for path in output_paths],
+            outputs=output_records,
+            output_name=output_path.name,
+            image_url=f"/api/inference/jobs/{job_id}/image",
+            elapsed_seconds=round(elapsed, 1),
+            wall_elapsed_seconds=round(wall_elapsed, 1),
+            paused_seconds=round(paused_seconds, 1),
+            completed_at=time.time(),
+            **pipeline_status_fields(),
+        )
     except GenerationCancelled:
         cleanup_partial_outputs()
         if not restore_cached_pipeline_state(job_id, request):
@@ -7315,10 +7289,6 @@ def run_generation(job_id: str, request: GenerateInput):
             error=None,
             completed_images=0,
             outputs=[],
-            preview_path=None,
-            preview_url=None,
-            context_preview_path=None,
-            context_preview_url=None,
             elapsed_seconds=round(control.active_elapsed(started_at), 1),
             paused_seconds=round(control.total_paused(), 1),
             completed_at=time.time(),
@@ -7341,10 +7311,6 @@ def run_generation(job_id: str, request: GenerateInput):
                 progress=0,
                 completed_images=0,
                 outputs=[],
-                preview_path=None,
-                preview_url=None,
-                context_preview_path=None,
-                context_preview_url=None,
                 **pipeline_status_fields(),
             )
         else:
@@ -7352,12 +7318,8 @@ def run_generation(job_id: str, request: GenerateInput):
                 pipeline = None
                 clear_pipeline()
             release_pipeline_after_job()
-            update_job(job_id, status="error", phase="Failed", stage="error", error=str(error), progress=0, completed_images=0, outputs=[], preview_path=None, preview_url=None, context_preview_path=None, context_preview_url=None, **pipeline_status_fields())
+            update_job(job_id, status="error", phase="Failed", stage="error", error=str(error), progress=0, completed_images=0, outputs=[], **pipeline_status_fields())
     finally:
-        with preview_lock:
-            preview_finished.set()
-            cleanup_job_previews(job_id)
-            update_job(job_id, preview_path=None, preview_url=None, context_preview_path=None, context_preview_url=None)
         gc.collect()
         if release_cuda_cache and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -7563,7 +7525,7 @@ def get_performance_settings():
 def update_performance_settings(request: PerformanceInput):
     with pipeline_lock:
         with jobs_lock:
-            busy = any(job["status"] in {"queued", "running", "pausing", "paused", "cancelling"} for job in jobs.values())
+            busy = any(job["status"] in JOB_ACTIVE_STATUSES for job in jobs.values())
         if busy:
             raise HTTPException(status_code=409, detail="Cannot change performance settings while generation is active")
         requested = request.model_dump()
@@ -7644,7 +7606,7 @@ def shutdown(x_shutdown_token: str | None = Header(default=None)):
 def unload_model_cache(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None, checkpoint: str | None = None):
     with pipeline_lock:
         with jobs_lock:
-            busy = any(job["status"] in {"queued", "running", "pausing", "paused", "cancelling"} for job in jobs.values())
+            busy = any(job["status"] in JOB_ACTIVE_STATUSES for job in jobs.values())
         if busy:
             raise HTTPException(status_code=409, detail="Cannot switch the loaded model while generation is active")
         if engine is None and checkpoint is None:
@@ -7819,12 +7781,16 @@ def create_job(request: GenerateInput):
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
     with jobs_lock:
-        if any(job["status"] in {"queued", "running", "pausing", "paused", "cancelling"} for job in jobs.values()):
-            raise HTTPException(status_code=409, detail="Another image is already being generated")
+        # Submitting while another job runs queues this one rather than refusing it. The request is
+        # validated and captured now, above, so the job carries the parameters and the model the
+        # user had selected at the moment they submitted — changing either afterwards has no effect
+        # on what is already in the queue.
         job_id = uuid.uuid4().hex
         job_controls[job_id] = JobControl()
+        trim_job_history()
         jobs[job_id] = {
             "id": job_id,
+            "sequence": next(job_sequence),
             "status": "queued",
             "phase": "Queued",
             "stage": "queued",
@@ -7833,12 +7799,17 @@ def create_job(request: GenerateInput):
             "progress": 0,
             "step": 0,
             "total_steps": request.steps,
+            # Carried on the record so the queue list can describe a job that has not started and
+            # has no diagnostics of its own yet.
+            "width": request.width,
+            "height": request.height,
             "images_per_batch": request.images_per_batch,
             "batch_count": request.batch_count,
             "batch_index": 0,
             "completed_images": 0,
             "total_images": request.images_per_batch * request.batch_count,
             "outputs": [],
+            "stage_previews": [],
             "seed": str(request.seed),
             "base_seed": str(request.seed),
             "hires_seed_mode": request.hires.mode,
@@ -7869,16 +7840,6 @@ def create_job(request: GenerateInput):
             "negative_prompt_tokens": None,
             "negative_prompt_blocks": None,
             "negative_prompt_weighted_tokens": None,
-            "preview_path": None,
-            "preview_url": None,
-            "preview_version": 0,
-            "preview_kind": None,
-            "preview_source_size": None,
-            "preview_crop_box": None,
-            "preview_region_index": 0,
-            "context_preview_path": None,
-            "context_preview_url": None,
-            "context_preview_version": 0,
             "adetailer_state": None,
             "elapsed_seconds": 0.0,
             "paused_seconds": 0.0,
@@ -7918,11 +7879,38 @@ def create_job(request: GenerateInput):
 @app.get("/api/inference/jobs/active")
 def get_active_job():
     with jobs_lock:
-        active = [job for job in jobs.values() if job["status"] in {"queued", "running", "pausing", "paused", "cancelling"}]
+        active = [job for job in jobs.values() if job["status"] in JOB_ACTIVE_STATUSES]
         if not active:
             return {"job": None}
-        job = max(active, key=lambda item: item.get("created_at", 0))
-        return {"job": {key: value for key, value in job.items() if key not in {"output_path", "output_paths", "preview_path", "context_preview_path"}}}
+        # The job being worked on, not the newest submission. With a queue those differ, and a
+        # client recovering its progress view wants the one that is actually moving.
+        started = [job for job in active if job["status"] != "queued"]
+        job = min(started or active, key=lambda item: item.get("sequence", 0))
+        return {"job": public_job_view(job)}
+
+
+@app.get("/api/inference/jobs")
+def list_jobs():
+    """Every job this session has seen, oldest first.
+
+    The registry is in memory, so this is a session queue rather than a durable history: restarting
+    the package empties it and numbering starts again at one.
+    """
+    with jobs_lock:
+        ordered = sorted(jobs.values(), key=lambda item: item.get("sequence", 0))
+        entries = []
+        running_seen = False
+        for job in ordered:
+            entries.append(job_queue_entry(job, running_seen))
+            if job["status"] in JOB_ACTIVE_STATUSES and job["status"] != "queued":
+                running_seen = True
+        counts = {"queued": 0, "running": 0, "complete": 0, "error": 0, "cancelled": 0}
+        for job in ordered:
+            status = job["status"]
+            key = "running" if status in JOB_ACTIVE_STATUSES and status != "queued" else status
+            if key in counts:
+                counts[key] += 1
+        return {"jobs": entries, "counts": counts, "total": len(entries)}
 
 
 @app.get("/api/inference/jobs/{job_id}")
@@ -7931,10 +7919,7 @@ def get_job(job_id: str):
         job = jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Generation job not found")
-        payload = {
-            key: value for key, value in job.items()
-            if key not in {"output_path", "output_paths", "preview_path", "context_preview_path"}
-        }
+        payload = public_job_view(job)
         control = job_controls.get(job_id)
     if control and job.get("started_at"):
         payload["elapsed_seconds"] = round(control.active_elapsed(job["started_at"]), 1)
@@ -7979,19 +7964,34 @@ def cancel_job(job_id: str):
     if status == "cancelling":
         return {"status": status}
     control.cancel()
+    if status == "queued":
+        # Nothing has started, so there is no current step to stop after. Reporting it as cancelled
+        # straight away keeps a job removed from the back of the queue from sitting in "stopping"
+        # until the worker finally reaches it — which, behind a long queue, could be many minutes.
+        # `run_generation` sees the same cancelled flag and drops it without loading anything.
+        update_job(
+            job_id, status="cancelled", stage="cancelled", phase="Cancelled before starting",
+            progress=0, completed_at=time.time(),
+        )
+        return {"status": "cancelled"}
     update_job(job_id, status="cancelling", phase="Stopping after current step")
     return {"status": "cancelling"}
 
 
-@app.get("/api/inference/jobs/{job_id}/preview")
-def get_job_preview(job_id: str, kind: str | None = None):
+@app.get("/api/inference/jobs/{job_id}/stages/{index}")
+def get_job_stage_preview(job_id: str, index: int):
+    """One finished stage's picture, still available after the job ends.
+
+    This survives the run: the whole point is to compare what each stage did once they have all
+    finished.
+    """
     with jobs_lock:
         job = jobs.get(job_id)
-        preview_path = job.get("context_preview_path" if kind == "context" else "preview_path") if job else None
-        if not preview_path or not Path(preview_path).is_file():
-            raise HTTPException(status_code=404, detail="Step preview is not available")
-    media_type = "image/png" if Path(preview_path).suffix.lower() == ".png" else "image/jpeg"
-    return FileResponse(preview_path, media_type=media_type, headers={"Cache-Control": "no-store"})
+        paths = (job.get("stage_preview_paths") or []) if job else []
+        stage_path = paths[index] if 0 <= index < len(paths) else None
+    if not stage_path or not Path(stage_path).is_file():
+        raise HTTPException(status_code=404, detail="Stage preview is not available")
+    return FileResponse(stage_path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/inference/jobs/{job_id}/image")

@@ -225,7 +225,7 @@ test("the preset prompt reaches the request body and never the prompt box", asyn
   // Group definitions describe the workspace, not one image. Copying them into
   // every gallery record would bloat it and let a restore silently rewrite
   // combinations the user never asked to change.
-  assert.match(app, /loraGroupsByEngine: _loraGroupsByEngine, \.\.\.gallerySettings/);
+  assert.match(app, /loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, \.\.\.gallerySettings/);
   assert.match(app, /delete source\.loraGroupsByEngine;/);
 });
 

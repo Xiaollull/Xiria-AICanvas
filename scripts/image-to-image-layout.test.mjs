@@ -81,7 +81,7 @@ test("the run bar holds the top of the stage and the prompt lives under the pict
     "first in order is not enough: the stage scrolls and would carry the bar away with it");
   assert.match(css, /\.i2i-stage-panel \{[^}]*display: flex;[^}]*flex-direction: column/);
   // A sticky bar over transparent background shows whatever scrolls beneath it.
-  assert.match(css, /\.i2i-run-bar \{[^}]*background: #/);
+  assert.match(css, /\.i2i-run-bar \{[^}]*background: var\(--n-\d\d\)/);
   // A prompt box is the widest thing a user types into; the rail is 400px at its widest.
   const rail = page.slice(page.indexOf('<aside className="i2i-controls-panel panel">'));
   assert.ok(!rail.includes("i2i-prompt"), "the prompt does not belong in the rail");

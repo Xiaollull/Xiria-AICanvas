@@ -36,6 +36,8 @@ the difference is visible in a generation's metadata instead of being an undocum
 
 import math
 
+import torch
+
 try:
     from .flux_sampling import (
         _ANCESTRAL_SAMPLERS,
@@ -117,6 +119,46 @@ def krea2_refinement_sigma_schedule(steps: int, denoise: float, scheduler: str, 
     if scheduler not in KREA2_SCHEDULERS:
         raise ValueError(f"Unsupported Krea2 scheduler: {scheduler}")
     return flux_refinement_sigma_schedule(steps, denoise, scheduler, shift)
+
+
+def prepare_krea2_refinement_sigmas(steps: int, denoise: float, scheduler: str, shift: float = KREA2_SHIFT):
+    """Build a device-neutral refinement suffix suitable for repeated calls.
+
+    USDU runs one refinement per tile against the same request, so the schedule is built once and
+    handed to every tile rather than recomputed a few dozen times.
+    """
+    sigmas, _diagnostics = krea2_refinement_sigma_schedule(steps, denoise, scheduler, shift)
+    return sigmas.detach().to(device="cpu", dtype=torch.float32).clone()
+
+
+def validate_prepared_krea2_refinement_sigmas(
+    sigmas, steps: int, denoise: float, scheduler: str, shift: float = KREA2_SHIFT
+):
+    """Fail closed unless a reusable suffix exactly matches its request contract.
+
+    A schedule that silently disagreed with the request would change what every tile denoises to,
+    and the seam between two tiles is exactly where that shows. Representation is checked before
+    any conversion: accepting a tensor after moving or downcasting it would change the caller's
+    schedule on their behalf.
+    """
+    if not isinstance(sigmas, torch.Tensor) or sigmas.ndim != 1:
+        raise ValueError("prepared_sigmas must be a one-dimensional torch.Tensor")
+    if sigmas.device.type != "cpu":
+        raise ValueError("prepared_sigmas must be a CPU tensor")
+    if sigmas.dtype != torch.float32:
+        raise ValueError("prepared_sigmas must have dtype torch.float32")
+    if not sigmas.is_contiguous():
+        raise ValueError("prepared_sigmas must be contiguous")
+    if len(sigmas) != steps + 1:
+        raise ValueError("prepared_sigmas length does not match steps")
+    if not torch.isfinite(sigmas).all() or sigmas[-1].item() != 0.0:
+        raise ValueError("prepared_sigmas must be finite and terminate at zero")
+    if not torch.all(sigmas[:-1] >= sigmas[1:]):
+        raise ValueError("prepared_sigmas must be monotonic non-increasing")
+    expected = prepare_krea2_refinement_sigmas(steps, denoise, scheduler, shift)
+    if not torch.equal(sigmas, expected):
+        raise ValueError("prepared_sigmas do not match the requested steps, denoise, and scheduler")
+    return sigmas.clone()
 
 
 def resolve_krea2_sampler(sampler: str) -> tuple[str, str | None]:

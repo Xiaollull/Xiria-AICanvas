@@ -33,6 +33,7 @@
     <h2>On this page</h2>
     <ul>
       <li><a href="#prompt">Prompt weights</a></li>
+      <li><a href="#prompt-length">Prompt length</a></li>
       <li><a href="#guidance">Guidance</a></li>
       <li><a href="#adapters">Adapter fusion</a></li>
       <li><a href="#lora-cards">LoRA cards</a></li>
@@ -66,6 +67,32 @@
       A1111 scheduling syntax are <strong>not</strong> interpreted by this grammar. Anima parses
       Qwen and T5 token boundaries independently and applies weights to the T5-aligned LLM-adapter
       output.</p>
+
+    <h2 id="prompt-length">Prompt length</h2>
+    <p>There is no length limit on a prompt, on any engine. A prompt is encoded at whatever length
+      it tokenises to: a long one costs a little more time in the text encoder and nothing else, and
+      it is never truncated, never rejected, and never a reason a generation refuses to start.</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Engine</th><th>What a long prompt does</th></tr></thead>
+        <tbody>
+          <tr><td>SD, iL</td><td>CLIP is encoded in 75-token blocks and the blocks are joined, which is what ComfyUI does. The block count is reported under the prompt after each run.</td></tr>
+          <tr><td>Anima</td><td>Qwen and T5 both run at the prompt's own length. Below 512 tokens the sequence is padded up to it and the padding is masked.</td></tr>
+          <tr><td>FLUX.1</td><td>T5-XXL carries the conditioning and runs at the prompt's own length. CLIP-L contributes only a pooled vector and reads the first 77 tokens, because that is how many position embeddings it has — the same vector ComfyUI takes from its first block.</td></tr>
+          <tr><td>FLUX.2, Krea 2</td><td>The language model runs at the prompt's own length. FLUX.2 pads up to its trained 512-token context; Krea 2 pads nothing.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The counter under each field is a character count, not an allowance. What a prompt actually
+      costs is tokens, and that number is reported after a run alongside the block count.</p>
+    <p>A prompt is part of the attention sequence, so a very long one raises what a sampling pass
+      needs. On the three engines that place a whole transformer on the card — FLUX.1, FLUX.2 and
+      Krea 2 — a pass that no longer fits is retried with the transformer streamed a block at a
+      time rather than abandoned: the picture still arrives, and the run reports
+      <strong>LOW_VRAM</strong> instead of the mode it started in. The seed is unaffected, because
+      the retry restarts from the same noise. Measured on a 24 GB card at 1024&#215;1472, Krea 2
+      stayed resident to roughly seven thousand prompt tokens and finished a 13,849-token prompt on
+      the streamed path in about two and a half minutes against forty seconds.</p>
 
     <h2 id="guidance">Guidance</h2>
     <div class="scroller">

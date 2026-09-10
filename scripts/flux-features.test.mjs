@@ -9,6 +9,7 @@ import {
   adetailerUnitSteps,
 } from "../src/adetailer-units.js";
 import { hiresEffectiveSteps } from "../src/hires-settings.js";
+import { normalizeEngineSettings } from "../src/engine-settings.js";
 import { imageToImageRequestBody } from "../src/image-to-image.js";
 import {
   READY_LORA_ENGINES,
@@ -52,10 +53,15 @@ test("a Flux generation is guidance distilled: no negative branch, no enhancemen
   assert.match(generate, /\.\.\.\(fluxGeneration\s*\n\s*\? \{ diffusion_model: diffusionModel, text_encoder: textEncoder, text_encoder_2: textEncoder2, vae \}/);
   assert.match(generate, /negative_prompt: distilledGeneration \? "" : negative\.trim\(\)/);
   assert.match(generate, /guidance: distilledGeneration \? "none" : guidance/);
-  assert.match(generate, /preview_enabled: nativeGeneration \? false : processPreview/);
+  assert.doesNotMatch(generate, /preview_enabled|processPreview/);
 
   const selectModel = sourceBetween(app, "  const selectModel = (nextModel)", "  const selectCheckpoint = (nextCheckpoint)");
-  assert.match(selectModel, /\} else if \(nextModel === "Flux"\) \{[\s\S]*?setGuidance\("none"\);[\s\S]*?setProcessPreview\(false\);/);
+  // Guidance distillation is a fact about the engine, so it is enforced by the per-engine store
+  // rather than by a branch in the switch handler. The switch is now a swap of whole records.
+  assert.equal(normalizeEngineSettings("Flux", { guidance: "pag" }).guidance, "none");
+  assert.equal(normalizeEngineSettings("Flux", { guidance: "cfg_zero_star" }).guidance, "none");
+  assert.match(selectModel, /applyEngineSettings\(restored\)/);
+  assert.doesNotMatch(selectModel, /setProcessPreview/);
 
   // The typed negative prompt survives the switch; only the request drops it.
   assert.match(app, /const engineAllowsNegativePrompt = !isDistilledGuidance/);
@@ -85,7 +91,9 @@ test("the image-to-image request carries both Flux encoders and drops the negati
   assert.equal(body.vae, "ae.safetensors");
   assert.equal(body.checkpoint, undefined);
   assert.equal(body.negative_prompt, "");
-  assert.equal(body.preview_enabled, false);
+  // The withdrawn latent preview: the request must not carry the field at all, because the
+  // server forbids unknown keys and would refuse the whole generation.
+  assert.equal("preview_enabled" in body, false);
   assert.equal(body.guidance, "none");
   // USDU tiling stays Anima's; a Flux request must never ask for it.
   assert.equal(body.hires.execution_mode, "full_frame");

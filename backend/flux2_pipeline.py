@@ -66,10 +66,15 @@ try:
         _scale_diffusers_lora_alphas,
         _shape_of,
         _swap_scale_shift,
+        cached_conditioning,
+        discard_conditioning_cache,
+        note_conditioning_reuse,
+        refuse_prepared_refinement,
         flux_component_bytes,
         fuse_flux_lora_state_dict,
         normalize_flux_checkpoint_keys,
         resolve_quantized_state_dict,
+        sample_or_stream,
         unmatched_lora_targets,
     )
     from .tekken_tokenizer import load_tekken_tokenizer, tekken_tokenizer_from_state_dict
@@ -104,10 +109,15 @@ except ImportError:
         _scale_diffusers_lora_alphas,
         _shape_of,
         _swap_scale_shift,
+        cached_conditioning,
+        discard_conditioning_cache,
+        note_conditioning_reuse,
+        refuse_prepared_refinement,
         flux_component_bytes,
         fuse_flux_lora_state_dict,
         normalize_flux_checkpoint_keys,
         resolve_quantized_state_dict,
+        sample_or_stream,
         unmatched_lora_targets,
     )
     from tekken_tokenizer import load_tekken_tokenizer, tekken_tokenizer_from_state_dict
@@ -130,11 +140,9 @@ FLUX2_PIXEL_ALIGNMENT = FLUX2_VAE_SCALE_FACTOR * FLUX2_LATENT_PATCH
 FLUX2_MAX_EDGE = 4096
 
 # `model_base.Flux2.extra_conds` left-pads the conditioning to 512 tokens with zeros. That is the
-# trained context; a longer prompt is passed through rather than truncated, exactly as ComfyUI
-# does, and the ceiling below only exists so a pathological prompt fails with a sentence instead
-# of an allocation.
+# trained context and it is a floor, not a ceiling: a longer prompt is passed through at its own
+# length rather than truncated or refused, exactly as ComfyUI does.
 FLUX2_TEXT_SEQUENCE_LENGTH = 512
-FLUX2_MAX_TEXT_TOKENS = 4096
 
 # `comfy/text_encoders/flux.py`: three intermediate layers are tapped and concatenated. The tap
 # depths are per language model and are what `joint_attention_dim` is three times the width of.
@@ -805,6 +813,7 @@ class Flux2Runtime:
                 self._remove_transformer_group_offload()
         except BaseException:
             self._poisoned = True
+        discard_conditioning_cache(self)
         for name in ("transformer", "text_encoder", "vae"):
             module = getattr(self, name, None)
             if module is None:
@@ -829,11 +838,6 @@ class Flux2Runtime:
         else:
             ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
         token_count = len(ids)
-        if token_count > FLUX2_MAX_TEXT_TOKENS:
-            raise ValueError(
-                f"This prompt tokenises to {token_count} FLUX.2 text tokens, beyond the "
-                f"{FLUX2_MAX_TEXT_TOKENS}-token ceiling; shorten it"
-            )
         mask = [1] * token_count
         if self.family != "mistral3" and token_count < self.text_sequence_length:
             # Klein pads its tokens to the trained context and masks the padding.
@@ -850,13 +854,13 @@ class Flux2Runtime:
         self._require_open()
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
-        _ids, _mask, token_count = self._encode_tokens(prompt)
+        ids, _mask, token_count = self._encode_tokens(prompt)
         return {
             "llm": {
                 "token_count": int(token_count),
                 "weighted_token_count": 0,
-                "max_length": self.text_sequence_length,
-                "ceiling": FLUX2_MAX_TEXT_TOKENS,
+                "sequence_length": int(ids.shape[1]),
+                "context_length": self.text_sequence_length,
                 "family": self.family,
             }
         }
@@ -868,34 +872,33 @@ class Flux2Runtime:
         dimension, and ``model_base.Flux2.extra_conds`` then left-pads the result to 512 tokens
         with zeros.  Both happen here so the transformer sees exactly what ComfyUI hands it.
         """
+        return cached_conditioning(self, prompt, lambda: self._encode_prompt_uncached(prompt))
+
+    def _encode_prompt_uncached(self, prompt: str) -> torch.Tensor:
+        """One encoder pass. The caller owns the encoder's residency and the cache."""
         ids, mask, _token_count = self._encode_tokens(prompt)
         device = self.device
-        try:
-            self.text_encoder.to(device=device, dtype=self.dtype)
-            with torch.inference_mode():
-                output = self.text_encoder(
-                    input_ids=ids.to(device),
-                    attention_mask=mask.to(device),
-                    output_hidden_states=True,
-                    use_cache=False,
+        with torch.inference_mode():
+            output = self.text_encoder(
+                input_ids=ids.to(device),
+                attention_mask=mask.to(device),
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            states = output.hidden_states
+            if len(states) <= max(self.tap_layers):
+                raise RuntimeError(
+                    f"FLUX.2 {self.family} text encoder produced {len(states)} hidden states, "
+                    f"too few for taps {self.tap_layers}"
                 )
-                states = output.hidden_states
-                if len(states) <= max(self.tap_layers):
-                    raise RuntimeError(
-                        f"FLUX.2 {self.family} text encoder produced {len(states)} hidden states, "
-                        f"too few for taps {self.tap_layers}"
-                    )
-                stacked = torch.stack([states[index] for index in self.tap_layers], dim=1)
-                batch, taps, sequence, width = stacked.shape
-                embeddings = stacked.permute(0, 2, 1, 3).reshape(batch, sequence, taps * width)
-                if sequence < self.text_sequence_length:
-                    embeddings = torch.nn.functional.pad(
-                        embeddings, (0, 0, self.text_sequence_length - sequence, 0)
-                    )
-            return embeddings.to(device="cpu", dtype=self.dtype)
-        finally:
-            self.text_encoder.to("cpu")
-            _empty_cuda_cache()
+            stacked = torch.stack([states[index] for index in self.tap_layers], dim=1)
+            batch, taps, sequence, width = stacked.shape
+            embeddings = stacked.permute(0, 2, 1, 3).reshape(batch, sequence, taps * width)
+            if sequence < self.text_sequence_length:
+                embeddings = torch.nn.functional.pad(
+                    embeddings, (0, 0, self.text_sequence_length - sequence, 0)
+                )
+        return embeddings.to(device="cpu", dtype=self.dtype)
 
     # -- latents -----------------------------------------------------------------------------
 
@@ -1226,6 +1229,7 @@ class Flux2Runtime:
         shift = flux2_resolution_shift(width, height, steps)
         sigmas = flux2_sigma_schedule(steps, scheduler, shift)
         embeddings = self._run_cuda_stage("prompt_encode", lambda: self._encode_prompt(prompt))
+        note_conditioning_reuse(self, 'prompt_encode')
         chunk_size = max(1, int(sampling_batch_size or len(generators)))
         chunks = [list(generators[start:start + chunk_size]) for start in range(0, len(generators), chunk_size)]
         steps_executed = len(sigmas) - 1
@@ -1241,8 +1245,9 @@ class Flux2Runtime:
                 return lambda step, _total, latents: callback(offset + step, total, latents)
 
             initial = self._initial_latents(chunk, height, width, sigmas[0])
-            latents = self._run_cuda_stage(
-                "sampling",
+            latents = sample_or_stream(
+                self,
+                chunk,
                 lambda initial=initial, chunk=chunk: self._sample(
                     embeddings, initial, sigmas, sampler, cfg, chunk,
                     chunked(on_step), chunked(on_step_checkpoint),
@@ -1298,6 +1303,7 @@ class Flux2Runtime:
         if float(denoise) <= 0.0 or float(denoise) > 1.0:
             raise ValueError("denoise must be greater than 0 and at most 1")
         self._require_cuda()
+        refuse_prepared_refinement("FLUX.2", prepared_conditioning, prepared_sigmas)
         del pag_scale, pag_applied_layers, prepared_conditioning, prepared_sigmas
 
         mask_tensor = None
@@ -1315,6 +1321,7 @@ class Flux2Runtime:
         shift = flux2_resolution_shift(width, height, steps)
         sigmas, schedule_diagnostics = flux2_refinement_sigma_schedule(steps, float(denoise), scheduler, shift)
         embeddings = self._run_cuda_stage("refinement.prompt_encode", lambda: self._encode_prompt(prompt))
+        note_conditioning_reuse(self, 'refinement.prompt_encode')
         source = self._run_cuda_stage("refinement.vae_encode", lambda: self._encode_images(images))
         noise = _cpu_noise_like_batch(source, generators)
         start_sigma = float(sigmas[0].item())

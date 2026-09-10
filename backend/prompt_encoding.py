@@ -81,20 +81,48 @@ def _tokenize_without_special_tokens(tokenizer, text: str):
     return tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
 
 
+def _positive_length(value, name):
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{name} must be a positive integer or None")
+    return value
+
+
+def _pad_token_id(tokenizer):
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "eos_token_id", None)
+    if pad_token_id is None:
+        raise ValueError("tokenizer is missing a pad or eos token")
+    return int(pad_token_id)
+
+
 def tokenize_weighted_prompt(
     tokenizer,
     text: str,
     *,
-    max_length: int,
+    max_length: int | None = None,
+    min_length: int | None = None,
     truncation: bool = True,
     padding: str = "max_length",
     add_special_tokens: bool = True,
 ):
-    """Tokenize a weighted prompt into one fixed-length, tokenizer-aligned sequence."""
-    if not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 1:
-        raise ValueError("max_length must be a positive integer")
+    """Tokenize a weighted prompt into one tokenizer-aligned sequence.
+
+    `max_length=None` is a prompt with no ceiling, which is what ComfyUI gives every encoder whose
+    context is a trained length rather than an architectural one — `comfy/text_encoders/flux.py`
+    writes it as `max_length=99999999`.  `min_length` is the other half of that setting: the prompt
+    is padded up to the trained context when it is shorter and passed through whole when it is
+    longer.  A `max_length` that *is* an architectural limit — CLIP's 77 learned position
+    embeddings — still truncates, because there the ceiling is the model's, not a policy.
+    """
+    max_length = _positive_length(max_length, "max_length")
+    min_length = _positive_length(min_length, "min_length")
     if padding not in {"max_length", False, None}:
         raise ValueError("padding must be 'max_length' or disabled")
+    if padding == "max_length" and max_length is None:
+        raise ValueError("padding to max_length requires a max_length")
 
     content_ids = []
     content_weights = []
@@ -107,20 +135,21 @@ def tokenize_weighted_prompt(
         if not hasattr(tokenizer, "build_inputs_with_special_tokens") or not hasattr(tokenizer, "get_special_tokens_mask"):
             raise ValueError("tokenizer cannot build aligned special tokens")
         empty_with_specials = list(tokenizer.build_inputs_with_special_tokens([]))
-        available_content = max_length - len(empty_with_specials)
-        if available_content < 0:
-            raise ValueError("max_length is too short for tokenizer special tokens")
-        if len(content_ids) > available_content:
-            if not truncation:
-                raise ValueError(
-                    f"weighted prompt uses {len(content_ids) + len(empty_with_specials)} tokens, exceeding max_length={max_length}"
-                )
-            if getattr(tokenizer, "truncation_side", "right") == "left":
-                content_ids = content_ids[-available_content:] if available_content else []
-                content_weights = content_weights[-available_content:] if available_content else []
-            else:
-                content_ids = content_ids[:available_content]
-                content_weights = content_weights[:available_content]
+        if max_length is not None:
+            available_content = max_length - len(empty_with_specials)
+            if available_content < 0:
+                raise ValueError("max_length is too short for tokenizer special tokens")
+            if len(content_ids) > available_content:
+                if not truncation:
+                    raise ValueError(
+                        f"weighted prompt uses {len(content_ids) + len(empty_with_specials)} tokens, exceeding max_length={max_length}"
+                    )
+                if getattr(tokenizer, "truncation_side", "right") == "left":
+                    content_ids = content_ids[-available_content:] if available_content else []
+                    content_weights = content_weights[-available_content:] if available_content else []
+                else:
+                    content_ids = content_ids[:available_content]
+                    content_weights = content_weights[:available_content]
         input_ids = list(tokenizer.build_inputs_with_special_tokens(content_ids))
         special_mask = list(tokenizer.get_special_tokens_mask(input_ids, already_has_special_tokens=True))
         if len(input_ids) != len(special_mask):
@@ -141,7 +170,7 @@ def tokenize_weighted_prompt(
         input_ids = content_ids
         weights = content_weights
 
-    if len(input_ids) > max_length:
+    if max_length is not None and len(input_ids) > max_length:
         if not truncation:
             raise ValueError(f"weighted prompt uses {len(input_ids)} tokens, exceeding max_length={max_length}")
         if getattr(tokenizer, "truncation_side", "right") == "left":
@@ -154,13 +183,12 @@ def tokenize_weighted_prompt(
     attention_mask = [1] * len(input_ids)
     token_count = len(input_ids)
     weighted_token_count = sum(weight != 1.0 for weight in weights)
-    if padding == "max_length" and len(input_ids) < max_length:
-        pad_token_id = getattr(tokenizer, "pad_token_id", None)
-        if pad_token_id is None:
-            pad_token_id = getattr(tokenizer, "eos_token_id", None)
-        if pad_token_id is None:
-            raise ValueError("tokenizer is missing a pad or eos token")
-        missing = max_length - len(input_ids)
+    pad_target = max_length if padding == "max_length" else 0
+    if min_length is not None:
+        pad_target = max(pad_target, min_length)
+    if len(input_ids) < pad_target:
+        pad_token_id = _pad_token_id(tokenizer)
+        missing = pad_target - len(input_ids)
         pad_ids = [int(pad_token_id)] * missing
         pad_weights = [1.0] * missing
         pad_mask = [0] * missing
@@ -180,6 +208,43 @@ def tokenize_weighted_prompt(
         "token_count": token_count,
         "weighted_token_count": weighted_token_count,
     }
+
+
+def pad_weighted_encodings(tokenizer, encodings, *, min_length: int | None = None):
+    """Bring a batch of tokenized prompts to one shared length.
+
+    A batch has to be rectangular, and the only rectangle that loses nothing is the one the
+    *longest* member needs — padding up to it rather than cutting down to the shortest.
+    `min_length` raises that floor to the trained context, so a batch of short prompts still fills
+    it.  The padding is masked, so what the encoder attends to is unchanged either way.
+    """
+    encodings = list(encodings)
+    if not encodings:
+        return encodings
+    min_length = _positive_length(min_length, "min_length")
+    target = max(int(item["input_ids"].shape[0]) for item in encodings)
+    if min_length is not None:
+        target = max(target, min_length)
+    pad_left = getattr(tokenizer, "padding_side", "right") == "left"
+    pad_token_id = _pad_token_id(tokenizer)
+    padded = []
+    for item in encodings:
+        missing = target - int(item["input_ids"].shape[0])
+        if missing <= 0:
+            padded.append(item)
+            continue
+        filler = {
+            "input_ids": torch.full((missing,), pad_token_id, dtype=torch.long),
+            "attention_mask": torch.zeros(missing, dtype=torch.long),
+            "weights": torch.ones(missing, dtype=torch.float32),
+        }
+        # `token_count` and `weighted_token_count` describe the prompt, not the rectangle, so they
+        # are carried across untouched.
+        merged = dict(item)
+        for key, pad in filler.items():
+            merged[key] = torch.cat((pad, item[key]) if pad_left else (item[key], pad))
+        padded.append(merged)
+    return padded
 
 
 def build_weighted_token_batches(tokenizer, text: str):

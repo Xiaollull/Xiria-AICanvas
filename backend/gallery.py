@@ -34,6 +34,23 @@ THUMBNAIL_QUALITY = 82
 # lossy derivative can genuinely come out larger than the source.
 THUMBNAIL_MIN_ORIGINAL_BYTES = 256 * 1024
 
+# Version 4 dropped the two 8000-character prompt CHECKs. A saved prompt is the same text the
+# engines encode, and they hold it to no length, so the library must not be the thing that refuses
+# to keep it. Title and notes keep their limits: those are labels for a person to scan, not prompts.
+GALLERY_SCHEMA_VERSION = 4
+PROMPT_ENTRIES_TABLE = """CREATE TABLE prompt_entries (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    positive_prompt TEXT NOT NULL,
+    negative_prompt TEXT NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(length(title) BETWEEN 1 AND 160),
+    CHECK(notes IS NULL OR length(notes) <= 2000)
+)"""
+PROMPT_ENTRIES_INDEX = "CREATE INDEX prompt_entries_updated_idx ON prompt_entries(updated_at DESC)"
+
 
 class GalleryError(Exception):
     pass
@@ -106,10 +123,10 @@ def _prompt_title(value):
 
 
 def _prompt_text(value, field):
+    # No length limit: a library entry holds the same text a generation runs, and refusing to save
+    # a prompt the engines would happily encode is the library losing the user's work.
     if not isinstance(value, str):
         raise GalleryValidationError(f"{field} must be a string")
-    if len(value) > 8000:
-        raise GalleryValidationError(f"{field} must not exceed 8000 characters")
     return value
 
 
@@ -166,8 +183,10 @@ class GalleryStore:
         try:
             self._begin(connection)
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > 3:
-                raise RuntimeError(f"Gallery database version {version} is newer than supported version 3")
+            if version > GALLERY_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Gallery database version {version} is newer than supported version {GALLERY_SCHEMA_VERSION}"
+                )
             if version == 0:
                 statements = (
                     """CREATE TABLE collections (
@@ -206,24 +225,12 @@ class GalleryStore:
                     "CREATE INDEX cards_collection_created_idx ON cards(collection_id, created_at DESC)",
                     "CREATE INDEX cards_collection_sort_idx ON cards(collection_id, sort_index)",
                     "CREATE INDEX card_images_card_order_idx ON card_images(card_id, sort_index)",
-                    """CREATE TABLE prompt_entries (
-                        id TEXT PRIMARY KEY,
-                        title TEXT NOT NULL,
-                        positive_prompt TEXT NOT NULL,
-                        negative_prompt TEXT NOT NULL,
-                        notes TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        CHECK(length(title) BETWEEN 1 AND 160),
-                        CHECK(length(positive_prompt) <= 8000),
-                        CHECK(length(negative_prompt) <= 8000),
-                        CHECK(notes IS NULL OR length(notes) <= 2000)
-                    )""",
-                    "CREATE INDEX prompt_entries_updated_idx ON prompt_entries(updated_at DESC)",
+                    PROMPT_ENTRIES_TABLE,
+                    PROMPT_ENTRIES_INDEX,
                 )
                 for statement in statements:
                     connection.execute(statement)
-                connection.execute("PRAGMA user_version = 3")
+                connection.execute(f"PRAGMA user_version = {GALLERY_SCHEMA_VERSION}")
             else:
                 if version == 1:
                     connection.execute(
@@ -244,23 +251,29 @@ class GalleryStore:
                     )
                     version = 2
                 if version == 2:
+                    # A version 2 database has no prompt library at all, so it is created in its
+                    # current shape and lands on the current version without the rebuild below.
+                    connection.execute(PROMPT_ENTRIES_TABLE)
+                    connection.execute(PROMPT_ENTRIES_INDEX)
+                    connection.execute(f"PRAGMA user_version = {GALLERY_SCHEMA_VERSION}")
+                    version = GALLERY_SCHEMA_VERSION
+                if version == 3:
+                    # Version 3 wrote an 8000-character CHECK on each prompt column. SQLite keeps a
+                    # CHECK in the table definition and has no statement to drop one, so lifting the
+                    # limit means rebuilding the table and carrying the rows over.
+                    connection.execute("ALTER TABLE prompt_entries RENAME TO prompt_entries_capped")
+                    connection.execute(PROMPT_ENTRIES_TABLE)
                     connection.execute(
-                        """CREATE TABLE prompt_entries (
-                            id TEXT PRIMARY KEY,
-                            title TEXT NOT NULL,
-                            positive_prompt TEXT NOT NULL,
-                            negative_prompt TEXT NOT NULL,
-                            notes TEXT,
-                            created_at TEXT NOT NULL,
-                            updated_at TEXT NOT NULL,
-                            CHECK(length(title) BETWEEN 1 AND 160),
-                            CHECK(length(positive_prompt) <= 8000),
-                            CHECK(length(negative_prompt) <= 8000),
-                            CHECK(notes IS NULL OR length(notes) <= 2000)
-                        )"""
+                        """INSERT INTO prompt_entries
+                               (id, title, positive_prompt, negative_prompt, notes, created_at, updated_at)
+                           SELECT id, title, positive_prompt, negative_prompt, notes, created_at, updated_at
+                           FROM prompt_entries_capped"""
                     )
-                    connection.execute("CREATE INDEX prompt_entries_updated_idx ON prompt_entries(updated_at DESC)")
-                    connection.execute("PRAGMA user_version = 3")
+                    # Dropping the renamed table drops the index that followed it across the rename.
+                    connection.execute("DROP TABLE prompt_entries_capped")
+                    connection.execute(PROMPT_ENTRIES_INDEX)
+                    connection.execute("PRAGMA user_version = 4")
+                    version = 4
             connection.commit()
         except Exception:
             self._rollback(connection)

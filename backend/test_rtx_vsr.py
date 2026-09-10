@@ -274,7 +274,6 @@ class RtxVsrTests(unittest.TestCase):
             seed=1,
             sampler="euler",
             scheduler="simple",
-            preview_enabled=False,
             rtx={"enabled": True, "scale": 2},
         )
         image = Image.new("RGB", (64, 64), "red")

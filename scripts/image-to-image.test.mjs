@@ -124,7 +124,9 @@ test("the request body carries the picture, the strength and nothing the page do
   assert.equal(body.negative_prompt, "blurry");
   assert.equal(body.denoise, 0.45);
   assert.equal(body.seed, "99");
-  assert.equal(body.preview_enabled, true);
+  // The withdrawn latent preview: the request must not carry the field at all, because the
+  // server forbids unknown keys and would refuse the whole generation.
+  assert.equal("preview_enabled" in body, false);
   assert.deepEqual(body.source_image, {
     enabled: true,
     image_data: "data:image/png;base64,PIXELS",
@@ -245,7 +247,9 @@ test("an Anima request sends split model assets and refuses process previews", (
     seed: "1",
   });
   assert.equal(body.diffusion_model, "d.safetensors");
-  assert.equal(body.preview_enabled, false);
+  // The withdrawn latent preview: the request must not carry the field at all, because the
+  // server forbids unknown keys and would refuse the whole generation.
+  assert.equal("preview_enabled" in body, false);
   assert.equal("checkpoint" in body, false);
 });
 

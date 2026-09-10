@@ -33,8 +33,9 @@ test("the toolbox replaced the downloader tab and lands on its first tool", () =
   assert.doesNotMatch(app, /activePage === "downloader"/);
   assert.doesNotMatch(app, /模型下载器<\/button>/);
 
-  // Opening the toolbox opens a tool, not a launcher screen.
-  assert.match(toolbox, /useState\(TOOLBOX_TOOLS\[0\]\.id\)/);
+  // Opening the toolbox opens a tool, not a launcher screen. Which tool that is now comes from the
+  // saved state, falling back to the first entry in the rail on a workspace that has none.
+  assert.match(toolbox, /state\?\.activeTool \|\| TOOLBOX_TOOLS\[0\]\.id/);
   assert.match(toolbox, /\{ id: "downloader"/);
   assert.match(toolbox, /\{ id: "image-info"/);
   assert.ok(toolbox.indexOf('id: "downloader"') < toolbox.indexOf('id: "image-info"'), "the downloader stays the default landing tool");
@@ -156,7 +157,7 @@ test("a model found nowhere is red, warned about, and not signalled by colour al
   assert.match(fields, /本地模型目录与共享目录中都没有这个模型/);
   assert.match(reader, /className="info-missing-warning"/);
   assert.match(reader, /在本地模型目录和共享目录中都找不到/);
-  assert.match(styles, /\.model-name-missing \{[^}]*color: #ff6b5a/);
+  assert.match(styles, /\.model-name-missing \{[^}]*color: var\(--state-error-strong\)/);
   // The icon and the warning line repeat the verdict for anyone who cannot
   // separate these hues.
   assert.match(fields, /<AlertTriangle size=\{12\} \/>\{name\}/);
@@ -264,10 +265,12 @@ test("the details dialog presents the complete record in sections", () => {
   assert.match(reader, /<ImageInfoDetails info=\{info\} onClose=\{\(\) => setDetailsOpen\(false\)\} \/>/);
 
   // One fixed dialog with a real dialog role, an Escape path and a
-  // backdrop-click path.
+  // backdrop-click path. Escape now arrives through the shared dialog lifecycle rather than a
+  // local listener, which is also what gives this dialog a focus trap and focus return.
   assert.match(details, /className="image-info-details-backdrop"/);
   assert.match(details, /role="dialog" aria-modal="true" aria-labelledby="image-info-details-title"/);
-  assert.match(details, /event\.key === "Escape"/);
+  assert.match(details, /useDialogLifecycle\(true, onClose\)/);
+  assert.match(details, /ref=\{dialogRef\}/);
   assert.match(details, /event\.target === event\.currentTarget/);
 
   // Complete block coverage: identity, model, prompts, parameters, LoRA,

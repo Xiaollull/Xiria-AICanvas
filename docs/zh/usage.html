@@ -33,6 +33,7 @@
     <h2>本页目录</h2>
     <ul>
       <li><a href="#prompt">提示词权重</a></li>
+      <li><a href="#prompt-length">提示词长度</a></li>
       <li><a href="#guidance">引导</a></li>
       <li><a href="#adapters">适配器融合</a></li>
       <li><a href="#lora-cards">LoRA 卡片</a></li>
@@ -62,6 +63,25 @@
 
     <p>方括号减弱、<code>BREAK</code>、文本反转（textual inversion）标签、Prompt LoRA 标签与 A1111
       调度语法<strong>不由</strong>此语法解释。Anima 独立解析 Qwen 与 T5 的 token 边界，并将权重应用于 T5 对齐的 LLM 适配器输出。</p>
+
+    <h2 id="prompt-length">提示词长度</h2>
+    <p>任何引擎都不对提示词长度设上限。提示词按它实际分词出的长度编码：写得长只是在文本编码器上多花一点时间，除此之外没有代价。它不会被截断，不会被拒绝，也不会成为生成无法开始的理由。</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>引擎</th><th>长提示词的处理方式</th></tr></thead>
+        <tbody>
+          <tr><td>SD、iL</td><td>CLIP 按 75 token 分块编码后拼接，与 ComfyUI 一致。每次生成后会在提示词下方显示块数。</td></tr>
+          <tr><td>Anima</td><td>Qwen 与 T5 都按提示词自身长度运行。不足 512 token 时补齐到该长度，补位部分被注意力掩码屏蔽。</td></tr>
+          <tr><td>FLUX.1</td><td>承载条件的是 T5-XXL，按提示词自身长度运行。CLIP-L 只贡献一个池化向量，读取前 77 个 token——因为它只有这么多位置嵌入，这与 ComfyUI 从首块取出的向量相同。</td></tr>
+          <tr><td>FLUX.2、Krea 2</td><td>语言模型按提示词自身长度运行。FLUX.2 会补齐到其 512 token 的训练上下文；Krea 2 不做任何补齐。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>各输入框下方的计数是字符数，不是额度。提示词真正的开销是 token，该数字会在生成后与块数一起显示。</p>
+    <p>提示词是注意力序列的一部分，因此过长的提示词会抬高一次采样所需的显存。在将整个 transformer 常驻显存的三个引擎上——FLUX.1、FLUX.2 与
+      Krea 2——若常驻的一次采样已放不下，会改为逐块动态装入 transformer 重试，而不是放弃：图仍然会出来，运行状态则显示为
+      <strong>LOW_VRAM</strong> 而非最初的模式。重试会从相同的噪声重新开始，因此种子不受影响。在 24 GB 显卡、1024&#215;1472 下实测，Krea 2
+      在约七千 token 以内保持常驻；13,849 token 的提示词走动态装入路径约需两分半，而常驻路径约为四十秒。</p>
 
     <h2 id="guidance">引导</h2>
     <div class="scroller">

@@ -4,6 +4,17 @@ import { NATIVE_STEP_ENGINES } from "./adetailer-units.js";
 
 export const MAX_UINT64_SEED = 18446744073709551615n;
 
+// The engines whose Hires stage can refine tile by tile. Both prepare their conditioning and their
+// sigma schedule once and hand the same pair to every tile; the Flux engines are guidance distilled
+// and expose no such surface, so their Hires stays full frame. Kept here rather than written out at
+// each of the seven places that ask, so the answer cannot drift between the workspace, the gallery
+// and image-to-image.
+export const USDU_TILED_ENGINES = ["Anima", "Krea2"];
+
+export function supportsUsduTiled(model) {
+  return USDU_TILED_ENGINES.includes(model);
+}
+
 export function secureRandomUint64Seed(cryptoSource = globalThis.crypto) {
   if (!cryptoSource?.getRandomValues) throw new Error("Secure random seed generation is unavailable");
   const words = cryptoSource.getRandomValues(new Uint32Array(2));
@@ -104,7 +115,7 @@ export function normalizeGalleryHires(model, sourceHires, baseHires, defaults, {
   const explicitExecutionMode = hasSource("executionMode")
     ? source.executionMode
     : sourceKind === "workspace_inheritance" && hasBase("executionMode") ? base.executionMode : undefined;
-  const executionMode = model === "Anima" && explicitExecutionMode !== "full_frame" ? "usdu_tiled" : "full_frame";
+  const executionMode = supportsUsduTiled(model) && explicitExecutionMode !== "full_frame" ? "usdu_tiled" : "full_frame";
   const hiresSeed = normalizeHiresSeed(value("seedMode", "inherit"), value("seed", null));
   return {
     ...fallback,

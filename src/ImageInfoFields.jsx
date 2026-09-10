@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, Copy, Share2 } from "lucide-react";
+import { copyText } from "./clipboard";
 import { groupParameters } from "./metadata-explorer";
 
 // The two presentational pieces the facts panel and the details dialog both use.
@@ -32,8 +33,8 @@ export function CopyField({ label, value, empty }) {
   return <div className="info-prompt-field">
     <header>
       <span>{label}</span>
-      {value ? <button type="button" onClick={() => { void navigator.clipboard?.writeText(value).then(() => setCopied(true)).catch(() => {}); }}>
-        {copied ? <Check size={12} /> : <Copy size={12} />}{copied ? "已复制" : "复制"}
+      {value ? <button type="button" onClick={() => { void copyText(value).then((ok) => setCopied(ok ? "ok" : "failed")); }}>
+        {copied === "ok" ? <Check size={12} /> : <Copy size={12} />}{copied === "ok" ? "已复制" : copied === "failed" ? "复制失败" : "复制"}
       </button> : null}
     </header>
     <p className={value ? "" : "empty"}>{value || empty}</p>
@@ -73,7 +74,7 @@ export function CopyButton({ value, label = "复制", size = 11 }) {
     const timer = window.setTimeout(() => setCopied(false), 1400);
     return () => window.clearTimeout(timer);
   }, [copied]);
-  return <button type="button" className="metadata-copy" onClick={() => { void navigator.clipboard?.writeText(String(value ?? "")).then(() => setCopied(true)).catch(() => {}); }}>
-    {copied ? <Check size={size} /> : <Copy size={size} />}{copied ? "已复制" : label}
+  return <button type="button" className="metadata-copy" onClick={() => { void copyText(String(value ?? "")).then((ok) => setCopied(ok ? "ok" : "failed")); }}>
+    {copied === "ok" ? <Check size={size} /> : <Copy size={size} />}{copied === "ok" ? "已复制" : copied === "failed" ? "复制失败" : label}
   </button>;
 }

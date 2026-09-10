@@ -226,9 +226,34 @@ class FluxRuntimeExecutionTests(unittest.TestCase):
 
     def test_token_diagnostics_report_both_encoders(self):
         diagnostics = self.runtime.token_diagnostics("a lantern in the rain")
+        # CLIP reports a ceiling because it has one; T5 reports the sequence it ran and the trained
+        # context a shorter prompt is padded up to.
         self.assertEqual(diagnostics["clip"]["max_length"], FLUX_CLIP_SEQUENCE_LENGTH)
-        self.assertEqual(diagnostics["t5"]["max_length"], 16)
+        self.assertEqual(diagnostics["t5"]["context_length"], 16)
+        self.assertEqual(diagnostics["t5"]["sequence_length"], 16)
         self.assertGreater(diagnostics["t5"]["token_count"], 0)
+
+    def test_a_prompt_past_the_trained_context_keeps_every_token(self):
+        # The whole point: the T5 sequence grows with the prompt instead of the tail being cut off.
+        # CLIP-L stays at its 77 because those position embeddings are the model, and FLUX.1 takes
+        # only a pooled vector from it — which ComfyUI also reads from the first block alone.
+        prompt = " ".join(f"word{index}" for index in range(200))
+        diagnostics = self.runtime.token_diagnostics(prompt)
+        self.assertEqual(diagnostics["t5"]["token_count"], 201)
+        self.assertEqual(diagnostics["t5"]["sequence_length"], 201)
+        self.assertGreater(diagnostics["t5"]["sequence_length"], diagnostics["t5"]["context_length"])
+        self.assertEqual(diagnostics["clip"]["token_count"], FLUX_CLIP_SEQUENCE_LENGTH)
+        embeddings, pooled = self.runtime._encode_prompt(prompt)
+        self.assertEqual(tuple(embeddings.shape)[:2], (1, 201))
+        self.assertEqual(tuple(pooled.shape), (1, POOLED))
+
+    def test_a_weighted_long_prompt_still_blends_against_an_empty_pass(self):
+        # The empty conditioning has to match the prompt token for token. It is padded up to the
+        # prompt's length rather than the prompt being cut down to the trained context.
+        prompt = " ".join(f"(word{index}:1.3)" for index in range(40))
+        embeddings, _pooled = self.runtime._encode_prompt(prompt)
+        self.assertEqual(tuple(embeddings.shape)[:2], (1, 41))
+        self.assertGreater(self.runtime.token_diagnostics(prompt)["t5"]["weighted_token_count"], 0)
 
     def test_a_canvas_that_cannot_be_packed_into_whole_tokens_is_refused(self):
         with self.assertRaises(ValueError) as error:

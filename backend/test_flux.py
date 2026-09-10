@@ -28,7 +28,6 @@ def flux_request(**overrides):
         seed=1,
         sampler="euler",
         scheduler="simple",
-        preview_enabled=False,
     )
     fields.update(overrides)
     return GenerateInput(**fields)
@@ -61,7 +60,7 @@ class FluxRequestContractTests(unittest.TestCase):
             with self.subTest(engine=engine), self.assertRaises(ValidationError):
                 GenerateInput(
                     engine=engine, prompt="x", width=512, height=512, steps=10, cfg=7, denoise=1,
-                    seed=1, sampler="euler", scheduler="simple", preview_enabled=False,
+                    seed=1, sampler="euler", scheduler="simple",
                     text_encoder_2="t5xxl.safetensors", **extra,
                 )
 
@@ -91,10 +90,6 @@ class FluxRequestContractTests(unittest.TestCase):
         self.assertEqual(flux_request(adetailer={"enabled": False, "units": [unit]}).adetailer.active_units, [])
         # An enabled stage whose units carry no negative prompt is the ordinary case.
         flux_request(adetailer={"enabled": True, "units": [{"detector": "face_yolov8n.pt"}]})
-
-    def test_process_previews_are_refused(self):
-        with self.assertRaises(ValidationError):
-            flux_request(preview_enabled=True)
 
     def test_usdu_tiled_hires_remains_anima_only(self):
         with self.assertRaises(ValidationError) as error:
@@ -197,7 +192,6 @@ class FluxEngineWiringTests(unittest.TestCase):
         self.assertFalse(features["pag"])
         self.assertFalse(features["cfg_zero_star"])
         self.assertFalse(features["negative_prompt"])
-        self.assertFalse(features["process_preview"])
         self.assertTrue(features["distilled_guidance"])
         for stage in ("hires", "adetailer", "rtx", "lora"):
             self.assertTrue(features[stage])

@@ -89,6 +89,45 @@ class ScanTests(unittest.TestCase):
             scan_quantized_layers(state, "test checkpoint")
         self.assertIn("int4_awq", str(raised.exception))
 
+    def test_a_rotated_int8_weight_is_refused_rather_than_read_as_plain_int8(self):
+        """Krea 2's INT8 build is the real case, and it is the dangerous shape of one.
+
+        Its marker is ``{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}``.
+        The format names something this loader supports, so reading only that field accepts the
+        file, dequantises it as an ordinary tensor-wise int8 layer, and multiplies a weight stored
+        in a rotated basis by an unrotated activation. ComfyUI undoes the rotation inside its own
+        compiled kernel; there is nothing here that can, so the answer is not close to right and
+        the file has to be refused instead of run.
+        """
+        state = {
+            "block.weight": torch.zeros(4, 4, dtype=torch.int8),
+            "block.weight_scale": torch.tensor(0.02),
+            "block.comfy_quant": torch.tensor(
+                list(json.dumps({
+                    "format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256,
+                }).encode("utf-8")),
+                dtype=torch.uint8,
+            ),
+        }
+        with self.assertRaises(UnsupportedQuantization) as raised:
+            scan_quantized_layers(state, "test checkpoint")
+        message = str(raised.exception)
+        self.assertIn("convrot", message)
+        # The message has to say what to do instead, or it is just a wall.
+        self.assertIn("fp8", message)
+
+    def test_a_marker_that_only_describes_the_matmul_is_not_a_refusal(self):
+        """`full_precision_matrix_mult` rides along on every layer of the Qwen3-VL fp8 encoder that
+        this project loads today. It picks how the same value is computed, not what is stored."""
+        state = fp8_layer()
+        state["block.comfy_quant"] = torch.tensor(
+            list(json.dumps({
+                "format": "float8_e4m3fn", "full_precision_matrix_mult": False,
+            }).encode("utf-8")),
+            dtype=torch.uint8,
+        )
+        self.assertEqual(scan_quantized_layers(state)["block"].format, "float8_e4m3fn")
+
     def test_a_declared_format_must_match_the_stored_type(self):
         state = fp8_layer()
         state["block.comfy_quant"] = comfy_quant_marker("int8_tensorwise")

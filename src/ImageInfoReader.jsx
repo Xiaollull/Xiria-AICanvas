@@ -17,6 +17,7 @@ import ImageInfoDetails from "./ImageInfoDetails";
 import ImageInfoApply from "./ImageInfoApply";
 import { CopyField, ModelName, ParameterModules } from "./ImageInfoFields";
 import { imageInfoApplyFields } from "./image-info-apply";
+import { emptyImageInfoState, toolboxImageUrl } from "./toolbox-state";
 
 const DIRECTORY_PLACEHOLDER = `批量读取：输入图片文件夹绝对路径，例如 ${hostPathExample("imageDirectory")}`;
 const MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
@@ -26,15 +27,64 @@ function isImageFile(file) {
   return Boolean(file) && (file.type?.startsWith("image/") || IMAGE_FILE_NAME.test(file.name || ""));
 }
 
-export default function ImageInfoReader({ onApplyParameters }) {
-  const [mode, setMode] = useState("single");
-  const [directory, setDirectory] = useState("");
-  const [files, setFiles] = useState([]);
-  const [index, setIndex] = useState(0);
-  const [scannedDirectory, setScannedDirectory] = useState("");
-  const [truncated, setTruncated] = useState(false);
-  const [info, setInfo] = useState(null);
-  const [imageUrl, setImageUrl] = useState("");
+/* Keep one uploaded picture in the project so it survives leaving the page, a refresh and a
+ * restart. Returns null when it could not be kept — too large to be worth storing, or a store that
+ * refused it — which costs the restore and nothing else, so it is never surfaced as an error. */
+async function storeUploadedImage(dataUrl) {
+  try {
+    const response = await fetch("/api/toolbox/state/asset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dataUrl }),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json().catch(() => null);
+    return payload?.id ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+/* Read one response as JSON without assuming it is JSON.
+ *
+ * Every reader request used to call `response.json()` before looking at `response.ok`. When Vite,
+ * the inference proxy or the dev server answered with an empty body or an HTML error page — which
+ * is what a 502 looks like — the parse threw first, and the user was shown
+ * "Unexpected token '<'" instead of being told the request had failed. The body is read once as
+ * text, parsed if it can be, and the HTTP status is what gets reported when it cannot. */
+async function readJsonResponse(response, operation) {
+  const text = await response.text().catch(() => "");
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = null;
+  }
+  if (!response.ok) {
+    throw new Error(payload?.error || `${operation}失败：HTTP ${response.status}`);
+  }
+  if (!payload) {
+    throw new Error(`${operation}失败：服务返回了无法解析的响应`);
+  }
+  return payload;
+}
+
+export default function ImageInfoReader({ onApplyParameters, savedState = null, onStateChange = null }) {
+  // Seeded from the saved snapshot rather than restored into afterwards, so the first paint is
+  // already the restored view and there is no empty flash to reconcile against.
+  const restored = savedState || emptyImageInfoState();
+  const [mode, setMode] = useState(restored.mode);
+  const [directory, setDirectory] = useState(restored.directory);
+  const [files, setFiles] = useState(restored.files);
+  const [index, setIndex] = useState(restored.index);
+  const [scannedDirectory, setScannedDirectory] = useState(restored.scannedDirectory);
+  const [truncated, setTruncated] = useState(restored.truncated);
+  const [info, setInfo] = useState(restored.info);
+  const [assetId, setAssetId] = useState(restored.assetId);
+  const [assetName, setAssetName] = useState(restored.assetName);
+  const [imageUrl, setImageUrl] = useState(() => toolboxImageUrl(restored));
+  // Never restored: a snapshot taken mid-request would come back as a reader stuck loading, and a
+  // drag that was in progress when the page unmounted is over.
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [dragActive, setDragActive] = useState(false);
@@ -44,12 +94,44 @@ export default function ImageInfoReader({ onApplyParameters }) {
   const requestRef = useRef(0);
   const dragDepthRef = useRef(0);
   const uploadInputRef = useRef(null);
+  const reportRef = useRef(onStateChange);
+  reportRef.current = onStateChange;
+
+  // One place that decides what is worth saving. `imageUrl` is deliberately absent: an uploaded
+  // picture's URL is a blob handle that means nothing in the next session, and a directory
+  // picture's URL is derived from the directory and file name on the way back in.
+  useEffect(() => {
+    reportRef.current?.({ mode, directory, files, index, scannedDirectory, truncated, info, assetId, assetName });
+  }, [mode, directory, files, index, scannedDirectory, truncated, info, assetId, assetName]);
 
   const releaseObjectUrl = () => {
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     objectUrlRef.current = "";
   };
   useEffect(() => releaseObjectUrl, []);
+
+  // A model match describes the disk at the moment the picture was parsed, and a restored record
+  // may have been parsed before a restart, an install, or a fix to how engines are told apart. It
+  // is checked again against what is installed now: once on the way back in, so the marks on screen
+  // are true, and again when Apply is pressed, because that is the moment the match decides which
+  // engine to switch to. A newer read that started meanwhile is never overwritten.
+  const resolveMatches = async (record) => {
+    if (!record || record.status !== "ok") return record;
+    const token = requestRef.current;
+    const response = await fetch("/api/image-info/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ info: record }),
+    });
+    const payload = await readJsonResponse(response, "核对本地模型");
+    if (token === requestRef.current) setInfo(payload.info);
+    return payload.info;
+  };
+  useEffect(() => {
+    if (restored.info) void resolveMatches(restored.info).catch(() => {});
+    // Once, for the record this reader was restored with; later records are resolved as they are read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const readUploadedFile = async (file) => {
     if (!file) return;
@@ -66,6 +148,9 @@ export default function ImageInfoReader({ onApplyParameters }) {
     setError("");
     setMode("single");
     setFiles([]);
+    setScannedDirectory("");
+    setAssetId("");
+    setAssetName("");
     releaseObjectUrl();
     // The picture is shown straight from the browser's own copy; only the
     // bytes needed for parsing go to the control plane.
@@ -84,9 +169,16 @@ export default function ImageInfoReader({ onApplyParameters }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image: dataUrl, name: file.name }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "无法解析图片信息");
-      if (token === requestRef.current) setInfo(payload.info);
+      const payload = await readJsonResponse(response, "读取图片信息");
+      if (token !== requestRef.current) return;
+      setInfo(payload.info);
+      // Keeping the picture is a convenience, and the reader works without it. A file too large
+      // to be worth storing, or a store that refuses it, costs the restore and nothing else — so
+      // it must not be reported as a failure to read the image.
+      const stored = await storeUploadedImage(dataUrl);
+      if (token !== requestRef.current) return;
+      setAssetId(stored?.id || "");
+      setAssetName(stored ? file.name : "");
     } catch (readError) {
       if (token === requestRef.current) { setInfo(null); setError(readError.message); }
     } finally {
@@ -99,6 +191,10 @@ export default function ImageInfoReader({ onApplyParameters }) {
     setLoading(true);
     setError("");
     releaseObjectUrl();
+    // A directory picture is addressed by the route that serves it, so the stored copy an upload
+    // needed is dropped rather than left pointing at a picture that is no longer on screen.
+    setAssetId("");
+    setAssetName("");
     setImageUrl(`/api/image-info/preview?directory=${encodeURIComponent(targetDirectory)}&name=${encodeURIComponent(name)}`);
     try {
       const response = await fetch("/api/image-info/read", {
@@ -106,8 +202,7 @@ export default function ImageInfoReader({ onApplyParameters }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ directory: targetDirectory, name }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "无法解析图片信息");
+      const payload = await readJsonResponse(response, "读取图片信息");
       if (token === requestRef.current) setInfo(payload.info);
     } catch (readError) {
       if (token === requestRef.current) { setInfo(null); setError(readError.message); }
@@ -130,8 +225,7 @@ export default function ImageInfoReader({ onApplyParameters }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ directory: target }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "无法读取目录");
+      const payload = await readJsonResponse(response, "读取目录");
       setMode("batch");
       setFiles(payload.files || []);
       setScannedDirectory(payload.directory);
@@ -266,7 +360,7 @@ export default function ImageInfoReader({ onApplyParameters }) {
         onDrop={handleDrop}
         onPaste={handlePaste}
       >
-        {imageUrl ? <div className="image-info-image-stage"><img src={imageUrl} alt={info?.name || "预览"} /></div> : <div className="image-info-empty-dropzone">
+        {imageUrl ? <div className="image-info-image-stage"><img src={imageUrl} alt={info?.name || "预览"} onError={() => { setImageUrl(""); setError("原图已不在原位置：文件可能被移动或删除，元数据仍为上次读取的结果"); }} /></div> : <div className="image-info-empty-dropzone">
           <Upload size={30} />
           <strong>拖入、粘贴或点击选择图片</strong>
           <span>PNG · JPEG · WebP</span>
@@ -302,7 +396,7 @@ export default function ImageInfoReader({ onApplyParameters }) {
                 {info.checkpointHash && <div><span>模型哈希</span><code>{info.checkpointHash.slice(0, 16)}</code></div>}
               </div>
 
-              {applyOpen && onApplyParameters && <ImageInfoApply info={info} onApply={onApplyParameters} onClose={() => setApplyOpen(false)} />}
+              {applyOpen && onApplyParameters && <ImageInfoApply info={info} onApply={onApplyParameters} onRefresh={() => resolveMatches(info)} onClose={() => setApplyOpen(false)} />}
 
               {missingCount > 0 && <p className="info-missing-warning">
                 <AlertTriangle size={13} />

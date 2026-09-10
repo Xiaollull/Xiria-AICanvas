@@ -115,5 +115,56 @@ class UsduTileTests(unittest.TestCase):
             compositor.composite(Image.new("RGB", plan.regions[0].model_size), plan.regions[0])
 
 
+class TileAlignmentTests(unittest.TestCase):
+    """A tile is sampled at the plan's processing size, so the plan has to be built to the size the
+    engine will accept. Rounding the padded core to the nearest multiple of 8 lands off Anima's 32
+    at most paddings and off Krea 2's 16 at many of them, and the rejection would arrive per tile
+    at sampling time rather than here."""
+
+    def test_the_default_alignment_is_unchanged(self):
+        plan = usdu_tiles.plan_tiles((2176, 2944), (1088, 1472), 32)
+        self.assertEqual(plan.processing_size, (1120, 1504))
+        self.assertEqual(plan.processing_size, usdu_tiles.plan_tiles((2176, 2944), (1088, 1472), 32, alignment=8).processing_size)
+
+    def test_every_padding_yields_a_size_the_engine_accepts(self):
+        for alignment in (16, 32):
+            for padding in range(0, 257):
+                with self.subTest(alignment=alignment, padding=padding):
+                    plan = usdu_tiles.plan_tiles((3072, 2304), (1536, 1152), padding, alignment=alignment)
+                    width, height = plan.processing_size
+                    self.assertEqual((width % alignment, height % alignment), (0, 0))
+                    self.assertGreaterEqual(min(width, height), alignment)
+
+    def test_a_padding_that_the_old_rounding_broke_now_aligns(self):
+        # round((1536 + 8) / 8) * 8 == 1544, which is neither a multiple of 32 nor of 16.
+        self.assertEqual(usdu_tiles.plan_tiles((3072, 2304), (1536, 1152), 8).processing_size[0] % 16, 8)
+        self.assertEqual(usdu_tiles.plan_tiles((3072, 2304), (1536, 1152), 8, alignment=16).processing_size[0] % 16, 0)
+        self.assertEqual(usdu_tiles.plan_tiles((3072, 2304), (1536, 1152), 8, alignment=32).processing_size[0] % 32, 0)
+
+    def test_asking_for_the_engines_alignment_only_adds_geometry(self):
+        """Anima planned at alignment 8 for as long as USDU has existed, and most paddings gave it a
+        size it then refused. Planning at its own 32 has to fix those without moving any plan that
+        already worked, or this would be a silent change to existing pictures rather than a fix."""
+        moved, fixed = 0, 0
+        for core in range(256, 2049, 64):  # the canvas is a multiple of 64
+            for padding in range(0, 257):
+                old = usdu_tiles.plan_tiles((core * 2, core * 2), (core, core), padding).processing_size[0]
+                new = usdu_tiles.plan_tiles(
+                    (core * 2, core * 2), (core, core), padding, alignment=32
+                ).processing_size[0]
+                if old % 32:
+                    fixed += 1
+                elif old != new:
+                    moved += 1
+        self.assertEqual(moved, 0, "a plan Anima already accepted must not change size")
+        self.assertGreater(fixed, 0)
+
+    def test_alignment_is_validated(self):
+        for bad in (0, -8, 1.5, True, "32", None):
+            with self.subTest(alignment=bad):
+                with self.assertRaises(ValueError):
+                    usdu_tiles.plan_tiles((16, 12), (8, 6), 2, alignment=bad)
+
+
 if __name__ == "__main__":
     unittest.main()

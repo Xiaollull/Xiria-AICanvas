@@ -23,6 +23,7 @@ import {
    engineScopeKey,
   mountedLorasForScope,
   normalizeMountedLoraMap,
+  READY_LORA_ENGINES,
   withMountedLorasForScope,
 } from "./lora-model-scope";
 import LoraDetailsDialog from "./LoraDetailsDialog";
@@ -44,7 +45,7 @@ import { pageLoraDragLocked } from "./lora-drag-handle";
 import { createLoraPersistenceEpochGuard, runLoraPersistenceEpoch } from "./lora-persistence-epoch";
 import { applyThemeToDocument, loadThemeState } from "./theme.js";
 
-const ENGINES = ["SD", "iL", "Anima"];
+const ENGINES = READY_LORA_ENGINES;
 const CHART_COLORS = ["var(--lime)", "#62d0ff", "#ffb55e", "#ff7548", "#8f9389"];
 const DONUT_CIRCUMFERENCE = 2 * Math.PI * 48;
 
@@ -106,7 +107,7 @@ export default function LoraManagerPage() {
   const [loras, setLoras] = useState([]);
   const [mountedLorasByEngine, setMountedLorasByEngine] = useState(emptyMountedLoraMap);
   const [loraGroupsByEngine, setLoraGroupsByEngine] = useState(emptyLoraGroupMap);
-  const [libraries, setLibraries] = useState({ SD: null, iL: null, Anima: null });
+  const [libraries, setLibraries] = useState(() => Object.fromEntries(ENGINES.map((engine) => [engine, null])));
   const [activeView, setActiveView] = useState("overview");
   const [category, setCategory] = useState("mounted");
   const [search, setSearch] = useState("");
@@ -511,7 +512,7 @@ export default function LoraManagerPage() {
 
     <section className="lora-page-content">
       <header className="lora-page-command">
-        <div><span>{activeView === "manager" ? "LIVE WORKSPACE CONTROL" : "LOCAL ASSET OBSERVATORY"}</span><h1>{activeView === "manager" ? `${model} LoRA 挂载管理` : "LoRA 资产概览"}</h1><p>{activeView === "manager" ? "浏览当前引擎目录，挂载与排序会实时同步到主工作区。" : "汇总 SD、iL 与 Anima 的容量、分类、引擎和文件夹分布。"}</p></div>
+        <div><span>{activeView === "manager" ? "LIVE WORKSPACE CONTROL" : "LOCAL ASSET OBSERVATORY"}</span><h1>{activeView === "manager" ? `${model} LoRA 挂载管理` : "LoRA 资产概览"}</h1><p>{activeView === "manager" ? "浏览当前引擎目录，挂载与排序会实时同步到主工作区。" : `汇总 ${ENGINES.length} 个引擎的容量、分类、引擎和文件夹分布。`}</p></div>
         <div><span>{activeView === "manager" ? `${loras.length} / 16 MOUNTED` : `${analytics.files.length} FILES · ${formatBytes(analytics.totalBytes)}`}</span><button type="button" disabled={refreshing || workspaceLocked} onClick={() => void loadLibraries(true)}><RefreshCw className={refreshing ? "spin" : ""} size={15} />刷新目录</button></div>
       </header>
 
@@ -519,7 +520,7 @@ export default function LoraManagerPage() {
         {error && <div className="lora-page-error"><X size={18} />{error}</div>}
         {pageLoading ? <div className="lora-page-loading"><RefreshCw className="spin" size={28} /><span>正在扫描全部 LoRA 目录</span></div> : activeView === "overview" ? <section className="lora-page-view lora-overview-view">
           <section className="lora-metric-grid">
-            <article className="lora-metric-card"><span><Database size={15} />总文件</span><strong data-count={analytics.files.length}>{analytics.files.length}</strong><small>SD + iL + Anima 完整目录</small></article>
+            <article className="lora-metric-card"><span><Database size={15} />总文件</span><strong data-count={analytics.files.length}>{analytics.files.length}</strong><small>{ENGINES.length} 个引擎完整目录</small></article>
             <article className="lora-metric-card"><span><HardDrive size={15} />磁盘占用</span><strong>{formatBytes(analytics.totalBytes)}</strong><small>{analytics.folders.length} 个分类目录</small></article>
             <article className="lora-metric-card"><span><Layers3 size={15} />当前挂载</span><strong data-count={loras.length}>{loras.length}</strong><small>{loras.filter((item) => item.enabled !== false).length} 个已启用</small></article>
             <article className="lora-metric-card"><span><BarChart3 size={15} />平均体积</span><strong>{formatBytes(analytics.files.length ? analytics.totalBytes / analytics.files.length : 0)}</strong><small>按全部文件计算</small></article>

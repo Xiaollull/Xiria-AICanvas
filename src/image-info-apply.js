@@ -11,6 +11,7 @@
 //
 // Pure on purpose: no React, no fetch. `App` owns the writing.
 
+import { isSplitEngine } from "./engine-settings.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
 
 export const IMAGE_INFO_APPLY_TARGETS = [
@@ -223,11 +224,15 @@ export function buildImageInfoApplyPlan(info, fieldIds, target = "t2i") {
     if (field.id === "model") {
       const value = resolvedValue(info.checkpointMatch);
       if (value) {
-        overlay.checkpoint = value;
         // Naming the engine is what lets the existing apply path switch to it;
         // without it the checkpoint would be looked for in the wrong catalogue.
         const engine = resolvedEngine(info.checkpointMatch);
         if (engine) overlay.model = engine;
+        // A split engine mounts a diffusion model, not a checkpoint, and its apply
+        // check validates `diffusionModel`. Writing the file into `checkpoint` left
+        // that check looking at whatever diffusion model the workspace already had.
+        if (isSplitEngine(engine)) overlay.diffusionModel = value;
+        else overlay.checkpoint = value;
         groups.push("model");
       } else missing.push({ kind: "checkpoint", name: info.checkpoint });
     }

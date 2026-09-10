@@ -29,10 +29,12 @@ import {
   Zap,
 } from "lucide-react";
 import { SAMPLER_NAMES as SAMPLERS, SCHEDULER_NAMES as SCHEDULERS } from "./sampling-options";
-import { normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed } from "./hires-settings";
+import { normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
 import { DEFAULT_SETTINGS, GUIDANCE, boundedGalleryImageIndex, clone, displayTitle, distributeGalleryCards, galleryImageSeed, galleryRequest, normalizedSettings, useDialogLifecycle } from "./gallery-core";
 import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
+import { copyText } from "./clipboard";
+import { engineGuidance, isSplitEngine } from "./engine-settings.js";
 
 const MAX_MANUAL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_MANUAL_TOTAL_BYTES = 100 * 1024 * 1024;
@@ -50,7 +52,7 @@ const APPLY_GROUPS = [
   ["hires", "Hires.fix", "开关、模型、倍率与精修参数"],
   ["adetailer", "ADetailer", "开关、检测模型、蒙版与重绘参数"],
   ["rtx", "RTX VSR", "开关、倍率、质量与后处理顺序"],
-  ["auxiliary", "其他选项", "过程预览与透明背景模型"],
+  ["auxiliary", "其他选项", "透明背景模型"],
 ];
 
 function selectedImageHiresSeed(settings, imageIndex) {
@@ -74,24 +76,6 @@ function formatDate(value) {
   if (!value) return "--";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "--" : date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-}
-
-async function copyText(value) {
-  if (!value) return false;
-  try {
-    await navigator.clipboard.writeText(value);
-    return true;
-  } catch {
-    const textarea = document.createElement("textarea");
-    textarea.value = value;
-    textarea.style.position = "fixed";
-    textarea.style.opacity = "0";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    return copied;
-  }
 }
 
 function fileToDataUrl(file) {
@@ -221,8 +205,8 @@ function PromptLibraryDialog({ entry, onClose, onSaved }) {
       <header><div><span>PROMPT LIBRARY</span><h2 id="gallery-prompt-dialog-title">{entry ? "编辑词条" : "添加词条"}</h2><p>保存一组可复用的正向与负向 Prompt。</p></div><button type="button" aria-label="关闭词条编辑器" disabled={busy} onClick={onClose}><X size={18} /></button></header>
       <fieldset disabled={busy}>
         <label className="gallery-field"><span>标题</span><input autoFocus value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)} placeholder="例如：雨夜霓虹街景" /></label>
-        <label className="gallery-field prompt-positive"><span>正向 Prompt</span><textarea value={positivePrompt} maxLength={8000} onChange={(event) => setPositivePrompt(event.target.value)} placeholder="主体、风格、构图、光线等" /></label>
-        <label className="gallery-field prompt-negative"><span>负向 Prompt</span><textarea value={negativePrompt} maxLength={8000} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="不希望出现的内容" /></label>
+        <label className="gallery-field prompt-positive"><span>正向 Prompt</span><textarea value={positivePrompt} onChange={(event) => setPositivePrompt(event.target.value)} placeholder="主体、风格、构图、光线等" /></label>
+        <label className="gallery-field prompt-negative"><span>负向 Prompt</span><textarea value={negativePrompt} onChange={(event) => setNegativePrompt(event.target.value)} placeholder="不希望出现的内容" /></label>
         <label className="gallery-field"><span>备注（可选）</span><textarea className="gallery-prompt-notes" value={notes} maxLength={2000} onChange={(event) => setNotes(event.target.value)} placeholder="用途、模型偏好或使用说明" /></label>
         {error && <p className="gallery-form-error">{error}</p>}
       </fieldset>
@@ -356,7 +340,7 @@ function GalleryCardTile({ card, tileIndex = 0, onOpen, onMenu, dragState, reord
     </span>
     <span className="gallery-card-copy">
       <strong>{displayTitle(card)}</strong>
-      <small>{compactName(settings.model === "Anima" ? settings.diffusionModel : settings.checkpoint)} · {settings.size?.width || "--"} × {settings.size?.height || "--"}</small>
+      <small>{compactName(isSplitEngine(settings.model) ? settings.diffusionModel : settings.checkpoint)} · {settings.size?.width || "--"} × {settings.size?.height || "--"}</small>
       <span><b>{settings.steps || "--"} STEP</b><b>CFG {settings.cfg ?? "--"}</b><b>{settings.loras?.filter((item) => item.enabled !== false).length || 0} LoRA</b></span>
     </span>
   </button>;
@@ -586,7 +570,7 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
     })
     : initialImages);
   const [checkpoints, setCheckpoints] = useState([]);
-  const [splitAssets, setSplitAssets] = useState({ diffusion_model: [], text_encoder: [], vae: [] });
+  const [splitAssets, setSplitAssets] = useState({ diffusion_model: [], text_encoder: [], text_encoder_2: [], vae: [] });
   const [loraOpen, setLoraOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -595,7 +579,14 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
   const fileInput = useRef(null);
   const setField = (key, value) => setSettings((current) => busy ? current : ({ ...current, [key]: value }));
   const setNested = (group, key, value) => setSettings((current) => busy ? current : ({ ...current, [group]: { ...current[group], [key]: value } }));
-  const isAnima = settings.model === "Anima";
+  // Every engine that mounts separate component files -- Anima, both Flux generations and Krea 2 --
+  // not only Anima, which was the only one when this editor was written.
+  const isSplit = isSplitEngine(settings.model);
+  const isFlux = settings.model === "Flux";
+  // Guidance the selected engine refuses: distilled Flux takes none, CFG-Zero* needs a
+  // flow-matching engine, Krea 2 has no PAG. One rule set, shared with the workspace.
+  const guidanceBlocked = engineGuidance(settings.model, settings.guidance) !== settings.guidance;
+  const tilesHires = supportsUsduTiled(settings.model);
   const visibleSamplers = SAMPLERS;
   const visibleSchedulers = SCHEDULERS;
   const changeEngine = (nextModel) => setSettings((current) => ({
@@ -604,12 +595,12 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
     checkpoint: "",
     diffusionModel: "",
     textEncoder: "",
+    textEncoder2: "",
     vae: "",
     loras: [],
-    sampler: SAMPLERS.includes(current.sampler) ? current.sampler : nextModel === "Anima" ? "euler" : "dpmpp_2m",
-    scheduler: SCHEDULERS.includes(current.scheduler) ? current.scheduler : nextModel === "Anima" ? "simple" : "karras",
-    guidance: nextModel !== "Anima" && current.guidance === "cfg_zero_star" ? "none" : current.guidance,
-    processPreview: nextModel === "Anima" ? false : current.processPreview,
+    sampler: SAMPLERS.includes(current.sampler) ? current.sampler : isSplitEngine(nextModel) ? "euler" : "dpmpp_2m",
+    scheduler: SCHEDULERS.includes(current.scheduler) ? current.scheduler : isSplitEngine(nextModel) ? "simple" : "karras",
+    guidance: engineGuidance(nextModel, current.guidance),
   }));
   useEffect(() => {
     const controller = new AbortController();
@@ -622,17 +613,18 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
           setSplitAssets({
             diffusion_model: payload.assets?.diffusion_model?.models || [],
             text_encoder: payload.assets?.text_encoder?.models || [],
+            text_encoder_2: payload.assets?.text_encoder_2?.models || [],
             vae: payload.assets?.vae?.models || [],
           });
         } else {
           setCheckpoints(payload.models || []);
-          setSplitAssets({ diffusion_model: [], text_encoder: [], vae: [] });
+          setSplitAssets({ diffusion_model: [], text_encoder: [], text_encoder_2: [], vae: [] });
         }
       })
       .catch((fetchError) => {
         if (fetchError.name === "AbortError") return;
         setCheckpoints([]);
-        setSplitAssets({ diffusion_model: [], text_encoder: [], vae: [] });
+        setSplitAssets({ diffusion_model: [], text_encoder: [], text_encoder_2: [], vae: [] });
         setModelCatalogError(fetchError.message || "模型目录不可用");
       });
     return () => controller.abort();
@@ -671,37 +663,39 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
       setError(`模型目录不可用：${modelCatalogError}`);
       return;
     }
-    if (isAnima) {
+    if (isSplit) {
       const required = [
         ["diffusionModel", "扩散模型", splitAssets.diffusion_model],
-        ["textEncoder", "文本编码器", splitAssets.text_encoder],
+        ["textEncoder", isFlux ? "CLIP-L 文本编码器" : "文本编码器", splitAssets.text_encoder],
+        ...(isFlux ? [["textEncoder2", "T5-XXL 文本编码器", splitAssets.text_encoder_2]] : []),
         ["vae", "VAE", splitAssets.vae],
       ];
       const unavailable = required.find(([field, , catalog]) => !settings[field] || !catalog.some((item) => item.value === settings[field]));
       if (unavailable) {
-        setError(`请选择当前目录中可用的 Anima ${unavailable[1]}`);
+        setError(`请选择当前目录中可用的 ${settings.model} ${unavailable[1]}`);
         return;
       }
     }
-    if (!isAnima && settings.guidance === "cfg_zero_star") {
-      setError("SD / iL 不支持 CFG-Zero*，请切换为“无”或 PAG");
+    if (guidanceBlocked) {
+      setError(`${settings.model} 不支持${GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "当前引导增强"}，请切换为可用选项`);
       return;
     }
     setBusy(true);
     setError("");
     const normalizedHiresSeed = normalizeHiresSeed(settings.hires.seedMode, settings.hires.seed);
     const safeSettings = { ...settings, seed: normalizeUint64Seed(settings.seed, "0"), hires: { ...settings.hires, ...normalizedHiresSeed } };
-    const savedSettings = isAnima ? {
+    const savedSettings = isSplit ? {
       ...safeSettings,
       checkpoint: "",
+      textEncoder2: isFlux ? settings.textEncoder2 || "" : "",
       sampler: SAMPLERS.includes(settings.sampler) ? settings.sampler : "euler",
       scheduler: SCHEDULERS.includes(settings.scheduler) ? settings.scheduler : "simple",
       guidance: settings.guidance,
-      processPreview: false,
     } : {
       ...safeSettings,
       diffusionModel: "",
       textEncoder: "",
+      textEncoder2: "",
       vae: "",
     };
     const payload = {
@@ -739,9 +733,9 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
 
         <section>
           <div className="gallery-editor-section-head"><div><span>02</span><strong>模型组件与 LoRA</strong></div><button type="button" onClick={() => setLoraOpen(true)}><Layers3 size={13} />LoRA 管理器</button></div>
-          <div className={`gallery-editor-grid ${isAnima ? "four" : "three"}`}>
-            <label className="gallery-field"><span>模型引擎</span><select value={settings.model} onChange={(event) => changeEngine(event.target.value)}><option value="SD">SD</option><option value="iL">iL / SDXL</option><option value="Anima">Anima</option></select></label>
-            {isAnima ? [["diffusionModel", "扩散模型", splitAssets.diffusion_model], ["textEncoder", "文本编码器", splitAssets.text_encoder], ["vae", "VAE", splitAssets.vae]].map(([key, label, catalog]) => <label className="gallery-field" key={key}><span>{label}</span><select value={settings[key]} onChange={(event) => setField(key, event.target.value)}><option value="">未指定</option>{settings[key] && !catalog.some((item) => item.value === settings[key]) && <option value={settings[key]}>{settings[key]}（未在当前目录发现）</option>}{catalog.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>) : <label className="gallery-field wide"><span>底模选择</span><select value={settings.checkpoint} onChange={(event) => setField("checkpoint", event.target.value)}><option value="">未指定</option>{settings.checkpoint && !checkpoints.some((item) => item.value === settings.checkpoint) && <option value={settings.checkpoint}>{settings.checkpoint}（未在当前目录发现）</option>}{checkpoints.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>}
+          <div className={`gallery-editor-grid ${isSplit ? "four" : "three"}`}>
+            <label className="gallery-field"><span>模型引擎</span><select value={settings.model} onChange={(event) => changeEngine(event.target.value)}><option value="SD">SD</option><option value="iL">iL / SDXL</option><option value="Anima">Anima</option><option value="Flux">FLUX.1</option><option value="Flux2">FLUX.2</option><option value="Krea2">Krea 2</option></select></label>
+            {isSplit ? [["diffusionModel", "扩散模型", splitAssets.diffusion_model], ["textEncoder", isFlux ? "CLIP-L 文本编码器" : "文本编码器", splitAssets.text_encoder], ...(isFlux ? [["textEncoder2", "T5-XXL 文本编码器", splitAssets.text_encoder_2]] : []), ["vae", "VAE", splitAssets.vae]].map(([key, label, catalog]) => <label className="gallery-field" key={key}><span>{label}</span><select value={settings[key]} onChange={(event) => setField(key, event.target.value)}><option value="">未指定</option>{settings[key] && !catalog.some((item) => item.value === settings[key]) && <option value={settings[key]}>{settings[key]}（未在当前目录发现）</option>}{catalog.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>) : <label className="gallery-field wide"><span>底模选择</span><select value={settings.checkpoint} onChange={(event) => setField("checkpoint", event.target.value)}><option value="">未指定</option>{settings.checkpoint && !checkpoints.some((item) => item.value === settings.checkpoint) && <option value={settings.checkpoint}>{settings.checkpoint}（未在当前目录发现）</option>}{checkpoints.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>}
           </div>
           {modelCatalogError && <p className="gallery-form-error">模型目录扫描失败：{modelCatalogError}</p>}
           <div className="gallery-editor-lora-summary">{settings.loras.length ? settings.loras.map((item, index) => <span className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><b>{item.name || compactName(item.value)}</b><small>{formatWeight(item.weight ?? 1)}</small></span>) : <p>未挂载 LoRA</p>}</div>
@@ -750,20 +744,19 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
         <section>
           <div className="gallery-editor-section-head"><div><span>03</span><strong>Prompt</strong></div></div>
           <p className="prompt-syntax-help gallery-prompt-syntax-help">权重语法：<code>(text)</code> = 1.1；<code>(text:1.25)</code> = 显式权重；<code>\(text\)</code> = 字面括号。</p>
-          <label className="gallery-field prompt-positive"><span>正向 Prompt</span><textarea value={settings.positive} maxLength={8000} onChange={(event) => setField("positive", event.target.value)} placeholder="画面主体、风格、构图与光线" /></label>
-          <label className="gallery-field prompt-negative"><span>负向 Prompt</span><textarea value={settings.negative} maxLength={8000} onChange={(event) => setField("negative", event.target.value)} placeholder="不希望出现的内容" /></label>
+          <label className="gallery-field prompt-positive"><span>正向 Prompt</span><textarea value={settings.positive} onChange={(event) => setField("positive", event.target.value)} placeholder="画面主体、风格、构图与光线" /></label>
+          <label className="gallery-field prompt-negative"><span>负向 Prompt</span><textarea value={settings.negative} onChange={(event) => setField("negative", event.target.value)} placeholder="不希望出现的内容" /></label>
         </section>
 
         <details open>
           <summary><SlidersHorizontal size={14} />采样参数与画布</summary>
           <div className="gallery-details-content">
             <div className="gallery-editor-grid four"><NumericField label="采样步数" value={settings.steps} min={1} max={100} onChange={(value) => setField("steps", Math.round(value))} /><NumericField label="CFG" value={settings.cfg} min={0} max={30} step={0.1} onChange={(value) => setField("cfg", value)} /><NumericField label="降噪" value={settings.denoise} min={0} max={1} step={0.01} onChange={(value) => setField("denoise", value)} /><label className="gallery-field"><span>Seed</span><input value={settings.seed} onChange={(event) => setField("seed", event.target.value.replace(/\D/g, ""))} /></label></div>
-            <div className="gallery-editor-grid three"><label className="gallery-field"><span>引导增强</span><select value={settings.guidance} aria-invalid={!isAnima && settings.guidance === "cfg_zero_star"} aria-describedby={!isAnima && settings.guidance === "cfg_zero_star" ? "gallery-guidance-note" : undefined} onChange={(event) => { const next = event.target.value; if (isAnima || next !== "cfg_zero_star") setField("guidance", next); }}>{GUIDANCE.map(([id, label]) => { const disabled = !isAnima && id === "cfg_zero_star"; return <option value={id} key={id} disabled={disabled}>{label}{disabled ? "（当前模型不可用）" : ""}</option>; })}</select></label><label className="gallery-field"><span>采样器</span><select value={settings.sampler} onChange={(event) => setField("sampler", event.target.value)}>{visibleSamplers.map((item) => <option value={item} key={item}>{item}</option>)}</select></label><label className="gallery-field"><span>调度器</span><select value={settings.scheduler} onChange={(event) => setField("scheduler", event.target.value)}>{visibleSchedulers.map((item) => <option value={item} key={item}>{item}</option>)}</select></label></div>
+            <div className="gallery-editor-grid three"><label className="gallery-field"><span>引导增强</span><select value={settings.guidance} aria-invalid={guidanceBlocked} aria-describedby={guidanceBlocked ? "gallery-guidance-note" : undefined} onChange={(event) => { const next = event.target.value; if (engineGuidance(settings.model, next) === next) setField("guidance", next); }}>{GUIDANCE.map(([id, label]) => { const disabled = engineGuidance(settings.model, id) !== id; return <option value={id} key={id} disabled={disabled}>{label}{disabled ? "（当前模型不可用）" : ""}</option>; })}</select></label><label className="gallery-field"><span>采样器</span><select value={settings.sampler} onChange={(event) => setField("sampler", event.target.value)}>{visibleSamplers.map((item) => <option value={item} key={item}>{item}</option>)}</select></label><label className="gallery-field"><span>调度器</span><select value={settings.scheduler} onChange={(event) => setField("scheduler", event.target.value)}>{visibleSchedulers.map((item) => <option value={item} key={item}>{item}</option>)}</select></label></div>
             {settings.guidance === "pag" && <><div className="gallery-editor-grid two"><NumericField label="PAG 强度" value={settings.pag.scale} min={0} max={5} step={0.01} onChange={(value) => setNested("pag", "scale", value)} /><label className="gallery-field"><span>PAG 作用层</span><select value={settings.pag.appliedLayers} onChange={(event) => setNested("pag", "appliedLayers", event.target.value)}><option value="mid">Mid（推荐）</option><option value="all">全部自注意力层（高风险）</option></select></label></div>{settings.pag.appliedLayers === "all" && <p className="gallery-guidance-note">全部层会明显放大对比、描边和色彩。动漫模型建议使用 Mid，并从强度 0.3 开始。</p>}</>}
-            {settings.guidance === "cfg_zero_star" && !isAnima && <p id="gallery-guidance-note" className="gallery-guidance-note" role="status">SD / iL 不支持 CFG-Zero*；该引导可用于已就绪的 Anima Flow Matching 引擎。</p>}
+            {guidanceBlocked && <p id="gallery-guidance-note" className="gallery-guidance-note" role="status">{settings.model} 不支持{GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "当前引导增强"}：FLUX 两代为蒸馏引导，只能选“无”；CFG-Zero* 需要 Anima 或 Krea 2 的 Flow Matching；Krea 2 不支持 PAG。</p>}
             <div className="gallery-editor-grid two"><NumericField label="单批图片数" value={settings.imagesPerBatch} min={1} max={10} onChange={(value) => setField("imagesPerBatch", Math.round(value))} /><NumericField label="批次数" value={settings.batchCount} min={1} max={20} onChange={(value) => setField("batchCount", Math.round(value))} /></div>
-            <div className="gallery-editor-grid four"><NumericField label="画布宽度" value={settings.size.width} min={64} max={2048} onChange={(value) => setField("size", { ...settings.size, width: Math.round(value / 64) * 64 })} /><NumericField label="画布高度" value={settings.size.height} min={64} max={2048} onChange={(value) => setField("size", { ...settings.size, height: Math.round(value / 64) * 64 })} /><label className="gallery-field"><span>Seed 模式</span><select value={settings.seedMode} onChange={(event) => setField("seedMode", event.target.value)}><option value="fixed">固定</option><option value="random">随机</option><option value="increment">递增</option><option value="decrement">递减</option></select></label><ToggleField label="过程预览" detail={isAnima ? "Anima 不支持" : "下一次生成时使用"} checked={settings.processPreview !== false} disabled={isAnima} onChange={(value) => setField("processPreview", value)} /></div>
-            {isAnima && <p className="gallery-guidance-note">Anima 始终关闭过程预览；该限制不影响 LoRA 或后处理参数。</p>}
+            <div className="gallery-editor-grid three"><NumericField label="画布宽度" value={settings.size.width} min={64} max={2048} onChange={(value) => setField("size", { ...settings.size, width: Math.round(value / 64) * 64 })} /><NumericField label="画布高度" value={settings.size.height} min={64} max={2048} onChange={(value) => setField("size", { ...settings.size, height: Math.round(value / 64) * 64 })} /><label className="gallery-field"><span>Seed 模式</span><select value={settings.seedMode} onChange={(event) => setField("seedMode", event.target.value)}><option value="fixed">固定</option><option value="random">随机</option><option value="increment">递增</option><option value="decrement">递减</option></select></label></div>
           </div>
         </details>
 
@@ -776,7 +769,7 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
             </div>
             {images.length > 0 && <div className="gallery-image-hires-seeds"><strong>逐图 Hires Seed</strong>{images.map((image, index) => { const imageHires = normalizeHiresSeed(image.hiresSeedMode ?? settings.hires.seedMode, image.hiresSeed ?? settings.hires.seed); return <div key={image.id || `${image.name}-${index}`}><span>{index + 1}</span><select value={imageHires.seedMode} onChange={(event) => { const mode = event.target.value; const next = normalizeHiresSeed(mode, mode === "fixed" ? normalizeUint64Seed(imageHires.seed, settings.seed) : null); setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeedMode: next.seedMode, hiresSeed: next.seed } : item)); }}><option value="inherit">继承</option><option value="fixed">固定</option><option value="random">随机</option></select>{imageHires.seedMode === "fixed" ? <><input inputMode="numeric" maxLength="20" value={imageHires.seed} onChange={(event) => setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeedMode: "fixed", hiresSeed: event.target.value.replace(/\D/g, "") } : item))} onBlur={() => setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeed: normalizeUint64Seed(item.hiresSeed, "0") } : item))} /><button type="button" title={`生成图片 ${index + 1} 的固定 Hires Seed`} onClick={() => setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeedMode: "fixed", hiresSeed: secureRandomUint64Seed() } : item))}><RefreshCw size={12} /></button></> : <small>{imageHires.seedMode === "inherit" ? "依赖该图首轮 Seed" : "下次生成时重新随机"}</small>}</div>; })}</div>}
           </div>
-          <div className="gallery-details-content"><ToggleField label="启用 Hires.fix" detail="应用时由生图区域验证引擎能力与超分模型" checked={settings.hires.enabled} onChange={(value) => setNested("hires", "enabled", value)} /><div className="gallery-editor-grid four"><label className="gallery-field"><span>超分模型</span><input value={settings.hires.model} onChange={(event) => setNested("hires", "model", event.target.value)} /></label><NumericField label="倍率" value={settings.hires.scale} min={1} max={4} step={0.1} onChange={(value) => setNested("hires", "scale", value)} /><NumericField label="重绘强度" value={settings.hires.denoise} min={0.05} max={1} step={0.01} onChange={(value) => setNested("hires", "denoise", value)} /><NumericField label="Hires 步数" value={settings.hires.steps} min={1} max={100} onChange={(value) => setNested("hires", "steps", Math.round(value))} /><NumericField label="Hires CFG" value={settings.hires.cfg} min={0} max={30} step={0.1} onChange={(value) => setNested("hires", "cfg", value)} /><NumericField label="像素放大分块" value={settings.hires.tileSize} min={32} max={2048} onChange={(value) => setNested("hires", "tileSize", Math.round(value))} /><NumericField label="像素放大分块重叠" value={settings.hires.tileOverlap} min={0} max={512} onChange={(value) => setNested("hires", "tileOverlap", Math.round(value))} /></div>{isAnima && <div className="gallery-editor-grid two"><label className="gallery-field"><span>重绘方式</span><select value={settings.hires.executionMode} onChange={(event) => setNested("hires", "executionMode", event.target.value)}><option value="usdu_tiled">USDU 分块重绘（推荐）</option><option value="full_frame">整图重绘（兼容）</option></select></label><label className="gallery-field"><span>Hires 采样器</span><select value={settings.hires.sampler || ""} onChange={(event) => setNested("hires", "sampler", event.target.value || null)}><option value="">跟随首轮</option>{SAMPLERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label><label className="gallery-field"><span>Hires 调度器</span><select value={settings.hires.scheduler || ""} onChange={(event) => setNested("hires", "scheduler", event.target.value || null)}><option value="">跟随首轮</option>{SCHEDULERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label></div>} {isAnima && settings.hires.executionMode === "usdu_tiled" && <p className="gallery-field-detail">扩散重绘分块：Auto 使用首轮图片宽高；padding 32；每 tile 按 Hires 步数执行；seam fix 目前为 None。</p>}</div>
+          <div className="gallery-details-content"><ToggleField label="启用 Hires.fix" detail="应用时由生图区域验证引擎能力与超分模型" checked={settings.hires.enabled} onChange={(value) => setNested("hires", "enabled", value)} /><div className="gallery-editor-grid four"><label className="gallery-field"><span>超分模型</span><input value={settings.hires.model} onChange={(event) => setNested("hires", "model", event.target.value)} /></label><NumericField label="倍率" value={settings.hires.scale} min={1} max={4} step={0.1} onChange={(value) => setNested("hires", "scale", value)} /><NumericField label="重绘强度" value={settings.hires.denoise} min={0.05} max={1} step={0.01} onChange={(value) => setNested("hires", "denoise", value)} /><NumericField label="Hires 步数" value={settings.hires.steps} min={1} max={100} onChange={(value) => setNested("hires", "steps", Math.round(value))} /><NumericField label="Hires CFG" value={settings.hires.cfg} min={0} max={30} step={0.1} onChange={(value) => setNested("hires", "cfg", value)} /><NumericField label="像素放大分块" value={settings.hires.tileSize} min={32} max={2048} onChange={(value) => setNested("hires", "tileSize", Math.round(value))} /><NumericField label="像素放大分块重叠" value={settings.hires.tileOverlap} min={0} max={512} onChange={(value) => setNested("hires", "tileOverlap", Math.round(value))} /></div>{tilesHires && <div className="gallery-editor-grid two"><label className="gallery-field"><span>重绘方式</span><select value={settings.hires.executionMode} onChange={(event) => setNested("hires", "executionMode", event.target.value)}><option value="usdu_tiled">USDU 分块重绘（推荐）</option><option value="full_frame">整图重绘（兼容）</option></select></label><label className="gallery-field"><span>Hires 采样器</span><select value={settings.hires.sampler || ""} onChange={(event) => setNested("hires", "sampler", event.target.value || null)}><option value="">跟随首轮</option>{SAMPLERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label><label className="gallery-field"><span>Hires 调度器</span><select value={settings.hires.scheduler || ""} onChange={(event) => setNested("hires", "scheduler", event.target.value || null)}><option value="">跟随首轮</option>{SCHEDULERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label></div>} {tilesHires && settings.hires.executionMode === "usdu_tiled" && <p className="gallery-field-detail">扩散重绘分块：Auto 使用首轮图片宽高；padding 32；每 tile 按 Hires 步数执行；seam fix 目前为 None。</p>}</div>
         </details>
 
         <details>
@@ -834,7 +827,8 @@ function ApplySettingsDialog({ card, onClose, onApply }) {
   </div>;
 }
 
-function GalleryInspector({ card, settings, isAnima, onEdit, onDelete, onNotice, onApplyOpenChange }) {
+function GalleryInspector({ card, settings, isSplit, onEdit, onDelete, onNotice, onApplyOpenChange }) {
+  const tilesHires = supportsUsduTiled(settings.model);
   const stageLabels = { hires: "Hires.fix", adetailer: "ADetailer", rtx: "RTX VSR" };
   return <section className="gallery-inspector" aria-label="生成参数">
     <header><div><span>CURATED DETAIL</span><h1 title={card.title || settings.positive}>{displayTitle(card)}</h1><p>{card.collection_id} · 更新于 {formatDate(card.updated_at)}</p></div><div><button type="button" onClick={() => onEdit(card)}><Pencil size={14} />编辑</button><button type="button" className="danger" aria-label="删除精选卡片" onClick={() => onDelete(card)}><Trash2 size={14} /></button></div></header>
@@ -871,9 +865,9 @@ function GalleryInspector({ card, settings, isAnima, onEdit, onDelete, onNotice,
           <p className="gallery-detail-line">组合的预设提示词在提交生成时拼接到正向 Prompt 最前面，生图页的输入框不会被改写。</p>
         </section>
       )}
-      <section className="gallery-detail-section"><header><span>MODEL</span><strong>模型组件与 LoRA</strong></header><dl><div><dt>引擎</dt><dd>{settings.model}</dd></div>{isAnima ? <><div><dt>扩散模型</dt><dd title={settings.diffusionModel}>{compactName(settings.diffusionModel)}</dd></div><div><dt>文本编码器</dt><dd title={settings.textEncoder}>{compactName(settings.textEncoder)}</dd></div><div><dt>VAE</dt><dd title={settings.vae}>{compactName(settings.vae)}</dd></div></> : <div><dt>底模</dt><dd title={settings.checkpoint}>{compactName(settings.checkpoint)}</dd></div>}</dl><div className="gallery-detail-loras">{settings.loras.length ? settings.loras.map((item, index) => { const owner = settings.loraGroups.find((group) => group.id === item.groupId); return <div className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name || compactName(item.value)}</strong>{owner && <em className="gallery-lora-group-tag" title={`来自组合 ${owner.name}`}>{owner.name}</em>}<b>{formatWeight(item.weight ?? 1)}</b><small>{item.enabled === false ? "关闭" : "启用"}</small></div>; }) : <p>未使用 LoRA</p>}</div></section>
-      <section className="gallery-detail-section"><header><span>SAMPLING</span><strong>采样与画布</strong></header><div className="gallery-stat-grid"><div><span>STEP</span><b>{settings.steps}</b></div><div><span>CFG</span><b>{settings.cfg}</b></div><div><span>DENOISE</span><b>{settings.denoise}</b></div><div><span>SEED</span><b title={settings.seed}>{settings.seed}</b></div><div><span>SIZE</span><b>{settings.size.width} × {settings.size.height}</b></div><div><span>BATCH</span><b>{settings.imagesPerBatch} × {settings.batchCount}</b></div></div><p className="gallery-detail-line">{GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "无（None）"}{settings.guidance === "pag" ? ` ${settings.pag.scale} / ${settings.pag.appliedLayers === "mid" ? "Mid" : "全部层"}` : ""} · {settings.sampler} · {settings.scheduler} · 过程预览 {settings.processPreview === false ? "关闭" : "开启"}</p></section>
-      <section className="gallery-detail-section"><header><span>POST PROCESS</span><strong>后处理开关与顺序</strong></header><div className="gallery-process-list">{settings.postprocessOrder.map((stage, index) => { const stageSettings = settings[stage]; return <div className={stageSettings?.enabled ? "enabled" : "disabled"} key={stage}><span>{index + 1}</span><strong>{stageLabels[stage]}</strong><b>{stageSettings?.enabled ? "ON" : "OFF"}</b><small>{stage === "hires" ? `${stageSettings.scale}x · ${compactName(stageSettings.model)}${isAnima ? ` · ${stageSettings.executionMode === "usdu_tiled" ? "USDU 分块重绘" : "整图重绘"}` : ""}` : stage === "adetailer" ? `${compactName(stageSettings.detector)} · ${stageSettings.confidence}` : `${stageSettings.scale}x · ${String(stageSettings.quality).toUpperCase()}`}</small></div>; })}</div><p className="gallery-detail-line">Hires Seed · {settings.hires.seedMode === "inherit" ? "继承当前图片首轮 Seed" : settings.hires.seedMode === "random" ? "每张安全随机" : settings.hires.seed}</p></section>
+      <section className="gallery-detail-section"><header><span>MODEL</span><strong>模型组件与 LoRA</strong></header><dl><div><dt>引擎</dt><dd>{settings.model}</dd></div>{isSplit ? <><div><dt>扩散模型</dt><dd title={settings.diffusionModel}>{compactName(settings.diffusionModel)}</dd></div><div><dt>文本编码器</dt><dd title={settings.textEncoder}>{compactName(settings.textEncoder)}</dd></div><div><dt>VAE</dt><dd title={settings.vae}>{compactName(settings.vae)}</dd></div></> : <div><dt>底模</dt><dd title={settings.checkpoint}>{compactName(settings.checkpoint)}</dd></div>}</dl><div className="gallery-detail-loras">{settings.loras.length ? settings.loras.map((item, index) => { const owner = settings.loraGroups.find((group) => group.id === item.groupId); return <div className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name || compactName(item.value)}</strong>{owner && <em className="gallery-lora-group-tag" title={`来自组合 ${owner.name}`}>{owner.name}</em>}<b>{formatWeight(item.weight ?? 1)}</b><small>{item.enabled === false ? "关闭" : "启用"}</small></div>; }) : <p>未使用 LoRA</p>}</div></section>
+      <section className="gallery-detail-section"><header><span>SAMPLING</span><strong>采样与画布</strong></header><div className="gallery-stat-grid"><div><span>STEP</span><b>{settings.steps}</b></div><div><span>CFG</span><b>{settings.cfg}</b></div><div><span>DENOISE</span><b>{settings.denoise}</b></div><div><span>SEED</span><b title={settings.seed}>{settings.seed}</b></div><div><span>SIZE</span><b>{settings.size.width} × {settings.size.height}</b></div><div><span>BATCH</span><b>{settings.imagesPerBatch} × {settings.batchCount}</b></div></div><p className="gallery-detail-line">{GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "无（None）"}{settings.guidance === "pag" ? ` ${settings.pag.scale} / ${settings.pag.appliedLayers === "mid" ? "Mid" : "全部层"}` : ""} · {settings.sampler} · {settings.scheduler}</p></section>
+      <section className="gallery-detail-section"><header><span>POST PROCESS</span><strong>后处理开关与顺序</strong></header><div className="gallery-process-list">{settings.postprocessOrder.map((stage, index) => { const stageSettings = settings[stage]; return <div className={stageSettings?.enabled ? "enabled" : "disabled"} key={stage}><span>{index + 1}</span><strong>{stageLabels[stage]}</strong><b>{stageSettings?.enabled ? "ON" : "OFF"}</b><small>{stage === "hires" ? `${stageSettings.scale}x · ${compactName(stageSettings.model)}${tilesHires ? ` · ${stageSettings.executionMode === "usdu_tiled" ? "USDU 分块重绘" : "整图重绘"}` : ""}` : stage === "adetailer" ? `${compactName(stageSettings.detector)} · ${stageSettings.confidence}` : `${stageSettings.scale}x · ${String(stageSettings.quality).toUpperCase()}`}</small></div>; })}</div><p className="gallery-detail-line">Hires Seed · {settings.hires.seedMode === "inherit" ? "继承当前图片首轮 Seed" : settings.hires.seedMode === "random" ? "每张安全随机" : settings.hires.seed}</p></section>
       <section className="gallery-detail-section"><header><span>ADETAILER DETAIL</span><strong>局部重绘参数</strong></header><dl><div><dt>Prompt</dt><dd>{settings.adetailer.prompt || "继承主 Prompt"}</dd></div><div><dt>负向</dt><dd>{settings.adetailer.negativePrompt || "继承主负向"}</dd></div><div><dt>蒙版</dt><dd>{settings.adetailer.maskMinRatio}–{settings.adetailer.maskMaxRatio} · blur {settings.adetailer.maskBlur}</dd></div><div><dt>重绘</dt><dd>{settings.adetailer.denoise} · {settings.adetailer.useSteps ? `${settings.adetailer.steps} steps` : "继承步数"}</dd></div></dl></section>
     </div>
     <footer><button type="button" onClick={() => onApplyOpenChange(true)}><SlidersHorizontal size={15} /><span><strong>应用参数</strong><small>选择性回填到生图区域</small></span><ChevronRight size={15} /></button></footer>
@@ -934,7 +928,7 @@ function GalleryDetail({ card, cards, onBack, onNavigate, onEdit, onDelete, onAp
   const baseSettings = normalizedSettings({ ...card.settings, seed: galleryImageSeed(card.settings, safeImageIndex) });
   const settings = { ...baseSettings, hires: { ...baseSettings.hires, ...selectedImageHiresSeed(baseSettings, safeImageIndex) } };
   const image = card.images?.[safeImageIndex];
-  const isAnima = settings.model === "Anima";
+  const isSplit = isSplitEngine(settings.model);
   const zoomAtPointer = (event) => {
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
@@ -971,7 +965,7 @@ function GalleryDetail({ card, cards, onBack, onNavigate, onEdit, onDelete, onAp
     <section ref={dialogRef} className="gallery-focus-shell" role="dialog" aria-modal="true" aria-labelledby="gallery-viewer-title" tabIndex="-1">
       <header className="gallery-viewer-topline"><div><span>NOW VIEWING / {String(cardIndex + 1).padStart(2, "0")} OF {String(viewerCards.length).padStart(2, "0")}</span><h1 id="gallery-viewer-title" title={card.title || settings.positive}>{displayTitle(card)}</h1></div><div><button type="button" className={drawerOpen ? "active" : ""} aria-pressed={drawerOpen} onClick={() => setDrawerOpen((current) => !current)}><SlidersHorizontal size={15} /><span>参数</span></button><button type="button" className="gallery-viewer-reset-zoom" disabled={zoom === 1 && pan.x === 0 && pan.y === 0} title="重置缩放与平移" onClick={resetViewport}><RefreshCw size={14} /><span>{Math.round(zoom * 100)}%</span></button><button type="button" className="gallery-viewer-close" aria-label="关闭图片预览" onClick={onBack}><X size={18} /><span>关闭</span></button></div></header>
       <div className="gallery-viewer-content"><button type="button" className="gallery-viewer-nav previous" aria-label="上一张精选" disabled={viewerCards.length < 2} onClick={() => changeCard(-1)}><ArrowLeft size={18} /></button><figure className="gallery-viewer-figure"><div className={`gallery-viewer-image-viewport${zoom > 1 ? " zoomed" : ""}${panSession.current ? " panning" : ""}`} onWheel={zoomAtPointer} onDoubleClick={() => { if (zoom > 1) resetViewport(); else setZoom(2.5); }} onPointerDown={beginPan} onPointerMove={movePan} onPointerUp={endPan} onPointerCancel={endPan} onContextMenu={(event) => { if (zoom > 1) event.preventDefault(); }}>{image ? <FocusImage key={image.id || image.url} image={image} alt={displayTitle(card)} style={{ "--gallery-viewer-zoom": zoom, "--gallery-viewer-pan-x": `${pan.x}px`, "--gallery-viewer-pan-y": `${pan.y}px`, "--gallery-viewer-origin-x": `${zoomOrigin.x}%`, "--gallery-viewer-origin-y": `${zoomOrigin.y}%` }} /> : <div className="gallery-viewer-empty"><ImageIcon size={42} /><strong>{card.title?.trim() || "无图片精选卡片"}</strong><p>{settings.positive || "未填写 Prompt"}</p></div>}</div><figcaption><div><span>{card.collection_id} / {settings.model} / {settings.size.width} × {settings.size.height} / IMAGE {String(imageCount ? safeImageIndex + 1 : 0).padStart(2, "0")} OF {String(imageCount).padStart(2, "0")}</span><strong>{displayTitle(card)}</strong></div><p>滚轮或双击缩放 · 右键/触摸拖拽 · Esc 关闭</p></figcaption>{imageCount > 1 && <div className="gallery-viewer-thumbs">{card.images.map((item, index) => <button type="button" className={index === safeImageIndex ? "active" : ""} key={item.id} aria-label={`查看图片 ${index + 1}`} onClick={() => { setImageIndex(index); resetViewport(); }}><img src={thumbUrl(item)} alt="" loading="lazy" decoding="async" /><b>{String(index + 1).padStart(2, "0")}</b></button>)}</div>}</figure><button type="button" className="gallery-viewer-nav next" aria-label="下一张精选" disabled={viewerCards.length < 2} onClick={() => changeCard(1)}><ArrowRight size={18} /></button></div>
-      <div className="gallery-viewer-drawer" aria-hidden={!drawerOpen}><button type="button" className="gallery-viewer-drawer-backdrop" tabIndex={drawerOpen ? 0 : -1} aria-label="关闭参数面板" onClick={() => setDrawerOpen(false)} /><aside className="gallery-viewer-drawer-sheet" inert={drawerOpen ? undefined : ""}><header><div><span>GENERATION RECORD</span><strong>参数与复现</strong></div><button type="button" aria-label="关闭参数面板" onClick={() => setDrawerOpen(false)}><X size={17} /></button></header><GalleryInspector card={card} settings={settings} isAnima={isAnima} onEdit={onEdit} onDelete={onDelete} onNotice={onNotice} onApplyOpenChange={setApplyOpen} /></aside></div>
+      <div className="gallery-viewer-drawer" aria-hidden={!drawerOpen}><button type="button" className="gallery-viewer-drawer-backdrop" tabIndex={drawerOpen ? 0 : -1} aria-label="关闭参数面板" onClick={() => setDrawerOpen(false)} /><aside className="gallery-viewer-drawer-sheet" inert={drawerOpen ? undefined : ""}><header><div><span>GENERATION RECORD</span><strong>参数与复现</strong></div><button type="button" aria-label="关闭参数面板" onClick={() => setDrawerOpen(false)}><X size={17} /></button></header><GalleryInspector card={card} settings={settings} isSplit={isSplit} onEdit={onEdit} onDelete={onDelete} onNotice={onNotice} onApplyOpenChange={setApplyOpen} /></aside></div>
     </section>
     {applyOpen && <ApplySettingsDialog card={{ ...card, settings }} onClose={() => setApplyOpen(false)} onApply={onApply} />}
   </div>;

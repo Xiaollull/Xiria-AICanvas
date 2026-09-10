@@ -639,3 +639,25 @@ export function matchModelName(name, catalog) {
   }
   return { status: "missing", name: wanted };
 }
+
+/**
+ * A parsed record with every model match taken off, ready to be matched again.
+ *
+ * A match is a fact about this machine at one moment, not about the picture. The image reader keeps
+ * its parsed record across navigation and restarts, so a match computed before a model was installed
+ * or moved -- or before the catalogue learned which engine owns a file in the shared diffusion
+ * folder -- would be applied as if it were still true. Matching turns the encoder and VAE names into
+ * `{ name, match }` pairs, which is why a resolved record cannot simply be matched a second time.
+ */
+export function stripImageInfoMatches(info) {
+  const source = info && typeof info === "object" && !Array.isArray(info) ? info : {};
+  const nameOf = (value) => (typeof value === "string" ? value : typeof value?.name === "string" ? value.name : "");
+  const { checkpointMatch: _checkpointMatch, ...rest } = source;
+  return {
+    ...rest,
+    loras: Array.isArray(source.loras) ? source.loras.map(({ match: _match, ...item }) => item) : [],
+    animaAssets: source.animaAssets
+      ? { text_encoder: nameOf(source.animaAssets.text_encoder), vae: nameOf(source.animaAssets.vae) }
+      : null,
+  };
+}

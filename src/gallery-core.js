@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import { SAMPLER_NAMES as SAMPLERS, SCHEDULER_NAMES as SCHEDULERS } from "./sampling-options.js";
 import { normalizeGalleryHires, normalizeUint64Seed } from "./hires-settings.js";
 import { normalizeADetailerStage } from "./adetailer-units.js";
+import { SETTINGS_ENGINES, engineGuidance, isSplitEngine } from "./engine-settings.js";
 
 export const DEFAULT_SETTINGS = {
   model: "SD",
@@ -25,7 +26,6 @@ export const DEFAULT_SETTINGS = {
   guidance: "none",
   pag: { scale: 0.3, appliedLayers: "mid" },
   size: { width: 1024, height: 1024 },
-  processPreview: true,
   backgroundRemovalModel: "",
   hires: { enabled: false, expanded: false, model: "", seedMode: "inherit", seed: "", scale: 1, denoise: 0.35, steps: 20, cfg: 7, tileSize: 192, tileOverlap: 16, executionMode: "full_frame", sampler: null, scheduler: null, tileWidth: "auto", tileHeight: "auto", padding: 32, maskBlur: 8, seamMode: "none", uniformTiles: true, tiledDecode: true },
   adetailer: normalizeADetailerStage({ enabled: false, expanded: false }),
@@ -72,9 +72,12 @@ export function clone(value) {
 export function normalizedSettings(value, fallback = DEFAULT_SETTINGS, { hiresSourceKind = "persisted_card" } = {}) {
   const source = value && typeof value === "object" ? value : {};
   const base = fallback && typeof fallback === "object" ? fallback : DEFAULT_SETTINGS;
-  const model = ["SD", "iL", "Anima"].includes(source.model)
+  // Every engine the workspace can run. This list stopped at Anima, so a Flux, FLUX.2 or Krea 2 card
+  // was quietly rewritten to the fallback engine on load -- SD for a card, or whatever the workspace
+  // had -- and applying it then asked that engine for files it never had.
+  const model = SETTINGS_ENGINES.includes(source.model)
     ? source.model
-    : ["SD", "iL", "Anima"].includes(base.model) ? base.model : "SD";
+    : SETTINGS_ENGINES.includes(base.model) ? base.model : "SD";
   const normalized = {
     ...clone(DEFAULT_SETTINGS),
     ...clone(base),
@@ -87,12 +90,16 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS, { hiresSo
     checkpoint: typeof source.checkpoint === "string" ? source.checkpoint : typeof base.checkpoint === "string" ? base.checkpoint : "",
     diffusionModel: typeof source.diffusionModel === "string" ? source.diffusionModel : typeof base.diffusionModel === "string" ? base.diffusionModel : "",
     textEncoder: typeof source.textEncoder === "string" ? source.textEncoder : typeof base.textEncoder === "string" ? base.textEncoder : "",
+    // Only FLUX.1 mounts a second encoder; any other engine's card carries none.
+    textEncoder2: model !== "Flux" ? "" : typeof source.textEncoder2 === "string" ? source.textEncoder2 : typeof base.textEncoder2 === "string" ? base.textEncoder2 : "",
     vae: typeof source.vae === "string" ? source.vae : typeof base.vae === "string" ? base.vae : "",
-    sampler: SAMPLERS.includes(source.sampler) ? source.sampler : SAMPLERS.includes(base.sampler) ? base.sampler : model === "Anima" ? "euler" : "dpmpp_2m",
-    scheduler: SCHEDULERS.includes(source.scheduler) ? source.scheduler : SCHEDULERS.includes(base.scheduler) ? base.scheduler : model === "Anima" ? "simple" : "karras",
-    guidance: GUIDANCE.some(([id]) => id === source.guidance)
+    sampler: SAMPLERS.includes(source.sampler) ? source.sampler : SAMPLERS.includes(base.sampler) ? base.sampler : isSplitEngine(model) ? "euler" : "dpmpp_2m",
+    scheduler: SCHEDULERS.includes(source.scheduler) ? source.scheduler : SCHEDULERS.includes(base.scheduler) ? base.scheduler : isSplitEngine(model) ? "simple" : "karras",
+    // Coerced by the engine's own rules: distilled Flux engines take none, CFG-Zero* needs a
+    // flow-matching engine, Krea 2 has no PAG. A card must not carry what its engine refuses.
+    guidance: engineGuidance(model, GUIDANCE.some(([id]) => id === source.guidance)
       ? source.guidance
-      : GUIDANCE.some(([id]) => id === base.guidance) ? base.guidance : "none",
+      : GUIDANCE.some(([id]) => id === base.guidance) ? base.guidance : "none"),
     pag: {
       scale: Math.max(0, Math.min(5, Number.isFinite(Number(source.pag?.scale)) ? Number(source.pag.scale) : Number.isFinite(Number(base.pag?.scale)) ? Number(base.pag.scale) : DEFAULT_SETTINGS.pag.scale)),
       appliedLayers: ["mid", "all"].includes(source.pag?.appliedLayers)
@@ -120,6 +127,13 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS, { hiresSo
   // Same reasoning: the group *library* describes the workspace, so a card can
   // never carry one back in and rewrite the user's saved combinations.
   delete normalized.loraGroupsByEngine;
+  // Same again for the per-engine parameter library: a card records one run, and a card carrying
+  // every engine's parameters could rewrite all of them when applied.
+  delete normalized.engineSettingsByEngine;
+  // The latent process preview was withdrawn. Cards written before that still carry the flag
+  // through the `...source` spread above, so it is dropped here rather than rejected: an old card
+  // keeps every setting that still means something and simply loses this one.
+  delete normalized.processPreview;
   return normalized;
 }
 
@@ -161,6 +175,12 @@ export function distributeGalleryCards(cards, columnCount) {
   return columns;
 }
 
+// Every dialog currently open, oldest first. Each one listens for Escape on `window`, and
+// listeners on the same target all run regardless of `stopPropagation`, so without a shared record
+// of who is on top one Escape would close a dialog and its parent together. Membership is by
+// mount order, which for a dialog opened from inside another dialog is also stacking order.
+const openDialogs = [];
+
 export function useDialogLifecycle(open, onClose, focusReturnSelector = "", canClose = true) {
   const dialogRef = useRef(null);
   const closeRef = useRef(onClose);
@@ -174,8 +194,14 @@ export function useDialogLifecycle(open, onClose, focusReturnSelector = "", canC
     const previousOverflow = document.body.style.overflow;
     const previousFocus = document.activeElement;
     document.body.style.overflow = "hidden";
+    const token = {};
+    openDialogs.push(token);
     const focusableSelector = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const isTopmost = () => openDialogs[openDialogs.length - 1] === token;
     const handleKeyDown = (event) => {
+      // Only the dialog on top reacts. A confirmation opened over a dialog closes itself on
+      // Escape and leaves its parent open, and Tab stays inside whichever one the user is in.
+      if (!isTopmost()) return;
       if (event.key === "Escape") {
         event.stopPropagation();
         if (canCloseRef.current) closeRef.current();
@@ -201,13 +227,18 @@ export function useDialogLifecycle(open, onClose, focusReturnSelector = "", canC
     };
     window.addEventListener("keydown", handleKeyDown);
     const focusFrame = window.requestAnimationFrame(() => {
+      if (!isTopmost()) return;
       const initialFocus = dialogRef.current?.querySelector("[autofocus], [data-dialog-autofocus]") || dialogRef.current?.querySelector(focusableSelector);
       (initialFocus || dialogRef.current)?.focus();
     });
     return () => {
+      const index = openDialogs.indexOf(token);
+      if (index >= 0) openDialogs.splice(index, 1);
       window.cancelAnimationFrame(focusFrame);
-      document.body.style.overflow = previousOverflow;
       window.removeEventListener("keydown", handleKeyDown);
+      // A nested dialog closing must not give the page its scrollbar back while its parent is
+      // still open, so the saved value is only restored once nothing is left on the stack.
+      if (!openDialogs.length) document.body.style.overflow = previousOverflow;
       if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
       else if (focusReturnSelectorRef.current) document.querySelector(focusReturnSelectorRef.current)?.focus();
     };

@@ -15,7 +15,7 @@ import {
 // a LoRA that was never downloaded, a sampler this workspace does not offer —
 // so the panel stays open afterwards and marks exactly which rows those were.
 // Closing it is the user's acknowledgement, not a timer's.
-export default function ImageInfoApply({ info, onApply, onClose }) {
+export default function ImageInfoApply({ info, onApply, onRefresh = null, onClose }) {
   const fields = useMemo(() => imageInfoApplyFields(info), [info]);
   const [target, setTarget] = useState(IMAGE_INFO_APPLY_TARGETS[0].id);
   const [selected, setSelected] = useState(() => new Set(imageInfoDefaultFields(info)));
@@ -24,12 +24,17 @@ export default function ImageInfoApply({ info, onApply, onClose }) {
   const [busy, setBusy] = useState(false);
 
   // A different picture is a different set of rows; keeping the old selection
-  // would apply a field the new record never mentioned.
+  // would apply a field the new record never mentioned. Keyed on the picture
+  // rather than the record object: re-checking the model matches replaces the
+  // object without changing the picture, and must not throw away what the user
+  // ticked -- least of all halfway through applying it.
+  const pictureKey = [info?.name, info?.bytes, info?.checkpoint, info?.positive].join("\u0000");
   useEffect(() => {
     setSelected(new Set(imageInfoDefaultFields(info)));
     setResult(null);
     setError("");
-  }, [info]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pictureKey]);
 
   const toggle = (id) => setSelected((current) => {
     const next = new Set(current);
@@ -38,10 +43,14 @@ export default function ImageInfoApply({ info, onApply, onClose }) {
   });
 
   const run = async (fieldIds) => {
-    const plan = buildImageInfoApplyPlan(info, fieldIds, target);
     setBusy(true);
     setError("");
     try {
+      // The rows were drawn from the record as it was read, which may predate a restart or an
+      // install. The match that decides which engine Apply switches to is checked again now; if it
+      // cannot be checked, nothing is applied rather than acting on a claim that may be stale.
+      const current = onRefresh ? await onRefresh() : info;
+      const plan = buildImageInfoApplyPlan(current, fieldIds, target);
       await onApply(plan);
       setResult(plan);
     } catch (applyError) {

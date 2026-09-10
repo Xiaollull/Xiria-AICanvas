@@ -13,6 +13,7 @@ from pydantic import ValidationError
 try:
     from . import gallery
     from .gallery import (
+        GALLERY_SCHEMA_VERSION,
         GalleryConflictError,
         GalleryNotFoundError,
         GalleryStorageError,
@@ -22,6 +23,7 @@ try:
 except ImportError:
     import gallery
     from gallery import (
+        GALLERY_SCHEMA_VERSION,
         GalleryConflictError,
         GalleryNotFoundError,
         GalleryStorageError,
@@ -316,7 +318,7 @@ class GalleryStoreTests(unittest.TestCase):
         self.assertEqual([card["sort_index"] for card in cards], [0, 1])
         connection = sqlite3.connect(database_path)
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], GALLERY_SCHEMA_VERSION)
         finally:
             connection.close()
 
@@ -366,7 +368,79 @@ class GalleryStoreTests(unittest.TestCase):
         self.assertEqual(migrated.list_prompt_entries()[0]["id"], prompt["id"])
         connection = sqlite3.connect(database_path)
         try:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], GALLERY_SCHEMA_VERSION)
+        finally:
+            connection.close()
+
+    def test_version_three_database_keeps_its_prompts_and_loses_the_length_cap(self):
+        # Version 3 wrote the 8000-character limit into the table itself. SQLite cannot drop a
+        # CHECK, so the migration rebuilds the table — which is exactly the migration that could
+        # lose rows if it went wrong, so the saved entry is what this checks first.
+        state_directory = self.root / "version-three-state"
+        state_directory.mkdir()
+        database_path = state_directory / "gallery.sqlite3"
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE collections (
+                    id TEXT PRIMARY KEY, description TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE cards (
+                    id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, title TEXT, settings_json TEXT NOT NULL,
+                    sort_index INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    FOREIGN KEY(collection_id) REFERENCES collections(id) ON UPDATE CASCADE ON DELETE CASCADE
+                );
+                CREATE TABLE card_images (
+                    id TEXT PRIMARY KEY, card_id TEXT NOT NULL, sort_index INTEGER NOT NULL,
+                    original_name TEXT NOT NULL, mime_type TEXT NOT NULL, storage_name TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL, FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE CASCADE
+                );
+                CREATE INDEX cards_collection_created_idx ON cards(collection_id, created_at DESC);
+                CREATE INDEX cards_collection_sort_idx ON cards(collection_id, sort_index);
+                CREATE INDEX card_images_card_order_idx ON card_images(card_id, sort_index);
+                CREATE TABLE prompt_entries (
+                    id TEXT PRIMARY KEY, title TEXT NOT NULL, positive_prompt TEXT NOT NULL,
+                    negative_prompt TEXT NOT NULL, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    CHECK(length(title) BETWEEN 1 AND 160),
+                    CHECK(length(positive_prompt) <= 8000),
+                    CHECK(length(negative_prompt) <= 8000),
+                    CHECK(notes IS NULL OR length(notes) <= 2000)
+                );
+                CREATE INDEX prompt_entries_updated_idx ON prompt_entries(updated_at DESC);
+                PRAGMA user_version = 3;
+                """
+            )
+            connection.execute(
+                "INSERT INTO prompt_entries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("kept", "Kept", "a lantern", "blurry", "notes", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = GalleryStore(state_directory)
+        entries = migrated.list_prompt_entries()
+        self.assertEqual([entry["id"] for entry in entries], ["kept"])
+        self.assertEqual(entries[0]["positive_prompt"], "a lantern")
+        self.assertEqual(entries[0]["notes"], "notes")
+        stored = migrated.create_prompt_entry("Long", "x" * 40_000)
+        self.assertEqual(len(stored["positive_prompt"]), 40_000)
+
+        connection = sqlite3.connect(database_path)
+        try:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], GALLERY_SCHEMA_VERSION)
+            # The index has to survive the rename-and-drop, or every library listing goes to a scan.
+            indexes = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'prompt_entries'"
+            ).fetchall()
+            self.assertIn("prompt_entries_updated_idx", {row[0] for row in indexes})
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'prompt_entries_capped'"
+                ).fetchone()[0],
+                0,
+            )
         finally:
             connection.close()
 
@@ -560,17 +634,30 @@ class GalleryStoreTests(unittest.TestCase):
         with self.assertRaises(GalleryNotFoundError):
             reopened.delete_prompt_entry(created["id"])
 
-    def test_prompt_library_rejects_empty_or_oversized_records(self):
+    def test_prompt_library_rejects_empty_records(self):
         with self.assertRaises(GalleryValidationError):
             self.store.create_prompt_entry("Empty", "  ", "")
         with self.assertRaises(GalleryValidationError):
             self.store.create_prompt_entry("", "prompt")
-        with self.assertRaises(GalleryValidationError):
-            self.store.create_prompt_entry("Prompt", "x" * 8001)
         created = self.store.create_prompt_entry("Valid", "prompt")
         with self.assertRaises(GalleryValidationError):
             self.store.update_prompt_entry(created["id"], positive_prompt="", negative_prompt="")
         self.assertEqual(self.store.list_prompt_entries()[0]["positive_prompt"], "prompt")
+
+    def test_the_library_stores_a_prompt_of_any_length(self):
+        # A saved prompt is the text a generation runs, and no engine holds that to a length, so
+        # the library must not be the one place that refuses to keep it. Both the Python validator
+        # and the table's own CHECK used to stop at 8000 characters.
+        long_prompt = "x" * 50_000
+        created = self.store.create_prompt_entry("Long", long_prompt, "y" * 20_000)
+        self.assertEqual(created["positive_prompt"], long_prompt)
+
+        reopened = GalleryStore(self.root / "state-cache", asset_resolver=self.store.asset_resolver)
+        stored = reopened.list_prompt_entries()[0]
+        self.assertEqual(stored["positive_prompt"], long_prompt)
+        self.assertEqual(len(stored["negative_prompt"]), 20_000)
+        updated = reopened.update_prompt_entry(created["id"], positive_prompt="z" * 90_000)
+        self.assertEqual(len(updated["positive_prompt"]), 90_000)
 
 
 if __name__ == "__main__":

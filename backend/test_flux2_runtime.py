@@ -259,7 +259,8 @@ class Flux2RuntimeExecutionTests(unittest.TestCase):
 
     def test_token_diagnostics_report_the_language_model(self):
         diagnostics = self.runtime.token_diagnostics("a lantern in the rain")
-        self.assertEqual(diagnostics["llm"]["max_length"], TEXT_SEQUENCE)
+        self.assertEqual(diagnostics["llm"]["context_length"], TEXT_SEQUENCE)
+        self.assertGreaterEqual(diagnostics["llm"]["sequence_length"], diagnostics["llm"]["token_count"])
         self.assertEqual(diagnostics["llm"]["family"], "mistral3")
         self.assertGreater(diagnostics["llm"]["token_count"], 0)
         # FLUX.2 tokenisers disable prompt weighting, so nothing is ever reported as weighted.

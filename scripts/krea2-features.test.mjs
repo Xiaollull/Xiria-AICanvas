@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { normalizeEngineSettings } from "../src/engine-settings.js";
+
 import {
   DISTILLED_GUIDANCE_ENGINES,
   NATIVE_STEP_ENGINES,
@@ -55,8 +57,10 @@ test("a Krea2 generation keeps its unconditional branch, unlike either Flux", as
   const selectModel = sourceBetween(app, "  const selectModel = (nextModel)", "  const selectCheckpoint = (nextCheckpoint)");
   // PAG has no attention override here, so it is cleared; CFG-Zero* survives the switch because
   // Krea 2 has a real unconditional branch to rescale against.
-  assert.match(selectModel, /\} else if \(nextModel === "Krea2"\) \{[\s\S]*?currentGuidance === "pag" \? "none" : currentGuidance[\s\S]*?setProcessPreview\(false\);/);
-  assert.doesNotMatch(selectModel, /nextModel === "Krea2"\) \{[\s\S]*?setGuidance\("none"\);/);
+  assert.equal(normalizeEngineSettings("Krea2", { guidance: "pag" }).guidance, "none");
+  assert.equal(normalizeEngineSettings("Krea2", { guidance: "cfg_zero_star" }).guidance, "cfg_zero_star");
+  assert.match(selectModel, /applyEngineSettings\(restored\)/);
+  assert.doesNotMatch(selectModel, /setProcessPreview/);
 });
 
 test("the image-to-image request mounts one Krea2 encoder and keeps the negative prompt", () => {
@@ -81,7 +85,9 @@ test("the image-to-image request mounts one Krea2 encoder and keeps the negative
   assert.equal(body.checkpoint, undefined);
   // This is the difference from both Flux engines: the negative prompt reaches the wire.
   assert.equal(body.negative_prompt, "blurry");
-  assert.equal(body.preview_enabled, false);
+  // The withdrawn latent preview: the request must not carry the field at all, because the
+  // server forbids unknown keys and would refuse the whole generation.
+  assert.equal("preview_enabled" in body, false);
   // USDU tiling stays Anima's.
   assert.equal(body.hires.execution_mode, "full_frame");
 });

@@ -57,6 +57,20 @@ SCALE_WEIGHT_SUFFIXES = (".scale_weight", ".weight_scale")
 # is read and dropped rather than carried into a module that has no use for it.
 INPUT_SCALE_SUFFIXES = (".scale_input", ".input_scale", ".pre_quant_scale")
 
+# Markers that sit beside ``format`` and change the arithmetic rather than describing it.
+#
+# ``convrot`` is the one that exists today. Krea 2's INT8 build is written as
+# ``{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}``: the weight was
+# rotated in groups before it was quantised, and ComfyUI undoes that by rotating the activation
+# inside ``comfy_kitchen``'s ``int8_linear`` kernel. Read the format alone and the layer looks like
+# an ordinary tensor-wise int8 one, dequantises without complaint, and multiplies a rotated weight
+# by an unrotated input — which is not an approximation of the right answer, it is noise. The file
+# has to be refused by name, because the thing that makes it wrong is the thing being ignored.
+#
+# Keys that only describe how to compute the same value belong nowhere near this set:
+# ``full_precision_matrix_mult`` is on every layer of the working Qwen3-VL fp8 encoder.
+ARITHMETIC_MODIFIER_KEYS = ("convrot",)
+
 BLOCK_SCALE_SUFFIX = ".weight_scale"
 GLOBAL_SCALE_SUFFIX = ".weight_scale_2"
 
@@ -140,6 +154,14 @@ def _quant_format_name(marker: torch.Tensor, layer: str) -> str:
         raise UnsupportedQuantization(f"Layer {layer!r} has an unreadable comfy_quant marker") from error
     if not isinstance(configuration, dict) or not configuration.get("format"):
         raise UnsupportedQuantization(f"Layer {layer!r} declares no quantisation format")
+    for modifier in ARITHMETIC_MODIFIER_KEYS:
+        if configuration.get(modifier):
+            raise UnsupportedQuantization(
+                f"Layer {layer!r} is {configuration['format']!r} with {modifier!r}, which stores "
+                f"the weight in a rotated basis that this runtime cannot undo. Loading it would "
+                f"produce noise rather than a picture, so it is refused. Use the fp8 or bf16 build "
+                f"of this model instead."
+            )
     return str(configuration["format"])
 
 

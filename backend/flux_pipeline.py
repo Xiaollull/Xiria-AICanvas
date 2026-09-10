@@ -21,6 +21,7 @@ native engines through the same staged-load, group-offload and refinement call s
 second incompatible interface would fork every one of them.
 """
 
+import contextlib
 import json
 import math
 import re
@@ -57,7 +58,7 @@ try:
         flux_sigma_schedule,
         resolve_flux_sampler,
     )
-    from .prompt_encoding import tokenize_weighted_prompt
+    from .prompt_encoding import pad_weighted_encodings, tokenize_weighted_prompt
 except ImportError:
     from anima_pipeline import (
         _cast_state_dict,
@@ -81,7 +82,7 @@ except ImportError:
         flux_sigma_schedule,
         resolve_flux_sampler,
     )
-    from prompt_encoding import tokenize_weighted_prompt
+    from prompt_encoding import pad_weighted_encodings, tokenize_weighted_prompt
 
 
 GIB = 1024**3
@@ -418,6 +419,186 @@ def resolve_quantized_state_dict(
     if checkpoint_is_scaled_fp8(state_dict):
         return dequantize_scaled_fp8(state_dict, dtype)
     return dict(state_dict)
+
+
+# `torch.cuda.OutOfMemoryError` is an alias of `torch.OutOfMemoryError` in current torch, but the
+# two have not always been the same class. Catching both means the sampling fallback below cannot
+# be switched off by a torch upgrade separating them again — and a fallback that silently stops
+# firing looks exactly like an engine that has started refusing long prompts.
+CUDA_OOM_ERRORS = tuple({torch.OutOfMemoryError, torch.cuda.OutOfMemoryError})
+
+
+def sample_or_stream(runtime, generators, sample, stage="sampling"):
+    """Sample with the transformer resident, streaming it instead if that runs out of memory.
+
+    Shared by FLUX.1, FLUX.2 and Krea 2, which all place a whole transformer on the card and all
+    take a prompt with no length limit. The activation working set is set by the entire attention
+    sequence, and the prompt is part of that sequence. Measured on a 24 GB card, Krea 2 at
+    1024x1472, with the transformer streamed so that every length could be recorded at all:
+
+        153 tokens    6,041 sequence   2.36 GiB      6,929 tokens   12,817 sequence   6.73 GiB
+      2,329 tokens    8,217 sequence   2.83 GiB     13,849 tokens   19,737 sequence  12.59 GiB
+
+    Predicting that at admission is a poor trade: the curve changes regime around ten thousand
+    tokens, so an estimate safe at the top would refuse residency — and several times the speed —
+    for every ordinary prompt below it. Trying residency and catching the failure is exact rather
+    than cautious, and it keeps the fast path for every prompt that does fit. That ordering is the
+    scheduling rule this engine already follows: speed first, as long as VRAM is not exceeded.
+
+    The generators are restored before the retry, so the second attempt draws the noise the first
+    one did and the seed still describes the picture that comes out.
+    """
+    states = [generator.get_state() for generator in generators]
+    try:
+        return runtime._run_cuda_stage(stage, sample)
+    except CUDA_OOM_ERRORS:
+        if runtime.transformer_group_offload_enabled:
+            raise
+        try:
+            runtime._park_transformer_on_cpu()
+            runtime.keep_transformer_resident = False
+            _empty_cuda_cache()
+            runtime.enable_transformer_group_offload(1)
+        except BaseException:
+            # Where the transformer's weights now live is no longer known, so the runtime cannot
+            # be handed back for another job.
+            runtime._poisoned = True
+            raise
+    for generator, state in zip(generators, states):
+        generator.set_state(state)
+    runtime.last_generation_metrics["sampling_fallback"] = {
+        "from": "staged_transformer_resident",
+        "to": "staged_transformer_group_offload",
+        "reason": "cuda_oom",
+        "stage": stage,
+        "attempts": 1,
+        "generator_states_restored": True,
+    }
+    return runtime._run_cuda_stage(stage, sample)
+
+
+# A cached encoding is held on the CPU for as long as the runtime lives, and prompts have no length
+# ceiling, so the bound has to be bytes rather than a count: one 13,849-token Krea 2 encoding is
+# around 850 MB, where the two an ordinary generation uses are a few MB together. Half a gigabyte
+# keeps the realistic working set — a prompt, its negative, and an ADetailer pair — and refuses to
+# accumulate several extreme ones.
+CONDITIONING_CACHE_BYTES = 512 * 1024 * 1024
+
+
+def _tensor_nbytes(value) -> int:
+    """Bytes held by one cache entry: a tensor, or FLUX.1's (conditioning, pooled) pair."""
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_nbytes(item) for item in value)
+    return int(value.element_size()) * int(value.nelement())
+
+
+def _text_encoder_modules(runtime):
+    """The encoders a runtime stages. FLUX.1 runs a CLIP beside its T5; the rest run one."""
+    names = getattr(runtime, "text_encoder_attributes", ("text_encoder",))
+    return [getattr(runtime, name) for name in names if getattr(runtime, name, None) is not None]
+
+
+@contextlib.contextmanager
+def text_encoder_resident(runtime):
+    """Keep the text encoder on the GPU across the block, if the block turns out to need it.
+
+    Encoding moves a multi-billion-parameter encoder across PCIe and back, and each encode used to
+    pay for its own round trip: a CFG generation moved it twice, once for the prompt and once for
+    the negative, then twice more for Hires.
+
+    The residency is claimed here but materialised lazily by `require_text_encoder`, because the
+    caller usually cannot know whether the block needs the encoder at all — a stage whose prompts
+    are both already cached must not move a single byte, which is the whole point of the cache.
+    Nesting is counted, so the outermost block decides when the encoder goes back to the CPU.
+    """
+    depth = getattr(runtime, "_text_encoder_residency", 0)
+    runtime._text_encoder_residency = depth + 1
+    try:
+        yield
+    finally:
+        runtime._text_encoder_residency = depth
+        if depth == 0 and getattr(runtime, "_text_encoder_on_gpu", False):
+            for module in _text_encoder_modules(runtime):
+                module.to("cpu")
+            runtime._text_encoder_on_gpu = False
+            _empty_cuda_cache()
+
+
+def require_text_encoder(runtime):
+    """Put the encoders on the GPU unless they are already there under an open residency."""
+    if not getattr(runtime, "_text_encoder_on_gpu", False):
+        for module in _text_encoder_modules(runtime):
+            module.to(device=runtime.device, dtype=runtime.dtype)
+        runtime._text_encoder_on_gpu = True
+
+
+def cached_conditioning(runtime, prompt, encode):
+    """Return the encoding of `prompt`, running the encoder only the first time it is asked for.
+
+    The encoder a runtime holds is fixed for that runtime's life: FLUX.1, FLUX.2 and Krea 2 all
+    fuse LoRAs into the transformer at load and never into the text encoder, so a change of LoRA
+    stack builds a new runtime with an empty cache. The same string therefore always encodes to
+    the same tensor, and every pass after the first is pure cost — which is what Hires, ADetailer
+    and img2img chunking were each paying, because they call `refine_batch` again with the prompt
+    the base pass already encoded.
+
+    The result is handed back without a defensive copy. Callers only ever move and expand it, both
+    of which copy or view rather than write, and an encoding can be large enough that cloning it
+    per call would cost more than the encode this saves.
+    """
+    cache = getattr(runtime, "_conditioning_cache", None)
+    if cache is None:
+        cache = {}
+        runtime._conditioning_cache = cache
+    if prompt in cache:
+        # Re-insert so that eviction is by least recent use: a negative prompt encoded once at the
+        # start is asked for again at every later stage, and is not the entry to drop.
+        cache[prompt] = cache.pop(prompt)
+        runtime.last_conditioning_reused = True
+        return cache[prompt]
+    with text_encoder_resident(runtime):
+        require_text_encoder(runtime)
+        embeddings = encode()
+    runtime.last_conditioning_reused = False
+    cache[prompt] = embeddings
+    # Never evict the entry just added, however large it is; the caller is about to use it.
+    while len(cache) > 1 and sum(_tensor_nbytes(item) for item in cache.values()) > CONDITIONING_CACHE_BYTES:
+        del cache[next(iter(cache))]
+    return embeddings
+
+
+def refuse_prepared_refinement(engine, prepared_conditioning, prepared_sigmas):
+    """Refuse a prepared pair rather than accept and discard it.
+
+    `refine_batch` shares one signature across all four native engines, and Anima and Krea 2 use
+    these two arguments to hand every tile of a USDU pass the same conditioning and the same sigma
+    schedule. FLUX.1 and FLUX.2 have neither surface — both are guidance distilled, and neither
+    runs the tiled Hires path — so a caller that passes one has made a mistake. These used to be
+    swallowed by a `del`, which meant preparing conditioning for a Flux run appeared to work and
+    changed nothing.
+    """
+    if prepared_conditioning is not None:
+        raise ValueError(f"{engine} does not reuse prepared conditioning; omit prepared_conditioning")
+    if prepared_sigmas is not None:
+        raise ValueError(f"{engine} does not reuse a prepared sigma schedule; omit prepared_sigmas")
+
+
+def note_conditioning_reuse(runtime, name):
+    """Record whether the named encode stage ran or was served from the cache, so a stage that
+    cost nothing reads as reused rather than as a suspiciously fast encoder."""
+    metric = runtime.last_generation_metrics.get(name)
+    if isinstance(metric, dict):
+        metric["conditioning_reused"] = bool(getattr(runtime, "last_conditioning_reused", False))
+
+
+def discard_conditioning_cache(runtime):
+    """Drop every cached encoding. Called when a runtime closes, so the tensors are not held."""
+    cache = getattr(runtime, "_conditioning_cache", None)
+    if cache:
+        cache.clear()
+    # The encoder itself is about to be discarded, so no residency survives this.
+    runtime._text_encoder_residency = 0
+    runtime._text_encoder_on_gpu = False
 
 
 def _shape_of(state_dict: Mapping[str, torch.Tensor], key: str, label: str = "Flux diffusion checkpoint") -> tuple[int, ...]:
@@ -882,6 +1063,10 @@ def _load_flux_tokenizers(clip_tokenizer_directory: Path, t5_tokenizer_path: Pat
 class FluxRuntime:
     """A loaded FLUX.1 model, driven through the same surface the Anima runtime exposes."""
 
+    # Both encoders are staged together: the pooled CLIP vector and the T5 conditioning come from
+    # a single pass, so residency covers the pair.
+    text_encoder_attributes = ("text_encoder", "text_encoder_2")
+
     def __init__(self, transformer, text_encoder, text_encoder_2, vae, clip_tokenizer, t5_tokenizer, dtype, config):
         self.transformer = transformer
         self.text_encoder = text_encoder
@@ -1047,6 +1232,7 @@ class FluxRuntime:
                 self._remove_transformer_group_offload()
         except BaseException:
             self._poisoned = True
+        discard_conditioning_cache(self)
         for name in ("transformer", "text_encoder", "text_encoder_2", "vae"):
             module = getattr(self, name, None)
             if module is None:
@@ -1061,6 +1247,10 @@ class FluxRuntime:
     # -- prompt encoding ---------------------------------------------------------------------
 
     def _tokenize(self, texts: Sequence[str]):
+        # CLIP-L keeps its 77-token window because that window is the model: the position
+        # embeddings are learned and there are 77 of them. FLUX.1 takes only the pooled vector from
+        # it, and ComfyUI's pooled vector comes from the first block of a chunked prompt
+        # (`sd1_clip.py` returns `output[0][:1]`), so one window is the whole of what it uses.
         clip = [
             tokenize_weighted_prompt(
                 self.clip_tokenizer,
@@ -1072,17 +1262,25 @@ class FluxRuntime:
             )
             for text in texts
         ]
-        t5 = [
-            tokenize_weighted_prompt(
-                self.t5_tokenizer,
-                text,
-                max_length=self.t5_sequence_length,
-                truncation=True,
-                padding="max_length",
-                add_special_tokens=True,
-            )
-            for text in texts
-        ]
+        # T5-XXL is the conditioning, and its context is trained rather than architectural: it uses
+        # relative position bias, so a longer sequence is simply a longer sequence. ComfyUI passes
+        # the whole prompt through here (`T5XXLTokenizer` sets `max_length=99999999` with a
+        # `min_length` floor) and this does the same — the sequence length is the prompt's, padded
+        # up to the trained context when the prompt is shorter than it.
+        t5 = pad_weighted_encodings(
+            self.t5_tokenizer,
+            [
+                tokenize_weighted_prompt(
+                    self.t5_tokenizer,
+                    text,
+                    truncation=False,
+                    padding=None,
+                    add_special_tokens=True,
+                )
+                for text in texts
+            ],
+            min_length=self.t5_sequence_length,
+        )
         return clip, t5
 
     def token_diagnostics(self, prompt: str):
@@ -1096,10 +1294,14 @@ class FluxRuntime:
                 "weighted_token_count": int(clip[0]["weighted_token_count"]),
                 "max_length": FLUX_CLIP_SEQUENCE_LENGTH,
             },
+            # T5 reports the sequence it actually encoded rather than a ceiling, because it has
+            # none: `context_length` is the trained context a short prompt is padded up to, and a
+            # longer prompt runs at its own length.
             "t5": {
                 "token_count": int(t5[0]["token_count"]),
                 "weighted_token_count": int(t5[0]["weighted_token_count"]),
-                "max_length": self.t5_sequence_length,
+                "sequence_length": int(t5[0]["input_ids"].shape[0]),
+                "context_length": self.t5_sequence_length,
             },
         }
 
@@ -1111,35 +1313,35 @@ class FluxRuntime:
         empty pass is only run when the prompt actually carries a weight — on T5-XXL it is not a
         free forward.
         """
+        return cached_conditioning(self, prompt, lambda: self._encode_prompt_uncached(prompt))
+
+    def _encode_prompt_uncached(self, prompt: str):
+        """One pass through both encoders. The caller owns their residency and the cache."""
         clip_tokens, t5_tokens = self._tokenize([prompt])
-        weights = t5_tokens[0]["weights"]
         weighted = bool(t5_tokens[0]["weighted_token_count"])
         if weighted:
-            empty_clip, empty_t5 = self._tokenize([""])
-            t5_ids = torch.stack([t5_tokens[0]["input_ids"], empty_t5[0]["input_ids"]])
+            # The empty pass has to line up with the prompt token for token, and the prompt is no
+            # longer cut to a fixed length: tokenizing the pair together pads them to their shared
+            # length instead of assuming both already sit at the trained context.
+            clip_tokens, t5_tokens = self._tokenize([prompt, ""])
+            t5_ids = torch.stack([t5_tokens[0]["input_ids"], t5_tokens[1]["input_ids"]])
         else:
             t5_ids = t5_tokens[0]["input_ids"].unsqueeze(0)
+        weights = t5_tokens[0]["weights"]
         clip_ids = clip_tokens[0]["input_ids"].unsqueeze(0)
         device = self.device
-        try:
-            self.text_encoder.to(device=device, dtype=self.dtype)
-            self.text_encoder_2.to(device=device, dtype=self.dtype)
-            with torch.inference_mode():
-                # FLUX.1 runs both encoders without an attention mask, exactly as the reference
-                # implementation does: the padding is part of the trained context.
-                pooled = self.text_encoder(input_ids=clip_ids.to(device), output_hidden_states=False).pooler_output
-                embeddings = self.text_encoder_2(input_ids=t5_ids.to(device), output_hidden_states=False)[0]
-                if weighted:
-                    prompt_embeddings, empty_embeddings = embeddings[0], embeddings[1]
-                    scale = weights.to(device=device, dtype=prompt_embeddings.dtype).unsqueeze(-1)
-                    embeddings = (
-                        (prompt_embeddings - empty_embeddings) * scale + empty_embeddings
-                    ).unsqueeze(0)
-            return embeddings.to(device="cpu", dtype=self.dtype), pooled.to(device="cpu", dtype=self.dtype)
-        finally:
-            self.text_encoder.to("cpu")
-            self.text_encoder_2.to("cpu")
-            _empty_cuda_cache()
+        with torch.inference_mode():
+            # FLUX.1 runs both encoders without an attention mask, exactly as the reference
+            # implementation does: the padding is part of the trained context.
+            pooled = self.text_encoder(input_ids=clip_ids.to(device), output_hidden_states=False).pooler_output
+            embeddings = self.text_encoder_2(input_ids=t5_ids.to(device), output_hidden_states=False)[0]
+            if weighted:
+                prompt_embeddings, empty_embeddings = embeddings[0], embeddings[1]
+                scale = weights.to(device=device, dtype=prompt_embeddings.dtype).unsqueeze(-1)
+                embeddings = (
+                    (prompt_embeddings - empty_embeddings) * scale + empty_embeddings
+                ).unsqueeze(0)
+        return embeddings.to(device="cpu", dtype=self.dtype), pooled.to(device="cpu", dtype=self.dtype)
 
     # -- latents -----------------------------------------------------------------------------
 
@@ -1471,6 +1673,7 @@ class FluxRuntime:
         shift = flux_resolution_shift(width, height)
         sigmas = flux_sigma_schedule(steps, scheduler, shift)
         embeddings, pooled = self._run_cuda_stage("prompt_encode", lambda: self._encode_prompt(prompt))
+        note_conditioning_reuse(self, 'prompt_encode')
         # A chunk is a subdivision of one batch, not a separate run: the progress callbacks are
         # offset so the bar counts one pass over `chunks x steps`, and the invocation total is
         # summed rather than overwritten by whichever chunk happened to finish last.
@@ -1489,8 +1692,9 @@ class FluxRuntime:
                 return lambda step, _total, latents: callback(offset + step, total, latents)
 
             initial = self._initial_latents(chunk, height, width, sigmas[0])
-            latents = self._run_cuda_stage(
-                "sampling",
+            latents = sample_or_stream(
+                self,
+                chunk,
                 lambda initial=initial, chunk=chunk: self._sample(
                     embeddings, pooled, initial, sigmas, sampler, cfg, chunk,
                     chunked(on_step), chunked(on_step_checkpoint),
@@ -1546,6 +1750,7 @@ class FluxRuntime:
         if float(denoise) <= 0.0 or float(denoise) > 1.0:
             raise ValueError("denoise must be greater than 0 and at most 1")
         self._require_cuda()
+        refuse_prepared_refinement("FLUX.1", prepared_conditioning, prepared_sigmas)
         del pag_scale, pag_applied_layers, prepared_conditioning, prepared_sigmas
 
         mask_tensor = None
@@ -1563,6 +1768,7 @@ class FluxRuntime:
         shift = flux_resolution_shift(width, height)
         sigmas, schedule_diagnostics = flux_refinement_sigma_schedule(steps, float(denoise), scheduler, shift)
         embeddings, pooled = self._run_cuda_stage("refinement.prompt_encode", lambda: self._encode_prompt(prompt))
+        note_conditioning_reuse(self, 'refinement.prompt_encode')
         source = self._run_cuda_stage("refinement.vae_encode", lambda: self._encode_images(images))
         noise = _cpu_noise_like_batch(source, generators)
         start_sigma = float(sigmas[0].item())

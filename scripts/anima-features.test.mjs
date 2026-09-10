@@ -32,14 +32,14 @@ test("Anima workspace restore and generation preserve supported feature settings
   assert.match(restore, /const mountedLoraMap = normalizeMountedLoraMap\(saved\.mountedLorasByEngine/);
   assert.match(restore, /mountedLorasByEngine: mountedLoraMap\.container/);
   assert.match(restore, /loras: mountedLoraMap\.activeLoras/);
-  // Neither native engine streams a decoded latent, so the split is by picker shape, not by name.
-  assert.match(restore, /processPreview: isSplitModel \? false : saved\.processPreview !== false/);
+  // The latent process preview was withdrawn, so the workspace no longer restores a switch for it.
+  assert.doesNotMatch(restore, /processPreview/);
   assert.match(restore, /guidance: guidanceOptions\.some\(\(item\) => item\.id === saved\.guidance\) \? saved\.guidance : "none"/);
   assert.doesNotMatch(restore, /enabled: !isAnima/);
   assert.doesNotMatch(restore, /loras: isAnima \? \[\]/);
   assert.doesNotMatch(restore, /saved\.guidance !== "pag"/);
 
-  assert.match(generate, /setGeneratedSettings\([\s\S]*?guidance,\s+processPreview/);
+  assert.match(generate, /setGeneratedSettings\([\s\S]*?guidance: distilledGeneration \? "none" : guidance,\s+hires:/);
   assert.match(generate, /hires: \{\s+(?:\/\/[^\n]*\n\s+)?enabled: hires\.enabled,/);
   assert.match(generate, /adetailer: adetailerPayload\(adetailer, model\)/);
   assert.match(generate, /rtx: \{\s+enabled: rtx\.enabled,/);
@@ -59,14 +59,14 @@ test("Hires migrates execution mode by engine and sends the independent tiled-re
   const restore = sourceBetween(app, "function loadWorkspaceState(saved)", "function reconcileModels");
   const generate = sourceBetween(app, "  const generate = async () => {", "  const releaseLoadedModel = async () => {");
 
-  assert.match(restore, /isAnima && !\["full_frame", "usdu_tiled"\]\.includes\(savedHires\.executionMode\)[\s\S]*?"usdu_tiled"/);
-  assert.match(restore, /savedHires\.executionMode === "usdu_tiled" && isAnima \? "usdu_tiled" : "full_frame"/);
+  assert.match(restore, /savedModelTilesHires && !\["full_frame", "usdu_tiled"\]\.includes\(savedHires\.executionMode\)[\s\S]*?"usdu_tiled"/);
+  assert.match(restore, /savedHires\.executionMode === "usdu_tiled" && savedModelTilesHires \? "usdu_tiled" : "full_frame"/);
   assert.match(restore, /sampler: \(isSplitModel \? ANIMA_SAMPLERS : samplerNames\)\.includes\(savedHires\.sampler\) \? savedHires\.sampler : null/);
   assert.match(restore, /tileWidth: normalizeHiresTileDimension\(savedHires\.tileWidth\)/);
   assert.match(restore, /padding: Math\.round\(numberInRange\(savedHires\.padding, 32, 0, 256\)\)/);
   assert.match(restore, /maskBlur: Math\.round\(numberInRange\(savedHires\.maskBlur, 8, 0, 64\)\)/);
 
-  assert.match(generate, /execution_mode: animaGeneration && hires\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame"/);
+  assert.match(generate, /execution_mode: tiledHiresGeneration && hires\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame"/);
   assert.match(generate, /\.\.\.\(hires\.sampler \? \{ sampler: hires\.sampler \} : \{\}\)/);
   assert.match(generate, /\.\.\.\(hires\.scheduler \? \{ scheduler: hires\.scheduler \} : \{\}\)/);
   for (const field of ["tile_width: hires.tileWidth", "tile_height: hires.tileHeight", "padding: hires.padding", "mask_blur: hires.maskBlur", "seam_mode: \"none\"", "uniform_tiles: hires.uniformTiles !== false", "tiled_decode: hires.tiledDecode !== false"]) assert.match(generate, new RegExp(field));
@@ -185,7 +185,10 @@ test("Anima controls and PAG fail closed from per-engine health without intrinsi
   assert.match(readiness, /当前 \$\{model\} 推理运行时未声明 \$\{guidance === "pag" \? "PAG" : "CFG-Zero\*"\} 可用/);
 
   const unsupported = sourceBetween(readiness, "  const animaSettingsUnsupported", "  const pipelineConfigReady");
-  assert.match(unsupported, /processPreview/);
+  // Sampling and guidance are all that can still be unsupported here; the preview switch that
+  // used to be the third case is gone.
+  assert.match(unsupported, /activeSamplerNames\.includes\(sampler\)/);
+  assert.doesNotMatch(unsupported, /processPreview/);
   assert.doesNotMatch(unsupported, /guidance === "pag"|hires\.enabled|adetailer\.enabled|rtx\.enabled|loras\.length/);
 
   assert.match(app, /\(!engineAllowsHires && !hires\.enabled\)/);
@@ -207,8 +210,11 @@ test("Anima LoRA discovery, gallery apply, and downloader avoid engine-specific 
   assert.doesNotMatch(refreshLoras, /engine === "Anima"/);
   assert.doesNotMatch(selectModel, /setLoras\(\[\]\)|setHires\([\s\S]*?enabled: false|setADetailer\([\s\S]*?enabled: false|setRtx\([\s\S]*?enabled: false/);
   assert.match(app, /inferenceHealthRef\.current = inferenceHealth/);
-  assert.match(selectModel, /setGuidance\(\(currentGuidance\) => currentGuidance === "pag" && !pagAvailableForEngine\(inferenceHealthRef\.current, nextModel\) \? "none" : currentGuidance\)/);
-  assert.match(selectModel, /setGuidance\(\(currentGuidance\) => currentGuidance === "cfg_zero_star" \? "none" : currentGuidance\)/);
+  // PAG availability is the one guidance rule the per-engine store cannot decide, because it
+  // depends on what the installed runtime reports rather than on the engine alone, so it is still
+  // applied here after the engine's own record has been restored. The static rules moved into
+  // `engine-settings.js` and are covered by `engine-settings.test.mjs`.
+  assert.match(selectModel, /restored\.guidance === "pag" && !pagAvailableForEngine\(inferenceHealthRef\.current, nextModel\)/);
   assert.match(applyGallery, /const targetLoraScopeKey = engineScopeKey\(targetLoraIdentity\.model\)/);
   assert.match(applyGallery, /const galleryTarget = galleryMountedLorasForTarget\(mountedLorasMapRef\.current/);
   assert.match(applyGallery, /applyLoras: selectedGroups\.has\("loras"\)/);
@@ -231,13 +237,15 @@ test("Gallery preserves, edits, and displays Anima PAG with other supported sett
   assert.match(galleryCore, /loras: \(Array\.isArray\(source\.loras\)[\s\S]*?\)\.slice\(0, 16\)/);
   assert.match(editor, /const setNested = \(group, key, value\) => setSettings\(\(current\) => busy \? current : \(\{ \.\.\.current/);
   assert.doesNotMatch(editor, /current\.model === "Anima" && key === "enabled"/);
-  assert.match(save, /processPreview: false/);
+  assert.doesNotMatch(save, /processPreview/);
   assert.match(save, /guidance: settings\.guidance/);
-  assert.match(save, /!isAnima && settings\.guidance === "cfg_zero_star"/);
+  // Guidance is refused by the engine's own rules (engine-settings), not by an Anima-only check.
+  assert.match(save, /if \(guidanceBlocked\) \{/);
   assert.doesNotMatch(save, /loras: \[\]|(?:hires|adetailer|rtx): \{ \.\.\.settings\.(?:hires|adetailer|rtx), enabled: false \}/);
   assert.doesNotMatch(save, /settings\.guidance === "pag" \? "none"/);
-  assert.match(editor, /guidance: nextModel !== "Anima" && current\.guidance === "cfg_zero_star" \? "none" : current\.guidance/);
-  assert.match(editor, /const disabled = !isAnima && id === "cfg_zero_star"/);
+  assert.match(editor, /guidance: engineGuidance\(nextModel, current\.guidance\)/);
+  // Each option is enabled by the selected engine's own guidance rules, shared with the workspace.
+  assert.match(editor, /const disabled = engineGuidance\(settings\.model, id\) !== id;/);
   assert.doesNotMatch(editor, /isAnima && (?:id|settings\.guidance|next) === "pag"/);
   assert.doesNotMatch(editor, /Anima 不支持 PAG/);
   assert.match(editor, /label="启用 Hires\.fix"[\s\S]*?checked=\{settings\.hires\.enabled\} onChange=/);
@@ -257,7 +265,7 @@ test("manual Gallery card model selections persist through edit and workspace ap
   assert.match(editor, /card\s*\? normalizedSettings\(card\.settings, DEFAULT_SETTINGS, \{ hiresSourceKind: "persisted_card" \}\)\s*: normalizedSettings\(undefined, initialSettings, \{ hiresSourceKind: "workspace_inheritance" \}\)/);
   assert.match(editor, /value=\{settings\.checkpoint\} onChange=\{\(event\) => setField\("checkpoint", event\.target\.value\)\}/);
   assert.match(editor, /value=\{settings\[key\]\} onChange=\{\(event\) => setField\(key, event\.target\.value\)\}/);
-  assert.match(save, /const savedSettings = isAnima \? \{[\s\S]*?checkpoint: "",[\s\S]*?\} : \{[\s\S]*?diffusionModel: "",[\s\S]*?textEncoder: "",[\s\S]*?vae: "",/);
+  assert.match(save, /const savedSettings = isSplit \? \{[\s\S]*?checkpoint: "",[\s\S]*?\} : \{[\s\S]*?diffusionModel: "",[\s\S]*?textEncoder: "",[\s\S]*?vae: "",/);
   assert.match(applyGallery, /checkpoint: typeof source\.checkpoint === "string" \? source\.checkpoint : "",/);
   assert.match(applyGallery, /diffusionModel: typeof source\.diffusionModel === "string" \? source\.diffusionModel : "",/);
   assert.match(applyGallery, /setRestoredWorkspace\(restored\);[\s\S]*?setCheckpoint\(normalized\.checkpoint\);[\s\S]*?setDiffusionModel\(normalized\.diffusionModel\);[\s\S]*?setTextEncoder\(normalized\.textEncoder\);[\s\S]*?setVae\(normalized\.vae\);/);

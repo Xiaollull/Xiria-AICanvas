@@ -252,7 +252,7 @@ class SamplingStepTests(unittest.TestCase):
     def test_anima_and_text_to_image_report_the_requested_steps(self):
         request = request_with_source(steps=20, denoise=0.6, engine="Anima", checkpoint=None,
                                       diffusion_model="d.safetensors", text_encoder="t.safetensors",
-                                      vae="v.safetensors", preview_enabled=False)
+                                      vae="v.safetensors")
         self.assertEqual(inference_server.base_sampling_steps(request, "anima"), 20)
         text_request = GenerateInput(
             engine="SD", checkpoint="model.safetensors", prompt="a lantern", width=512, height=512,

@@ -35,7 +35,7 @@ import {
 import SizeGrid from "./SizeGrid";
 import { normalizePostprocessOrder, postprocessTargetSize } from "./postprocessing";
 import WorkspaceSelect from "./WorkspaceSelect";
-import { hiresEffectiveSteps, secureRandomUint64Seed } from "./hires-settings";
+import { hiresEffectiveSteps, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
 import { formatWeight } from "./lora-weight";
 import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
 import { loraCardPresentation } from "./lora-cards.js";
@@ -193,12 +193,12 @@ function PostprocessControls({ config, engine, postprocess, running, dimensions,
           <RangeField label="Hires CFG" value={config.hires.cfg} min={0} max={30} step={0.5} disabled={running} onChange={(value) => updateStage("hires", { cfg: value })} format={(value) => value.toFixed(1)} />
           <label>Hires Seed 模式<WorkspaceSelect ariaLabel="Hires Seed 模式" value={config.hires.seedMode} disabled={running} onChange={(value) => updateStage("hires", { seedMode: value, seed: value === "fixed" ? config.hires.seed : "" })} options={[{ value: "inherit", label: "继承首轮 Seed" }, { value: "fixed", label: "固定 Hires Seed" }, { value: "random", label: "每张安全随机" }]} /></label>
           {config.hires.seedMode === "fixed" && <label className="i2i-fixed-seed">固定 Hires Seed<span><input className="i2i-inline-input" inputMode="numeric" maxLength="20" value={config.hires.seed} disabled={running} onChange={(event) => updateStage("hires", { seed: event.target.value.replace(/\D/g, "") })} placeholder="0–18446744073709551615" /><button type="button" title="生成固定 Hires Seed" disabled={running} onClick={() => updateStage("hires", { seed: secureRandomUint64Seed() })}><RefreshCw size={13} /></button></span></label>}
-          {engine.name === "Anima" && <label>重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={config.hires.executionMode} disabled={running} onChange={(value) => updateStage("hires", { executionMode: value })} options={[{ value: "usdu_tiled", label: "USDU 分块" }, { value: "full_frame", label: "整图" }]} /></label>}
+          {supportsUsduTiled(engine.name) && <label>重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={config.hires.executionMode} disabled={running} onChange={(value) => updateStage("hires", { executionMode: value })} options={[{ value: "usdu_tiled", label: "USDU 分块" }, { value: "full_frame", label: "整图" }]} /></label>}
           <div className="i2i-compact-grid i2i-select-grid">
             <label>Hires 采样器<WorkspaceSelect ariaLabel="Hires 采样器" value={config.hires.sampler || ""} disabled={running} onChange={(value) => updateStage("hires", { sampler: value || null })} options={[{ value: "", label: "跟随首轮" }, ...engine.samplers.map((name) => ({ value: name, label: name }))]} /></label>
             <label>Hires 调度器<WorkspaceSelect ariaLabel="Hires 调度器" value={config.hires.scheduler || ""} disabled={running} onChange={(value) => updateStage("hires", { scheduler: value || null })} options={[{ value: "", label: "跟随首轮" }, ...engine.schedulers.map((name) => ({ value: name, label: name }))]} /></label>
           </div>
-          {engine.name === "Anima" && config.hires.executionMode === "usdu_tiled" && <><div className="i2i-readonly-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div><p className="i2i-note">Auto 使用首轮源图宽高；padding 32 · mask blur 8 · uniform tiles · tiled decode。</p></>}
+          {supportsUsduTiled(engine.name) && config.hires.executionMode === "usdu_tiled" && <><div className="i2i-readonly-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div><p className="i2i-note">Auto 使用首轮源图宽高；padding 32 · mask blur 8 · uniform tiles · tiled decode。</p></>}
           <div className="i2i-number-grid two"><NumberField label="像素放大分块" value={config.hires.tileSize} min={32} max={2048} integer disabled={running} onChange={(tileSize) => updateStage("hires", { tileSize, tileOverlap: Math.min(config.hires.tileOverlap, Math.floor(tileSize / 2)) })} /><NumberField label="分块重叠" value={config.hires.tileOverlap} min={0} max={Math.min(512, Math.floor(config.hires.tileSize / 2))} integer disabled={running} onChange={(tileOverlap) => updateStage("hires", { tileOverlap })} /></div>
           {!selectedUpscaler && <p className="i2i-stage-warning">请选择兼容的超分模型</p>}
           {config.hires.seedMode === "fixed" && !config.hires.seed && <p className="i2i-stage-warning">固定 Hires Seed 需要填写 0 ～ 18446744073709551615</p>}
@@ -533,7 +533,7 @@ export default function ImageToImagePage({
             <div className={`i2i-compare-figure preview-stage ${job.status}`}>
               <div className="preview-grid" />
               {job.status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>{source ? "已就绪" : "等待来源图片"}</strong><p>{source ? (postprocessOnly ? "选择增强阶段与顺序后开始" : "调整重绘强度后开始生成") : "先放入一张来源图片"}</p><button type="button" onClick={onOpenViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
-              {job.status === "running" && <div className="generating-preview"><div className="step-preview-empty">{job.livePreview ? null : <><ImageIcon size={28} /><span>正在生成</span></>}</div>{job.livePreview && <img className="step-preview-image" src={job.livePreview} alt="实时预览" />}</div>}
+              {job.status === "running" && <div className="generating-preview"><div className="step-preview-empty"><ImageIcon size={28} /><span>正在生成</span></div></div>}
               {job.status === "complete" && selectedOutput && <button className="completed-preview" onClick={onOpenViewer} title="点击放大预览"><img className="generated-image" src={selectedOutput.url} alt={`第 ${job.selectedIndex + 1} 张图生图结果`} /></button>}
               {job.status === "cancelled" && <div className="generation-cancelled"><Square size={30} /><strong>生成已终止</strong><p>已安全停止任务</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>}
               {job.status === "error" && <div className="generation-error"><X size={32} /><strong>生成失败</strong><p>{job.error}</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>}

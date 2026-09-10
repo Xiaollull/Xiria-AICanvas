@@ -5,6 +5,7 @@ import torch
 from backend.prompt_encoding import (
     build_weighted_token_batches,
     encode_weighted_prompt,
+    pad_weighted_encodings,
     parse_prompt_weights,
     prepare_prompt_conditioning,
     prompt_diagnostics,
@@ -124,6 +125,54 @@ class PromptEncodingTests(unittest.TestCase):
         truncated = tokenize_weighted_prompt(FakeTokenizer(), "(abcdef:2)", max_length=4)
         self.assertEqual(truncated["input_ids"].tolist(), [1, 97, 98, 2])
         self.assertEqual(truncated["weights"].tolist(), [1.0, 2.0, 2.0, 1.0])
+
+    def test_without_a_max_length_a_prompt_is_never_cut(self):
+        # `max_length=None` is ComfyUI's setting for every encoder whose context is trained rather
+        # than architectural, written there as `max_length=99999999`.
+        encoded = tokenize_weighted_prompt(FakeTokenizer(), "abcdefghij", max_length=None, padding=None)
+        self.assertEqual(encoded["token_count"], 12)
+        self.assertEqual(encoded["input_ids"].tolist(), [1, *(ord(c) for c in "abcdefghij"), 2])
+        self.assertEqual(encoded["attention_mask"].tolist(), [1] * 12)
+
+    def test_a_min_length_pads_a_short_prompt_and_leaves_a_long_one_alone(self):
+        short = tokenize_weighted_prompt(FakeTokenizer(), "ab", max_length=None, min_length=8, padding=None)
+        self.assertEqual(short["input_ids"].tolist(), [1, 97, 98, 2, 0, 0, 0, 0])
+        self.assertEqual(short["attention_mask"].tolist(), [1, 1, 1, 1, 0, 0, 0, 0])
+        self.assertEqual(short["token_count"], 4)
+
+        long = tokenize_weighted_prompt(FakeTokenizer(), "abcdefghij", max_length=None, min_length=8, padding=None)
+        self.assertEqual(long["input_ids"].shape[0], 12)
+
+    def test_padding_to_max_length_needs_a_max_length_to_pad_to(self):
+        with self.assertRaises(ValueError):
+            tokenize_weighted_prompt(FakeTokenizer(), "ab", max_length=None, padding="max_length")
+        for bad in (0, -1, 1.5, True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                tokenize_weighted_prompt(FakeTokenizer(), "ab", max_length=None, min_length=bad, padding=None)
+
+    def test_a_batch_is_squared_up_by_padding_rather_than_by_cutting(self):
+        tokenizer = FakeTokenizer()
+        encodings = pad_weighted_encodings(
+            tokenizer,
+            [
+                tokenize_weighted_prompt(tokenizer, text, max_length=None, padding=None)
+                for text in ("abcdefghij", "a")
+            ],
+            min_length=4,
+        )
+        self.assertEqual([item["input_ids"].shape[0] for item in encodings], [12, 12])
+        # The long member is untouched and the short one is padded out with masked tokens, so the
+        # rectangle costs the longer prompt nothing.
+        self.assertEqual(encodings[0]["attention_mask"].tolist(), [1] * 12)
+        self.assertEqual(encodings[1]["attention_mask"].tolist(), [1, 1, 1, *([0] * 9)])
+        self.assertEqual([item["token_count"] for item in encodings], [12, 3])
+
+        floor = pad_weighted_encodings(
+            tokenizer,
+            [tokenize_weighted_prompt(tokenizer, "a", max_length=None, padding=None)],
+            min_length=9,
+        )
+        self.assertEqual(floor[0]["input_ids"].shape[0], 9)
 
     def test_long_prompt_uses_multiple_clip_blocks(self):
         batches = build_weighted_token_batches(FakeTokenizer(), "abcdefghi")

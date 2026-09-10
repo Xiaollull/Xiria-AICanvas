@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { normalizeEngineSettings } from "../src/engine-settings.js";
+
 import {
   DISTILLED_GUIDANCE_ENGINES,
   NATIVE_STEP_ENGINES,
@@ -50,7 +52,11 @@ test("a Flux2 generation is guidance distilled: no negative branch, no enhanceme
   assert.match(generate, /guidance: distilledGeneration \? "none" : guidance/);
 
   const selectModel = sourceBetween(app, "  const selectModel = (nextModel)", "  const selectCheckpoint = (nextCheckpoint)");
-  assert.match(selectModel, /\} else if \(nextModel === "Flux2"\) \{[\s\S]*?setGuidance\("none"\);[\s\S]*?setProcessPreview\(false\);/);
+  // As with FLUX.1: distillation is a property of the engine, enforced in the per-engine store.
+  assert.equal(normalizeEngineSettings("Flux2", { guidance: "pag" }).guidance, "none");
+  assert.equal(normalizeEngineSettings("Flux2", { guidance: "cfg_zero_star" }).guidance, "none");
+  assert.match(selectModel, /applyEngineSettings\(restored\)/);
+  assert.doesNotMatch(selectModel, /setProcessPreview/);
 
   // The typed negative prompt survives the switch; only the request drops it.
   assert.match(app, /const isDistilledGuidance = DISTILLED_GUIDANCE_ENGINES\.includes\(model\)/);
@@ -78,7 +84,9 @@ test("the image-to-image request mounts one Flux2 encoder and drops the negative
   assert.equal(body.vae, "flux2-vae.safetensors");
   assert.equal(body.checkpoint, undefined);
   assert.equal(body.negative_prompt, "");
-  assert.equal(body.preview_enabled, false);
+  // The withdrawn latent preview: the request must not carry the field at all, because the
+  // server forbids unknown keys and would refuse the whole generation.
+  assert.equal("preview_enabled" in body, false);
   assert.equal(body.guidance, "none");
   // USDU tiling stays Anima's.
   assert.equal(body.hires.execution_mode, "full_frame");

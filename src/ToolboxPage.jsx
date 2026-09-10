@@ -1,8 +1,10 @@
-import { Suspense, lazy, useState } from "react";
+import { Suspense, lazy } from "react";
 import { Activity, ArrowUpRight, Download, FileSearch, RefreshCw, ScanLine } from "lucide-react";
 
 const ModelDownloader = lazy(() => import("./ModelDownloader"));
 const ImageInfoReader = lazy(() => import("./ImageInfoReader"));
+
+import { useToolboxState } from "./use-toolbox-state";
 
 // The toolbox is a sub-navigation, not a launcher screen: opening it lands on
 // the first tool directly, so reaching the downloader still costs one click
@@ -13,7 +15,11 @@ export const TOOLBOX_TOOLS = [
 ];
 
 export default function ToolboxPage({ onDownloaded, onApplyImageParameters }) {
-  const [activeTool, setActiveTool] = useState(TOOLBOX_TOOLS[0].id);
+  // The selected tool and the reader's working state are project state, not component state: this
+  // page is lazily mounted and is unmounted as soon as the user navigates away, so anything held
+  // in `useState` here was being thrown away on every visit.
+  const { state, ready, error, setActiveTool, setImageInfo } = useToolboxState();
+  const activeTool = state?.activeTool || TOOLBOX_TOOLS[0].id;
   const current = TOOLBOX_TOOLS.find((tool) => tool.id === activeTool) || TOOLBOX_TOOLS[0];
 
   return <section className="toolbox-page">
@@ -36,14 +42,19 @@ export default function ToolboxPage({ onDownloaded, onApplyImageParameters }) {
         <ArrowUpRight className="toolbox-tool-arrow" size={14} />
       </button>)}
       <footer className="toolbox-rail-foot">
-        <div><Activity size={13} /><span>WORKSPACE STATUS</span><b>READY</b></div>
-        <p>工具之间独立运行，切换时保留当前工作区。</p>
+        <div><Activity size={13} /><span>WORKSPACE STATUS</span><b>{ready ? "READY" : "LOADING"}</b></div>
+        {error ? <p className="toolbox-rail-error">{error}</p> : <p>工具之间独立运行，切换时保留当前工作区。</p>}
         <code><ScanLine size={11} /> LOCAL CONTROL PLANE</code>
       </footer>
     </nav>
     <div className="toolbox-stage">
       <Suspense fallback={<div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在加载{current.label}</span></div>}>
-        {activeTool === "image-info" ? <ImageInfoReader onApplyParameters={onApplyImageParameters} /> : <ModelDownloader onDownloaded={onDownloaded} />}
+        {/* Nothing mounts until the snapshot is in. A tool that mounted empty and was handed its
+            state afterwards would flash the empty view and then have to reconcile the restore
+            against whatever the user had already started typing. */}
+        {!ready ? <div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在读取工作区</span></div>
+          : activeTool === "image-info" ? <ImageInfoReader onApplyParameters={onApplyImageParameters} savedState={state.imageInfo} onStateChange={setImageInfo} />
+            : <ModelDownloader onDownloaded={onDownloaded} />}
       </Suspense>
     </div>
   </section>;
