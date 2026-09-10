@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -38,6 +39,19 @@ function firstReplyLine(port) {
   });
 }
 
+function readPageDirect(port) {
+  return new Promise((resolve, reject) => {
+    const request = http.get({ hostname: "127.0.0.1", port, path: "/", agent: false }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode, body }));
+    });
+    request.setTimeout(3000, () => request.destroy(new Error("Timed out reading the local Vite page")));
+    request.on("error", reject);
+  });
+}
+
 async function withServer(server, check) {
   const root = await mkdtemp(path.join(os.tmpdir(), "xirai-no-reload-"));
   await writeFile(path.join(root, "index.html"), "<!doctype html><title>probe</title><p>page</p>");
@@ -62,9 +76,9 @@ test("a default Vite server accepts the handshake the reload waits for", async (
 test("the service settings refuse that handshake and still serve the page", async () => {
   await withServer({ hmr: false, ws: false }, async (port) => {
     assert.doesNotMatch(await firstReplyLine(port), / 101 /, "the socket is still offered, so a dropped connection still reloads the page");
-    const page = await fetch(`http://127.0.0.1:${port}/`);
+    const page = await readPageDirect(port);
     assert.equal(page.status, 200);
-    assert.match(await page.text(), /<p>page<\/p>/);
+    assert.match(page.body, /<p>page<\/p>/);
   });
 });
 
