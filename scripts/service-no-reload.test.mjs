@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -60,7 +59,8 @@ function readPageDirect(port) {
 }
 
 async function withServer(server, check) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "xirai-no-reload-"));
+  // Vite refuses Windows 8.3 paths containing `~`; hosted runners can expose os.tmpdir() that way.
+  const root = await mkdtemp(path.join(projectRoot, "node_modules", ".xirai-no-reload-"));
   await writeFile(path.join(root, "index.html"), "<!doctype html><title>probe</title><p>page</p>");
   // Host filtering is a separate Vite feature and varies with the hosted runner's network setup.
   // This loopback fixture isolates the HMR contract it exists to test.
