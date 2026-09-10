@@ -62,7 +62,9 @@ function readPageDirect(port) {
 async function withServer(server, check) {
   const root = await mkdtemp(path.join(os.tmpdir(), "xirai-no-reload-"));
   await writeFile(path.join(root, "index.html"), "<!doctype html><title>probe</title><p>page</p>");
-  const vite = await createServer({ configFile: false, root, logLevel: "silent", server: { host: "127.0.0.1", port: 0, ...server } });
+  // Host filtering is a separate Vite feature and varies with the hosted runner's network setup.
+  // This loopback fixture isolates the HMR contract it exists to test.
+  const vite = await createServer({ configFile: false, root, logLevel: "silent", server: { host: "127.0.0.1", allowedHosts: true, port: 0, ...server } });
   try {
     await vite.listen();
     const { port } = vite.httpServer.address();
