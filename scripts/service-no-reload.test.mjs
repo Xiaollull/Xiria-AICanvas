@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -41,14 +40,22 @@ function firstReplyLine(port) {
 
 function readPageDirect(port) {
   return new Promise((resolve, reject) => {
-    const request = http.get({ hostname: "127.0.0.1", port, path: "/", agent: false }, (response) => {
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk) => { body += chunk; });
-      response.on("end", () => resolve({ status: response.statusCode, body }));
+    let reply = "";
+    const socket = net.connect(port, "127.0.0.1", () => socket.write([
+      "GET / HTTP/1.1",
+      `Host: 127.0.0.1:${port}`,
+      "Connection: close",
+      "", "",
+    ].join("\r\n")));
+    socket.setEncoding("utf8");
+    socket.setTimeout(3000, () => socket.destroy(new Error("Timed out reading the local Vite page")));
+    socket.on("data", (chunk) => { reply += chunk; });
+    socket.on("end", () => {
+      const [head, body = ""] = reply.split("\r\n\r\n", 2);
+      const status = Number(/^HTTP\/\d(?:\.\d)? (\d{3})/.exec(head)?.[1]);
+      resolve({ status, body });
     });
-    request.setTimeout(3000, () => request.destroy(new Error("Timed out reading the local Vite page")));
-    request.on("error", reject);
+    socket.on("error", reject);
   });
 }
 
