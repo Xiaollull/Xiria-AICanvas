@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const execFileAsync = promisify(execFile);
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const skipBrowserFixture = process.env.XIRAI_SKIP_BROWSER_FIXTURES === "1";
 const chromeCandidates = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -43,7 +44,9 @@ function assertContained(value, label) {
   assert.deepEqual(value.stageStyle, ["rgba(0, 0, 0, 0)", "none"], `${label} stage must be fully transparent; ${geometry}`);
 }
 
-test("local Chromium fully contains extreme panoramic and portrait originals", async (context) => {
+test("local Chromium fully contains extreme panoramic and portrait originals", {
+  skip: skipBrowserFixture && "XIRAI_SKIP_BROWSER_FIXTURES keeps CI independent of runner browsers",
+}, async (context) => {
   const chrome = await chromePath();
   if (!chrome) {
     context.skip("Chromium is unavailable");
