@@ -22,6 +22,16 @@ test("fit is order-independent, 100% is source-pixel scale, and does not mutate 
   assert.equal(JSON.stringify(layers), before);
 });
 
+test("scene bounds and fit include rotation-aware AABBs", () => {
+  const rotated = { ...layer(100, 40, 10, -5, 1), rotation: 90, kind: "text" };
+  const bounds = viewerSceneBounds([rotated]);
+  assert.ok(Math.abs(bounds.left + 10) < 1e-9);
+  assert.ok(Math.abs(bounds.right - 30) < 1e-9);
+  assert.ok(Math.abs(bounds.top + 55) < 1e-9);
+  assert.ok(Math.abs(bounds.bottom - 45) < 1e-9);
+  assert.equal(fitViewerZoom(140, 80, [rotated], 10), .6);
+});
+
 test("zoom keeps the cursor anchor", () => {
   const result = viewerZoomAtPoint(1, { x: 20, y: -10 }, { x: 200, y: 120 }, 2);
   assert.deepEqual(result.pan, { x: -160, y: -140 });

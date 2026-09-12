@@ -6,12 +6,14 @@ function normalizedDigest(value) {
 
 export function filterPendingRecommendedArtifacts(artifacts, installed, queueItems = []) {
   const installedDigests = installed instanceof Map ? new Set(installed.keys()) : new Set(installed || []);
-  const queuedDigests = new Set(queueItems
-    .filter((item) => item.status !== "complete")
+  const activeQueueItems = queueItems.filter((item) => item.status !== "complete");
+  const queuedDigests = new Set(activeQueueItems
     .map((item) => normalizedDigest(item.sha256))
     .filter(Boolean));
+  const queuedArtifactIds = new Set(activeQueueItems.map((item) => item.artifactId).filter(Boolean));
   return artifacts.filter((artifact) => {
     const digest = normalizedDigest(artifact.sha256);
+    if (artifact.id && queuedArtifactIds.has(artifact.id)) return false;
     return !digest || (!installedDigests.has(digest) && !queuedDigests.has(digest));
   });
 }

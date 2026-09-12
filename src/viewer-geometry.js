@@ -7,6 +7,8 @@ export const VIEWER_MAX_HANDLE_EPSILON = VIEWER_MIN_TOTAL_SCALE;
 export const VIEWER_MAX_INVERSE_SCALE = 256;
 export const VIEWER_MIN_INVERSE_SCALE = 1 / VIEWER_MAX_INVERSE_SCALE;
 export const VIEWER_RESIZE_CHANGE_EPSILON = 0.000001;
+export const VIEWER_BRUSH_CURSOR_MIN_PX = 3;
+export const VIEWER_BRUSH_CURSOR_MAX_PX = 8192;
 
 export function inverseViewerHandleScale(viewerZoom, layerScale, epsilon = 0.0001) {
   const zoom = Number(viewerZoom);
@@ -34,6 +36,30 @@ export function viewerHandleScreenMetrics(viewerZoom, layerScale) {
     visualPx: VIEWER_HANDLE_VISUAL_PX * screenScale,
     hitPx: VIEWER_HANDLE_HIT_PX * screenScale,
   };
+}
+
+// The brush ring is drawn at the size of the pixels the stroke will cover: a stroke is stored in
+// the layer's own pixels, so the ring is brush pixels x that layer's scale x the viewer's zoom.
+// It stays a DOM circle rather than a `cursor:` image because CSS cursors stop at 128px, while a
+// 300px brush at 8x zoom needs far more; the floor keeps a one-pixel brush visible when zoomed out.
+export function viewerBrushCursorSize(brushSize, viewerZoom, layerScale = 1) {
+  const size = Number(brushSize);
+  const zoom = Number(viewerZoom);
+  const scale = Number(layerScale);
+  const product = size * (Number.isFinite(zoom) && zoom > 0 ? zoom : 1) * (Number.isFinite(scale) && scale > 0 ? scale : 1);
+  if (!Number.isFinite(product) || product <= 0) return VIEWER_BRUSH_CURSOR_MIN_PX;
+  return Math.max(VIEWER_BRUSH_CURSOR_MIN_PX, Math.min(VIEWER_BRUSH_CURSOR_MAX_PX, product));
+}
+
+// The rectangle a drag has swept, normalised so dragging up or left describes the same box as
+// dragging down or right.
+export function viewerMarqueeRect(origin, current) {
+  const coordinate = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const left = Math.min(coordinate(origin?.x), coordinate(current?.x));
+  const top = Math.min(coordinate(origin?.y), coordinate(current?.y));
+  const width = Math.abs(coordinate(current?.x) - coordinate(origin?.x));
+  const height = Math.abs(coordinate(current?.y) - coordinate(origin?.y));
+  return { x: left, y: top, width, height, centerX: left + width / 2, centerY: top + height / 2 };
 }
 
 export function viewerResizeChanged(initial, next, epsilon = VIEWER_RESIZE_CHANGE_EPSILON) {
@@ -87,11 +113,7 @@ export function intrinsicDimensions(width, height) {
 }
 
 export function viewerLayerBounds(layer) {
-  const { naturalWidth, naturalHeight } = intrinsicDimensions(layer.naturalWidth, layer.naturalHeight);
-  const scale = Math.max(0.1, Number(layer.scale) || 1);
-  const width = naturalWidth * scale;
-  const height = naturalHeight * scale;
-  return { left: layer.x - width / 2, right: layer.x + width / 2, top: layer.y - height / 2, bottom: layer.y + height / 2, width, height };
+  return viewerEditorLayerBounds(layer);
 }
 
 export function viewerSceneBounds(layers) {
@@ -118,3 +140,4 @@ export function viewerZoomAtPoint(currentZoom, currentPan, pointer, factor) {
   const ratio = nextZoom / currentZoom;
   return { zoom: nextZoom, pan: { x: pointer.x - (pointer.x - currentPan.x) * ratio, y: pointer.y - (pointer.y - currentPan.y) * ratio } };
 }
+import { viewerEditorLayerBounds } from "./viewer-editor.js";

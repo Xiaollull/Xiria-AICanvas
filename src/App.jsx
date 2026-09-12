@@ -1,7 +1,58 @@
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
-import { fitViewerZoom, inverseViewerHandleScale, intrinsicDimensions, viewerLayerBounds, viewerResizeGestureMove, viewerResizeDisableDecision, viewerZoomAtPoint, VIEWER_MAX_ZOOM, VIEWER_MIN_ZOOM } from "./viewer-geometry.js";
+import { fitViewerZoom, inverseViewerHandleScale, intrinsicDimensions, viewerBrushCursorSize, viewerLayerBounds, viewerMarqueeRect, viewerResizeGestureMove, viewerResizeDisableDecision, viewerZoomAtPoint, VIEWER_MAX_ZOOM, VIEWER_MIN_ZOOM } from "./viewer-geometry.js";
 import { createViewerRafScheduler, ViewerAsyncSession, viewerOpenPlan } from "./viewer-async-session.js";
 import { VIEWER_TOOLBAR_POPOVER_LAYOUT, VIEWER_TOOLBAR_POPOVER_TEMPLATES, viewerEscapeAction, viewerToolbarPopoverTransition } from "./viewer-toolbar.js";
+import {
+  appendStrokePoints,
+  admitViewerUndoSnapshot,
+  assertViewerByteBudget,
+  clipStrokeSamples,
+  clientPointToLayer,
+  clientPointToScene,
+  cloneViewerLayer,
+  cloneViewerLayers,
+  drawViewerLayer,
+  hasLayerPaint,
+  hasViewerEdits,
+  mapViewerConcurrent,
+  measureTextLayer,
+  normalizeManualLayout,
+  normalizePaintStroke,
+  normalizeRotation,
+  normalizeTextLayer,
+  normalizeViewerColor,
+  normalizeViewerEdgeLine,
+  persistedManualLayout,
+  readViewerFileAsDataUrl,
+  renderRasterLayer,
+  resolvedCollageEntries,
+  serializeViewerLayer,
+  viewerCanvasDimensions,
+  viewerAbortError,
+  viewerAnimatedBatchAdmission,
+  viewerClipboardPasteIntent,
+  viewerDataUrlBytes,
+  viewerFileBatchAdmission,
+  viewerLayerKind,
+  viewerLayerSourceByteCount,
+  viewerSafeResizeHandles,
+  viewerStrokeCount,
+  viewerStrokePointCount,
+  viewerTextBox,
+  viewerTextBoxResize,
+  VIEWER_DEFAULT_COLOR,
+  VIEWER_RESIZE_HANDLES,
+  VIEWER_MAX_LAYOUT_POINTS,
+  VIEWER_MAX_LAYOUT_STROKES,
+  VIEWER_MAX_FILE_BYTES,
+  VIEWER_MAX_ANIMATED_SOURCE_BYTES,
+  VIEWER_MAX_LAYER_SOURCE_BYTES,
+  VIEWER_MAX_OUTPUT_BYTES,
+  VIEWER_MAX_RESTORE_PIXELS,
+  VIEWER_MAX_STROKE_POINTS,
+  VIEWER_TEXT_MIN_BOX,
+} from "./viewer-editor.js";
+import ViewerRasterLayer from "./ViewerRasterLayer.jsx";
 import { pluginDiagnosticMessage, pluginRegistrySummary, pluginRemoveConfirmation, pluginStatePresentation, pluginToggleAvailable } from "./plugin-presentation.js";
 import { appendHardwareSample, EMPTY_HARDWARE_HISTORY, formatMib, HARDWARE_POLL_MS, sensorAgeLabel, sparklineSegments, vramWallPercent } from "./hardware-monitor.js";
 import { collapseConsoleEntries, progressFigures } from "./console-progress.js";
@@ -10,6 +61,9 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   Blocks,
   Check,
   ChevronLeft,
@@ -19,6 +73,7 @@ import {
   Copy,
   Cpu,
   Download,
+  Eraser,
   ExternalLink,
   Eye,
   EyeOff,
@@ -33,13 +88,16 @@ import {
   Maximize2,
   Minimize2,
   Move,
+  MousePointer2,
   PanelLeft,
   Pause,
   Palette,
+  Paintbrush,
   Pencil,
   Play,
   Plus,
   RefreshCw,
+  RotateCw,
   Search,
   Save,
   Send,
@@ -51,6 +109,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  Type,
   Upload,
   WandSparkles,
   Wrench,
@@ -393,15 +452,16 @@ function adaptiveCollageLayout(template, entries) {
 }
 
 function drawEdgeLine(context, x, y, width, height, options, scale = 1, hiddenSides = []) {
-  if (!options.enabled) return;
-  const lineWidth = Math.max(1, options.width * scale);
+  const normalized = normalizeViewerEdgeLine(options);
+  if (!normalized.enabled) return;
+  const lineWidth = Math.max(1, normalized.width * Math.max(0.000001, Number(scale) || 1));
   const hidden = new Set(hiddenSides);
   context.save();
-  context.strokeStyle = options.color;
-  context.lineWidth = options.style === "double" ? lineWidth * 3 : lineWidth;
-  if (options.style === "dashed") context.setLineDash([lineWidth * 4, lineWidth * 2.5]);
-  if (options.style === "dotted") { context.setLineDash([lineWidth, lineWidth * 2.4]); context.lineCap = "round"; }
-  if (options.style === "glow") { context.shadowColor = options.color; context.shadowBlur = lineWidth * 5; }
+  context.strokeStyle = normalized.color;
+  context.lineWidth = normalized.style === "double" ? lineWidth * 3 : lineWidth;
+  if (normalized.style === "dashed") context.setLineDash([lineWidth * 4, lineWidth * 2.5]);
+  if (normalized.style === "dotted") { context.setLineDash([lineWidth, lineWidth * 2.4]); context.lineCap = "round"; }
+  if (normalized.style === "glow") { context.shadowColor = normalized.color; context.shadowBlur = lineWidth * 5; }
   const strokeSides = (inset = context.lineWidth / 2) => {
     const left = x + inset;
     const top = y + inset;
@@ -416,7 +476,7 @@ function drawEdgeLine(context, x, y, width, height, options, scale = 1, hiddenSi
   };
   if (hidden.size) strokeSides();
   else context.strokeRect(x + context.lineWidth / 2, y + context.lineWidth / 2, Math.max(0, width - context.lineWidth), Math.max(0, height - context.lineWidth));
-  if (options.style === "double") {
+  if (normalized.style === "double") {
     context.lineWidth = lineWidth;
     if (hidden.size) strokeSides(lineWidth * 2.5);
     else context.strokeRect(x + lineWidth * 2.5, y + lineWidth * 2.5, Math.max(0, width - lineWidth * 5), Math.max(0, height - lineWidth * 5));
@@ -482,16 +542,88 @@ function randomSeed() {
   return secureRandomUint64Seed();
 }
 
-function loadBrowserImage(source) {
+function loadBrowserImage(source, { signal } = {}) {
+  if (signal?.aborted) return Promise.reject(signal.reason?.name === "AbortError" ? signal.reason : viewerAbortError());
   return new Promise((resolve, reject) => {
     const image = new Image();
-    image.onload = async () => { try { if (image.decode) await image.decode(); } catch {} resolve(image); };
-    image.onerror = () => reject(new Error("图片读取失败"));
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener?.("abort", onAbort);
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      image.onload = null;
+      image.onerror = null;
+      callback(value);
+    };
+    const onAbort = () => {
+      image.src = "";
+      finish(reject, signal.reason?.name === "AbortError" ? signal.reason : viewerAbortError());
+    };
+    image.onload = async () => {
+      try { if (image.decode) await image.decode(); } catch {}
+      if (signal?.aborted) onAbort();
+      else finish(resolve, image);
+    };
+    image.onerror = () => finish(reject, new Error("图片读取失败"));
+    signal?.addEventListener?.("abort", onAbort, { once: true });
     image.src = source;
   });
 }
 
+async function boundedViewerResponseBlob(response, maximumBytes, signal, onSourceBytes, purpose = "图片源") {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared)) assertViewerByteBudget(declared, maximumBytes, purpose);
+  if (!response.body?.getReader) {
+    const blob = await response.blob();
+    if (signal?.aborted) throw signal.reason?.name === "AbortError" ? signal.reason : viewerAbortError();
+    assertViewerByteBudget(blob.size, maximumBytes, purpose);
+    onSourceBytes?.(blob.size);
+    return blob;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      if (signal?.aborted) throw signal.reason?.name === "AbortError" ? signal.reason : viewerAbortError();
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      assertViewerByteBudget(totalBytes, maximumBytes, purpose);
+      onSourceBytes?.(value.byteLength);
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  return new Blob(chunks, { type: response.headers.get("content-type") || "application/octet-stream" });
+}
+
+async function loadBudgetedBrowserImage(source, { signal, maximumBytes = VIEWER_MAX_FILE_BYTES, onSourceBytes } = {}) {
+  if (typeof source !== "string" || !source) throw new Error("图片来源无效");
+  if (source.startsWith("data:")) {
+    const bytes = viewerDataUrlBytes(source);
+    assertViewerByteBudget(bytes, maximumBytes, "图片源");
+    onSourceBytes?.(bytes);
+    return { image: await loadBrowserImage(source, { signal }), sourceBytes: bytes };
+  }
+  const response = await fetch(source, { signal, cache: "no-store" });
+  if (!response.ok) throw new Error("图片读取失败");
+  const blob = await boundedViewerResponseBlob(response, maximumBytes, signal, onSourceBytes);
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    return { image: await loadBrowserImage(objectUrl, { signal }), sourceBytes: blob.size };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 function dataUrlBlob(dataUrl) {
+  if (viewerDataUrlBytes(dataUrl) > VIEWER_MAX_FILE_BYTES) throw new Error("图片源超过 128 MiB 上限");
   const [header, encoded] = dataUrl.split(",", 2);
   const mime = header.match(/data:([^;]+)/)?.[1] || "image/png";
   const bytes = atob(encoded);
@@ -500,19 +632,20 @@ function dataUrlBlob(dataUrl) {
   return new Blob([array], { type: mime });
 }
 
-function readImageFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error("图片读取失败"));
-    reader.readAsDataURL(file);
-  });
+function readImageFile(file, options) {
+  return readViewerFileAsDataUrl(file, options);
 }
 
-async function imageAssetFromSource(asset) {
-  const image = await loadBrowserImage(asset.url);
+function newViewerIdempotencyKey() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `viewer-${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function imageAssetFromSource(asset, options = {}) {
+  const { image, sourceBytes } = await loadBudgetedBrowserImage(asset.url, options);
   const { naturalWidth, naturalHeight } = intrinsicDimensions(image.naturalWidth, image.naturalHeight);
-  return { ...asset, naturalWidth, naturalHeight };
+  viewerCanvasDimensions(naturalWidth, naturalHeight, "图片图层");
+  return { ...asset, naturalWidth, naturalHeight, sourceBytes };
 }
 
 function isGifAsset(asset) {
@@ -521,28 +654,90 @@ function isGifAsset(asset) {
   return mime === "image/gif" || source.startsWith("data:image/gif") || /\.gif(?:$|[?#])/i.test(asset?.name || "");
 }
 
-async function renderAnimatedCollage(layers, width, height, edgeLine) {
+async function renderAnimatedCollage(layers, width, height, edgeLine, { signal } = {}) {
+  viewerCanvasDimensions(width, height, "GIF 拼图画布");
   const response = await fetch("/api/inference/collages/animated", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ layers, width, height, edge_line: edgeLine }),
+    signal,
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.detail || "GIF 拼图合成失败");
   }
-  return readImageFile(await response.blob());
+  const blob = await boundedViewerResponseBlob(response, VIEWER_MAX_OUTPUT_BYTES, signal, null, "GIF 拼图输出");
+  return readImageFile(blob, { signal });
 }
 
-async function imageSourceDataUrl(source) {
-  if (source.startsWith("data:image/")) return source;
-  const response = await fetch(source);
+async function imageSourceDataUrl(source, { signal } = {}) {
+  if (signal?.aborted) throw signal.reason?.name === "AbortError" ? signal.reason : viewerAbortError();
+  if (source.startsWith("data:image/")) {
+    assertViewerByteBudget(viewerDataUrlBytes(source), VIEWER_MAX_ANIMATED_SOURCE_BYTES, "GIF 拼图单个源图");
+    return source;
+  }
+  const response = await fetch(source, { signal, cache: "no-store" });
   if (!response.ok) throw new Error("无法读取 GIF 拼图源图");
-  return readImageFile(await response.blob());
+  const blob = await boundedViewerResponseBlob(response, VIEWER_MAX_ANIMATED_SOURCE_BYTES, signal, null, "GIF 拼图单个源图");
+  return readImageFile(blob, { signal });
+}
+
+function measureViewerText(value) {
+  const normalized = normalizeTextLayer(value);
+  viewerCanvasDimensions(300, 150, "文字测量画布");
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  context.font = `${normalized.fontWeight} ${normalized.fontSize}px ${normalized.fontFamily}`;
+  const measured = measureTextLayer(normalized.text, normalized, (text) => context.measureText(text).width);
+  // The wrapped lines come back with the size: a box renders exactly these lines, so the same font
+  // metrics that laid them out here lay them out again in the exported canvas.
+  return { ...normalized, naturalWidth: measured.naturalWidth, naturalHeight: measured.naturalHeight, lines: measured.lines };
+}
+
+async function viewerLayerBitmap(layer, { signal } = {}) {
+  if (viewerLayerKind(layer) === "text") return null;
+  const { image } = await loadBudgetedBrowserImage(layer.originalUrl || layer.url, { signal });
+  if (!hasLayerPaint(layer)) return image;
+  viewerCanvasDimensions(layer.naturalWidth || image.naturalWidth, layer.naturalHeight || image.naturalHeight, "图片编辑画布");
+  return renderRasterLayer(document.createElement("canvas"), image, layer);
+}
+
+function canvasToBlob(canvas, type = "image/png") {
+  return new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("PNG 编码失败")), type));
+}
+
+async function renderViewerLayerPng(layer, { signal } = {}) {
+  const source = await viewerLayerBitmap(layer, { signal });
+  const bounds = viewerLayerBounds(layer);
+  const dimensions = viewerCanvasDimensions(bounds.width, bounds.height, "图层复制画布");
+  const canvas = document.createElement("canvas");
+  canvas.width = dimensions.width;
+  canvas.height = dimensions.height;
+  const context = canvas.getContext("2d", { alpha: true });
+  drawViewerLayer(context, layer, source, bounds);
+  if (signal?.aborted) throw signal.reason?.name === "AbortError" ? signal.reason : viewerAbortError();
+  return canvasToBlob(canvas);
+}
+
+function drawViewerLayerEdge(context, layer, bounds, options, outputScale = 1, hiddenSides = []) {
+  if (viewerLayerKind(layer) === "text") return;
+  const normalized = normalizeViewerEdgeLine(options);
+  if (!normalized.enabled) return;
+  context.save();
+  context.translate((layer.x - bounds.left) * outputScale, (layer.y - bounds.top) * outputScale);
+  context.rotate(normalizeRotation(layer.rotation) * Math.PI / 180);
+  context.scale(layer.scale * outputScale, layer.scale * outputScale);
+  context.translate(-layer.naturalWidth / 2, -layer.naturalHeight / 2);
+  drawEdgeLine(context, 0, 0, layer.naturalWidth, layer.naturalHeight, normalized, 1 / Math.max(.000001, layer.scale), hiddenSides);
+  context.restore();
 }
 
 function isEditableTarget(target) {
   return target instanceof Element && Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+}
+
+function viewerResizeHandles(layer) {
+  return viewerSafeResizeHandles(layer);
 }
 
 function sharedEdgeLineSegments(rectangles, tolerance = 1) {
@@ -1273,6 +1468,12 @@ function App() {
   const [viewerLayers, setViewerLayers] = useState([]);
   const [viewerLayerResizeEnabled, setViewerLayerResizeEnabled] = useState(true);
   const [activeViewerLayer, setActiveViewerLayer] = useState("");
+  const [viewerTool, setViewerTool] = useState("move");
+  const [viewerBrush, setViewerBrush] = useState({ size: 40, opacity: 100, color: VIEWER_DEFAULT_COLOR });
+  const [viewerTextDefaults, setViewerTextDefaults] = useState({ text: "文字图层", fontFamily: "Arial, sans-serif", fontSize: 48, fontWeight: 400, color: VIEWER_DEFAULT_COLOR, textAlign: "left", lineHeight: 1.2, rotation: 0 });
+  const [editingViewerText, setEditingViewerText] = useState("");
+  const [viewerTextMarquee, setViewerTextMarquee] = useState(null);
+  const [viewerPointerOverCanvas, setViewerPointerOverCanvas] = useState(false);
   const [viewerGridSize, setViewerGridSize] = useState(16);
   const [viewerGridEnabled, setViewerGridEnabled] = useState(true);
   const [viewerEdgeSnapEnabled, setViewerEdgeSnapEnabled] = useState(false);
@@ -1281,11 +1482,12 @@ function App() {
   const [viewerSnappedLayers, setViewerSnappedLayers] = useState([]);
   const [viewerLayerEdges, setViewerLayerEdges] = useState({});
   const [viewerEdgePanelOpen, setViewerEdgePanelOpen] = useState(false);
-  const [viewerEdgeLine, setViewerEdgeLine] = useState({ enabled: false, style: "solid", color: "#D6FF3F", width: 2 });
+  const [viewerEdgeLine, setViewerEdgeLine] = useState(() => normalizeViewerEdgeLine({ enabled: false, style: "solid", color: VIEWER_DEFAULT_COLOR, width: 2 }));
   const [viewerTemplatesOpen, setViewerTemplatesOpen] = useState(false);
   const [activeCollage, setActiveCollage] = useState(null);
   const [activeCollageSlot, setActiveCollageSlot] = useState(-1);
   const [collageResult, setCollageResult] = useState(null);
+  const [viewerCollageBusy, setViewerCollageBusy] = useState("");
   const [viewerMenu, setViewerMenu] = useState(null);
   const [historyDelete, setHistoryDelete] = useState(null);
   const [viewerNotice, setViewerNotice] = useState("");
@@ -1303,9 +1505,13 @@ function App() {
   // the app is served to, and only the input is held back when the host has not allowed it.
   const [consoleCommandsAllowed, setConsoleCommandsAllowed] = useState(true);
   const viewerDrag = useRef(null);
+  const viewerTextEdit = useRef(null);
+  const viewerPropertyEdit = useRef(null);
   const viewerNudge = useRef(null);
   const viewerUndo = useRef([]);
+  const viewerSourceBytes = useRef(0);
   const viewerClipboard = useRef(null);
+  const viewerCollageOperation = useRef(null);
   // Over plain HTTP a page cannot put a picture on the clipboard at all: no clipboard API exists
   // outside a secure context. The browser's own right-click menu still can -- that is how filecat's
   // enlarged preview copies -- so on such a page a plain right-click on a layer is left to the
@@ -1319,6 +1525,9 @@ function App() {
     setViewerNotice("HTTP 访问：请用浏览器菜单的「复制图片」复制（不含生成元数据）；Shift + 右键打开删除等操作");
   };
   const viewerCanvasRef = useRef(null);
+  const viewerBrushCursorRef = useRef(null);
+  const viewerBrushCursorAt = useRef(null);
+  const viewerTextEditorRef = useRef(null);
   const viewerToolbarRef = useRef(null);
   const viewerEdgeTriggerRef = useRef(null);
   const viewerTemplateTriggerRef = useRef(null);
@@ -1326,6 +1535,11 @@ function App() {
   const viewerTemplatePanelRef = useRef(null);
   const viewerHistoryRef = useRef(null);
   const viewerHistoryScroll = useRef(0);
+  const handleViewerRasterError = useCallback((error) => setViewerNotice(error?.message || "图片编辑层读取失败"), []);
+
+  useEffect(() => {
+    viewerSourceBytes.current = viewerLayerSourceByteCount(viewerLayers);
+  }, [viewerLayers]);
   const loaderStartedAt = useRef(Date.now());
   const generationLocked = useRef(false);
   // Guards the submit request itself, so a double click sends one job rather than two. It is
@@ -2083,6 +2297,12 @@ function App() {
     void refreshViewerHistory();
     const handleEscape = (event) => {
       if (event.key !== "Escape") return;
+      if (editingViewerText) {
+        event.preventDefault();
+        cancelViewerTextEdit();
+        return;
+      }
+      if (isEditableTarget(event.target)) return;
       const action = viewerEscapeAction({ historyDelete, contextMenu: viewerMenu, popover: viewerEdgePanelOpen ? VIEWER_TOOLBAR_POPOVER_LAYOUT : viewerTemplatesOpen ? VIEWER_TOOLBAR_POPOVER_TEMPLATES : "none", historyBatch: viewerHistoryBatch });
       if (action === "historyDelete") setHistoryDelete(null);
       else if (action === "contextMenu") setViewerMenu(null);
@@ -2105,7 +2325,7 @@ function App() {
       window.removeEventListener("keydown", handleEscape);
       window.removeEventListener("pointerdown", closeMenu);
     };
-  }, [imageViewerOpen, historyDelete, viewerMenu, viewerEdgePanelOpen, viewerTemplatesOpen, viewerHistoryBatch]);
+  }, [imageViewerOpen, historyDelete, viewerMenu, viewerEdgePanelOpen, viewerTemplatesOpen, viewerHistoryBatch, editingViewerText]);
 
   useEffect(() => {
     if (!imageViewerOpen) return undefined;
@@ -3382,10 +3602,38 @@ function App() {
     setViewerPan({ x: 0, y: 0 });
   };
 
+  const invalidateViewerComposition = (options) => {
+    viewerSession.current.revise(options);
+    viewerCollageOperation.current = null;
+    setViewerCollageBusy("");
+  };
+
+  const beginViewerCollageOperation = (kind) => {
+    const token = viewerSession.current.beginOperation(kind, { group: "collage", abortable: true });
+    if (!token) return null;
+    viewerCollageOperation.current = token;
+    setViewerCollageBusy(kind);
+    return token;
+  };
+
+  const finishViewerCollageOperation = (token) => {
+    if (!viewerSession.current.finishOperation(token)) return;
+    if (viewerCollageOperation.current === token) viewerCollageOperation.current = null;
+    setViewerCollageBusy("");
+  };
+
   const closeImageViewer = () => {
+    const drag = viewerDrag.current;
+    if (drag?.pointerTarget?.hasPointerCapture?.(drag.pointerId)) drag.pointerTarget.releasePointerCapture?.(drag.pointerId);
+    viewerDrag.current = null;
+    viewerTextEdit.current = null;
+    viewerPropertyEdit.current = null;
+    setEditingViewerText("");
     viewerFitRaf.current?.cancel();
     viewerFitRaf.current = null;
     viewerSession.current.close();
+    viewerCollageOperation.current = null;
+    setViewerCollageBusy("");
     setImageViewerOpen(false);
     setViewerMenu(null);
     setViewerEdgePanelOpen(false);
@@ -3421,11 +3669,19 @@ function App() {
     viewerFitRaf.current?.cancel();
     viewerFitRaf.current = null;
     const session = viewerSession.current.beginSession();
-    const token = viewerSession.current.request("open", { session, latest: true });
+    viewerCollageOperation.current = null;
+    setViewerCollageBusy("");
+    const token = viewerSession.current.beginReplacement("open", { session });
     setViewerZoom(1);
+    setViewerTool("move");
+    setEditingViewerText("");
+    viewerTextEdit.current = null;
+    viewerPropertyEdit.current = null;
+    viewerDrag.current = null;
     setViewerLayerResizeEnabled(true);
     setViewerPan({ x: 0, y: 0 });
     viewerUndo.current = [];
+    viewerSourceBytes.current = 0;
     setViewerLayers([]);
     setActiveViewerLayer("");
     setViewerHistoryBatch(null);
@@ -3444,11 +3700,12 @@ function App() {
       assetId: selectedOutput?.asset_id || "",
       url: generatedImage,
       name: generatedName || "XirAI.png",
-    }).then((asset) => ({ ...asset, x: 0, y: 0, scale: 1 })).catch((error) => {
+    }, { signal: token.signal }).then((asset) => ({ ...asset, originalUrl: asset.url, x: 0, y: 0, scale: 1, rotation: 0, paintStrokes: [] })).catch((error) => {
       if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
       return null;
     });
     if (!viewerSession.current.isCurrent(token) || !initialLayer) return;
+    viewerSourceBytes.current = initialLayer.sourceBytes || 0;
     setViewerLayers([initialLayer]);
     setActiveViewerLayer(initialLayer.id);
     if (initialLayer) {
@@ -3499,17 +3756,26 @@ function App() {
   }).filter((card) => card.files.length > 0);
 
   const saveViewerUndo = (snapshot = { layers: viewerLayers, snappedLayers: viewerSnappedLayers, activeLayer: activeViewerLayer }) => {
-    viewerUndo.current = [...viewerUndo.current.slice(-49), {
-      layers: snapshot.layers.map((layer) => ({ ...layer })),
+    const admission = admitViewerUndoSnapshot(viewerUndo.current, snapshot);
+    if (!admission.saved) {
+      queueMicrotask(() => setViewerNotice(admission.reason));
+      return false;
+    }
+    const stored = {
+      layers: cloneViewerLayers(snapshot.layers),
       snappedLayers: [...snapshot.snappedLayers],
       activeLayer: snapshot.activeLayer,
-    }];
+    };
+    viewerUndo.current = admitViewerUndoSnapshot(viewerUndo.current, stored).stack;
+    return true;
   };
 
   const undoViewerChange = () => {
     const snapshot = viewerUndo.current.pop();
     if (!snapshot) return;
-    setViewerLayers(snapshot.layers);
+    const layers = cloneViewerLayers(snapshot.layers);
+    viewerSourceBytes.current = viewerLayerSourceByteCount(layers);
+    setViewerLayers(layers);
     setViewerSnappedLayers(snapshot.snappedLayers);
     setActiveViewerLayer(snapshot.activeLayer);
     setViewerSnapGuide(null);
@@ -3521,45 +3787,86 @@ function App() {
     assetId: asset.id || asset.asset_id || "",
     url: asset.url,
     originalUrl: asset.originalUrl || asset.url,
+    sourceBytes: Number.isFinite(asset.sourceBytes)
+      ? Math.max(0, asset.sourceBytes)
+      : String(asset.originalUrl || asset.url || "").startsWith("data:") ? viewerDataUrlBytes(asset.originalUrl || asset.url) : undefined,
     naturalWidth: asset.naturalWidth || asset.width || 1,
     naturalHeight: asset.naturalHeight || asset.height || 1,
     name: asset.name || asset.output_name || "XirAI.png",
     x: position.x ?? 0,
     y: position.y ?? 0,
     scale: 1,
+    rotation: normalizeRotation(asset.rotation),
+    paintStrokes: Array.isArray(asset.paintStrokes) ? cloneViewerLayer(asset).paintStrokes : [],
     isCollage: Boolean(asset.manual_layout || asset.manualLayout),
     manualLayout: asset.manual_layout || asset.manualLayout || null,
+    manualLayoutTrusted: asset.manualLayoutTrusted === true,
     mimeType: asset.mime_type || asset.mimeType || "",
   });
 
-  const restoreManualCollage = async (layout) => {
+  const restoreManualCollage = async (layout, { trustedCurrentSession = false } = {}) => {
     viewerFitRaf.current?.cancel();
     viewerFitRaf.current = null;
     const session = viewerSession.current.beginSession();
-    const token = viewerSession.current.request("restore", { session, latest: true });
-    const sourceLayers = layout?.layers?.filter((layer) => typeof layer?.url === "string" && layer.url) || [];
+    viewerCollageOperation.current = null;
+    setViewerCollageBusy("");
+    const token = viewerSession.current.beginReplacement("restore", { session });
+    const normalizedLayout = normalizeManualLayout(layout, { trustedCurrentSession });
+    const sourceLayers = normalizedLayout?.layers || [];
     if (!sourceLayers.length) {
-      setViewerNotice("该拼图没有可恢复的原图布局");
+      setViewerNotice("该布局版本、资源预算或图片来源不安全，未替换当前画布");
       return false;
     }
-    const loadedLayers = await Promise.all(sourceLayers.map((layer) => imageAssetFromSource(layer).catch((error) => {
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
-      return null;
-    })));
+    let restoredSourceBytes = 0;
+    let restoredPixels = 0;
+    let loadedLayers;
+    try {
+      loadedLayers = await mapViewerConcurrent(sourceLayers, 4, async (layer) => {
+        if (viewerLayerKind(layer) === "text") return { layer: measureViewerText(layer), error: null };
+        try {
+          const loaded = await imageAssetFromSource({ ...layer, url: layer.originalUrl || layer.url }, {
+            signal: token.signal,
+            onSourceBytes(bytes) {
+              if (restoredSourceBytes + bytes > VIEWER_MAX_LAYER_SOURCE_BYTES) throw Object.assign(new Error("恢复布局的图片源总量超过 256 MiB 上限"), { viewerBudget: true });
+              restoredSourceBytes += bytes;
+            },
+          });
+          if (!viewerSession.current.isCurrent(token)) throw viewerAbortError();
+          const pixels = loaded.naturalWidth * loaded.naturalHeight;
+          if (restoredPixels + pixels > VIEWER_MAX_RESTORE_PIXELS) throw Object.assign(new Error("恢复布局的源图像素总量超过 128 MP 上限"), { viewerBudget: true });
+          restoredPixels += pixels;
+          return { layer: loaded, error: null };
+        } catch (error) {
+          if (error?.viewerBudget || error?.name === "AbortError") throw error;
+          return { layer: null, error };
+        }
+      }, { signal: token.signal, controller: token.controller });
+    } catch (error) {
+      if (error?.name !== "AbortError" && viewerSession.current.isOwned(token)) setViewerNotice(error.message);
+      return false;
+    }
     if (!viewerSession.current.isCurrent(token)) return false;
-    const restored = loadedLayers.filter(Boolean).map((layer, index) => ({
+    const failedCount = loadedLayers.filter((entry) => !entry.layer).length;
+    const restored = loadedLayers.map((entry) => entry.layer).filter(Boolean).map((layer, index) => cloneViewerLayer({
+      ...layer,
       id: `restored-${Date.now()}-${index}-${Math.random().toString(16).slice(2)}`,
       assetId: layer.assetId || "",
-      url: layer.url,
-      originalUrl: layer.originalUrl || layer.url,
+      url: layer.url || "",
+      originalUrl: layer.originalUrl || layer.url || "",
       naturalWidth: layer.naturalWidth,
       naturalHeight: layer.naturalHeight,
-      name: layer.name || `图片 ${index + 1}`,
+      name: layer.name || (viewerLayerKind(layer) === "text" ? "文字图层" : `图片 ${index + 1}`),
       x: Number.isFinite(layer.x) ? layer.x : 0,
       y: Number.isFinite(layer.y) ? layer.y : 0,
       scale: Math.max(.1, Math.min(8, Number(layer.scale) || 1)),
+      rotation: normalizeRotation(layer.rotation),
     }));
+    if (!restored.length) {
+      setViewerNotice("布局中的源图均无法读取，未替换当前画布");
+      return false;
+    }
     viewerUndo.current = [];
+    viewerSourceBytes.current = viewerLayerSourceByteCount(restored);
     setViewerLayers(restored);
     setViewerSnappedLayers([]);
     setActiveViewerLayer(restored.at(-1).id);
@@ -3567,20 +3874,24 @@ function App() {
     setViewerPan({ x: 0, y: 0 });
     setCollageResult(null);
     setViewerMenu(null);
-    setViewerNotice("已恢复原图、位置和实际缩放，可继续无损排版");
+    setViewerNotice(failedCount
+      ? `已恢复 manualLayout v${normalizedLayout.version} 的 ${restored.length} 个图层；${failedCount} 个历史源读取失败，已跳过`
+      : `已恢复 manualLayout v${normalizedLayout.version} 的图像、笔画与文字，可继续无损编辑`);
     return true;
   };
 
   const focusViewerAsset = async (asset) => {
-    const token = viewerSession.current.request("focus", { latest: true });
-    const loaded = await imageAssetFromSource(asset).catch((error) => {
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
+    invalidateViewerComposition();
+    const token = viewerSession.current.beginReplacement("focus");
+    const loaded = await imageAssetFromSource(asset, { signal: token.signal }).catch((error) => {
+      if (error.name !== "AbortError" && viewerSession.current.isOwned(token)) setViewerNotice(error.message);
       return null;
     });
     if (!viewerSession.current.isCurrent(token)) return;
     if (!loaded) return;
     const layer = viewerLayerFromAsset(loaded);
     viewerUndo.current = [];
+    viewerSourceBytes.current = viewerLayerSourceByteCount([layer]);
     setViewerLayers([layer]);
     setActiveViewerLayer(layer.id);
     setViewerSnappedLayers([]);
@@ -3591,18 +3902,26 @@ function App() {
   };
 
   const addViewerAsset = async (asset, position = {}) => {
-    const token = viewerSession.current.request("add", { latest: false });
-    const loaded = await imageAssetFromSource(asset).catch((error) => {
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
-      return null;
-    });
-    if (!viewerSession.current.isCurrent(token)) return;
-    if (!loaded) return;
-    const layer = viewerLayerFromAsset(loaded, position);
-    saveViewerUndo();
-    setViewerLayers((current) => [...current, layer]);
-    setActiveViewerLayer(layer.id);
-    setViewerMenu(null);
+    const token = viewerSession.current.beginAppend("add");
+    try {
+      const loaded = await imageAssetFromSource(asset, { signal: token.signal }).catch((error) => {
+        if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
+        return null;
+      });
+      if (!viewerSession.current.isCurrent(token) || !loaded) return;
+      const layer = viewerLayerFromAsset(loaded, position);
+      const sourceBytes = viewerLayerSourceByteCount([layer]);
+      if (viewerSourceBytes.current + sourceBytes > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("画布图片源总量超过 256 MiB 上限");
+      saveViewerUndo();
+      viewerSourceBytes.current += sourceBytes;
+      setViewerLayers((current) => [...current, layer]);
+      setActiveViewerLayer(layer.id);
+      setViewerMenu(null);
+    } catch (error) {
+      if (error.name !== "AbortError" && viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
+    } finally {
+      viewerSession.current.finishAppend(token);
+    }
   };
 
   const openHistoryCard = (card) => {
@@ -3650,15 +3969,22 @@ function App() {
   const addViewerFiles = async (files, event) => {
     const imageFiles = files.filter((file) => file.type.startsWith("image/"));
     if (activeCollage || !imageFiles.length) return;
-    const token = viewerSession.current.request("drop", { latest: false });
+    const admission = viewerFileBatchAdmission(imageFiles);
+    if (!admission.ok || imageFiles.length > 100) {
+      setViewerNotice(!admission.ok ? admission.reason : "单次最多添加 100 张图片");
+      return;
+    }
+    const token = viewerSession.current.beginAppend("drop");
     try {
-      const assets = await Promise.all(imageFiles.map(async (file, index) => ({
+      const assets = await mapViewerConcurrent(imageFiles, 4, async (file, index) => imageAssetFromSource({
         id: "",
-        url: await readImageFile(file),
+        url: await readImageFile(file, { signal: token.signal }),
         name: file.name || `粘贴图片-${index + 1}.png`,
         mimeType: file.type,
-      }))).then((assets) => Promise.all(assets.map((asset) => imageAssetFromSource(asset))));
+      }, { signal: token.signal }), { signal: token.signal, controller: token.controller });
       if (!(await viewerSession.current.waitForDropTurn(token))) return;
+      const incomingBytes = viewerLayerSourceByteCount(assets);
+      if (viewerSourceBytes.current + incomingBytes > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("画布图片源总量超过 256 MiB 上限");
       const rect = viewerCanvasRef.current?.getBoundingClientRect();
       const point = rect && event ? {
         x: (event.clientX - rect.left - rect.width / 2 - viewerPan.x) / viewerZoom,
@@ -3666,20 +3992,234 @@ function App() {
       } : { x: -viewerPan.x / viewerZoom, y: -viewerPan.y / viewerZoom };
       saveViewerUndo();
       const layers = assets.map((asset, index) => viewerLayerFromAsset(asset, { x: point.x + index * 28, y: point.y + index * 28 }));
+      viewerSourceBytes.current += incomingBytes;
       setViewerLayers((current) => [...current, ...layers]);
       setActiveViewerLayer(layers.at(-1).id);
       setViewerNotice(`已添加 ${layers.length} 张本地图片`);
     } catch (error) {
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
+      if (error.name !== "AbortError" && viewerSession.current.isOwned(token)) setViewerNotice(error.message);
     } finally {
       viewerSession.current.releaseDrop(token);
     }
   };
 
-  const updateViewerLayer = (id, updates) => setViewerLayers((current) => current.map((layer) => layer.id === id ? { ...layer, ...updates } : layer));
+  const updateViewerLayer = (id, updates) => {
+    invalidateViewerComposition();
+    setViewerLayers((current) => current.map((layer) => layer.id === id ? { ...layer, ...updates } : layer));
+  };
+
+  const viewerSnapshot = (activeLayer = activeViewerLayer) => ({
+    layers: cloneViewerLayers(viewerLayers),
+    snappedLayers: [...viewerSnappedLayers],
+    activeLayer,
+  });
+
+  const restoreViewerSnapshot = (snapshot) => {
+    if (!snapshot) return;
+    invalidateViewerComposition();
+    const layers = cloneViewerLayers(snapshot.layers);
+    viewerSourceBytes.current = viewerLayerSourceByteCount(layers);
+    setViewerLayers(layers);
+    setViewerSnappedLayers([...snapshot.snappedLayers]);
+    setActiveViewerLayer(snapshot.activeLayer);
+    setViewerSnapGuide(null);
+  };
+
+  const cancelViewerGesture = () => {
+    const drag = viewerDrag.current;
+    if (!drag) return;
+    viewerDrag.current = null;
+    setViewerTextMarquee(null);
+    if (drag.undoSnapshot) restoreViewerSnapshot(drag.undoSnapshot);
+    if (drag.pointerTarget?.hasPointerCapture?.(drag.pointerId)) drag.pointerTarget.releasePointerCapture?.(drag.pointerId);
+  };
+
+  const commitViewerTextEdit = () => {
+    const edit = viewerTextEdit.current;
+    if (!edit) return;
+    viewerTextEdit.current = null;
+    setEditingViewerText("");
+    const current = viewerLayers.find((layer) => layer.id === edit.id);
+    const before = edit.snapshot.layers.find((layer) => layer.id === edit.id);
+    if (edit.isNew || JSON.stringify(serializeViewerLayer(current)) !== JSON.stringify(before && serializeViewerLayer(before))) {
+      saveViewerUndo(edit.snapshot);
+      setViewerNotice(edit.isNew ? "已创建文字图层" : "已更新文字内容");
+    }
+  };
+
+  const cancelViewerTextEdit = () => {
+    const edit = viewerTextEdit.current;
+    if (!edit) {
+      setEditingViewerText("");
+      return;
+    }
+    viewerTextEdit.current = null;
+    setEditingViewerText("");
+    restoreViewerSnapshot(edit.snapshot);
+    setViewerNotice(edit.isNew ? "已取消新建文字" : "已取消文字编辑");
+  };
+
+  const beginViewerTextEdit = (layer, { isNew = false, snapshot = null } = {}) => {
+    if (viewerLayerKind(layer) !== "text") return;
+    if (viewerTextEdit.current?.id === layer.id) {
+      viewerTextEditorRef.current?.focus();
+      return;
+    }
+    if (viewerTextEdit.current) commitViewerTextEdit();
+    viewerTextEdit.current = { id: layer.id, isNew, snapshot: snapshot || viewerSnapshot(layer.id) };
+    setActiveViewerLayer(layer.id);
+    setEditingViewerText(layer.id);
+  };
+
+  const updateViewerText = (id, text) => {
+    invalidateViewerComposition();
+    setViewerLayers((current) => current.map((layer) => layer.id === id ? measureViewerText({ ...layer, text: String(text).slice(0, 8000) }) : layer));
+  };
+
+  const updateViewerTextProperties = (layer, updates, { saveUndo = true } = {}) => {
+    if (!layer || viewerLayerKind(layer) !== "text") return;
+    const next = measureViewerText({ ...layer, ...updates });
+    if (JSON.stringify(serializeViewerLayer(next)) === JSON.stringify(serializeViewerLayer(layer))) return;
+    if (saveUndo) saveViewerUndo(viewerSnapshot(layer.id));
+    updateViewerLayer(layer.id, next);
+    setViewerTextDefaults((current) => ({
+      ...current,
+      text: next.text,
+      fontFamily: next.fontFamily,
+      fontSize: next.fontSize,
+      fontWeight: next.fontWeight,
+      color: next.color,
+      textAlign: next.textAlign,
+      lineHeight: next.lineHeight,
+      rotation: next.rotation,
+    }));
+  };
+
+  // Photoshop's two text gestures: a drag opens a box of exactly that size which the text wraps
+  // inside, a click drops text that grows with what is typed. A new layer is unscaled, so the swept
+  // scene rectangle is already in the layer's own pixels.
+  const createViewerText = (rect) => {
+    if (activeCollage) return;
+    const boxed = rect.width >= VIEWER_TEXT_MIN_BOX && rect.height >= VIEWER_TEXT_MIN_BOX;
+    invalidateViewerComposition();
+    const snapshot = viewerSnapshot();
+    const layer = measureViewerText({
+      ...viewerTextDefaults,
+      id: `viewer-text-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      kind: "text",
+      type: "text",
+      name: "文字图层",
+      x: boxed ? rect.centerX : rect.x,
+      y: boxed ? rect.centerY : rect.y,
+      boxWidth: boxed ? Math.round(rect.width) : undefined,
+      boxHeight: boxed ? Math.round(rect.height) : undefined,
+      scale: 1,
+      rotation: normalizeRotation(viewerTextDefaults.rotation),
+    });
+    setViewerLayers((current) => [...current, layer]);
+    setActiveViewerLayer(layer.id);
+    viewerTextEdit.current = { id: layer.id, isNew: true, snapshot };
+    setEditingViewerText(layer.id);
+  };
+
+  const selectViewerTool = (tool) => {
+    if (!["move", "brush", "eraser", "text"].includes(tool) || tool === viewerTool) return;
+    cancelViewerGesture();
+    if (viewerTextEdit.current) commitViewerTextEdit();
+    setViewerTool(tool);
+    setViewerMenu(null);
+    setViewerTextMarquee(null);
+  };
+
+  // The ring follows the pointer through the DOM rather than through React state: a repaint of this
+  // component per pointer sample would stutter under a brush stroke, and only two style properties
+  // change. Its size is the layer's, because the stroke lands in that layer's pixels.
+  const viewerBrushLayerScale = (target) => {
+    const id = target?.closest?.("[data-viewer-layer-id]")?.dataset?.viewerLayerId;
+    const layer = id ? viewerLayers.find((item) => item.id === id) : null;
+    return layer && viewerLayerKind(layer) === "image" ? layer.scale : 1;
+  };
+
+  const paintViewerBrushCursor = (at = viewerBrushCursorAt.current) => {
+    const node = viewerBrushCursorRef.current;
+    if (!node || !at) return;
+    const diameter = viewerBrushCursorSize(viewerBrush.size, viewerZoom, at.scale);
+    node.style.width = `${diameter}px`;
+    node.style.height = `${diameter}px`;
+    node.style.left = `${at.x}px`;
+    node.style.top = `${at.y}px`;
+  };
+
+  const moveViewerBrushCursor = (event) => {
+    if (viewerTool !== "brush" && viewerTool !== "eraser") return;
+    const canvasRect = viewerCanvasRef.current?.getBoundingClientRect();
+    if (!canvasRect) return;
+    viewerBrushCursorAt.current = {
+      x: event.clientX - canvasRect.left,
+      y: event.clientY - canvasRect.top,
+      scale: viewerBrushLayerScale(event.target),
+    };
+    paintViewerBrushCursor();
+    // Shown from the first sample rather than from pointerenter, so it is never drawn before it has
+    // somewhere to be -- switching to the brush without moving the mouse leaves it where it was.
+    setViewerPointerOverCanvas(true);
+  };
+
+  // Resizing the brush from the toolbar has to resize the ring where it already sits, without
+  // waiting for the pointer to move again.
+  useEffect(() => {
+    paintViewerBrushCursor();
+  }, [viewerBrush.size, viewerZoom, viewerTool, viewerPointerOverCanvas]);
+
+  const startViewerTextMarquee = (event) => {
+    if (activeCollage) return;
+    const canvasRect = viewerCanvasRef.current?.getBoundingClientRect();
+    if (!canvasRect) return;
+    event.preventDefault();
+    if (viewerTextEdit.current) commitViewerTextEdit();
+    const origin = clientPointToScene(event, canvasRect, viewerPan, viewerZoom);
+    const rect = viewerMarqueeRect(origin, origin);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    viewerDrag.current = { kind: "text-marquee", origin, rect, pointerId: event.pointerId, pointerTarget: event.currentTarget };
+    setViewerTextMarquee(rect);
+  };
+
+  const moveViewerTextMarquee = (event) => {
+    const drag = viewerDrag.current;
+    if (drag?.kind !== "text-marquee" || drag.pointerId !== event.pointerId) return false;
+    const canvasRect = viewerCanvasRef.current?.getBoundingClientRect();
+    if (!canvasRect) return true;
+    const next = viewerMarqueeRect(drag.origin, clientPointToScene(event, canvasRect, viewerPan, viewerZoom));
+    drag.rect = next;
+    setViewerTextMarquee((current) => current && current.x === next.x && current.y === next.y && current.width === next.width && current.height === next.height ? current : next);
+    return true;
+  };
+
+  const pickViewerBrushColor = async () => {
+    const token = viewerSession.current.request("brush-eyedropper", { latest: true });
+    try {
+      if (!globalThis.EyeDropper) throw new Error("当前浏览器不支持颜色提取器");
+      const result = await new globalThis.EyeDropper().open();
+      if (viewerSession.current.isCurrent(token)) setViewerBrush((current) => ({ ...current, color: normalizeViewerColor(result.sRGBHex) }));
+    } catch (error) {
+      if (error.name !== "AbortError" && viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
+    }
+  };
+
+  useEffect(() => {
+    if (!editingViewerText) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      const editor = viewerTextEditorRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.select();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [editingViewerText]);
 
   const scaleViewerLayer = (id, factor) => {
     if (!viewerLayerResizeEnabled) return;
+    invalidateViewerComposition();
     saveViewerUndo();
     setViewerLayers((current) => current.map((layer) => layer.id === id
       ? { ...layer, scale: Math.max(.1, Math.min(8, layer.scale * factor)) }
@@ -3690,14 +4230,17 @@ function App() {
     if (!viewerLayerResizeEnabled) return;
     const value = Number(percentage);
     if (!Number.isFinite(value)) return;
+    invalidateViewerComposition();
     saveViewerUndo();
     updateViewerLayer(id, { scale: Math.max(.1, Math.min(8, value / 100)) });
   };
 
   const removeViewerLayer = (id) => {
+    invalidateViewerComposition();
     const removed = viewerLayers.find((layer) => layer.id === id);
     saveViewerUndo();
     setViewerLayers((current) => current.filter((layer) => layer.id !== id));
+    viewerSourceBytes.current = Math.max(0, viewerSourceBytes.current - viewerLayerSourceByteCount(removed ? [removed] : []));
     setViewerSnappedLayers((current) => current.filter((layerId) => layerId !== id));
     setActiveViewerLayer((current) => current === id ? "" : current);
     if (removed?.isCollage) setCollageResult(null);
@@ -3705,27 +4248,32 @@ function App() {
   };
 
   const copyViewerLayer = async (layer, includeLayerMarker = false) => {
-    const token = viewerSession.current.request("copy", { latest: true });
+    const token = viewerSession.current.request("copy", { latest: true, abortable: true });
     try {
       let blob;
-      if (layer.url.startsWith("data:")) {
+      if (viewerLayerKind(layer) === "text" || hasLayerPaint(layer) || normalizeRotation(layer.rotation) !== 0) {
+        blob = await renderViewerLayerPng(layer, { signal: token.signal });
+      } else if (layer.url.startsWith("data:")) {
         blob = dataUrlBlob(layer.url);
       } else if (layer.assetId) {
         const response = await fetch("/api/inference/history/copy", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ asset_id: layer.assetId }),
+          signal: token.signal,
         });
         if (!response.ok) throw new Error("无法读取干净图片");
         blob = await response.blob();
       } else {
-        const image = await loadBrowserImage(layer.url);
+        const { image } = await loadBudgetedBrowserImage(layer.url, { signal: token.signal });
+        const dimensions = viewerCanvasDimensions(image.naturalWidth, image.naturalHeight, "图片复制画布");
         const canvas = document.createElement("canvas");
-        canvas.width = image.naturalWidth;
-        canvas.height = image.naturalHeight;
+        canvas.width = dimensions.width;
+        canvas.height = dimensions.height;
         canvas.getContext("2d").drawImage(image, 0, 0);
         blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
       }
+      assertViewerByteBudget(blob?.size, VIEWER_MAX_OUTPUT_BYTES, "复制图片输出");
       if (!viewerSession.current.isCurrent(token)) return;
       const mimeType = blob.type === "image/gif" ? "image/gif" : "image/png";
       const contents = { [mimeType]: blob };
@@ -3739,9 +4287,11 @@ function App() {
       await navigator.clipboard.write([new ClipboardItem(contents)]);
       if (viewerSession.current.isCurrent(token)) setViewerNotice(mimeType === "image/gif" ? "已复制 GIF 动画" : "已复制无生成元数据的 PNG 图片");
     } catch (error) {
+      if (includeLayerMarker && !nativeImageCopy && viewerClipboard.current?.layer?.id === layer.id) viewerClipboard.current = null;
       if (viewerSession.current.isCurrent(token)) setViewerNotice(`复制失败：${error.message}`);
     }
     if (viewerSession.current.isCurrent(token)) setViewerMenu(null);
+    viewerSession.current.finishRequest(token);
   };
 
   const requestHistoryDelete = (files, label) => {
@@ -3753,6 +4303,7 @@ function App() {
 
   const finishHistoryDelete = async (deleteSource) => {
     if (!historyDelete) return;
+    invalidateViewerComposition();
     const assetIds = historyDelete.assetIds;
     const token = viewerSession.current.request("history-delete", { latest: true });
     if (deleteSource) {
@@ -3797,6 +4348,7 @@ function App() {
   };
 
   const chooseCollageTemplate = (template) => {
+    invalidateViewerComposition();
     setActiveCollage({ templateId: template.id, slots: Array(template.count).fill(null) });
     setActiveCollageSlot(-1);
     setCollageResult(null);
@@ -3807,18 +4359,20 @@ function App() {
   };
 
   const setCollageSlot = (index, asset, existingToken = null) => {
-    const token = existingToken || viewerSession.current.request("slot", { latest: true, key: `slot:${index}` });
+    if (!existingToken) invalidateViewerComposition();
+    const token = existingToken || viewerSession.current.request("slot", { latest: true, key: `slot:${index}`, abortable: true });
     if (!viewerSession.current.isCurrent(token)) return;
     const entry = { asset, scale: 1, alignX: .5, alignY: .5 };
     setActiveCollage((current) => current
       ? { ...current, slots: current.slots.map((item, slotIndex) => slotIndex === index ? entry : item) }
       : current);
-    void loadBrowserImage(asset.url).then((image) => {
+    void loadBudgetedBrowserImage(asset.url, { signal: token.signal }).then(({ image }) => {
       if (!viewerSession.current.isCurrent(token)) return;
       setActiveCollage((current) => current
         ? { ...current, slots: current.slots.map((item, slotIndex) => slotIndex === index && item?.asset.url === asset.url ? { ...item, asset: { ...item.asset, width: image.naturalWidth, height: image.naturalHeight } } : item) }
         : current);
-    }).catch((error) => { if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message); });
+    }).catch((error) => { if (error.name !== "AbortError" && viewerSession.current.isCurrent(token)) setViewerNotice(error.message); })
+      .finally(() => viewerSession.current.finishRequest(token));
   };
 
   const dropCollageSlot = (event, index) => {
@@ -3831,35 +4385,46 @@ function App() {
     }
     const file = [...event.dataTransfer.files].find((item) => item.type.startsWith("image/"));
     if (!file) return;
-    const token = viewerSession.current.request("slot", { latest: true, key: `slot:${index}` });
-    void readImageFile(file).then((url) => {
+    const admission = viewerFileBatchAdmission([file]);
+    if (!admission.ok) { setViewerNotice(admission.reason); return; }
+    invalidateViewerComposition();
+    const token = viewerSession.current.request("slot", { latest: true, key: `slot:${index}`, abortable: true });
+    let handedOff = false;
+    void readImageFile(file, { signal: token.signal }).then((url) => {
       if (!viewerSession.current.isCurrent(token)) return;
+      handedOff = true;
       setCollageSlot(index, { id: "", url, name: file.name || `外部图片-${index + 1}.png`, mimeType: file.type }, token);
       if (!viewerSession.current.isCurrent(token)) return;
       setActiveCollageSlot(index);
       setViewerNotice(`已将外部图片填入区块 ${index + 1}${event.dataTransfer.files.length > 1 ? "（仅使用第一张）" : ""}`);
-    }).catch((error) => { if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message); });
+    }).catch((error) => { if (error.name !== "AbortError" && viewerSession.current.isCurrent(token)) setViewerNotice(error.message); })
+      .finally(() => { if (!handedOff) viewerSession.current.finishRequest(token); });
   };
 
-  const updateCollageSlot = (index, updates) => setActiveCollage((current) => current
-    ? { ...current, slots: current.slots.map((item, slotIndex) => slotIndex === index && item ? { ...item, ...updates } : item) }
-    : current);
+  const updateCollageSlot = (index, updates) => {
+    invalidateViewerComposition();
+    setActiveCollage((current) => current
+      ? { ...current, slots: current.slots.map((item, slotIndex) => slotIndex === index && item ? { ...item, ...updates } : item) }
+      : current);
+  };
 
   const toggleEdgeLines = () => {
     updateViewerEdgeLine({ enabled: !viewerEdgeLine.enabled });
   };
 
   const updateViewerEdgeLine = (updates) => {
-    const next = { ...viewerEdgeLine, ...updates };
+    invalidateViewerComposition();
+    const next = normalizeViewerEdgeLine({ ...viewerEdgeLine, ...(updates && typeof updates === "object" ? updates : {}) });
     setViewerEdgeLine(next);
     if (!collageResult || collageResult.saved) return;
     if (collageResult.mode === "manual") {
-      restoreManualCollage(collageResult.manualLayout);
+      restoreManualCollage(collageResult.manualLayout, { trustedCurrentSession: true });
       setViewerNotice("边缘线已更新，已恢复原图布局，请再次点击一键拼图");
       return;
     }
     setActiveCollage({ templateId: collageResult.templateId, slots: collageResult.slots });
     setActiveCollageSlot(-1);
+    viewerSourceBytes.current = 0;
     setViewerLayers([]);
     setCollageResult(null);
     setViewerNotice("边缘线已更新，请再次确认拼图后保存");
@@ -3891,34 +4456,54 @@ function App() {
   };
 
   const confirmCollage = async () => {
-    const token = viewerSession.current.request("confirm", { latest: true });
     const template = collageTemplates.find((item) => item.id === activeCollage?.templateId);
     if (!template || activeCollage.slots.some((slot) => !slot)) {
       setViewerNotice("请先填满全部拼图区块");
       return;
     }
+    const token = beginViewerCollageOperation("confirm");
+    if (!token) return;
     try {
       const entries = activeCollage.slots;
-      const images = await Promise.all(entries.map((entry) => loadBrowserImage(entry.asset.url)));
-      if (!viewerSession.current.isCurrent(token)) return;
-      const layout = adaptiveCollageLayout(template, entries.map((entry) => entry.asset));
-      const width = Math.min(24576, Math.ceil(Math.max(...images.map((image, index) => image.naturalWidth / layout.slots[index].w))));
-      const height = Math.min(24576, Math.ceil(width / layout.aspect));
+      let sourceBytes = 0;
+      const loadedImages = await mapViewerConcurrent(entries, 4, async (entry) => {
+        const loaded = await loadBudgetedBrowserImage(entry.asset.url, {
+          signal: token.signal,
+          onSourceBytes(bytes) {
+            if (sourceBytes + bytes > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("模板拼图图片源总量超过 256 MiB 上限");
+            sourceBytes += bytes;
+          },
+        });
+        if (!viewerSession.current.isOperationCurrent(token)) throw viewerAbortError();
+        return loaded.image;
+      }, { signal: token.signal, controller: token.controller });
+      const images = loadedImages;
+      if (!viewerSession.current.isOperationCurrent(token)) return;
+      const resolvedEntries = resolvedCollageEntries(entries, images);
+      const layout = adaptiveCollageLayout(template, resolvedEntries.map((entry) => entry.asset));
+      const width = Math.ceil(Math.max(...images.map((image, index) => image.naturalWidth / layout.slots[index].w)));
+      const height = Math.ceil(width / layout.aspect);
+      viewerCanvasDimensions(width, height, "模板拼图画布");
+      const slotEdges = sharedEdgeHiddenSides(layout.slots.map((slot, index) => ({ id: String(index), left: slot.x, right: slot.x + slot.w, top: slot.y, bottom: slot.y + slot.h })), .0001);
       const animated = entries.some((entry) => isGifAsset(entry.asset));
       if (animated) {
-        const animatedLayers = await Promise.all(entries.map(async (entry, index) => {
+        const animatedLayers = await mapViewerConcurrent(resolvedEntries, 4, async (entry, index) => {
           const normalized = layout.slots[index];
           const slot = { x: normalized.x * width, y: normalized.y * height, width: normalized.w * width, height: normalized.h * height };
           const drawing = imageLayoutForSlot(images[index], slot, entry);
           return {
-            url: await imageSourceDataUrl(entry.asset.url),
+            url: await imageSourceDataUrl(entry.asset.url, { signal: token.signal }),
             x: drawing.x,
             y: drawing.y,
             width: drawing.width,
             height: drawing.height,
             clip: slot,
+            hidden_sides: slotEdges[index] || [],
           };
-        }));
+        }, { signal: token.signal, controller: token.controller });
+        const animatedAdmission = viewerAnimatedBatchAdmission(animatedLayers);
+        if (!animatedAdmission.ok) throw new Error(animatedAdmission.reason);
+        if (!viewerSession.current.isOperationCurrent(token)) return;
         const animationScale = Math.min(1, 4096 / width, 4096 / height);
         const animatedWidth = Math.max(1, Math.round(width * animationScale));
         const animatedHeight = Math.max(1, Math.round(height * animationScale));
@@ -3929,13 +4514,15 @@ function App() {
           width: layer.width * animationScale,
           height: layer.height * animationScale,
           clip: layer.clip && Object.fromEntries(Object.entries(layer.clip).map(([key, value]) => [key, value * animationScale])),
-        })), animatedWidth, animatedHeight, viewerEdgeLine);
-        if (!viewerSession.current.isCurrent(token)) return;
+        })), animatedWidth, animatedHeight, viewerEdgeLine, { signal: token.signal });
+        if (!viewerSession.current.isOperationCurrent(token)) return;
+        assertViewerByteBudget(viewerDataUrlBytes(dataUrl), VIEWER_MAX_OUTPUT_BYTES, "GIF 拼图输出");
         const name = `XirAI-collage-${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16)}.gif`;
-        const result = { dataUrl, name, width: animatedWidth, height: animatedHeight, templateId: template.id, slots: activeCollage.slots, edgeLine: { ...viewerEdgeLine }, isGif: true, needsConfirmation: false };
-        const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, naturalWidth: animatedWidth, naturalHeight: animatedHeight, name, x: 0, y: 0, scale: 1, isCollage: true, mimeType: "image/gif" };
+        const result = { dataUrl, name, width: animatedWidth, height: animatedHeight, templateId: template.id, slots: resolvedEntries, edgeLine: { ...viewerEdgeLine }, isGif: true, needsConfirmation: false, idempotencyKey: newViewerIdempotencyKey() };
+        const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, sourceBytes: viewerDataUrlBytes(dataUrl), naturalWidth: animatedWidth, naturalHeight: animatedHeight, name, x: 0, y: 0, scale: 1, isCollage: true, mimeType: "image/gif" };
         setCollageResult(result);
         setActiveCollage(null);
+        viewerSourceBytes.current = layer.sourceBytes;
         setViewerLayers([layer]);
         setActiveViewerLayer(layer.id);
         setViewerNotice(`GIF 拼图已合成为 ${animatedWidth} × ${animatedHeight}`);
@@ -3945,11 +4532,10 @@ function App() {
       canvas.width = width;
       canvas.height = height;
       const context = canvas.getContext("2d", { alpha: true });
-      const slotEdges = sharedEdgeHiddenSides(layout.slots.map((slot, index) => ({ id: String(index), left: slot.x, right: slot.x + slot.w, top: slot.y, bottom: slot.y + slot.h })), .0001);
       images.forEach((image, index) => {
         const normalized = layout.slots[index];
         const slot = { x: normalized.x * width, y: normalized.y * height, width: normalized.w * width, height: normalized.h * height };
-        const drawing = imageLayoutForSlot(image, slot, entries[index]);
+        const drawing = imageLayoutForSlot(image, slot, resolvedEntries[index]);
         context.save();
         context.beginPath();
         context.rect(slot.x, slot.y, slot.width, slot.height);
@@ -3959,24 +4545,36 @@ function App() {
         drawEdgeLine(context, slot.x, slot.y, slot.width, slot.height, viewerEdgeLine, 1, slotEdges[index] || []);
       });
       const dataUrl = canvas.toDataURL("image/png");
-      if (!viewerSession.current.isCurrent(token)) return;
+      try {
+        assertViewerByteBudget(viewerDataUrlBytes(dataUrl), VIEWER_MAX_OUTPUT_BYTES, "PNG 拼图输出");
+      } catch (error) {
+        canvas.width = 1;
+        canvas.height = 1;
+        throw error;
+      }
+      if (!viewerSession.current.isOperationCurrent(token)) return;
       const name = `XirAI-collage-${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16)}.png`;
-      const result = { dataUrl, name, width, height, templateId: template.id, slots: activeCollage.slots, edgeLine: { ...viewerEdgeLine }, needsConfirmation: false };
-      const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, naturalWidth: width, naturalHeight: height, name, x: 0, y: 0, scale: 1, isCollage: true };
+      const result = { dataUrl, name, width, height, templateId: template.id, slots: resolvedEntries, edgeLine: { ...viewerEdgeLine }, needsConfirmation: false, idempotencyKey: newViewerIdempotencyKey() };
+      const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, sourceBytes: viewerDataUrlBytes(dataUrl), naturalWidth: width, naturalHeight: height, name, x: 0, y: 0, scale: 1, isCollage: true };
       setCollageResult(result);
       setActiveCollage(null);
+      viewerSourceBytes.current = layer.sourceBytes;
       setViewerLayers([layer]);
       setActiveViewerLayer(layer.id);
       setViewerNotice(`拼图已合成为 ${width} × ${height} 无损 PNG`);
     } catch (error) {
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(`拼图失败：${error.message}`);
+      if (error.name !== "AbortError" && viewerSession.current.isOperationOwned(token)) setViewerNotice(`拼图失败：${error.message}`);
+    } finally {
+      finishViewerCollageOperation(token);
     }
   };
 
   const editCollage = (target = null) => {
-    const manualLayout = target?.manualLayout || (collageResult?.mode === "manual" ? collageResult.manualLayout : null);
+    invalidateViewerComposition();
+    const explicitTarget = target?.manualLayout || target?.manual_layout ? target : null;
+    const manualLayout = explicitTarget?.manualLayout || explicitTarget?.manual_layout || (collageResult?.mode === "manual" ? collageResult.manualLayout : null);
     if (manualLayout) {
-      restoreManualCollage(manualLayout);
+      restoreManualCollage(manualLayout, { trustedCurrentSession: explicitTarget ? explicitTarget.manualLayoutTrusted === true : true });
       return;
     }
     if (!collageResult) {
@@ -3984,21 +4582,25 @@ function App() {
       return;
     }
     setActiveCollage({ templateId: collageResult.templateId, slots: collageResult.slots });
-    setViewerEdgeLine(collageResult.edgeLine || viewerEdgeLine);
+    setViewerEdgeLine(normalizeViewerEdgeLine(collageResult.edgeLine || viewerEdgeLine));
     setActiveCollageSlot(-1);
+    viewerSourceBytes.current = 0;
     setViewerLayers([]);
     setCollageResult(null);
     setViewerMenu(null);
   };
 
   const discardCollage = () => {
+    invalidateViewerComposition();
     setActiveCollage(null);
     setCollageResult(null);
+    viewerSourceBytes.current = 0;
     setViewerLayers([]);
     setViewerNotice("拼图已清空，未保存源文件");
   };
 
   const cancelCollageDraft = () => {
+    invalidateViewerComposition();
     setActiveCollage(null);
     setViewerMenu(null);
     setViewerNotice("已取消未完成的拼图，预览窗口图片已保留");
@@ -4006,60 +4608,88 @@ function App() {
 
   const saveCollage = async () => {
     if (!collageResult) return;
-    const token = viewerSession.current.request("save", { latest: true });
+    const result = collageResult;
+    try {
+      assertViewerByteBudget(viewerDataUrlBytes(result.dataUrl), VIEWER_MAX_OUTPUT_BYTES, "拼图保存数据");
+    } catch (error) {
+      setViewerNotice(error.message);
+      return;
+    }
+    const token = beginViewerCollageOperation("save");
+    if (!token) return;
     try {
       const response = await fetch("/api/inference/collages", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image_data: collageResult.dataUrl, name: collageResult.name, manual_layout: collageResult.persistedManualLayout }),
+        headers: { "Content-Type": "application/json", "Idempotency-Key": result.idempotencyKey },
+        body: JSON.stringify({ image_data: result.dataUrl, name: result.name, manual_layout: result.persistedManualLayout, idempotency_key: result.idempotencyKey }),
+        signal: token.signal,
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "拼图保存失败");
-      if (!viewerSession.current.isCurrent(token)) return;
-      setViewerLayers((current) => current.map((layer) => layer.isCollage ? { ...layer, assetId: payload.id, url: payload.url, name: payload.name, manualLayout: collageResult.manualLayout || layer.manualLayout } : layer));
-      setCollageResult((current) => ({ ...current, saved: true, assetId: payload.id, url: payload.url, name: payload.name }));
-      await refreshViewerHistory(viewerSelectedFolder);
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(`已保存到当日 outputs：${payload.name}`);
+      if (!viewerSession.current.isOperationCurrent(token)) return;
+      setViewerLayers((current) => current.map((layer) => layer.isCollage && layer.url === result.dataUrl ? { ...layer, assetId: payload.id, url: payload.url, name: payload.name, manualLayout: result.manualLayout || layer.manualLayout } : layer));
+      setCollageResult((current) => current?.idempotencyKey === result.idempotencyKey ? { ...current, saved: true, assetId: payload.id, url: payload.url, name: payload.name } : current);
+      setViewerNotice(result.persistedManualLayout
+        ? `已保存到当日 outputs：${payload.name}；manualLayout v2 可重新编辑`
+        : `已扁平保存到当日 outputs：${payload.name}；${result.persistenceReason || "源图不满足持久恢复条件"}`);
+      void refreshViewerHistory(viewerSelectedFolder);
     } catch (error) {
-      if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
+      if (error.name !== "AbortError" && viewerSession.current.isOperationOwned(token)) setViewerNotice(error.message);
+    } finally {
+      finishViewerCollageOperation(token);
     }
   };
 
   const createManualCollage = async () => {
-    if (viewerLayers.length < 2) {
-      setViewerNotice("至少需要两张图片才能一键拼图");
+    if (viewerLayers.length < 2 && !hasViewerEdits(viewerLayers)) {
+      setViewerNotice("至少需要两张图片；单层图片需先添加画笔或文字编辑");
       return;
     }
-    const token = viewerSession.current.request("manual-collage", { latest: true });
+    const token = beginViewerCollageOperation("manual-collage");
+    if (!token) return;
     try {
-       const nodes = viewerLayers.map((layer) => ({
-          layer,
-       }));
-       const images = await Promise.all(nodes.map((item) => loadBrowserImage(item.layer.url)));
-       if (!viewerSession.current.isCurrent(token)) return;
-       const rectangles = nodes.map((item) => viewerLayerBounds(item.layer));
+      const sourceLayers = cloneViewerLayers(viewerLayers);
+      if (viewerLayerSourceByteCount(sourceLayers) > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("画布图片源总量超过 256 MiB 上限");
+      const nodes = await mapViewerConcurrent(sourceLayers, 4, async (layer) => {
+        const source = viewerLayerKind(layer) === "text" ? null : await viewerLayerBitmap(layer, { signal: token.signal });
+        if (!viewerSession.current.isOperationCurrent(token)) throw viewerAbortError();
+        return { layer, source };
+      }, { signal: token.signal, controller: token.controller });
+      if (!viewerSession.current.isOperationCurrent(token)) return;
+      const rectangles = nodes.map((item) => viewerLayerBounds(item.layer));
       const left = Math.min(...rectangles.map((rect) => rect.left));
       const top = Math.min(...rectangles.map((rect) => rect.top));
       const right = Math.max(...rectangles.map((rect) => rect.right));
       const bottom = Math.max(...rectangles.map((rect) => rect.bottom));
       // Use each image's unscaled display size as the output-resolution reference.
       // A 10% handle resize must keep the image small in the exported collage.
-       const outputScale = 1;
-       const width = Math.ceil(right - left);
-       const height = Math.ceil(bottom - top);
-       if (width > 24576 || height > 24576) throw new Error(`导出尺寸 ${width} × ${height} 超过 24576 像素上限，请缩小图层后重试`);
-      const animated = nodes.some((item) => isGifAsset(item.layer));
+      const outputScale = 1;
+      const width = Math.max(1, Math.ceil(right - left));
+      const height = Math.max(1, Math.ceil(bottom - top));
+      viewerCanvasDimensions(width, height, "手动编辑导出画布");
+      const manualLayout = normalizeManualLayout({ version: 2, layers: sourceLayers.map(serializeViewerLayer) }, { trustedCurrentSession: true });
+      if (!manualLayout) throw new Error("当前编辑布局超过图层、文字或笔画安全预算，无法合成");
+      const persistence = persistedManualLayout(manualLayout);
+      const hasAnimatedSource = sourceLayers.some(isGifAsset);
+      const animated = hasAnimatedSource && !hasViewerEdits(sourceLayers) && sourceLayers.every((layer) => viewerLayerKind(layer) === "image");
+      const edgeRectangles = rectangles.map((rect, index) => ({ ...rect, id: nodes[index].layer.id, layer: nodes[index].layer }))
+        .filter((rect) => viewerLayerKind(rect.layer) === "image" && normalizeRotation(rect.layer.rotation) === 0);
+      const layerEdges = sharedEdgeHiddenSides(edgeRectangles, Math.max(1, viewerEdgeLine.width));
       if (animated) {
-        const animatedLayers = await Promise.all(nodes.map(async (item, index) => {
+        const animatedLayers = await mapViewerConcurrent(nodes, 4, async (item, index) => {
           const rect = rectangles[index];
           return {
-            url: await imageSourceDataUrl(item.layer.url),
+            url: await imageSourceDataUrl(item.layer.originalUrl || item.layer.url, { signal: token.signal }),
             x: (rect.left - left) * outputScale,
             y: (rect.top - top) * outputScale,
             width: rect.width * outputScale,
             height: rect.height * outputScale,
+            hidden_sides: layerEdges[item.layer.id] || [],
           };
-        }));
+        }, { signal: token.signal, controller: token.controller });
+        const animatedAdmission = viewerAnimatedBatchAdmission(animatedLayers);
+        if (!animatedAdmission.ok) throw new Error(animatedAdmission.reason);
+        if (!viewerSession.current.isOperationCurrent(token)) return;
         const animationScale = Math.min(1, 4096 / width, 4096 / height);
         const animatedWidth = Math.max(1, Math.round(width * animationScale));
         const animatedHeight = Math.max(1, Math.round(height * animationScale));
@@ -4069,50 +4699,48 @@ function App() {
           y: layer.y * animationScale,
           width: layer.width * animationScale,
           height: layer.height * animationScale,
-         })), animatedWidth, animatedHeight, viewerEdgeLine);
-         if (!viewerSession.current.isCurrent(token)) return;
+          })), animatedWidth, animatedHeight, viewerEdgeLine, { signal: token.signal });
+        if (!viewerSession.current.isOperationCurrent(token)) return;
+        assertViewerByteBudget(viewerDataUrlBytes(dataUrl), VIEWER_MAX_OUTPUT_BYTES, "GIF 拼图输出");
         const name = `XirAI-manual-collage-${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16)}.gif`;
-        const manualLayout = {
-          version: 1,
-          layers: viewerLayers.map(({ assetId, url, name: layerName, x, y, scale }) => ({ assetId, url, name: layerName, x, y, scale })),
-        };
-        const persistedManualLayout = manualLayout.layers.every((layer) => layer.assetId && layer.url.startsWith("/api/inference/history/assets/")) ? manualLayout : null;
-        const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, naturalWidth: animatedWidth, naturalHeight: animatedHeight, name, x: 0, y: 0, scale: 1, isCollage: true, mimeType: "image/gif", manualLayout };
-        setCollageResult({ mode: "manual", dataUrl, name, width: animatedWidth, height: animatedHeight, manualLayout, persistedManualLayout, edgeLine: { ...viewerEdgeLine }, isGif: true, needsConfirmation: false });
+        const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, sourceBytes: viewerDataUrlBytes(dataUrl), naturalWidth: animatedWidth, naturalHeight: animatedHeight, name, x: 0, y: 0, scale: 1, isCollage: true, mimeType: "image/gif", manualLayout, manualLayoutTrusted: true };
+        setCollageResult({ mode: "manual", dataUrl, name, width: animatedWidth, height: animatedHeight, manualLayout, persistedManualLayout: persistence.layout, persistenceReason: persistence.reason, edgeLine: { ...viewerEdgeLine }, isGif: true, needsConfirmation: false, idempotencyKey: newViewerIdempotencyKey() });
+        viewerSourceBytes.current = layer.sourceBytes;
         setViewerLayers([layer]);
         setActiveViewerLayer(layer.id);
-        setViewerNotice(`已将手动排版合成为 ${animatedWidth} × ${animatedHeight} GIF`);
+        setViewerNotice(`已将纯图片排版合成为 ${animatedWidth} × ${animatedHeight} GIF，动画帧已保留${persistence.layout ? "，保存后仍可恢复布局" : `；布局仅在当前会话可编辑（${persistence.reason}）`}`);
         return;
       }
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
       const context = canvas.getContext("2d", { alpha: true });
-      const layerEdges = sharedEdgeHiddenSides(rectangles.map((rect, index) => ({ id: nodes[index].layer.id, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom })), Math.max(1, viewerEdgeLine.width));
-      images.forEach((image, index) => {
-        const rect = rectangles[index];
-        const x = (rect.left - left) * outputScale;
-        const y = (rect.top - top) * outputScale;
-        const drawWidth = rect.width * outputScale;
-        const drawHeight = rect.height * outputScale;
-        context.drawImage(image, x, y, drawWidth, drawHeight);
-        drawEdgeLine(context, x, y, drawWidth, drawHeight, viewerEdgeLine, outputScale, layerEdges[nodes[index].layer.id] || []);
+      nodes.forEach((item) => {
+        drawViewerLayer(context, item.layer, item.source, { left, top }, outputScale);
+        drawViewerLayerEdge(context, item.layer, { left, top }, viewerEdgeLine, outputScale, layerEdges[item.layer.id] || []);
       });
       const name = `XirAI-manual-collage-${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16)}.png`;
-       const dataUrl = canvas.toDataURL("image/png");
-       if (!viewerSession.current.isCurrent(token)) return;
-      const manualLayout = {
-        version: 1,
-        layers: viewerLayers.map(({ assetId, url, name: layerName, x, y, scale }) => ({ assetId, url, name: layerName, x, y, scale })),
-      };
-      const persistedManualLayout = manualLayout.layers.every((layer) => layer.assetId && layer.url.startsWith("/api/inference/history/assets/")) ? manualLayout : null;
-      const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, naturalWidth: width, naturalHeight: height, name, x: 0, y: 0, scale: 1, isCollage: true, manualLayout };
-      setCollageResult({ mode: "manual", dataUrl, name, width, height, manualLayout, persistedManualLayout, edgeLine: { ...viewerEdgeLine }, needsConfirmation: false });
+      const dataUrl = canvas.toDataURL("image/png");
+      try {
+        assertViewerByteBudget(viewerDataUrlBytes(dataUrl), VIEWER_MAX_OUTPUT_BYTES, "PNG 编辑输出");
+      } catch (error) {
+        canvas.width = 1;
+        canvas.height = 1;
+        throw error;
+      }
+      if (!viewerSession.current.isOperationCurrent(token)) return;
+      const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, sourceBytes: viewerDataUrlBytes(dataUrl), naturalWidth: width, naturalHeight: height, name, x: 0, y: 0, scale: 1, rotation: 0, paintStrokes: [], isCollage: true, mimeType: "image/png", manualLayout, manualLayoutTrusted: true };
+      setCollageResult({ mode: "manual", dataUrl, name, width, height, manualLayout, persistedManualLayout: persistence.layout, persistenceReason: persistence.reason, edgeLine: { ...viewerEdgeLine }, needsConfirmation: false, idempotencyKey: newViewerIdempotencyKey() });
+      viewerSourceBytes.current = layer.sourceBytes;
       setViewerLayers([layer]);
       setActiveViewerLayer(layer.id);
-      setViewerNotice(`已将手动排版合成为 ${width} × ${height} PNG`);
-     } catch (error) {
-       if (viewerSession.current.isCurrent(token)) setViewerNotice(`一键拼图失败：${error.message}`);
+      const animationNotice = hasAnimatedSource ? "GIF 与编辑内容已静态合成为 PNG；" : "";
+      const persistenceNotice = persistence.layout ? "保存后可恢复全部文字、旋转与笔画" : `布局仅在当前会话可编辑，保存时会扁平化（${persistence.reason}）`;
+      setViewerNotice(`${animationNotice}已合成为 ${width} × ${height} PNG，${persistenceNotice}`);
+    } catch (error) {
+      if (error.name !== "AbortError" && viewerSession.current.isOperationOwned(token)) setViewerNotice(`应用编辑失败：${error.message}`);
+    } finally {
+      finishViewerCollageOperation(token);
     }
   };
 
@@ -4136,13 +4764,96 @@ function App() {
     setViewerZoom(result.zoom);
   };
 
+  const viewerStrokePoints = (event, layer) => {
+    const canvasRect = viewerCanvasRef.current?.getBoundingClientRect();
+    if (!canvasRect) return [];
+    const native = event.nativeEvent || event;
+    const coalesced = typeof native.getCoalescedEvents === "function" ? native.getCoalescedEvents() : null;
+    const events = coalesced?.length ? coalesced : [native];
+    return events.map((point) => clientPointToLayer(point, canvasRect, viewerPan, viewerZoom, layer));
+  };
+
+  const startViewerPaint = (event, layer) => {
+    if (event.button !== 0 || event.isPrimary === false || viewerLayerKind(layer) !== "image") return false;
+    if (isGifAsset({ ...layer, url: layer.originalUrl || layer.url })) {
+      setViewerNotice("GIF 动画不能直接画笔编辑；请先合成为静态 PNG，以免静默丢失动画帧");
+      return true;
+    }
+    if (viewerStrokeCount(viewerLayers) >= VIEWER_MAX_LAYOUT_STROKES) {
+      setViewerNotice(`画布笔画已达到 ${VIEWER_MAX_LAYOUT_STROKES.toLocaleString()} 笔的安全上限，请撤销或合成后继续`);
+      return true;
+    }
+    const remainingPoints = Math.max(0, VIEWER_MAX_LAYOUT_POINTS - viewerStrokePointCount(viewerLayers));
+    if (!remainingPoints) {
+      setViewerNotice(`画布笔画已达到 ${VIEWER_MAX_LAYOUT_POINTS.toLocaleString()} 个点的安全上限，请撤销或合成后继续`);
+      return true;
+    }
+    const clipped = clipStrokeSamples(viewerStrokePoints(event, layer), layer);
+    const stroke = normalizePaintStroke({
+      id: `stroke-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      tool: viewerTool,
+      color: viewerBrush.color,
+      size: viewerBrush.size,
+      opacity: viewerBrush.opacity / 100,
+      points: clipped.points.slice(0, remainingPoints),
+    }, layer);
+    if (!stroke.points.length) return true;
+    const undoSnapshot = viewerSnapshot(layer.id);
+    invalidateViewerComposition();
+    setActiveViewerLayer(layer.id);
+    setViewerLayers((current) => current.map((item) => item.id === layer.id
+      ? { ...item, originalUrl: item.originalUrl || item.url, paintStrokes: [...(item.paintStrokes || []), stroke] }
+      : item));
+    event.currentTarget.setPointerCapture(event.pointerId);
+    viewerDrag.current = {
+      kind: "paint",
+      id: layer.id,
+      strokeId: stroke.id,
+      layer: cloneViewerLayer(layer),
+      undoSnapshot,
+      changed: true,
+      pointerId: event.pointerId,
+      pointerTarget: event.currentTarget,
+      previousRawPoint: clipped.previousRawPoint,
+      remainingPoints: remainingPoints - stroke.points.length,
+      strokePointCount: stroke.points.length,
+      limitNotified: false,
+    };
+    return true;
+  };
+
+  // The middle button drags layers and the view, so the browser must not take it for autoscroll on
+  // Windows or for a primary-selection paste on Linux.
+  const suppressViewerMiddleClick = (event) => {
+    if (event.button === 1) event.preventDefault();
+  };
+
+  const startViewerPan = (event) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    viewerDrag.current = { kind: "canvas", x: event.clientX, y: event.clientY, panX: viewerPan.x, panY: viewerPan.y, pointerId: event.pointerId, pointerTarget: event.currentTarget };
+  };
+
   const startViewerDrag = (event) => {
     if (event.target.closest?.(".viewer-image-layer, .collage-slot")) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    viewerDrag.current = { kind: "canvas", x: event.clientX, y: event.clientY, panX: viewerPan.x, panY: viewerPan.y };
+    // The middle button drags the view whichever tool is selected, so the canvas can be moved
+    // without putting the brush down.
+    if (event.button === 1) {
+      startViewerPan(event);
+      return;
+    }
+    if (event.button !== 0 || event.isPrimary === false) return;
+    if (viewerTool === "text") {
+      startViewerTextMarquee(event);
+      return;
+    }
+    if (viewerTool !== "move") return;
+    startViewerPan(event);
   };
 
   const moveViewerImage = (event) => {
+    moveViewerBrushCursor(event);
+    if (moveViewerTextMarquee(event)) return;
     if (!viewerDrag.current || viewerDrag.current.kind !== "canvas" || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
     setViewerPan({
       x: viewerDrag.current.panX + event.clientX - viewerDrag.current.x,
@@ -4152,13 +4863,60 @@ function App() {
 
   const startViewerLayerDrag = (event, layer) => {
     event.stopPropagation();
-    const resizeHandle = event.target.closest?.(".layer-corner");
-    if (resizeHandle && !viewerLayerResizeEnabled) return;
+    // The middle button moves whatever is under it -- picture, text, any layer -- whichever tool is
+    // selected, so nothing has to be put down to nudge a layer into place.
+    const middleButton = event.button === 1;
+    if (!middleButton && (event.button !== 0 || event.isPrimary === false)) return;
+    if (middleButton) event.preventDefault();
+    if (!middleButton && (viewerTool === "brush" || viewerTool === "eraser") && startViewerPaint(event, layer)) return;
     setActiveViewerLayer(layer.id);
+    if (!middleButton && editingViewerText === layer.id && event.target.closest?.(".viewer-text-editor")) return;
+    const rotateHandle = middleButton ? null : event.target.closest?.(".layer-rotate-handle");
+    const resizeHandle = middleButton ? null : event.target.closest?.(".layer-corner");
+    if (!middleButton && viewerTool === "text") {
+      // The text tool acts on text: it resizes the box it is pointed at and opens it for editing on
+      // a plain click. Over anything else it draws a new box, so a drag across a picture still
+      // defines one rather than dying on the picture underneath.
+      if (viewerLayerKind(layer) !== "text") {
+        startViewerTextMarquee(event);
+        return;
+      }
+      if (!resizeHandle) {
+        beginViewerTextEdit(layer);
+        return;
+      }
+    } else if (!middleButton && viewerTool !== "move") return;
+    if (resizeHandle && !viewerLayerResizeEnabled) return;
     const snapToken = viewerSession.current.request("snap", { latest: true });
     window.requestAnimationFrame(() => { if (viewerSession.current.isCurrent(snapToken)) refreshViewerSnapGuide(layer.id); });
+    invalidateViewerComposition();
     event.currentTarget.setPointerCapture(event.pointerId);
-    const undoSnapshot = { layers: viewerLayers, snappedLayers: viewerSnappedLayers, activeLayer: activeViewerLayer };
+    const undoSnapshot = viewerSnapshot(layer.id);
+    if (rotateHandle && viewerLayerKind(layer) === "text") {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const centerX = (rect.left + rect.right) / 2;
+      const centerY = (rect.top + rect.bottom) / 2;
+      viewerDrag.current = {
+        kind: "rotate", id: layer.id, centerX, centerY,
+        startAngle: Math.atan2(event.clientY - centerY, event.clientX - centerX) * 180 / Math.PI,
+        rotation: normalizeRotation(layer.rotation), undoSnapshot, changed: false,
+        pointerId: event.pointerId, pointerTarget: event.currentTarget,
+      };
+      return;
+    }
+    const textBox = resizeHandle ? viewerTextBox(layer) : null;
+    if (textBox) {
+      // A text box resizes into a different box -- the text reflows inside it -- rather than into
+      // bigger glyphs, so this gesture changes the box and leaves the layer's scale alone.
+      viewerDrag.current = {
+        kind: "text-box", id: layer.id,
+        handle: VIEWER_RESIZE_HANDLES.find((name) => event.target.classList.contains(name)) || "br",
+        box: textBox, scale: layer.scale, layerX: layer.x, layerY: layer.y,
+        startX: event.clientX, startY: event.clientY, undoSnapshot, changed: false,
+        pointerId: event.pointerId, pointerTarget: event.currentTarget,
+      };
+      return;
+    }
     if (resizeHandle) {
       const rect = event.currentTarget.getBoundingClientRect();
       const handle = ["tl", "tr", "bl", "br", "top", "right", "bottom", "left"].find((name) => event.target.classList.contains(name));
@@ -4221,8 +4979,57 @@ function App() {
     };
   };
 
+  const resizeViewerTextBox = (drag, event) => {
+    const total = Math.max(0.000001, viewerZoom * Math.max(0.1, drag.scale));
+    const next = viewerTextBoxResize(drag.handle, drag.box, { x: (event.clientX - drag.startX) / total, y: (event.clientY - drag.startY) / total });
+    drag.changed = next.boxWidth !== drag.box.width || next.boxHeight !== drag.box.height;
+    invalidateViewerComposition();
+    setViewerLayers((current) => current.map((layer) => layer.id === drag.id
+      ? measureViewerText({ ...layer, boxWidth: next.boxWidth, boxHeight: next.boxHeight, x: drag.layerX + next.dx * drag.scale, y: drag.layerY + next.dy * drag.scale })
+      : layer));
+  };
+
   const moveViewerLayer = (event) => {
-    if (!viewerDrag.current || !["layer", "resize"].includes(viewerDrag.current.kind) || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    if (viewerDrag.current?.kind === "text-box" && event.currentTarget.hasPointerCapture(event.pointerId)) {
+      resizeViewerTextBox(viewerDrag.current, event);
+      return;
+    }
+    if (!viewerDrag.current || !["layer", "resize", "rotate", "paint"].includes(viewerDrag.current.kind) || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    if (viewerDrag.current.kind === "paint") {
+      const drag = viewerDrag.current;
+      const clipped = clipStrokeSamples(viewerStrokePoints(event, drag.layer), drag.layer, drag.previousRawPoint);
+      drag.previousRawPoint = clipped.previousRawPoint;
+      const points = clipped.points;
+      if (!points.length) return;
+      const allowance = Math.max(0, Math.min(drag.remainingPoints, VIEWER_MAX_STROKE_POINTS - drag.strokePointCount));
+      const accepted = points.slice(0, allowance);
+      if (!accepted.length || accepted.length < points.length) {
+        if (!drag.limitNotified) setViewerNotice(`笔画已达到单笔或全局 ${VIEWER_MAX_LAYOUT_POINTS.toLocaleString()} 点安全上限`);
+        drag.limitNotified = true;
+      }
+      if (!accepted.length) return;
+      drag.remainingPoints -= accepted.length;
+      drag.strokePointCount += accepted.length;
+      setViewerLayers((current) => current.map((layer) => {
+        if (layer.id !== drag.id) return layer;
+        return {
+          ...layer,
+          paintStrokes: (layer.paintStrokes || []).map((stroke) => stroke.id === drag.strokeId
+            ? appendStrokePoints(stroke, accepted, layer)
+            : stroke),
+        };
+      }));
+      return;
+    }
+    if (viewerDrag.current.kind === "rotate") {
+      const drag = viewerDrag.current;
+      const angle = Math.atan2(event.clientY - drag.centerY, event.clientX - drag.centerX) * 180 / Math.PI;
+      let rotation = normalizeRotation(drag.rotation + normalizeRotation(angle - drag.startAngle));
+      if (event.shiftKey) rotation = normalizeRotation(Math.round(rotation / 15) * 15);
+      drag.changed = normalizeRotation(rotation) !== normalizeRotation(drag.rotation);
+      updateViewerLayer(drag.id, { rotation });
+      return;
+    }
     if (viewerDrag.current.kind === "resize" && !viewerLayerResizeEnabled) return;
     if (viewerDrag.current.kind === "resize") {
       const drag = viewerDrag.current;
@@ -4394,18 +5201,34 @@ function App() {
     updateViewerLayer(viewerDrag.current.id, { x, y });
   };
 
-  const finishViewerPointer = () => {
+  const finishViewerPointer = (event, cancelled = false) => {
     const drag = viewerDrag.current;
+    if (drag && Number.isInteger(drag.pointerId) && event?.pointerId !== undefined && drag.pointerId !== event.pointerId) return;
+    viewerDrag.current = null;
+    if (drag?.kind === "text-marquee") {
+      setViewerTextMarquee(null);
+      if (!cancelled && drag.rect) createViewerText(drag.rect);
+      return;
+    }
+    if (cancelled) {
+      if (drag?.undoSnapshot) restoreViewerSnapshot(drag.undoSnapshot);
+      setViewerSnapGuide(null);
+      return;
+    }
     if (drag?.changed) saveViewerUndo(drag.undoSnapshot);
     if (drag?.kind === "layer" && drag.snappedWith?.length) {
       setViewerSnappedLayers((current) => [...new Set([...current, drag.id, ...drag.snappedWith])]);
     }
-    viewerDrag.current = null;
     if (!viewerAlignmentGuidesEnabled) setViewerSnapGuide(null);
     else if (drag?.kind === "resize") {
       const snapToken = viewerSession.current.request("snap", { latest: true });
       window.requestAnimationFrame(() => { if (viewerSession.current.isCurrent(snapToken)) refreshViewerSnapGuide(drag.id); });
     }
+  };
+
+  const loseViewerPointer = (event) => {
+    const drag = viewerDrag.current;
+    if (drag && drag.pointerId === event.pointerId) finishViewerPointer(event, true);
   };
 
   const finishViewerResizeForDisable = () => {
@@ -4474,7 +5297,7 @@ function App() {
 
   const copyActiveViewerLayer = () => {
     if (!activeViewerLayerItem || activeCollage) return;
-    viewerClipboard.current = { layer: { ...activeViewerLayerItem }, copiedAt: Date.now() };
+    viewerClipboard.current = { layer: cloneViewerLayer(activeViewerLayerItem), copiedAt: Date.now() };
     void copyViewerLayer(activeViewerLayerItem, true);
   };
 
@@ -4485,7 +5308,7 @@ function App() {
   const copyViewerLayerMarker = (event) => {
     if (!nativeImageCopy || !imageViewerOpen || activeCollage || !activeViewerLayerItem || isEditableTarget(event.target)) return;
     if (window.getSelection?.()?.toString()) return;
-    viewerClipboard.current = { layer: { ...activeViewerLayerItem }, copiedAt: Date.now() };
+    viewerClipboard.current = { layer: cloneViewerLayer(activeViewerLayerItem), copiedAt: Date.now() };
     event.clipboardData?.setData("text/plain", `XIRAI_LAYER:${activeViewerLayerItem.id}`);
     event.preventDefault();
     setViewerNotice("已复制到画布：HTTP 访问下只能在本页粘贴，复制到其他软件请右键用浏览器菜单「复制图片」");
@@ -4502,32 +5325,34 @@ function App() {
     if (!imageViewerOpen || activeCollage || isEditableTarget(event.target)) return;
     const copied = viewerClipboard.current;
     const marker = event.clipboardData?.getData("text/plain");
-    if (copied && marker === `XIRAI_LAYER:${copied.layer.id}` && Date.now() - copied.copiedAt <= 300000) {
+    const clipboardItems = [...(event.clipboardData?.items || [])];
+    const files = [...new Map([...event.clipboardData?.files || [], ...clipboardItems.map((item) => item.kind === "file" ? item.getAsFile() : null)]
+      .filter((file) => file?.type.startsWith("image/"))
+      .map((file) => [`${file.name}:${file.size}:${file.lastModified}`, file])).values()];
+    const intent = viewerClipboardPasteIntent({ copied, marker, hasImages: files.length > 0 });
+    if (intent === "internal-layer") {
       event.preventDefault();
-      const layer = { ...copied.layer, id: `viewer-copy-${Date.now()}-${Math.random().toString(16).slice(2)}`, x: copied.layer.x + 28, y: copied.layer.y + 28 };
+      invalidateViewerComposition({ invalidateReplacement: true });
+      const layer = { ...cloneViewerLayer(copied.layer), id: `viewer-copy-${Date.now()}-${Math.random().toString(16).slice(2)}`, x: copied.layer.x + 28, y: copied.layer.y + 28 };
+      const sourceBytes = viewerLayerSourceByteCount([layer]);
+      if (viewerSourceBytes.current + sourceBytes > VIEWER_MAX_LAYER_SOURCE_BYTES) {
+        setViewerNotice("画布图片源总量超过 256 MiB 上限");
+        return;
+      }
       saveViewerUndo();
+      viewerSourceBytes.current += sourceBytes;
       setViewerLayers((current) => [...current, layer]);
       setActiveViewerLayer(layer.id);
       setViewerNotice("已粘贴画布图片");
       return;
     }
-    const clipboardItems = [...(event.clipboardData?.items || [])];
-    const files = [...new Map([...event.clipboardData?.files || [], ...clipboardItems.map((item) => item.kind === "file" ? item.getAsFile() : null)]
-      .filter((file) => file?.type.startsWith("image/"))
-      .map((file) => [`${file.name}:${file.size}:${file.lastModified}`, file])).values()];
-    if (files.length) {
+    if (intent === "images") {
       event.preventDefault();
       viewerClipboard.current = null;
       void addViewerFiles(files);
       return;
     }
-    if (!copied || Date.now() - copied.copiedAt > 300000) return;
-    event.preventDefault();
-    const layer = { ...copied.layer, id: `viewer-copy-${Date.now()}-${Math.random().toString(16).slice(2)}`, x: copied.layer.x + 28, y: copied.layer.y + 28 };
-    saveViewerUndo();
-    setViewerLayers((current) => [...current, layer]);
-    setActiveViewerLayer(layer.id);
-    setViewerNotice("已粘贴画布图片");
+    viewerClipboard.current = null;
   };
 
   useEffect(() => {
@@ -4536,7 +5361,7 @@ function App() {
       return undefined;
     }
     const frame = window.requestAnimationFrame(() => {
-      const rectangles = viewerLayers.map((layer) => {
+      const rectangles = viewerLayers.filter((layer) => viewerLayerKind(layer) === "image").map((layer) => {
         const node = viewerCanvasRef.current?.querySelector(`[data-viewer-layer-id="${layer.id}"]`);
         const rect = node?.getBoundingClientRect();
         return rect && { id: layer.id, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
@@ -5132,11 +5957,21 @@ function App() {
 
   useEffect(() => {
     const handleShortcut = (event) => {
-      if (imageViewerOpen && !activeCollage && activeViewerLayerItem && !isEditableTarget(event.target)) {
+      const editable = isEditableTarget(event.target);
+      if (imageViewerOpen && !activeCollage && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        const tool = { v: "move", b: "brush", e: "eraser", t: "text" }[event.key.toLowerCase()];
+        if (tool) {
+          event.preventDefault();
+          if (!event.repeat) selectViewerTool(tool);
+          return;
+        }
+      }
+      if (imageViewerOpen && viewerTool === "move" && !activeCollage && activeViewerLayerItem && !editable) {
         const adjustment = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[event.key];
         if (adjustment) {
           event.preventDefault();
           if (!viewerNudge.current || viewerNudge.current.key !== event.key || viewerNudge.current.id !== activeViewerLayerItem.id) {
+            invalidateViewerComposition();
             viewerNudge.current = { key: event.key, id: activeViewerLayerItem.id };
             saveViewerUndo({ layers: viewerLayers, snappedLayers: viewerSnappedLayers, activeLayer: activeViewerLayer });
           }
@@ -5228,6 +6063,8 @@ function App() {
     ? current.replace(TRANSPARENT_BACKGROUND_PATTERN_ALL, "").replace(/\s*,\s*,+/g, ", ").replace(/^\s*,\s*|\s*,\s*$/g, "").trim()
     : `${current.trim()}${current.trim() ? ", " : ""}${TRANSPARENT_BACKGROUND_TAG}`);
   const activeViewerLayerItem = viewerLayers.find((layer) => layer.id === activeViewerLayer) || viewerLayers.at(-1) || null;
+  const activeViewerTextLayer = viewerLayerKind(activeViewerLayerItem) === "text" ? activeViewerLayerItem : null;
+  const viewerHasEditableContent = hasViewerEdits(viewerLayers);
   const activeCollageTemplate = collageTemplates.find((template) => template.id === activeCollage?.templateId) || null;
   const activeCollageLayout = activeCollageTemplate && activeCollage
     ? adaptiveCollageLayout(activeCollageTemplate, activeCollage.slots.map((entry) => entry?.asset))
@@ -6542,43 +7379,140 @@ function App() {
               <button className="viewer-sidebar-handle" type="button" aria-label={viewerSidebarOpen ? "收起图片栏" : "展开图片栏"} title={viewerSidebarOpen ? "收起图片栏" : "展开图片栏"} onClick={() => setViewerSidebarOpen((current) => !current)}>{viewerSidebarOpen ? <ChevronLeft size={17} /> : <PanelLeft size={17} />}<span>{viewerSidebarOpen ? "收起" : "图片"}</span></button>
               <section className="viewer-workspace" style={{ "--viewer-toolbar-height": `${viewerToolbarHeight}px` }}>
                   <div className="viewer-toolbar" ref={viewerToolbarRef}>
-                    <div className="viewer-toolbar-group viewer-tool-group" aria-label="视图"><button title="缩小视图" aria-label="缩小视图" onClick={() => setViewerZoom((current) => Math.max(VIEWER_MIN_ZOOM, current / 1.15))}><ZoomOut size={14} /></button><output>{Math.round(viewerZoom * 100)}%</output><button title="放大视图" aria-label="放大视图" onClick={() => setViewerZoom((current) => Math.min(VIEWER_MAX_ZOOM, current * 1.15))}><ZoomIn size={14} /></button></div>
-                    <div className="viewer-toolbar-group" aria-label="布局"><button ref={viewerEdgeTriggerRef} className={viewerEdgePanelOpen ? "active" : ""} aria-expanded={viewerEdgePanelOpen} aria-controls="viewer-alignment-panel" aria-haspopup="dialog" title="对齐与线条" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_LAYOUT)}><SlidersHorizontal size={14} /><span>对齐与线条</span></button><button ref={viewerTemplateTriggerRef} className={viewerTemplatesOpen ? "active" : ""} aria-expanded={viewerTemplatesOpen} aria-controls="viewer-template-panel" aria-haspopup="dialog" title="拼图模板" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_TEMPLATES)}><LayoutTemplate size={14} /><span>拼图模板</span></button>{!activeCollage && viewerLayers.length > 1 && <button title="一键拼图" onClick={createManualCollage}><Layers3 size={14} /><span>一键拼图</span></button>}</div>
-                    <div className="viewer-toolbar-group" aria-label="图层"><button className={viewerLayerResizeEnabled ? "active" : ""} aria-pressed={viewerLayerResizeEnabled} title={viewerLayerResizeEnabled ? "关闭图片尺寸调整（不影响相机缩放或拖动）" : "开启图片尺寸调整"} onClick={toggleViewerLayerResize}><Move size={14} /><span>图片尺寸调整</span></button>{!activeCollage && activeViewerLayerItem && <div className="viewer-layer-scale"><Move size={13} /><span>选中图片</span><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1 / 1.1)}>-</button><BoundedNumberInput value={Math.round(activeViewerLayerItem.scale * 100)} min={10} max={800} integer disabled={!viewerLayerResizeEnabled} onCommit={(percentage) => setViewerLayerScale(activeViewerLayerItem.id, percentage)} ariaLabel="选中图片缩放比例" /><em>%</em><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1.1)}>+</button></div>}</div>
+                     <div className="viewer-toolbar-group viewer-tool-group" aria-label="视图"><button title="缩小视图" aria-label="缩小视图" onClick={() => setViewerZoom((current) => Math.max(VIEWER_MIN_ZOOM, current / 1.15))}><ZoomOut size={14} /></button><output>{Math.round(viewerZoom * 100)}%</output><button title="放大视图" aria-label="放大视图" onClick={() => setViewerZoom((current) => Math.min(VIEWER_MAX_ZOOM, current * 1.15))}><ZoomIn size={14} /></button></div>
+                     <div className="viewer-toolbar-group viewer-editor-tools" aria-label="编辑工具">
+                       <button className={viewerTool === "move" ? "active" : ""} aria-pressed={viewerTool === "move"} title="移动工具 (V)" onClick={() => selectViewerTool("move")}><MousePointer2 size={14} /><span>移动</span></button>
+                       <button className={viewerTool === "brush" ? "active" : ""} aria-pressed={viewerTool === "brush"} disabled={Boolean(activeCollage)} title="画笔工具 (B)" onClick={() => selectViewerTool("brush")}><Paintbrush size={14} /><span>画笔</span></button>
+                       <button className={viewerTool === "eraser" ? "active" : ""} aria-pressed={viewerTool === "eraser"} disabled={Boolean(activeCollage)} title="橡皮擦工具 (E)" onClick={() => selectViewerTool("eraser")}><Eraser size={14} /><span>橡皮</span></button>
+                       <button className={viewerTool === "text" ? "active" : ""} aria-pressed={viewerTool === "text"} disabled={Boolean(activeCollage)} title="文字工具 (T)" onClick={() => selectViewerTool("text")}><Type size={14} /><span>文字</span></button>
+                     </div>
+                     {(viewerTool === "brush" || viewerTool === "eraser") && <div className="viewer-toolbar-group viewer-editor-properties" aria-label={`${viewerTool === "brush" ? "画笔" : "橡皮擦"}属性`}>
+                       <label className="viewer-property-field"><span>大小</span><BoundedNumberInput value={viewerBrush.size} min={1} max={300} integer onCommit={(size) => setViewerBrush((current) => ({ ...current, size }))} ariaLabel="笔刷大小" /><em>px</em></label>
+                       <label className="viewer-property-field"><span>不透明度</span><BoundedNumberInput value={viewerBrush.opacity} min={1} max={100} integer onCommit={(opacity) => setViewerBrush((current) => ({ ...current, opacity }))} ariaLabel="笔刷不透明度" /><em>%</em></label>
+                       {viewerTool === "brush" && <><label className="viewer-property-color"><span>颜色</span><input type="color" value={viewerBrush.color} onChange={(event) => setViewerBrush((current) => ({ ...current, color: normalizeViewerColor(event.target.value) }))} aria-label="画笔颜色" /></label><button title="提取屏幕颜色" aria-label="提取屏幕颜色" onClick={pickViewerBrushColor}><Palette size={14} /></button></>}
+                     </div>}
+                     {viewerTool === "text" && <div className="viewer-toolbar-group viewer-editor-properties viewer-text-properties" aria-label="文字属性">
+                       <label className="viewer-property-field viewer-text-content-field"><span>内容</span><input
+                         type="text"
+                         value={activeViewerTextLayer?.text ?? viewerTextDefaults.text}
+                         aria-label="文字内容"
+                         onFocus={() => { if (activeViewerTextLayer) viewerPropertyEdit.current = { id: activeViewerTextLayer.id, snapshot: viewerSnapshot(activeViewerTextLayer.id), defaults: { ...viewerTextDefaults }, changed: false }; }}
+                         onChange={(event) => {
+                           const text = event.target.value.slice(0, 8000);
+                           setViewerTextDefaults((current) => ({ ...current, text }));
+                           if (activeViewerTextLayer) {
+                             if (viewerPropertyEdit.current?.id === activeViewerTextLayer.id) viewerPropertyEdit.current.changed = true;
+                             updateViewerText(activeViewerTextLayer.id, text);
+                           }
+                         }}
+                         onBlur={() => { const edit = viewerPropertyEdit.current; viewerPropertyEdit.current = null; if (edit?.changed) saveViewerUndo(edit.snapshot); }}
+                         onKeyDown={(event) => {
+                           if (event.key === "Escape" && viewerPropertyEdit.current) {
+                             event.preventDefault();
+                             event.stopPropagation();
+                             const edit = viewerPropertyEdit.current;
+                             viewerPropertyEdit.current = null;
+                             restoreViewerSnapshot(edit.snapshot);
+                             if (edit.defaults) setViewerTextDefaults(edit.defaults);
+                             event.currentTarget.blur();
+                           } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                             event.preventDefault();
+                             event.currentTarget.blur();
+                           }
+                         }}
+                       /></label>
+                       <label className="viewer-property-field"><span>字号</span><BoundedNumberInput value={activeViewerTextLayer?.fontSize ?? viewerTextDefaults.fontSize} min={8} max={300} integer onCommit={(fontSize) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { fontSize }) : setViewerTextDefaults((current) => ({ ...current, fontSize }))} ariaLabel="文字字号" /><em>px</em></label>
+                       <label className="viewer-property-color"><span>颜色</span><input type="color" value={activeViewerTextLayer?.color ?? viewerTextDefaults.color} onChange={(event) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { color: event.target.value }) : setViewerTextDefaults((current) => ({ ...current, color: normalizeViewerColor(event.target.value) }))} aria-label="文字颜色" /></label>
+                       <label className="viewer-property-select"><span>字重</span><select value={activeViewerTextLayer?.fontWeight ?? viewerTextDefaults.fontWeight} onChange={(event) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { fontWeight: Number(event.target.value) }) : setViewerTextDefaults((current) => ({ ...current, fontWeight: Number(event.target.value) }))}>{[400, 500, 600, 700, 800, 900].map((weight) => <option key={weight} value={weight}>{weight}</option>)}</select></label>
+                       <div className="viewer-property-align" aria-label="文字对齐">{[["left", AlignLeft], ["center", AlignCenter], ["right", AlignRight]].map(([align, Icon]) => <button key={align} className={(activeViewerTextLayer?.textAlign ?? viewerTextDefaults.textAlign) === align ? "active" : ""} aria-pressed={(activeViewerTextLayer?.textAlign ?? viewerTextDefaults.textAlign) === align} title={{ left: "左对齐", center: "居中", right: "右对齐" }[align]} onClick={() => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { textAlign: align }) : setViewerTextDefaults((current) => ({ ...current, textAlign: align }))}><Icon size={13} /></button>)}</div>
+                       <label className="viewer-property-field"><span>行高</span><BoundedNumberInput value={activeViewerTextLayer?.lineHeight ?? viewerTextDefaults.lineHeight} min={0.8} max={3} fixed={1} onCommit={(lineHeight) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { lineHeight }) : setViewerTextDefaults((current) => ({ ...current, lineHeight }))} ariaLabel="文字行高" /></label>
+                       <label className="viewer-property-field"><span>角度</span><BoundedNumberInput value={activeViewerTextLayer?.rotation ?? viewerTextDefaults.rotation} min={-180} max={180} integer onCommit={(rotation) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { rotation: normalizeRotation(rotation) }) : setViewerTextDefaults((current) => ({ ...current, rotation: normalizeRotation(rotation) }))} ariaLabel="文字旋转角度" /><em>°</em></label>
+                       {activeViewerTextLayer && <button title="编辑多行文字（双击文字也可编辑）" onClick={() => beginViewerTextEdit(activeViewerTextLayer)}><Pencil size={14} /><span>编辑</span></button>}
+                     </div>}
+                     <div className="viewer-toolbar-group" aria-label="布局"><button ref={viewerEdgeTriggerRef} className={viewerEdgePanelOpen ? "active" : ""} aria-expanded={viewerEdgePanelOpen} aria-controls="viewer-alignment-panel" aria-haspopup="dialog" title="对齐与线条" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_LAYOUT)}><SlidersHorizontal size={14} /><span>对齐与线条</span></button><button ref={viewerTemplateTriggerRef} className={viewerTemplatesOpen ? "active" : ""} aria-expanded={viewerTemplatesOpen} aria-controls="viewer-template-panel" aria-haspopup="dialog" title="拼图模板" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_TEMPLATES)}><LayoutTemplate size={14} /><span>拼图模板</span></button>{!activeCollage && !collageResult && (viewerLayers.length > 1 || viewerHasEditableContent) && <button disabled={Boolean(viewerCollageBusy)} title={viewerHasEditableContent ? "应用编辑并合成为 PNG" : "一键拼图"} onClick={createManualCollage}><Layers3 size={14} /><span>{viewerCollageBusy === "manual-collage" ? "合成中…" : viewerHasEditableContent ? "应用编辑" : "一键拼图"}</span></button>}</div>
+                     <div className="viewer-toolbar-group" aria-label="图层"><button className={viewerLayerResizeEnabled ? "active" : ""} aria-pressed={viewerLayerResizeEnabled} title={viewerLayerResizeEnabled ? "关闭图片尺寸调整（不影响相机缩放或拖动）" : "开启图片尺寸调整"} onClick={toggleViewerLayerResize}><Move size={14} /><span>图片尺寸调整</span></button>{!activeCollage && activeViewerLayerItem && <div className="viewer-layer-scale"><Move size={13} /><span>选中{viewerLayerKind(activeViewerLayerItem) === "text" ? "文字" : "图片"}</span><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1 / 1.1)}>-</button><BoundedNumberInput value={Math.round(activeViewerLayerItem.scale * 100)} min={10} max={800} integer disabled={!viewerLayerResizeEnabled} onCommit={(percentage) => setViewerLayerScale(activeViewerLayerItem.id, percentage)} ariaLabel={`选中${viewerLayerKind(activeViewerLayerItem) === "text" ? "文字" : "图片"}缩放比例`} /><em>%</em><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1.1)}>+</button></div>}</div>
                     {activeCollageSlotItem && <div className="viewer-toolbar-group collage-slot-adjust" aria-label={`拼图区块 ${activeCollageSlot + 1}`}><div className="viewer-toolbar-subgroup viewer-layer-scale"><Move size={13} /><span>区块 {activeCollageSlot + 1}</span><button onClick={() => updateCollageSlot(activeCollageSlot, { scale: Math.max(.1, activeCollageSlotItem.scale / 1.1) })}>-</button><output>{Math.round(activeCollageSlotItem.scale * 100)}%</output><button onClick={() => updateCollageSlot(activeCollageSlot, { scale: Math.min(4, activeCollageSlotItem.scale * 1.1) })}>+</button></div><div className="viewer-toolbar-subgroup viewer-tool-group"><button title="左边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: 0 })}>L</button><button title="水平居中" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: .5 })}>C</button><button title="右边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: 1 })}>R</button></div><div className="viewer-toolbar-subgroup viewer-tool-group"><button title="顶边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: 0 })}>T</button><button title="垂直居中" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: .5 })}>M</button><button title="底边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: 1 })}>B</button></div></div>}
-                    {(activeCollage || collageResult) && <div className="viewer-toolbar-group viewer-toolbar-results" aria-label="结果">{activeCollage && <button className="viewer-confirm" onClick={confirmCollage}><Check size={14} /><span>确认拼图</span></button>}{collageResult && <><button className="viewer-confirm" disabled={collageResult.saved} onClick={saveCollage}><Save size={14} /><span>{collageResult.saved ? "已保存" : "保存拼图"}</span></button><button onClick={editCollage}><LayoutTemplate size={14} /><span>重新拼图</span></button><button className="viewer-danger" onClick={discardCollage}><Trash2 size={14} /><span>删除拼图</span></button></>}</div>}
+                    {(activeCollage || collageResult) && <div className="viewer-toolbar-group viewer-toolbar-results" aria-label="结果">{activeCollage && <button className="viewer-confirm" disabled={Boolean(viewerCollageBusy)} onClick={confirmCollage}><Check size={14} /><span>{viewerCollageBusy === "confirm" ? "合成中…" : "确认拼图"}</span></button>}{collageResult && <><button className="viewer-confirm" disabled={collageResult.saved || Boolean(viewerCollageBusy)} onClick={saveCollage}><Save size={14} /><span>{viewerCollageBusy === "save" ? "保存中…" : collageResult.saved ? "已保存" : "保存拼图"}</span></button><button disabled={Boolean(viewerCollageBusy)} onClick={editCollage}><LayoutTemplate size={14} /><span>重新拼图</span></button><button className="viewer-danger" disabled={Boolean(viewerCollageBusy)} onClick={discardCollage}><Trash2 size={14} /><span>删除拼图</span></button></>}</div>}
                  </div>
                  {(viewerTemplatesOpen || viewerEdgePanelOpen) && <div className="viewer-toolbar-popover-backdrop" style={{ top: viewerToolbarHeight }} aria-hidden="true" onPointerDown={() => closeViewerToolbarPopover("backdrop")} />}
                  {viewerTemplatesOpen && <div ref={viewerTemplatePanelRef} id="viewer-template-panel" className="collage-template-panel" style={{ top: viewerToolbarHeight + 1 }} role="dialog" aria-label="拼图模板">
                    <header><div><strong>拼图模板</strong><span>2–9 图 · 每种数量提供 3 种推荐排版</span></div><button aria-label="关闭拼图模板" onClick={closeViewerToolbarPopover}><X size={15} /></button></header>
                   <div className="collage-template-groups">{Array.from({ length: 8 }, (_, index) => index + 2).map((count) => <section key={count}><h4>{count} 图</h4><div>{collageTemplates.filter((template) => template.count === count).map((template) => <button key={template.id} onClick={() => chooseCollageTemplate(template)}><span className="template-miniature">{template.slots.map((slot, slotIndex) => <i key={slotIndex} style={{ left: `${slot.x * 100}%`, top: `${slot.y * 100}%`, width: `${slot.w * 100}%`, height: `${slot.h * 100}%` }} />)}</span><b>{template.label}</b></button>)}</div></section>)}</div>
                 </div>}
-                 {viewerEdgePanelOpen && <div ref={viewerEdgePanelRef} id="viewer-alignment-panel" className="viewer-edge-panel" role="dialog" aria-label="对齐与线条"><header><div><strong>对齐与线条</strong><span>吸附、辅助线与拼图边缘样式</span></div><button aria-label="关闭对齐与线条" onClick={closeViewerToolbarPopover}><X size={14} /></button></header><div className="viewer-alignment-controls"><label className="viewer-grid-control"><input type="checkbox" checked={viewerGridEnabled} onChange={(event) => setViewerGridEnabled(event.target.checked)} /><span>网格吸附</span><BoundedNumberInput value={viewerGridSize} min={4} max={256} integer onCommit={setViewerGridSize} ariaLabel="网格吸附像素尺寸" /><small>px / 格</small></label><label className="viewer-grid-control"><input type="checkbox" checked={viewerEdgeSnapEnabled} onChange={(event) => setViewerEdgeSnapEnabled(event.target.checked)} /><span>边缘吸附</span></label><label className="viewer-grid-control"><input type="checkbox" checked={viewerAlignmentGuidesEnabled} onChange={(event) => { setViewerAlignmentGuidesEnabled(event.target.checked); if (!event.target.checked) setViewerSnapGuide(null); }} /><span>辅助对齐线</span></label><label className="viewer-grid-control"><input type="checkbox" checked={viewerEdgeLine.enabled} onChange={toggleEdgeLines} /><span>显示边缘线</span></label></div><div className="edge-style-options">{edgeLineStyles.map((style) => <button key={style.id} className={viewerEdgeLine.style === style.id ? "active" : ""} onClick={() => updateViewerEdgeLine({ style: style.id })}><i className={style.id} style={{ "--edge-color": viewerEdgeLine.color }} />{style.label}</button>)}</div><div className="edge-color-row"><label><span>颜色</span><input type="color" value={viewerEdgeLine.color} onChange={(event) => updateViewerEdgeLine({ color: event.target.value })} /></label><button onClick={pickEdgeColor}><Palette size={14} />提取屏幕颜色</button><label><span>线宽</span><input type="range" min="1" max="12" value={viewerEdgeLine.width} onChange={(event) => updateViewerEdgeLine({ width: Number(event.target.value) })} /><b>{viewerEdgeLine.width}px</b></label></div></div>}
+                 {viewerEdgePanelOpen && <div ref={viewerEdgePanelRef} id="viewer-alignment-panel" className="viewer-edge-panel" role="dialog" aria-label="对齐与线条"><header><div><strong>对齐与线条</strong><span>吸附、辅助线与拼图边缘样式</span></div><button aria-label="关闭对齐与线条" onClick={closeViewerToolbarPopover}><X size={14} /></button></header><div className="viewer-alignment-controls"><label className="viewer-grid-control"><input type="checkbox" checked={viewerGridEnabled} onChange={(event) => setViewerGridEnabled(event.target.checked)} /><span>网格吸附</span><BoundedNumberInput value={viewerGridSize} min={4} max={256} integer onCommit={setViewerGridSize} ariaLabel="网格吸附像素尺寸" /><small>px / 格</small></label><label className="viewer-grid-control"><input type="checkbox" checked={viewerEdgeSnapEnabled} onChange={(event) => setViewerEdgeSnapEnabled(event.target.checked)} /><span>边缘吸附</span></label><label className="viewer-grid-control"><input type="checkbox" checked={viewerAlignmentGuidesEnabled} onChange={(event) => { setViewerAlignmentGuidesEnabled(event.target.checked); if (!event.target.checked) setViewerSnapGuide(null); }} /><span>辅助对齐线</span></label><label className="viewer-grid-control"><input type="checkbox" checked={viewerEdgeLine.enabled} onChange={toggleEdgeLines} /><span>显示边缘线</span></label></div><div className="edge-style-options">{edgeLineStyles.map((style) => <button key={style.id} className={viewerEdgeLine.style === style.id ? "active" : ""} onClick={() => updateViewerEdgeLine({ style: style.id })}><i className={style.id} style={{ "--edge-color": viewerEdgeLine.color }} />{style.label}</button>)}</div><div className="edge-color-row"><label><span>颜色</span><input type="color" value={viewerEdgeLine.color} onChange={(event) => updateViewerEdgeLine({ color: event.target.value })} /></label><button onClick={pickEdgeColor}><Palette size={14} />提取屏幕颜色</button><label><span>线宽</span><input type="range" min="1" max="50" value={viewerEdgeLine.width} onChange={(event) => updateViewerEdgeLine({ width: Number(event.target.value) })} /><b>{viewerEdgeLine.width}px</b></label></div></div>}
                 <div
-                  className={`image-viewer-canvas ${activeCollage ? "collage-active" : ""}`}
+                  className={`image-viewer-canvas tool-${viewerTool} ${activeCollage ? "collage-active" : ""}`}
                   ref={viewerCanvasRef}
                   style={{ "--viewer-grid-size": `${viewerGridSize * viewerZoom}px`, "--edge-color": viewerEdgeLine.color, "--edge-width": `${viewerEdgeLine.width}px` }}
                   onWheel={zoomImageAt}
                   onPointerDown={startViewerDrag}
-                  onPointerMove={moveViewerImage}
-                  onPointerUp={finishViewerPointer}
-                  onPointerCancel={finishViewerPointer}
+                   onPointerMove={moveViewerImage}
+                   onPointerUp={finishViewerPointer}
+                   onPointerCancel={(event) => finishViewerPointer(event, true)}
+                   onLostPointerCapture={loseViewerPointer}
+                   onPointerLeave={() => setViewerPointerOverCanvas(false)}
+                  onMouseDown={suppressViewerMiddleClick}
+                  onAuxClick={suppressViewerMiddleClick}
                   onDragOver={(event) => event.preventDefault()}
                   onDrop={viewerDrop}
                   onContextMenu={(event) => { if (event.target === event.currentTarget) event.preventDefault(); }}
                 >
                   <div className="viewer-scene" style={{ transform: `translate(${viewerPan.x}px, ${viewerPan.y}px) scale(${viewerZoom})` }}>
-                    {!activeCollage && viewerLayers.map((layer) => <div
-                      className={`viewer-image-layer ${nativeImageCopy ? "native-copy " : ""}${activeViewerLayer === layer.id ? "active" : ""} ${viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : ""}`}
-                      key={layer.id}
-                      data-viewer-layer-id={layer.id}
-                       style={{ width: `${layer.naturalWidth}px`, height: `${layer.naturalHeight}px`, transform: `translate(${layer.x}px, ${layer.y}px) scale(${layer.scale})` }}
-                      onPointerDown={(event) => startViewerLayerDrag(event, layer)}
-                      onPointerMove={moveViewerLayer}
-                      onPointerUp={finishViewerPointer}
-                      onPointerCancel={finishViewerPointer}
-                       onContextMenu={(event) => { event.stopPropagation(); setActiveViewerLayer(layer.id); if (nativeImageCopy && !event.shiftKey) { hintNativeImageCopy(); return; } event.preventDefault(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "layer", layer }); }}
-                     ><img src={layer.url} alt={layer.name} draggable="false" />{viewerEdgeLine.enabled && ["top", "right", "bottom", "left"].filter((side) => !viewerLayerEdges[layer.id]?.includes(side)).map((side) => <i className={`layer-edge ${side}`} key={side} />)}{viewerLayerResizeEnabled && activeViewerLayer === layer.id && ["tl", "tr", "bl", "br", "top", "right", "bottom", "left"].map((handle) => <i className={`layer-corner-anchor ${handle}`} key={handle} style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className={`layer-corner ${handle}`} /></i>)}</div>)}
+                    {viewerTextMarquee && <i className="viewer-text-marquee" style={{ width: `${viewerTextMarquee.width}px`, height: `${viewerTextMarquee.height}px`, transform: `translate(${viewerTextMarquee.centerX}px, ${viewerTextMarquee.centerY}px)` }} aria-hidden="true" />}
+                    {!activeCollage && viewerLayers.map((layer) => {
+                      const kind = viewerLayerKind(layer);
+                      const painted = hasLayerPaint(layer);
+                      const textLayer = kind === "text";
+                      const nativeCopyLayer = nativeImageCopy && kind === "image" && !painted && normalizeRotation(layer.rotation) === 0;
+                      const edgeClass = !textLayer && viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : "";
+                      const textStyle = textLayer ? {
+                        color: layer.color,
+                        fontFamily: layer.fontFamily,
+                        fontSize: `${layer.fontSize}px`,
+                        fontWeight: layer.fontWeight,
+                        lineHeight: layer.lineHeight,
+                        textAlign: layer.textAlign,
+                      } : undefined;
+                      return <div
+                        className={`viewer-image-layer ${textLayer ? "viewer-text-layer " : ""}${nativeCopyLayer ? "native-copy " : ""}${activeViewerLayer === layer.id ? "active" : ""} ${edgeClass}`}
+                        key={layer.id}
+                        data-viewer-layer-id={layer.id}
+                        data-viewer-layer-kind={kind}
+                        style={{ width: `${layer.naturalWidth}px`, height: `${layer.naturalHeight}px`, transform: `translate(${layer.x}px, ${layer.y}px) rotate(${normalizeRotation(layer.rotation)}deg) scale(${layer.scale})` }}
+                        onPointerDown={(event) => startViewerLayerDrag(event, layer)}
+                        onPointerMove={moveViewerLayer}
+                        onPointerUp={finishViewerPointer}
+                        onPointerCancel={(event) => finishViewerPointer(event, true)}
+                        onLostPointerCapture={loseViewerPointer}
+                        onDoubleClick={(event) => { if (!textLayer) return; event.preventDefault(); event.stopPropagation(); beginViewerTextEdit(layer); }}
+                        onContextMenu={(event) => { event.stopPropagation(); setActiveViewerLayer(layer.id); if (nativeCopyLayer && !event.shiftKey) { hintNativeImageCopy(); return; } event.preventDefault(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "layer", layer }); }}
+                      >
+                        {textLayer
+                          ? editingViewerText === layer.id
+                            ? <textarea
+                              ref={viewerTextEditorRef}
+                              className="viewer-text-editor"
+                              value={layer.text}
+                              style={textStyle}
+                              aria-label="编辑文字图层"
+                              spellCheck="false"
+                              onPointerDown={(event) => { if (event.button !== 1) event.stopPropagation(); }}
+                              onChange={(event) => updateViewerText(layer.id, event.target.value)}
+                              onBlur={commitViewerTextEdit}
+                              onKeyDown={(event) => {
+                                if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); cancelViewerTextEdit(); }
+                                else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); commitViewerTextEdit(); }
+                              }}
+                            />
+                            : <div className="viewer-text-content" style={textStyle} aria-label={layer.text || "空文字图层"}>{(layer.lines || [layer.text]).join("\n")}</div>
+                          : painted
+                            ? <ViewerRasterLayer layer={layer} onError={handleViewerRasterError} />
+                            : <img src={layer.url} alt={layer.name} draggable="false" />}
+                        {!textLayer && viewerEdgeLine.enabled && ["top", "right", "bottom", "left"].filter((side) => !viewerLayerEdges[layer.id]?.includes(side)).map((side) => <i className={`layer-edge ${side}`} key={side} />)}
+                        {(viewerTool === "move" || (viewerTool === "text" && textLayer)) && viewerLayerResizeEnabled && activeViewerLayer === layer.id && viewerResizeHandles(layer).map((handle) => <i className={`layer-corner-anchor ${handle}`} key={handle} style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className={`layer-corner ${handle}`} /></i>)}
+                        {viewerTool === "move" && activeViewerLayer === layer.id && textLayer && <i className="layer-rotate-anchor" style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className="layer-rotate-handle" title="拖动旋转；按住 Shift 以 15° 吸附"><RotateCw size={12} /></i></i>}
+                      </div>;
+                    })}
                     {activeCollage && activeCollageTemplate && activeCollageLayout && <div className={`collage-board ${activeCollageLayout.aspect > 1.35 ? "wide" : "square"}`} style={{ "--collage-aspect": activeCollageLayout.aspect }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "collage-draft" }); }}>
                       {activeCollageLayout.slots.map((slot, index) => <div
                         className={`collage-slot ${activeCollage.slots[index] ? "filled" : ""} ${activeCollageSlot === index ? "active" : ""} ${activeCollage.slots[index] && viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : ""}`}
@@ -6590,6 +7524,7 @@ function App() {
                       >{activeCollage.slots[index] ? <><img src={activeCollage.slots[index].asset.url} alt="" draggable="true" onDragStart={(event) => historyDragStart(event, activeCollage.slots[index].asset)} style={{ transform: `scale(${activeCollage.slots[index].scale})`, transformOrigin: `${activeCollage.slots[index].alignX * 100}% ${activeCollage.slots[index].alignY * 100}%` }} />{viewerEdgeLine.enabled && ["top", "right", "bottom", "left"].filter((side) => !activeCollageEdges[index]?.includes(side)).map((side) => <i className={`layer-edge ${side}`} key={side} />)}</> : <span><ImagePlus size={20} />拖入图片<br />区块 {index + 1}</span>}</div>)}
                     </div>}
                   </div>
+                  {(viewerTool === "brush" || viewerTool === "eraser") && !activeCollage && <i className={`viewer-brush-cursor ${viewerTool} ${viewerPointerOverCanvas ? "" : "away"}`} ref={viewerBrushCursorRef} style={{ "--viewer-brush-color": viewerBrush.color }} aria-hidden="true" />}
                   {!activeCollage && viewerLayers.length === 0 && <div className="viewer-canvas-empty"><ImagePlus size={31} /><strong>拖入或粘贴图片开始排版</strong><span>支持左侧图片栏、本地文件拖入和系统剪贴板图片</span></div>}
                   {viewerSnapGuide && <><i className="viewer-snap-guide vertical" style={{ left: viewerSnapGuide.x ?? -100 }} /><i className="viewer-snap-guide vertical" style={{ left: viewerSnapGuide.x2 ?? -100 }} /><i className="viewer-snap-guide horizontal" style={{ top: viewerSnapGuide.y ?? -100 }} /><i className="viewer-snap-guide horizontal" style={{ top: viewerSnapGuide.y2 ?? -100 }} /></>}
                   {activeCollage && viewerLayers.length > 0 && <div className="collage-source-tray"><span>预览窗口图片 · 拖入区块</span><div>{viewerLayers.map((layer) => <button type="button" key={layer.id} draggable onDragStart={(event) => historyDragStart(event, { id: layer.assetId, url: layer.url, name: layer.name })} title={`拖入拼图：${layer.name}`}><img src={layer.url} alt="" /><small>{layer.name}</small></button>)}</div></div>}
@@ -6599,8 +7534,8 @@ function App() {
             </div>
           </section>
           {viewerMenu && <div className="viewer-context-menu" style={{ left: Math.min(viewerMenu.x, window.innerWidth - 230), top: Math.min(viewerMenu.y, window.innerHeight - 180) }} onPointerDown={(event) => event.stopPropagation()}>
-            {viewerMenu.kind === "history" && <><button onClick={() => focusViewerAsset(viewerMenu.asset)}><ImageIcon size={14} />切换当前预览</button><button onClick={() => addViewerAsset(viewerMenu.asset)}><ImagePlus size={14} />添加到预览窗口</button>{viewerMenu.asset.manual_layout && <button onClick={() => editCollage({ manualLayout: viewerMenu.asset.manual_layout })}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => requestHistoryDelete(viewerMenu.files, viewerMenu.label)}><Trash2 size={14} />删除{viewerMenu.files.length > 1 ? "本批次" : "图片"}</button></>}
-            {viewerMenu.kind === "layer" && <>{nativeImageCopy ? <p className="viewer-context-hint"><Copy size={13} />复制请直接右键，用浏览器菜单「复制图片」</p> : <button onClick={() => copyViewerLayer(viewerMenu.layer)}><Copy size={14} />复制干净 PNG</button>}{viewerMenu.layer.isCollage && <button onClick={() => editCollage(viewerMenu.layer)}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => removeViewerLayer(viewerMenu.layer.id)}><Trash2 size={14} />删除当前预览图片</button></>}
+            {viewerMenu.kind === "history" && <><button onClick={() => focusViewerAsset(viewerMenu.asset)}><ImageIcon size={14} />切换当前预览</button><button onClick={() => addViewerAsset(viewerMenu.asset)}><ImagePlus size={14} />添加到预览窗口</button>{viewerMenu.asset.manual_layout && <button onClick={() => editCollage({ manualLayout: viewerMenu.asset.manual_layout, manualLayoutTrusted: false })}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => requestHistoryDelete(viewerMenu.files, viewerMenu.label)}><Trash2 size={14} />删除{viewerMenu.files.length > 1 ? "本批次" : "图片"}</button></>}
+            {viewerMenu.kind === "layer" && <>{nativeImageCopy && viewerLayerKind(viewerMenu.layer) === "image" && !hasLayerPaint(viewerMenu.layer) && normalizeRotation(viewerMenu.layer.rotation) === 0 ? <p className="viewer-context-hint"><Copy size={13} />复制请直接右键，用浏览器菜单「复制图片」</p> : <button onClick={() => copyViewerLayer(viewerMenu.layer)}><Copy size={14} />复制实际 PNG</button>}{viewerMenu.layer.isCollage && <button onClick={() => editCollage(viewerMenu.layer)}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => removeViewerLayer(viewerMenu.layer.id)}><Trash2 size={14} />删除当前预览图层</button></>}
             {viewerMenu.kind === "collage-draft" && <button className="danger" onClick={cancelCollageDraft}><X size={14} />取消拼图</button>}
           </div>}
           {historyDelete && <div className="viewer-confirm-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setHistoryDelete(null)}><section className="viewer-delete-dialog"><Trash2 size={23} /><strong>删除{historyDelete.count > 1 ? "整组批次" : "图片"}？</strong><p>{historyDelete.label}<br />请选择仅从本次启动的左侧历史中隐藏，或同时永久删除 outputs 中的 {historyDelete.count} 个 PNG 源文件。</p><div><button onClick={() => finishHistoryDelete(false)}>只删除预览卡片</button><button className="danger" onClick={() => finishHistoryDelete(true)}>同时删除源文件</button><button onClick={() => setHistoryDelete(null)}>取消</button></div></section></div>}

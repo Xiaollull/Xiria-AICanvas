@@ -126,16 +126,28 @@ test("gallery opens directly on the themed archive without an editorial hero", a
 
 test("the lightbox scales both portrait and panoramic originals fully inside the stage", async () => {
   const css = await read("src/styles.css");
-  assert.match(css, /\.gallery-viewer-image-viewport \{[^}]*padding: clamp\(24px,4vw,72px\)/,
-    "the opened image must have breathing room instead of filling the window edge to edge");
-  assert.match(css, /\.gallery-viewer-image-viewport \.gallery-focus-frame > \.gallery-focus-full \{ width: auto; height: auto; max-width: 100%; max-height: 100%; \}/,
-    "the decoded image must scale down against both axes while preserving its ratio");
+  assert.match(css, /\.gallery-focus-shell \{ width: 100%; padding: clamp\(10px,1\.3vw,22px\)/,
+    "the viewing stage must use the full window instead of capping large screens at 1500px");
+  assert.match(css, /\.gallery-viewer-image-viewport \{[^}]*padding: clamp\(4px,\.65vw,10px\)/,
+    "the opened image must keep a compact safety margin without wasting the viewing stage");
+  assert.match(css, /\.gallery-viewer-image-viewport \.gallery-focus-frame > \.gallery-focus-full \{ width: 100%; height: 100%; max-width: 100%; max-height: 100%; \}/,
+    "the decoded image must fill the contain box on either axis while preserving its ratio");
   assert.match(css, /\.gallery-focus-shell \.gallery-viewer-image-viewport \{ background-color: transparent; background-image: none; \}/,
     "the high-specificity viewing stage must not restore an opaque black rectangle");
   assert.match(css, /\.gallery-viewer-image-viewport \.gallery-focus-frame \{[^}]*background: transparent;/,
     "the fitted image frame itself must remain transparent");
-  assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.gallery-viewer-image-viewport \{ padding: 8px; \}/,
+  assert.match(css, /@media \(max-width: 680px\)[\s\S]*?\.gallery-viewer-image-viewport \{ padding: 4px; \}/,
     "phone viewers must keep a compact fit margin");
+  assert.match(css, /@media \(min-width: 681px\) and \(max-width: 720px\)[\s\S]*?\.gallery-viewer-image-viewport \{ padding: 4px; \}/,
+    "the viewer must not jump back to desktop spacing between 681px and 720px");
+});
+
+test("ADetailer independent overrides use readable checkboxes in both workspaces", async () => {
+  const css = await read("src/styles.css");
+  assert.match(css, /\.adetailer-overrides input\[type="checkbox"\] \{ width: 18px; height: 18px;/,
+    "text-to-image ADetailer checkboxes must not fall back to the tiny browser default");
+  assert.match(css, /\.i2i-override-grid input\[type="checkbox"\] \{ width: 18px; height: 18px;/,
+    "image-to-image ADetailer checkboxes must match the readable control size");
 });
 
 test("every gallery UI font is at least 9px unless it is an explicit icon-hide zero", async () => {

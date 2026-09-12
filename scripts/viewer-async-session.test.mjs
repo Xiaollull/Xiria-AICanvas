@@ -13,6 +13,100 @@ test("slow open A cannot commit over fast open B", () => {
   assert.equal(gate.isCurrent(b), true);
 });
 
+test("open, focus, and restore share replacement ordering while appends invalidate stale replacement only", () => {
+  const gate = new ViewerAsyncSession();
+  gate.beginSession();
+  const open = gate.beginReplacement("open");
+  const focus = gate.beginReplacement("focus");
+  assert.equal(gate.isCurrent(open), false);
+  assert.equal(gate.isCurrent(focus), true);
+  const restore = gate.beginReplacement("restore");
+  assert.equal(gate.isCurrent(focus), false);
+  const drop = gate.beginAppend("drop");
+  const add = gate.beginAppend("add");
+  assert.equal(gate.isCurrent(restore), false);
+  assert.equal(gate.isCurrent(drop), true, "append requests remain current after invalidating a replacement");
+  assert.equal(gate.isCurrent(add), true);
+  const laterFocus = gate.beginReplacement("focus");
+  assert.equal(gate.isCurrent(drop), false, "a later replacement cancels unresolved appends from the old canvas");
+  assert.equal(gate.isCurrent(add), false);
+  assert.equal(gate.isCurrent(laterFocus), true);
+});
+
+test("replacement tokens are revision-bound so a canvas edit aborts a slow open", () => {
+  const gate = new ViewerAsyncSession();
+  gate.beginSession();
+  const slowOpen = gate.beginReplacement("open");
+  const originalRevision = slowOpen.revision;
+  assert.equal(gate.isCurrent(slowOpen), true);
+  gate.revise(); // create text / stroke / property update / delete all use this boundary
+  assert.equal(gate.revision > originalRevision, true);
+  assert.equal(slowOpen.signal.aborted, true);
+  assert.equal(gate.isCurrent(slowOpen), false);
+});
+
+test("slow open resolving after create text cannot replace the new text layer", async () => {
+  const gate = new ViewerAsyncSession();
+  gate.beginSession();
+  const loading = deferred();
+  const open = gate.beginReplacement("open");
+  const layers = [];
+  const completion = loading.promise.then(() => { if (gate.isCurrent(open)) layers.splice(0, layers.length, "opened-image"); });
+  gate.revise();
+  layers.push("new-text");
+  loading.resolve();
+  await completion;
+  assert.deepEqual(layers, ["new-text"]);
+});
+
+test("replacement releases only the old drop epoch and a late old release cannot unblock the new queue", async () => {
+  const gate = new ViewerAsyncSession();
+  gate.beginSession();
+  const oldLargeDrop = gate.beginAppend("drop");
+  gate.beginReplacement("focus");
+  assert.equal(await gate.waitForDropTurn(oldLargeDrop), false);
+
+  const newFirst = gate.beginAppend("drop");
+  const newSecond = gate.beginAppend("drop");
+  assert.equal(await gate.waitForDropTurn(newFirst), true, "the first drop in the new epoch never waits for old work");
+  let secondReleased = false;
+  const waitingSecond = gate.waitForDropTurn(newSecond).then((current) => { secondReleased = true; return current; });
+  gate.releaseDrop(oldLargeDrop);
+  await Promise.resolve();
+  assert.equal(secondReleased, false, "an old epoch release cannot alter the new epoch tail");
+  gate.releaseDrop(newFirst);
+  assert.equal(await waitingSecond, true);
+  gate.releaseDrop(newSecond);
+});
+
+test("collage operations are single-flight, abort on revision, and reject stale commits", () => {
+  const gate = new ViewerAsyncSession();
+  gate.beginSession();
+  const first = gate.beginOperation("confirm", { group: "collage" });
+  assert.ok(first);
+  assert.equal(gate.beginOperation("confirm", { group: "collage" }), null);
+  assert.equal(gate.isOperationCurrent(first), true);
+  gate.revise();
+  assert.equal(first.signal.aborted, true);
+  assert.equal(gate.isOperationCurrent(first), false);
+  const second = gate.beginOperation("save", { group: "collage" });
+  assert.equal(gate.isOperationCurrent(second), true);
+  assert.equal(gate.finishOperation(first), false, "an old finally block cannot clear a newer operation");
+  assert.equal(gate.finishOperation(second), true);
+  assert.equal(gate.isOperationCurrent(second), false);
+});
+
+test("a worker-aborted operation stays owned until catch and finally finish it", () => {
+  const gate = new ViewerAsyncSession();
+  gate.beginSession();
+  const token = gate.beginOperation("confirm", { group: "collage" });
+  token.controller.abort(new Error("worker failed"));
+  assert.equal(gate.isOperationCurrent(token), false);
+  assert.equal(gate.isOperationOwned(token), true, "catch can still report the primary error before finally removes ownership");
+  assert.equal(gate.finishOperation(token), true);
+  assert.equal(gate.isOperationOwned(token), false);
+});
+
 test("close and unmount invalidate unresolved requests without reopening", () => {
   const gate = new ViewerAsyncSession();
   const token = gate.request("open", { session: gate.beginSession(), latest: true });
@@ -204,7 +298,12 @@ test("App uses the gate and unified close contract", () => {
   assert.equal((source.match(/setImageViewerOpen\(false\)/g) || []).length, 1, "only closeImageViewer may set closed state");
   for (const name of ["openImageViewer", "focusViewerAsset", "addViewerAsset", "addViewerFiles", "restoreManualCollage", "setCollageSlot", "dropCollageSlot", "confirmCollage", "copyViewerLayer", "createManualCollage", "finishHistoryDelete", "pickEdgeColor"]) assert.match(source, new RegExp(`${name}[\\s\\S]{0,3000}viewerSession`));
   assert.match(source, /key: `slot:\$\{index\}`/);
-  assert.match(source, /request\("confirm", \{ latest: true \}\)/);
+  assert.match(source, /beginViewerCollageOperation\("confirm"\)/);
+  assert.match(source, /beginViewerCollageOperation\("save"\)/);
+  assert.match(source, /isOperationCurrent\(token\)/);
+  for (const kind of ["open", "focus", "restore"]) assert.match(source, new RegExp(`beginReplacement\\("${kind}"`));
+  for (const kind of ["add", "drop"]) assert.match(source, new RegExp(`beginAppend\\("${kind}"\\)`));
+  assert.match(source, /invalidateReplacement: true/);
   assert.match(source, /await navigator\.clipboard\.write[\s\S]{0,180}isCurrent\(token\)/);
   assert.match(source, /const token = viewerSession\.current\.request\("eyedropper", \{ latest: true \}\)/);
   assert.match(source, /viewerFitRaf\.current\?\.cancel\(\)/);

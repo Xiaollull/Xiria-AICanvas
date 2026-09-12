@@ -11,12 +11,16 @@ test("recommended queue omits verified and already queued artifacts", () => {
     { id: "downloading", sha256: digest("b") },
     { id: "missing", sha256: digest("c") },
     { id: "unverified" },
+    { id: "fallback-version" },
+    { id: "completed-fallback" },
   ];
   const pending = filterPendingRecommendedArtifacts(artifacts, new Map([[digest("a"), "models/a"]]), [
     { status: "downloading", sha256: digest("b") },
     { status: "error", sha256: digest("c") },
+    { status: "waiting", artifactId: "fallback-version" },
+    { status: "complete", artifactId: "completed-fallback" },
   ]);
-  assert.deepEqual(pending.map((item) => item.id), ["unverified"]);
+  assert.deepEqual(pending.map((item) => item.id), ["unverified", "completed-fallback"]);
 });
 
 test("download batches append stable indexes and refresh targets", () => {

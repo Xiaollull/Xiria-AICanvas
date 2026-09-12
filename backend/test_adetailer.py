@@ -617,6 +617,21 @@ class ADetailerTests(unittest.TestCase):
             finally:
                 inference_server.OUTPUT_DIRECTORY = original_output
 
+    def test_collage_edge_validation_uses_purple_default_and_clamps_at_50px(self):
+        invalid = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+        inference_server.draw_collage_edge(invalid, {"x": 0, "y": 0, "width": 120, "height": 120}, {
+            "enabled": True, "color": "not-a-color", "width": "not-a-number", "style": "script",
+        })
+        self.assertEqual(invalid.getpixel((0, 0)), (200, 172, 251, 255))
+        self.assertEqual(invalid.getpixel((3, 3)), (0, 0, 0, 0), "invalid width falls back to 2px")
+
+        wide = Image.new("RGBA", (120, 120), (0, 0, 0, 0))
+        inference_server.draw_collage_edge(wide, {"x": 0, "y": 0, "width": 120, "height": 120}, {
+            "enabled": True, "color": "#C8ACFB", "width": 500, "style": "solid",
+        })
+        self.assertEqual(wide.getpixel((49, 49)), (200, 172, 251, 255))
+        self.assertEqual(wide.getpixel((51, 51)), (0, 0, 0, 0), "edge width must stop at 50px")
+
     def test_animated_collage_preserves_gif_frames_and_saves_gif(self):
         frames = [Image.new("RGBA", (8, 8), "red"), Image.new("RGBA", (8, 8), "blue")]
         buffer = io.BytesIO()
@@ -629,7 +644,7 @@ class ADetailerTests(unittest.TestCase):
         )
         rendered, durations = inference_server.animated_collage_frames(request)
         self.assertEqual(len(rendered), 2)
-        self.assertEqual(durations, [100, 100])
+        self.assertEqual(durations, [40, 80])
         self.assertEqual(rendered[0].getpixel((2, 3))[:3], (255, 0, 0))
         self.assertEqual(rendered[1].getpixel((2, 3))[:3], (0, 0, 255))
         with tempfile.TemporaryDirectory() as temporary:

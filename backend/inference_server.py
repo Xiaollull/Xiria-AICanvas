@@ -3,6 +3,7 @@ import base64
 import binascii
 import copy
 import gc
+import hashlib
 import io
 import itertools
 import json
@@ -1233,17 +1234,370 @@ class PerformanceInput(BaseModel):
     vram_limit_gb: float = Field(default=0.0, ge=0.0, le=1024.0)
 
 
+COLLAGE_MAX_DECODED_BYTES = 128 * 1024 * 1024
+COLLAGE_MAX_DATA_URL_CHARS = ((COLLAGE_MAX_DECODED_BYTES + 2) // 3) * 4 + 64
+COLLAGE_MAX_PIXELS = 64 * 1024 * 1024
+COLLAGE_MAX_GIF_FRAMES = 240
+COLLAGE_MAX_TOTAL_FRAME_PIXELS = 120_000_000
+COLLAGE_MAX_MANUAL_LAYOUT_BYTES = 1024 * 1024
+COLLAGE_MAX_LAYOUT_LAYERS = 100
+COLLAGE_MAX_LAYOUT_TEXT = 8000
+COLLAGE_MAX_LAYOUT_STROKES = 1000
+COLLAGE_MAX_STROKE_POINTS = 10_000
+COLLAGE_MAX_LAYOUT_POINTS = 50_000
+COLLAGE_MAX_ANIMATED_SOURCE_BYTES = 32 * 1024 * 1024
+COLLAGE_MAX_ANIMATED_INPUT_BYTES = 128 * 1024 * 1024
+COLLAGE_MAX_ANIMATED_SOURCE_PIXELS = 64 * 1024 * 1024
+COLLAGE_MAX_ANIMATED_INPUT_PIXELS = 128 * 1024 * 1024
+COLLAGE_MAX_ANIMATED_SOURCE_FRAMES = 240
+COLLAGE_MAX_ANIMATED_INPUT_FRAMES = 1000
+COLLAGE_MAX_ANIMATED_FRAME_PIXELS = 256 * 1024 * 1024
+COLLAGE_MAX_ANIMATED_TARGET_PIXELS = 128 * 1024 * 1024
+COLLAGE_MAX_ENCODED_OUTPUT_BYTES = 128 * 1024 * 1024
+COLLAGE_MAX_HISTORY_COPY_BYTES = 128 * 1024 * 1024
+COLLAGE_MAX_LAYOUT_SOURCE_BYTES = 256 * 1024 * 1024
+COLLAGE_MAX_LAYOUT_SOURCE_PIXELS = 128 * 1024 * 1024
+COLLAGE_MAX_LAYOUT_SOURCE_FRAMES = 1000
+COLLAGE_MAX_LAYOUT_SOURCE_FRAME_PIXELS = 256 * 1024 * 1024
+COLLAGE_MAX_REQUEST_BYTES = max(COLLAGE_MAX_DATA_URL_CHARS, ((COLLAGE_MAX_ANIMATED_INPUT_BYTES + 2) // 3) * 4) + COLLAGE_MAX_MANUAL_LAYOUT_BYTES + 2 * 1024 * 1024
+COLLAGE_GIF_DURATION_DEFAULT_MS = 100
+COLLAGE_GIF_DURATION_MIN_MS = 20
+COLLAGE_GIF_DURATION_MAX_MS = 60_000
+
+_COLLAGE_HISTORY_SOURCE = re.compile(r"^/api/inference/history/assets/[A-Za-z0-9_-]+$")
+_COLLAGE_IMAGE_LAYER_KEYS = {
+    "kind", "type", "assetId", "url", "originalUrl", "name", "naturalWidth", "naturalHeight",
+    "x", "y", "scale", "rotation", "mimeType", "paintStrokes",
+}
+_COLLAGE_TEXT_LAYER_KEYS = {
+    "kind", "type", "text", "font", "fontFamily", "size", "fontSize", "weight", "fontWeight",
+    "color", "align", "textAlign", "lineHeight", "naturalWidth", "naturalHeight", "x", "y", "scale",
+    "rotation", "name",
+}
+_COLLAGE_STROKE_KEYS = {"id", "tool", "color", "size", "opacity", "points"}
+
+
+class CollageResourceLimitError(ValueError):
+    pass
+
+
+def normalize_collage_gif_duration(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return COLLAGE_GIF_DURATION_DEFAULT_MS
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return COLLAGE_GIF_DURATION_DEFAULT_MS
+    if not math.isfinite(duration) or duration <= 0:
+        return COLLAGE_GIF_DURATION_DEFAULT_MS
+    return int(round(min(COLLAGE_GIF_DURATION_MAX_MS, max(COLLAGE_GIF_DURATION_MIN_MS, duration))))
+
+
+class BoundedOutputWriter:
+    def __init__(self, stream, maximum_bytes: int):
+        self.stream = stream
+        self.maximum_bytes = maximum_bytes
+        self.length = 0
+
+    def write(self, data):
+        projected = max(self.length, self.stream.tell() + len(data))
+        if projected > self.maximum_bytes:
+            raise CollageResourceLimitError("Encoded collage output exceeds the 128 MiB budget")
+        written = self.stream.write(data)
+        self.length = max(self.length, self.stream.tell())
+        return written
+
+    def seek(self, *args):
+        return self.stream.seek(*args)
+
+    def tell(self):
+        return self.stream.tell()
+
+    def flush(self):
+        return self.stream.flush()
+
+    def truncate(self, *args):
+        result = self.stream.truncate(*args)
+        self.length = min(self.length, self.stream.tell())
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def bounded_output_buffer(maximum_bytes: int | None = None):
+    stream = io.BytesIO()
+    return stream, BoundedOutputWriter(stream, maximum_bytes or COLLAGE_MAX_ENCODED_OUTPUT_BYTES)
+
+
+class CollageRequestBodyLimitMiddleware:
+    def __init__(self, app, maximum_bytes: int):
+        self.app = app
+        self.maximum_bytes = maximum_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("path") not in {"/api/inference/collages", "/api/inference/collages/animated"}:
+            await self.app(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        try:
+            declared = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            declared = 0
+        if declared > self.maximum_bytes:
+            response = Response(content=json.dumps({"detail": "Collage request body exceeds the upload budget"}), status_code=413, media_type="application/json")
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            received += len(message.get("body", b""))
+            if received > self.maximum_bytes:
+                raise CollageResourceLimitError("Collage request body exceeds the upload budget")
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except CollageResourceLimitError:
+            response = Response(content=json.dumps({"detail": "Collage request body exceeds the upload budget"}), status_code=413, media_type="application/json")
+            await response(scope, receive, send)
+
+
+app.add_middleware(CollageRequestBodyLimitMiddleware, maximum_bytes=COLLAGE_MAX_REQUEST_BYTES)
+
+
+def _collage_finite_number(value, label: str):
+    try:
+        valid = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError(f"manual_layout {label} must be a finite number")
+    return float(value)
+
+
+def history_image_resource_metrics(path: Path, maximum_bytes: int, label: str, decode_frames: bool = False):
+    try:
+        file_bytes = path.stat().st_size
+    except OSError as error:
+        raise ValueError(f"Unable to inspect {label}") from error
+    if file_bytes > maximum_bytes:
+        raise CollageResourceLimitError(f"{label} exceeds the file byte budget")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                width, height = image.size
+                frame_count = max(1, int(getattr(image, "n_frames", 1)))
+                image_format = image.format
+                if decode_frames:
+                    for frame_index in range(frame_count):
+                        image.seek(frame_index)
+                        image.load()
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as error:
+        raise CollageResourceLimitError(f"{label} triggered the decompression-bomb guard") from error
+    except (MemoryError, OverflowError) as error:
+        raise CollageResourceLimitError(f"{label} could not be decoded inside the allocation budget") from error
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ValueError(f"Unable to read {label}") from error
+    pixels = width * height
+    frame_pixels = pixels * frame_count
+    if pixels > COLLAGE_MAX_PIXELS or frame_count > COLLAGE_MAX_GIF_FRAMES or frame_pixels > COLLAGE_MAX_TOTAL_FRAME_PIXELS:
+        raise CollageResourceLimitError(f"{label} exceeds the pixel or GIF frame budget")
+    return {"bytes": file_bytes, "pixels": pixels, "frames": frame_count, "frame_pixels": frame_pixels, "format": image_format}
+
+
+def validate_manual_layout_schema(layout: dict | None):
+    if layout is None:
+        return None
+    if not isinstance(layout, dict) or set(layout) != {"version", "layers"}:
+        raise ValueError("manual_layout must contain only version and layers")
+    version = layout.get("version")
+    layers = layout.get("layers")
+    if isinstance(version, bool) or version not in (1, 2):
+        raise ValueError("manual_layout version must be 1 or 2")
+    if not isinstance(layers, list) or not 1 <= len(layers) <= COLLAGE_MAX_LAYOUT_LAYERS:
+        raise ValueError(f"manual_layout must contain 1 to {COLLAGE_MAX_LAYOUT_LAYERS} layers")
+    stroke_count = 0
+    point_count = 0
+    source_bytes = 0
+    source_pixels = 0
+    source_frames = 0
+    source_frame_pixels = 0
+    for layer_index, layer in enumerate(layers):
+        if not isinstance(layer, dict):
+            raise ValueError(f"manual_layout layer {layer_index} must be an object")
+        is_text = version == 2 and (layer.get("kind") == "text" or layer.get("type") == "text")
+        allowed = _COLLAGE_TEXT_LAYER_KEYS if is_text else _COLLAGE_IMAGE_LAYER_KEYS
+        if not set(layer).issubset(allowed):
+            raise ValueError(f"manual_layout layer {layer_index} contains unsupported fields")
+        for key in ("x", "y", "scale", "rotation", "naturalWidth", "naturalHeight"):
+            if key in layer:
+                number = _collage_finite_number(layer[key], f"layer {layer_index}.{key}")
+                if key in {"x", "y"} and abs(number) > 10_000_000:
+                    raise ValueError(f"manual_layout layer {layer_index}.{key} is outside the coordinate budget")
+                if key == "scale" and not 0.1 <= number <= 8:
+                    raise ValueError(f"manual_layout layer {layer_index}.scale is outside 0.1 to 8")
+                if key == "rotation" and not -180 <= number <= 180:
+                    raise ValueError(f"manual_layout layer {layer_index}.rotation is outside -180 to 180")
+                if key in {"naturalWidth", "naturalHeight"} and not 1 <= number <= 24576:
+                    raise ValueError(f"manual_layout layer {layer_index}.{key} exceeds the dimension budget")
+        if "naturalWidth" in layer and "naturalHeight" in layer and float(layer["naturalWidth"]) * float(layer["naturalHeight"]) > COLLAGE_MAX_PIXELS:
+            raise ValueError(f"manual_layout layer {layer_index} exceeds the pixel budget")
+        name = layer.get("name", "")
+        if not isinstance(name, str) or len(name) > 200:
+            raise ValueError(f"manual_layout layer {layer_index} name is invalid")
+        if is_text:
+            text = layer.get("text")
+            if not isinstance(text, str) or len(text) > COLLAGE_MAX_LAYOUT_TEXT:
+                raise ValueError(f"manual_layout text exceeds {COLLAGE_MAX_LAYOUT_TEXT} characters")
+            for key, maximum in (("font", 160), ("fontFamily", 160), ("color", 16), ("align", 16), ("textAlign", 16)):
+                if key in layer and (not isinstance(layer[key], str) or len(layer[key]) > maximum):
+                    raise ValueError(f"manual_layout text field {key} is invalid")
+            for key in ("size", "fontSize", "weight", "fontWeight", "lineHeight"):
+                if key in layer:
+                    number = _collage_finite_number(layer[key], f"text layer {layer_index}.{key}")
+                    if key in {"size", "fontSize"} and not 8 <= number <= 300:
+                        raise ValueError("manual_layout text size is outside 8 to 300")
+                    if key == "lineHeight" and not 0.8 <= number <= 3:
+                        raise ValueError("manual_layout text lineHeight is outside 0.8 to 3")
+            continue
+        if version == 1 and (layer.get("kind") == "text" or layer.get("type") == "text"):
+            raise ValueError("manual_layout v1 cannot contain text layers")
+        asset_id = layer.get("assetId")
+        if not isinstance(asset_id, str) or not asset_id or len(asset_id) > 512:
+            raise ValueError(f"manual_layout image layer {layer_index} requires assetId")
+        sources = [layer[key] for key in ("url", "originalUrl") if key in layer and layer[key]]
+        if not sources or any(not isinstance(source, str) or not _COLLAGE_HISTORY_SOURCE.fullmatch(source) for source in sources):
+            raise ValueError("manual_layout image sources must use protected history asset routes")
+        source_tokens = [source.rsplit("/", 1)[-1] for source in sources]
+        if any(token != asset_id for token in source_tokens):
+            raise ValueError("manual_layout assetId must match every history source token")
+        try:
+            source_path = history_asset_path(asset_id)
+        except HTTPException as error:
+            raise ValueError("manual_layout image source token is invalid") from error
+        if not source_path.is_file():
+            raise ValueError("manual_layout image source is missing")
+        metrics = history_image_resource_metrics(source_path, COLLAGE_MAX_HISTORY_COPY_BYTES, "manual_layout history source")
+        source_bytes += metrics["bytes"]
+        source_pixels += metrics["pixels"]
+        source_frames += metrics["frames"]
+        source_frame_pixels += metrics["frame_pixels"]
+        if source_bytes > COLLAGE_MAX_LAYOUT_SOURCE_BYTES or source_pixels > COLLAGE_MAX_LAYOUT_SOURCE_PIXELS or source_frames > COLLAGE_MAX_LAYOUT_SOURCE_FRAMES or source_frame_pixels > COLLAGE_MAX_LAYOUT_SOURCE_FRAME_PIXELS:
+            raise CollageResourceLimitError("manual_layout history sources exceed the aggregate byte, pixel, or frame budget")
+        strokes = layer.get("paintStrokes", [])
+        if not isinstance(strokes, list):
+            raise ValueError("manual_layout paintStrokes must be a list")
+        if len(strokes) > COLLAGE_MAX_LAYOUT_STROKES - stroke_count:
+            raise ValueError(f"manual_layout exceeds {COLLAGE_MAX_LAYOUT_STROKES} strokes")
+        for stroke in strokes:
+            if not isinstance(stroke, dict) or not set(stroke).issubset(_COLLAGE_STROKE_KEYS):
+                raise ValueError("manual_layout contains an invalid stroke")
+            points = stroke.get("points")
+            if not isinstance(points, list) or len(points) > COLLAGE_MAX_STROKE_POINTS or point_count + len(points) > COLLAGE_MAX_LAYOUT_POINTS:
+                raise ValueError("manual_layout exceeds the stroke point budget")
+            if stroke.get("tool", "brush") not in {"brush", "eraser"}:
+                raise ValueError("manual_layout stroke tool is invalid")
+            for key in ("size", "opacity"):
+                if key in stroke:
+                    number = _collage_finite_number(stroke[key], f"stroke.{key}")
+                    if key == "size" and not 1 <= number <= 300:
+                        raise ValueError("manual_layout stroke size is outside 1 to 300")
+                    if key == "opacity" and not 0.01 <= number <= 1:
+                        raise ValueError("manual_layout stroke opacity is outside 0.01 to 1")
+            for key, maximum in (("id", 96), ("color", 16)):
+                if key in stroke and (not isinstance(stroke[key], str) or len(stroke[key]) > maximum):
+                    raise ValueError(f"manual_layout stroke field {key} is invalid")
+            for point in points:
+                if not isinstance(point, dict) or set(point) != {"x", "y"}:
+                    raise ValueError("manual_layout contains an invalid stroke point")
+                _collage_finite_number(point["x"], "stroke point x")
+                _collage_finite_number(point["y"], "stroke point y")
+            stroke_count += 1
+            point_count += len(points)
+    try:
+        encoded = json.dumps(layout, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("manual_layout is not JSON serializable") from error
+    if len(encoded) > COLLAGE_MAX_MANUAL_LAYOUT_BYTES:
+        raise ValueError("manual_layout exceeds the 1 MiB metadata budget")
+    return layout
+
+
 class CollageInput(BaseModel):
-    image_data: str = Field(min_length=32, max_length=200_000_000)
+    model_config = ConfigDict(extra="forbid")
+
+    image_data: str = Field(min_length=32, max_length=COLLAGE_MAX_DATA_URL_CHARS)
     name: str = Field(default="XirAI-collage.png", max_length=160)
     manual_layout: dict | None = None
+    idempotency_key: str = Field(default="", max_length=96, pattern=r"^[A-Za-z0-9._:-]*$")
+
+    @field_validator("manual_layout", mode="before")
+    @classmethod
+    def validate_layout(cls, layout):
+        return validate_manual_layout_schema(layout)
+
+
+class AnimatedCollageClip(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: float = Field(ge=-24576, le=24576)
+    y: float = Field(ge=-24576, le=24576)
+    width: float = Field(gt=0, le=24576)
+    height: float = Field(gt=0, le=24576)
+
+
+class AnimatedCollageLayer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=32, max_length=((COLLAGE_MAX_ANIMATED_SOURCE_BYTES + 2) // 3) * 4 + 64)
+    x: float = Field(default=0, ge=-24576, le=24576)
+    y: float = Field(default=0, ge=-24576, le=24576)
+    width: float = Field(gt=0, le=24576)
+    height: float = Field(gt=0, le=24576)
+    clip: AnimatedCollageClip | None = None
+    hidden_sides: list[Literal["top", "right", "bottom", "left"]] = Field(default_factory=list, max_length=4)
 
 
 class AnimatedCollageInput(BaseModel):
-    layers: list[dict] = Field(min_length=1, max_length=100)
+    model_config = ConfigDict(extra="forbid")
+
+    layers: list[AnimatedCollageLayer] = Field(min_length=1, max_length=100)
     width: int = Field(ge=1, le=4096)
     height: int = Field(ge=1, le=4096)
     edge_line: dict | None = None
+
+    @field_validator("layers", mode="before")
+    @classmethod
+    def validate_raw_encoded_budget(cls, layers):
+        if not isinstance(layers, list) or not 1 <= len(layers) <= 100:
+            return layers
+        encoded_total = 0
+        for layer in layers:
+            if not isinstance(layer, dict) or not isinstance(layer.get("url"), str):
+                continue
+            encoded_total += len(layer["url"].split(",", 1)[-1])
+            if encoded_total > ((COLLAGE_MAX_ANIMATED_INPUT_BYTES + 2) // 3) * 4:
+                raise ValueError("Animated collage encoded input exceeds its total budget")
+        return layers
+
+    @model_validator(mode="after")
+    def validate_encoded_budget(self):
+        target_pixels = 0
+        for layer in self.layers:
+            if not re.match(r"^data:image/(?:png|gif|jpeg|webp);base64,", layer.url, re.IGNORECASE):
+                raise ValueError("Animated collage sources must be supported image data URLs")
+            if math.ceil(layer.width) * math.ceil(layer.height) > COLLAGE_MAX_PIXELS:
+                raise ValueError("Animated collage layer target exceeds the pixel budget")
+            target_pixels += math.ceil(layer.width) * math.ceil(layer.height)
+            if target_pixels > COLLAGE_MAX_ANIMATED_TARGET_PIXELS:
+                raise ValueError("Animated collage layers exceed the aggregate target pixel budget")
+        if self.width * self.height > COLLAGE_MAX_PIXELS:
+            raise ValueError("Animated collage output exceeds the pixel budget")
+        return self
 
 
 class HistoryDeleteInput(BaseModel):
@@ -1736,78 +2090,204 @@ def clean_output_name(name: str, fallback: str):
 def draw_collage_edge(image: Image.Image, layer: dict, options: dict | None):
     if not options or not options.get("enabled"):
         return
-    color = options.get("color", "#D6FF3F")
-    width = max(1, min(12, int(options.get("width", 2))))
-    style = options.get("style", "solid")
+    candidate_color = options.get("color", "#c8acfb")
+    color = candidate_color.lower() if isinstance(candidate_color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", candidate_color) else "#c8acfb"
+    try:
+        width = max(1, min(50, int(options.get("width", 2))))
+    except (TypeError, ValueError, OverflowError):
+        width = 2
+    style = options.get("style", "solid") if options.get("style") in {"solid", "dashed", "dotted", "double", "glow"} else "solid"
     left, top = int(layer["x"]), int(layer["y"])
     right = left + max(1, int(layer["width"])) - 1
     bottom = top + max(1, int(layer["height"])) - 1
+    hidden = {side for side in layer.get("hidden_sides", []) if side in {"top", "right", "bottom", "left"}}
     draw = ImageDraw.Draw(image)
     if style == "dashed":
         for x in range(left, right + 1, width * 6):
-            draw.line((x, top, min(right, x + width * 3), top), fill=color, width=width)
-            draw.line((x, bottom, min(right, x + width * 3), bottom), fill=color, width=width)
+            if "top" not in hidden:
+                draw.line((x, top, min(right, x + width * 3), top), fill=color, width=width)
+            if "bottom" not in hidden:
+                draw.line((x, bottom, min(right, x + width * 3), bottom), fill=color, width=width)
         for y in range(top, bottom + 1, width * 6):
-            draw.line((left, y, left, min(bottom, y + width * 3)), fill=color, width=width)
-            draw.line((right, y, right, min(bottom, y + width * 3)), fill=color, width=width)
+            if "left" not in hidden:
+                draw.line((left, y, left, min(bottom, y + width * 3)), fill=color, width=width)
+            if "right" not in hidden:
+                draw.line((right, y, right, min(bottom, y + width * 3)), fill=color, width=width)
     elif style == "dotted":
         for x in range(left, right + 1, width * 3):
-            draw.ellipse((x, top, x + width, top + width), fill=color)
-            draw.ellipse((x, bottom - width, x + width, bottom), fill=color)
+            if "top" not in hidden:
+                draw.ellipse((x, top, x + width, top + width), fill=color)
+            if "bottom" not in hidden:
+                draw.ellipse((x, bottom - width, x + width, bottom), fill=color)
         for y in range(top, bottom + 1, width * 3):
-            draw.ellipse((left, y, left + width, y + width), fill=color)
-            draw.ellipse((right - width, y, right, y + width), fill=color)
+            if "left" not in hidden:
+                draw.ellipse((left, y, left + width, y + width), fill=color)
+            if "right" not in hidden:
+                draw.ellipse((right - width, y, right, y + width), fill=color)
     else:
-        draw.rectangle((left, top, right, bottom), outline=color, width=width * (2 if style == "double" else 1))
+        shortest_edge = max(1, min(right - left + 1, bottom - top + 1))
+        outer_width = min(width * (2 if style == "double" else 1), max(1, shortest_edge // 2))
+        def draw_sides(rectangle, line_width):
+            side_left, side_top, side_right, side_bottom = rectangle
+            line_width = max(1, min(line_width, side_right - side_left + 1, side_bottom - side_top + 1))
+            if "top" not in hidden:
+                draw.rectangle((side_left, side_top, side_right, min(side_bottom, side_top + line_width - 1)), fill=color)
+            if "right" not in hidden:
+                draw.rectangle((max(side_left, side_right - line_width + 1), side_top, side_right, side_bottom), fill=color)
+            if "bottom" not in hidden:
+                draw.rectangle((side_left, max(side_top, side_bottom - line_width + 1), side_right, side_bottom), fill=color)
+            if "left" not in hidden:
+                draw.rectangle((side_left, side_top, min(side_right, side_left + line_width - 1), side_bottom), fill=color)
+        draw_sides((left, top, right, bottom), outer_width)
         if style == "double":
-            draw.rectangle((left + width * 3, top + width * 3, right - width * 3, bottom - width * 3), outline=color, width=width)
+            inset = width * 3
+            if left + inset <= right - inset and top + inset <= bottom - inset:
+                draw_sides((left + inset, top + inset, right - inset, bottom - inset), width)
+
+
+def decode_collage_data_url(source: str, maximum_bytes: int, label: str):
+    if not isinstance(source, str) or not re.match(r"^data:image/(?:png|gif|jpeg|webp);base64,", source, re.IGNORECASE):
+        raise ValueError(f"{label} must be a supported image data URL")
+    encoded = source.partition(",")[2]
+    maximum_encoded = ((maximum_bytes + 2) // 3) * 4
+    if len(encoded) > maximum_encoded:
+        raise CollageResourceLimitError(f"{label} exceeds the decoded byte budget")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError(f"{label} contains invalid base64 data") from error
+    if len(raw) > maximum_bytes:
+        raise CollageResourceLimitError(f"{label} exceeds the decoded byte budget")
+    return raw
+
+
+def open_budgeted_collage_image(raw: bytes, maximum_pixels: int, label: str):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(io.BytesIO(raw))
+            width, height = image.size
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as error:
+        raise CollageResourceLimitError(f"{label} triggered the decompression-bomb guard") from error
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ValueError(f"Unable to read {label}") from error
+    if width < 1 or height < 1:
+        image.close()
+        raise ValueError(f"{label} has invalid dimensions")
+    if width * height > maximum_pixels:
+        image.close()
+        raise CollageResourceLimitError(f"{label} exceeds the pixel budget")
+    return image
+
+
+def composite_animated_layer(output: Image.Image, current: Image.Image, layer: dict):
+    width = max(1, int(round(layer.get("width", current.width))))
+    height = max(1, int(round(layer.get("height", current.height))))
+    if width * height > COLLAGE_MAX_PIXELS:
+        raise CollageResourceLimitError("Animated collage resized layer exceeds the pixel budget")
+    x, y = int(round(layer.get("x", 0))), int(round(layer.get("y", 0)))
+    clip = layer.get("clip") if isinstance(layer.get("clip"), dict) else None
+    raw_clip_left = int(round(clip.get("x", 0))) if clip else 0
+    raw_clip_top = int(round(clip.get("y", 0))) if clip else 0
+    raw_clip_right = raw_clip_left + max(1, int(round(clip.get("width", output.width)))) if clip else output.width
+    raw_clip_bottom = raw_clip_top + max(1, int(round(clip.get("height", output.height)))) if clip else output.height
+    destination_left = max(0, raw_clip_left, x)
+    destination_top = max(0, raw_clip_top, y)
+    destination_right = min(output.width, raw_clip_right, x + width)
+    destination_bottom = min(output.height, raw_clip_bottom, y + height)
+    if destination_right <= destination_left or destination_bottom <= destination_top:
+        return None
+    visible_width = destination_right - destination_left
+    visible_height = destination_bottom - destination_top
+    source_left = max(0, min(current.width - 1, math.floor((destination_left - x) * current.width / width)))
+    source_top = max(0, min(current.height - 1, math.floor((destination_top - y) * current.height / height)))
+    source_right = max(source_left + 1, min(current.width, math.ceil((destination_right - x) * current.width / width)))
+    source_bottom = max(source_top + 1, min(current.height, math.ceil((destination_bottom - y) * current.height / height)))
+    source_region = current.crop((source_left, source_top, source_right, source_bottom))
+    rgba_region = None
+    resized_region = None
+    try:
+        rgba_region = source_region.convert("RGBA")
+        if rgba_region.size == (visible_width, visible_height):
+            resized_region = rgba_region
+        else:
+            resized_region = rgba_region.resize((visible_width, visible_height), Image.Resampling.LANCZOS)
+        output.alpha_composite(resized_region, (destination_left, destination_top))
+    finally:
+        if resized_region is not None and resized_region is not rgba_region:
+            resized_region.close()
+        if rgba_region is not None:
+            rgba_region.close()
+        source_region.close()
+    edge_left = max(0, raw_clip_left if clip else x)
+    edge_top = max(0, raw_clip_top if clip else y)
+    edge_right = min(output.width, raw_clip_right if clip else x + width)
+    edge_bottom = min(output.height, raw_clip_bottom if clip else y + height)
+    return {
+        "x": edge_left,
+        "y": edge_top,
+        "width": max(1, edge_right - edge_left),
+        "height": max(1, edge_bottom - edge_top),
+        "hidden_sides": layer.get("hidden_sides", []),
+    }
 
 
 def animated_collage_frames(input_data: AnimatedCollageInput):
     sources = []
     output_frame_count = 1
-    for layer in input_data.layers:
-        source = layer.get("url") if isinstance(layer, dict) else None
-        if not isinstance(source, str) or not source.startswith("data:image/"):
-            raise ValueError("Animated collage source is invalid")
-        try:
-            raw = base64.b64decode(source.split(",", 1)[-1], validate=True)
-            image = Image.open(io.BytesIO(raw))
-            source_frame_count = max(1, int(getattr(image, "n_frames", 1)))
-        except (ValueError, binascii.Error, OSError) as error:
-            raise ValueError("Unable to read GIF collage source") from error
-        sources.append((image, layer, source_frame_count))
-        output_frame_count = max(output_frame_count, source_frame_count)
-    if output_frame_count > 240 or input_data.width * input_data.height * output_frame_count > 120_000_000:
-        raise ValueError("GIF collage is too large")
-    frames, durations = [], []
-    for frame_index in range(output_frame_count):
-        output = Image.new("RGBA", (input_data.width, input_data.height), (0, 0, 0, 0))
-        duration = 100
-        for image, layer, source_frame_count in sources:
-            image.seek(frame_index % source_frame_count)
-            current = image.convert("RGBA")
-            width = max(1, min(input_data.width, int(layer.get("width", current.width))))
-            height = max(1, min(input_data.height, int(layer.get("height", current.height))))
-            x, y = int(layer.get("x", 0)), int(layer.get("y", 0))
-            placed = Image.new("RGBA", (input_data.width, input_data.height), (0, 0, 0, 0))
-            placed.paste(current.resize((width, height), Image.Resampling.LANCZOS), (x, y), current.resize((width, height), Image.Resampling.LANCZOS))
-            clip = layer.get("clip") if isinstance(layer.get("clip"), dict) else None
-            if clip:
-                clip_left = max(0, int(clip.get("x", 0)))
-                clip_top = max(0, int(clip.get("y", 0)))
-                clip_right = min(input_data.width, clip_left + max(1, int(clip.get("width", input_data.width))))
-                clip_bottom = min(input_data.height, clip_top + max(1, int(clip.get("height", input_data.height))))
-                clipped = placed.crop((clip_left, clip_top, clip_right, clip_bottom))
-                output.alpha_composite(clipped, (clip_left, clip_top))
-                draw_collage_edge(output, {"x": clip_left, "y": clip_top, "width": clip_right - clip_left, "height": clip_bottom - clip_top}, input_data.edge_line)
-            else:
-                output.alpha_composite(placed)
-                draw_collage_edge(output, {"x": x, "y": y, "width": width, "height": height}, input_data.edge_line)
-            duration = max(duration, max(20, int(image.info.get("duration", 100))))
-        frames.append(output)
-        durations.append(duration)
-    return frames, durations
+    decoded_total = 0
+    source_pixels = 0
+    source_frames = 0
+    source_frame_pixels = 0
+    try:
+        for raw_layer in input_data.layers:
+            layer = raw_layer.model_dump() if isinstance(raw_layer, BaseModel) else raw_layer
+            raw = decode_collage_data_url(layer.get("url"), COLLAGE_MAX_ANIMATED_SOURCE_BYTES, "Animated collage source")
+            decoded_total += len(raw)
+            if decoded_total > COLLAGE_MAX_ANIMATED_INPUT_BYTES:
+                raise CollageResourceLimitError("Animated collage exceeds the total decoded input byte budget")
+            image = open_budgeted_collage_image(raw, COLLAGE_MAX_ANIMATED_SOURCE_PIXELS, "animated collage source")
+            if image.format not in {"PNG", "GIF", "JPEG", "WEBP"}:
+                image.close()
+                raise ValueError("Unsupported animated collage source format")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    source_frame_count = max(1, int(getattr(image, "n_frames", 1)))
+            except (Image.DecompressionBombWarning, Image.DecompressionBombError) as error:
+                image.close()
+                raise CollageResourceLimitError("Animated collage source triggered the decompression-bomb guard") from error
+            if source_frame_count > COLLAGE_MAX_ANIMATED_SOURCE_FRAMES:
+                image.close()
+                raise CollageResourceLimitError("Animated collage source exceeds the frame limit")
+            source_pixels += image.width * image.height
+            source_frames += source_frame_count
+            source_frame_pixels += image.width * image.height * source_frame_count
+            if source_pixels > COLLAGE_MAX_ANIMATED_INPUT_PIXELS or source_frames > COLLAGE_MAX_ANIMATED_INPUT_FRAMES or source_frame_pixels > COLLAGE_MAX_ANIMATED_FRAME_PIXELS:
+                image.close()
+                raise CollageResourceLimitError("Animated collage sources exceed their aggregate pixel or frame budget")
+            sources.append((image, layer, source_frame_count))
+            output_frame_count = max(output_frame_count, source_frame_count)
+        if output_frame_count > COLLAGE_MAX_GIF_FRAMES or input_data.width * input_data.height * output_frame_count > COLLAGE_MAX_TOTAL_FRAME_PIXELS:
+            raise CollageResourceLimitError("GIF collage exceeds the output frame budget")
+        frames, durations = [], []
+        for frame_index in range(output_frame_count):
+            output = Image.new("RGBA", (input_data.width, input_data.height), (0, 0, 0, 0))
+            duration = 20
+            for image, layer, source_frame_count in sources:
+                image.seek(frame_index % source_frame_count)
+                edge = composite_animated_layer(output, image, layer)
+                if edge:
+                    draw_collage_edge(output, edge, input_data.edge_line)
+                duration = max(duration, normalize_collage_gif_duration(image.info.get("duration")))
+            frames.append(output)
+            durations.append(duration)
+        return frames, durations
+    except (MemoryError, OverflowError) as error:
+        raise CollageResourceLimitError("Animated collage could not allocate its bounded image buffers") from error
+    finally:
+        for image, _layer, _frame_count in sources:
+            image.close()
 
 
 def create_named_output_path(name: str):
@@ -8235,67 +8715,151 @@ def copy_history_asset(input_data: dict):
     source = history_asset_path(asset_id)
     if not source.is_file():
         raise HTTPException(status_code=404, detail="Image asset is missing")
-    if source.suffix.lower() == ".gif":
-        try:
-            return Response(content=source.read_bytes(), media_type="image/gif", headers={"Cache-Control": "no-store"})
-        except OSError as error:
-            raise HTTPException(status_code=500, detail="Unable to copy GIF") from error
     try:
-        with Image.open(source) as image:
-            copied = image.copy()
-            copied.info.clear()
-            buffer = io.BytesIO()
-            copied.save(buffer, format="PNG", optimize=False)
-    except OSError as error:
-        raise HTTPException(status_code=500, detail="Unable to copy image") from error
-    return Response(content=buffer.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
+        metrics = history_image_resource_metrics(source, COLLAGE_MAX_HISTORY_COPY_BYTES, "history copy source", decode_frames=True)
+        if metrics["format"] == "GIF":
+            if metrics["bytes"] > COLLAGE_MAX_ENCODED_OUTPUT_BYTES:
+                raise CollageResourceLimitError("GIF copy exceeds the encoded output budget")
+            return Response(content=source.read_bytes(), media_type="image/gif", headers={"Cache-Control": "no-store"})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(source) as image:
+                image.load()
+                copied = image.copy()
+                copied.info.clear()
+        raw_buffer, bounded_buffer = bounded_output_buffer()
+        try:
+            copied.save(bounded_buffer, format="PNG", optimize=False)
+            content = raw_buffer.getvalue()
+        finally:
+            copied.close()
+            raw_buffer.close()
+    except (CollageResourceLimitError, Image.DecompressionBombWarning, Image.DecompressionBombError, MemoryError, OverflowError) as error:
+        raise HTTPException(status_code=413, detail=f"History copy resource budget exceeded: {error}") from error
+    except (OSError, SyntaxError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="Unable to copy image") from error
+    return Response(content=content, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+_COLLAGE_SAVE_LOCK = threading.Lock()
+_COLLAGE_SAVE_RESULT_TTL_SECONDS = 3600
+_COLLAGE_SAVE_RESULT_LIMIT = 256
+_COLLAGE_SAVE_RESULTS: dict[str, tuple[float, str, dict]] = {}
+
+
+def prune_collage_save_results(now: float | None = None):
+    current = time.monotonic() if now is None else now
+    for key, (expires_at, _digest, _result) in list(_COLLAGE_SAVE_RESULTS.items()):
+        if expires_at <= current:
+            _COLLAGE_SAVE_RESULTS.pop(key, None)
+    while len(_COLLAGE_SAVE_RESULTS) > _COLLAGE_SAVE_RESULT_LIMIT:
+        _COLLAGE_SAVE_RESULTS.pop(next(iter(_COLLAGE_SAVE_RESULTS)))
 
 
 @app.post("/api/inference/collages", status_code=201)
 def save_collage(input_data: CollageInput):
+    image = None
+    frames = []
+    output_path = None
+    completed = False
     try:
-        encoded = input_data.image_data.split(",", 1)[-1]
-        raw = base64.b64decode(encoded, validate=True)
-        if len(raw) > 150_000_000:
-            raise ValueError("collage is too large")
-        image = Image.open(io.BytesIO(raw))
-        image.load()
-        if image.width < 1 or image.height < 1:
-            raise ValueError("invalid collage dimensions")
-        is_gif = image.format == "GIF" or input_data.name.lower().endswith(".gif")
-        output_path = create_named_output_path(input_data.name if is_gif else input_data.name.removesuffix(".gif") + ".png")
-        if is_gif:
-            frames = []
-            durations = []
-            for frame_index in range(max(1, int(getattr(image, "n_frames", 1)))):
-                image.seek(frame_index)
-                frames.append(image.convert("RGBA"))
-                durations.append(max(20, int(image.info.get("duration", 100))))
-            comment = json.dumps({"manual_layout": input_data.manual_layout}, ensure_ascii=False).encode("utf-8") if input_data.manual_layout else None
-            frames[0].save(output_path, format="GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2, optimize=False, comment=comment)
-        else:
-            metadata = PngInfo()
-            if input_data.manual_layout:
-                metadata.add_text("parameters", json.dumps({"manual_layout": input_data.manual_layout}, ensure_ascii=False))
-            image.convert("RGBA").save(output_path, format="PNG", optimize=False, pnginfo=metadata)
-    except (ValueError, binascii.Error, OSError) as error:
-        raise HTTPException(status_code=422, detail=f"Invalid collage image: {error}") from error
-    return {
-        "name": output_path.name,
-        "url": f"/api/inference/history/assets/{history_asset_token(output_path)}",
-        "id": history_asset_token(output_path),
-    }
+        raw = decode_collage_data_url(input_data.image_data, COLLAGE_MAX_DECODED_BYTES, "Collage image")
+        digest = hashlib.sha256(raw)
+        digest.update(input_data.name.encode("utf-8"))
+        if input_data.manual_layout:
+            digest.update(json.dumps(input_data.manual_layout, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        request_digest = digest.hexdigest()
+        with _COLLAGE_SAVE_LOCK:
+            now = time.monotonic()
+            prune_collage_save_results(now)
+            if input_data.idempotency_key:
+                cached = _COLLAGE_SAVE_RESULTS.get(input_data.idempotency_key)
+                if cached:
+                    if cached[1] != request_digest:
+                        raise HTTPException(status_code=409, detail="Idempotency key was already used for different collage data")
+                    return dict(cached[2])
+            image = open_budgeted_collage_image(raw, COLLAGE_MAX_PIXELS, "collage image")
+            if image.format not in {"PNG", "GIF", "JPEG", "WEBP"}:
+                raise ValueError("Unsupported collage image format")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                frame_count = max(1, int(getattr(image, "n_frames", 1)))
+            if frame_count > COLLAGE_MAX_GIF_FRAMES or image.width * image.height * frame_count > COLLAGE_MAX_TOTAL_FRAME_PIXELS:
+                raise CollageResourceLimitError("Collage GIF exceeds the frame or total frame-pixel budget")
+            is_gif = image.format == "GIF"
+            requested_name = input_data.name if is_gif else f"{Path(input_data.name).stem}.png"
+            output_path = create_named_output_path(requested_name)
+            if is_gif:
+                durations = []
+                for frame_index in range(frame_count):
+                    image.seek(frame_index)
+                    frames.append(image.convert("RGBA"))
+                    durations.append(normalize_collage_gif_duration(image.info.get("duration")))
+                comment = json.dumps({"manual_layout": input_data.manual_layout}, ensure_ascii=False).encode("utf-8") if input_data.manual_layout else None
+                with output_path.open("w+b") as output_file:
+                    frames[0].save(BoundedOutputWriter(output_file, COLLAGE_MAX_ENCODED_OUTPUT_BYTES), format="GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2, optimize=False, comment=comment)
+            else:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    image.load()
+                metadata = PngInfo()
+                if input_data.manual_layout:
+                    metadata.add_text("parameters", json.dumps({"manual_layout": input_data.manual_layout}, ensure_ascii=False))
+                converted = image.convert("RGBA")
+                try:
+                    with output_path.open("w+b") as output_file:
+                        converted.save(BoundedOutputWriter(output_file, COLLAGE_MAX_ENCODED_OUTPUT_BYTES), format="PNG", optimize=False, pnginfo=metadata)
+                finally:
+                    converted.close()
+            token = history_asset_token(output_path)
+            result = {"name": output_path.name, "url": f"/api/inference/history/assets/{token}", "id": token}
+            if input_data.idempotency_key:
+                if len(_COLLAGE_SAVE_RESULTS) >= _COLLAGE_SAVE_RESULT_LIMIT:
+                    _COLLAGE_SAVE_RESULTS.pop(next(iter(_COLLAGE_SAVE_RESULTS)))
+                _COLLAGE_SAVE_RESULTS[input_data.idempotency_key] = (now + _COLLAGE_SAVE_RESULT_TTL_SECONDS, request_digest, dict(result))
+            completed = True
+            return result
+    except HTTPException:
+        raise
+    except (CollageResourceLimitError, Image.DecompressionBombWarning, Image.DecompressionBombError, MemoryError, OverflowError) as error:
+        raise HTTPException(status_code=413, detail=f"Collage resource budget exceeded: {error}") from error
+    except (ValueError, binascii.Error, OSError, SyntaxError) as error:
+        raise HTTPException(status_code=400, detail=f"Invalid collage image: {error}") from error
+    finally:
+        for frame in frames:
+            frame.close()
+        if image is not None:
+            image.close()
+        if output_path is not None and not completed:
+            with suppress(OSError):
+                output_path.unlink()
+
+
+_COLLAGE_ANIMATED_RENDER_LOCK = threading.Lock()
 
 
 @app.post("/api/inference/collages/animated")
 def render_animated_collage(input_data: AnimatedCollageInput):
+    if not _COLLAGE_ANIMATED_RENDER_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Another animated collage is rendering; retry shortly", headers={"Retry-After": "1"})
+    frames = []
+    raw_buffer = None
     try:
         frames, durations = animated_collage_frames(input_data)
-        buffer = io.BytesIO()
-        frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2, optimize=False)
-    except (ValueError, OSError) as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return Response(content=buffer.getvalue(), media_type="image/gif", headers={"Cache-Control": "no-store"})
+        raw_buffer, bounded_buffer = bounded_output_buffer()
+        frames[0].save(bounded_buffer, format="GIF", save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2, optimize=False)
+        content = raw_buffer.getvalue()
+    except (CollageResourceLimitError, Image.DecompressionBombWarning, Image.DecompressionBombError, MemoryError, OverflowError) as error:
+        raise HTTPException(status_code=413, detail=str(error)) from error
+    except (ValueError, OSError, SyntaxError, binascii.Error) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    finally:
+        for frame in frames:
+            frame.close()
+        if raw_buffer is not None:
+            raw_buffer.close()
+        _COLLAGE_ANIMATED_RENDER_LOCK.release()
+    return Response(content=content, media_type="image/gif", headers={"Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":

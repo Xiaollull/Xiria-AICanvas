@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { formatFileSize } from "./format-size";
+import { configuredDownloadCredentialCount, createLatestRequestGate, normalizedDownloadCredentials, reconcileRecommendedSelection } from "./model-downloader-state";
 
 export default function ModelDownloader({ onDownloaded }) {
   const [civitaiKey, setCivitaiKey] = useState("");
@@ -22,6 +23,8 @@ export default function ModelDownloader({ onDownloaded }) {
   const [keyManagerOpen, setKeyManagerOpen] = useState(false);
   const [visibleKeys, setVisibleKeys] = useState({ civitai: false, huggingface: false, modelscope: false });
   const keysLoaded = useRef(false);
+  const credentials = normalizedDownloadCredentials({ civitai: civitaiKey, huggingface: huggingfaceKey, modelscope: modelscopeKey });
+  const configuredCredentialCount = configuredDownloadCredentialCount(credentials);
 
   useEffect(() => {
     if (keysLoaded.current) return;
@@ -37,11 +40,14 @@ export default function ModelDownloader({ onDownloaded }) {
   const saveKeys = () => {
     try {
       const payload = {};
-      if (civitaiKey.trim()) payload.c = civitaiKey.trim();
-      if (huggingfaceKey.trim()) payload.h = huggingfaceKey.trim();
-      if (modelscopeKey.trim()) payload.m = modelscopeKey.trim();
+      if (credentials.civitai) payload.c = credentials.civitai;
+      if (credentials.huggingface) payload.h = credentials.huggingface;
+      if (credentials.modelscope) payload.m = credentials.modelscope;
       window.localStorage.setItem("xirai_model_keys", JSON.stringify(payload));
     } catch {}
+    setCivitaiKey(credentials.civitai);
+    setHuggingfaceKey(credentials.huggingface);
+    setModelscopeKey(credentials.modelscope);
     setKeyManagerOpen(false);
   };
 
@@ -55,13 +61,24 @@ export default function ModelDownloader({ onDownloaded }) {
   const [connectionDraft, setConnectionDraft] = useState(8);
   const [download, setDownload] = useState({ status: "checking", message: "正在恢复本地下载任务...", currentBytes: 0, totalBytes: 0, speedBps: 0, connections: 0, route: "" });
   const [submittingDownload, setSubmittingDownload] = useState(false);
-  const [recommended, setRecommended] = useState({ loading: true, checkingInstalled: false, installedChecked: false, remoteRefreshed: false, families: [], error: "" });
+  const [downloadPollRevision, setDownloadPollRevision] = useState(0);
+  const [recommended, setRecommended] = useState({ loading: true, refreshing: false, checkingInstalled: false, installedChecked: false, remoteRefreshed: false, families: [], error: "" });
   const recommendedRequestId = useRef(0);
+  const recommendedAbortController = useRef(null);
+  const recommendedPollTimer = useRef(null);
+  const recommendedZoneReviewed = useRef(false);
+  const downloadPollController = useRef(null);
+  const downloadPollGate = useRef(null);
+  downloadPollGate.current ||= createLatestRequestGate();
   const completedDownloadJob = useRef("");
   const [recommendedZoneOpen, setRecommendedZoneOpen] = useState(false);
   const [recommendedCategoryId, setRecommendedCategoryId] = useState("");
   const [recommendedFamilyId, setRecommendedFamilyId] = useState("");
   const [recommendedSelection, setRecommendedSelection] = useState({ modelId: "", textEncoderId: "", vaeId: "" });
+  const recommendedFamilyIdRef = useRef("");
+  const recommendedSelectionRef = useRef(recommendedSelection);
+  recommendedFamilyIdRef.current = recommendedFamilyId;
+  recommendedSelectionRef.current = recommendedSelection;
 
   const kindOptions = [
     { id: "checkpoint", label: "底模", detail: "Stable Diffusion / Illustrious" },
@@ -96,41 +113,79 @@ export default function ModelDownloader({ onDownloaded }) {
       : modelPaths?.[{ diffusion_model: "diffusion_models", text_encoder: "text_encoders", embedding: "embeddings", config: "configs" }[kind] || kind];
   const targetLabel = `${configuredTarget || defaultTargetPaths[kind]}${kind === "lora" ? `/${category}` : ""}`;
 
-  const refreshRecommendedInstallations = async (requestId, refreshRemote) => {
-    setRecommended((current) => requestId === recommendedRequestId.current ? { ...current, checkingInstalled: true } : current);
-    try {
-      const response = await fetch(`/api/recommended-models?${refreshRemote ? "refresh=1&" : ""}installed=1`, { cache: "no-store" });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "无法检查推荐模型安装状态");
-      if (requestId === recommendedRequestId.current) {
-        setRecommended((current) => ({ ...current, checkingInstalled: false, installedChecked: true, remoteRefreshed: current.remoteRefreshed || payload.remote_refreshed === true, families: payload.families || [] }));
-      }
-    } catch {
-      if (requestId === recommendedRequestId.current) {
-        setRecommended((current) => ({ ...current, checkingInstalled: false, installedChecked: true }));
-      }
-    }
-  };
-
-  const refreshRecommended = async (force = false) => {
+  const requestRecommendedCatalog = async ({ refreshRemote = false, checkInstalled = false, initial = false, pollAttempt = 0 } = {}) => {
     const requestId = recommendedRequestId.current + 1;
     recommendedRequestId.current = requestId;
-    setRecommended((current) => ({ ...current, loading: true, error: "" }));
+    recommendedAbortController.current?.abort();
+    window.clearTimeout(recommendedPollTimer.current);
+    const controller = new AbortController();
+    recommendedAbortController.current = controller;
+    let timedOut = false;
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 4000);
+    setRecommended((current) => ({
+      ...current,
+      loading: initial && !current.families.length,
+      refreshing: current.refreshing || refreshRemote,
+      checkingInstalled: current.checkingInstalled || checkInstalled,
+      error: "",
+    }));
     try {
-      const response = await fetch(`/api/recommended-models${force ? "?refresh=1" : ""}`, { cache: "no-store" });
+      const query = new URLSearchParams();
+      if (refreshRemote) query.set("refresh", "1");
+      if (checkInstalled) query.set("installed", "1");
+      const queryString = query.toString();
+      const response = await fetch(`/api/recommended-models${queryString ? `?${queryString}` : ""}`, { cache: "no-store", signal: controller.signal });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "无法读取推荐模型目录");
       if (requestId !== recommendedRequestId.current) return;
-      setRecommended({ loading: false, checkingInstalled: false, installedChecked: false, remoteRefreshed: payload.remote_refreshed === true, families: payload.families || [], error: "" });
+      const stillReviewing = payload.installation_reviewing === true;
+      const stillRefreshing = payload.remote_refreshing === true;
+      const continuePolling = (stillReviewing || stillRefreshing) && pollAttempt < 60;
+      const nextFamilies = Array.isArray(payload.families) ? payload.families : null;
+      if (nextFamilies) {
+        const reconciled = reconcileRecommendedSelection(nextFamilies, recommendedFamilyIdRef.current, recommendedSelectionRef.current);
+        recommendedFamilyIdRef.current = reconciled.familyId;
+        recommendedSelectionRef.current = reconciled.selection;
+        setRecommendedFamilyId(reconciled.familyId);
+        setRecommendedSelection(reconciled.selection);
+      }
+      setRecommended((current) => ({
+        ...current,
+        loading: false,
+        refreshing: continuePolling && stillRefreshing,
+        checkingInstalled: continuePolling && stillReviewing,
+        installedChecked: payload.installed_checked !== false,
+        remoteRefreshed: current.remoteRefreshed || payload.remote_refreshed === true,
+        families: nextFamilies || current.families,
+        error: "",
+      }));
+      if (continuePolling) {
+        recommendedPollTimer.current = window.setTimeout(() => {
+          void requestRecommendedCatalog({ pollAttempt: pollAttempt + 1 });
+        }, 1000);
+      }
     } catch (error) {
       if (requestId === recommendedRequestId.current) {
-        setRecommended((current) => ({ ...current, loading: false, checkingInstalled: false, installedChecked: true, error: error.message }));
+        if (controller.signal.aborted && !timedOut) return;
+        setRecommended((current) => ({
+          ...current,
+          loading: false,
+          refreshing: false,
+          checkingInstalled: false,
+          installedChecked: current.installedChecked || current.families.length > 0,
+          error: timedOut ? "推荐模型目录请求超时，已保留当前目录" : error.message,
+        }));
       }
+    } finally {
+      window.clearTimeout(timeout);
+      if (recommendedAbortController.current === controller) recommendedAbortController.current = null;
     }
   };
 
+  const refreshRecommended = (force = false, initial = false) => requestRecommendedCatalog({ refreshRemote: force, checkInstalled: force, initial });
+
   useEffect(() => {
-    void refreshRecommended();
+    void refreshRecommended(false, true);
     fetch("/api/model-paths", { cache: "no-store" })
       .then(async (response) => {
         const payload = await response.json();
@@ -138,12 +193,22 @@ export default function ModelDownloader({ onDownloaded }) {
         setModelPaths(payload.paths || null);
       })
       .catch(() => setModelPaths(null));
+    return () => {
+      recommendedRequestId.current += 1;
+      recommendedAbortController.current?.abort();
+      window.clearTimeout(recommendedPollTimer.current);
+    };
   }, []);
 
   useEffect(() => {
-    if (!recommendedZoneOpen || recommended.loading || recommended.checkingInstalled || recommended.installedChecked || !recommended.families.length) return;
-    void refreshRecommendedInstallations(recommendedRequestId.current, !recommended.remoteRefreshed);
-  }, [recommendedZoneOpen, recommended.loading, recommended.checkingInstalled, recommended.installedChecked, recommended.remoteRefreshed, recommended.families.length]);
+    if (!recommendedZoneOpen) {
+      recommendedZoneReviewed.current = false;
+      return;
+    }
+    if (recommendedZoneReviewed.current || recommended.loading || !recommended.families.length) return;
+    recommendedZoneReviewed.current = true;
+    void requestRecommendedCatalog({ refreshRemote: !recommended.remoteRefreshed, checkInstalled: true });
+  }, [recommendedZoneOpen, recommended.loading, recommended.remoteRefreshed, recommended.families.length]);
 
   useEffect(() => {
     if (!recommendedZoneOpen && !recommendedFamilyId) return undefined;
@@ -171,7 +236,7 @@ export default function ModelDownloader({ onDownloaded }) {
 
   const selectedRecommendedFamily = recommended.families.find((family) => family.id === recommendedFamilyId);
   const selectedRecommendedModel = selectedRecommendedFamily?.models.find((item) => item.id === recommendedSelection.modelId);
-  const selectedRecommendedArtifacts = selectedRecommendedFamily ? [
+  const selectedRecommendedArtifacts = selectedRecommendedFamily && selectedRecommendedModel ? [
     selectedRecommendedModel,
     selectedRecommendedFamily.textEncoders.find((item) => item.id === recommendedSelection.textEncoderId),
     selectedRecommendedFamily.vaes.find((item) => item.id === recommendedSelection.vaeId),
@@ -210,33 +275,40 @@ export default function ModelDownloader({ onDownloaded }) {
     setRecommendedFamilyId(family.id);
   };
 
-  const syncModelDownloadJob = async () => {
-    const response = await fetch("/api/model-download/job", { cache: "no-store" });
+  const syncModelDownloadJob = async (generation, signal) => {
+    const response = await fetch("/api/model-download/job", { cache: "no-store", signal });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "无法读取模型下载状态");
-    if (payload.job) setDownload(payload.job);
-    else setDownload({ status: "idle", message: "粘贴模型链接后开始解析", currentBytes: 0, totalBytes: 0, speedBps: 0, connections: 0, route: "" });
+    downloadPollGate.current.commit(generation, () => {
+      if (payload.job) setDownload(payload.job);
+      else setDownload({ status: "idle", message: "粘贴模型链接后开始解析", currentBytes: 0, totalBytes: 0, speedBps: 0, connections: 0, route: "" });
+    });
     return payload.job;
   };
 
   useEffect(() => {
-    let stopped = false;
+    if (submittingDownload) return undefined;
+    const generation = downloadPollGate.current.begin();
+    const controller = new AbortController();
+    downloadPollController.current = controller;
     let timer;
     const poll = async () => {
       try {
-        const job = await syncModelDownloadJob();
-        if (stopped) return;
+        const job = await syncModelDownloadJob(generation, controller.signal);
+        if (!downloadPollGate.current.isCurrent(generation)) return;
         timer = window.setTimeout(poll, job?.active ? 500 : 5000);
       } catch {
-        if (!stopped) timer = window.setTimeout(poll, 5000);
+        if (!controller.signal.aborted && downloadPollGate.current.isCurrent(generation)) timer = window.setTimeout(poll, 5000);
       }
     };
     void poll();
     return () => {
-      stopped = true;
+      if (downloadPollGate.current.isCurrent(generation)) downloadPollGate.current.invalidate();
+      controller.abort();
+      if (downloadPollController.current === controller) downloadPollController.current = null;
       window.clearTimeout(timer);
     };
-  }, [download.active]);
+  }, [download.active, submittingDownload, downloadPollRevision]);
 
   useEffect(() => {
     const completionKey = `${download.jobId}:${download.completedModels}:${download.failedModels}`;
@@ -248,6 +320,9 @@ export default function ModelDownloader({ onDownloaded }) {
 
   const runDownload = async ({ endpoint, body, items, accepted }) => {
     if (submittingDownload || !items.length) return;
+    downloadPollGate.current.invalidate();
+    downloadPollController.current?.abort();
+    setDownloadPollRevision((current) => current + 1);
     setSubmittingDownload(true);
     try {
       const response = await fetch(endpoint, {
@@ -276,17 +351,17 @@ export default function ModelDownloader({ onDownloaded }) {
     event.preventDefault();
     void runDownload({
       endpoint: "/api/model-download",
-      body: { urls: modelLinks, civitai_key: civitaiKey, huggingface_key: huggingfaceKey, modelscope_key: modelscopeKey, kind, engine: requiresEngine ? engine : undefined, category: kind === "lora" ? category : undefined, connections },
+      body: { urls: modelLinks, civitai_key: credentials.civitai, huggingface_key: credentials.huggingface, modelscope_key: credentials.modelscope, kind, engine: requiresEngine ? engine : undefined, category: kind === "lora" ? category : undefined, connections },
       items: modelLinks,
       accepted: () => setModelUrls(""),
     });
   };
 
   const startRecommendedDownload = () => {
-    if (!selectedRecommendedFamily || !recommendedSelection.modelId || recommended.checkingInstalled || !recommended.installedChecked || !pendingRecommendedArtifacts.length) return;
+    if (!selectedRecommendedFamily || !selectedRecommendedModel || !pendingRecommendedArtifacts.length) return;
     void runDownload({
       endpoint: "/api/recommended-download",
-      body: { family_id: selectedRecommendedFamily.id, model_id: recommendedSelection.modelId, text_encoder_id: recommendedSelection.textEncoderId, vae_id: recommendedSelection.vaeId, civitai_key: civitaiKey, huggingface_key: huggingfaceKey, connections },
+      body: { family_id: selectedRecommendedFamily.id, model_id: recommendedSelection.modelId, text_encoder_id: recommendedSelection.textEncoderId, vae_id: recommendedSelection.vaeId, civitai_key: credentials.civitai, huggingface_key: credentials.huggingface, connections },
       items: pendingRecommendedArtifacts.map((item) => item.label),
       accepted: () => { setRecommendedFamilyId(""); setRecommendedZoneOpen(false); void refreshRecommended(); },
     });
@@ -296,7 +371,7 @@ export default function ModelDownloader({ onDownloaded }) {
     if (submittingDownload || !download.failedModels) return;
     void runDownload({
       endpoint: "/api/model-download/retry",
-      body: { civitai_key: civitaiKey, huggingface_key: huggingfaceKey, modelscope_key: modelscopeKey, connections },
+      body: { civitai_key: credentials.civitai, huggingface_key: credentials.huggingface, modelscope_key: credentials.modelscope, connections },
       items: (download.items || []).filter((item) => item.status === "error").map((item) => item.url),
     });
   };
@@ -311,7 +386,7 @@ export default function ModelDownloader({ onDownloaded }) {
         <div className="downloader-section-head"><span>01</span><div><strong>API Key 管理</strong><small>可选，为 Civitai、Hugging Face 或 ModelScope 分别配置密钥</small></div></div>
         <button type="button" className="key-manager-trigger" onClick={() => setKeyManagerOpen(true)}>
           <Key size={15} />
-          <span>管理 API 密钥<small>{[civitaiKey, huggingfaceKey, modelscopeKey].filter(Boolean).length ? `${[civitaiKey, huggingfaceKey, modelscopeKey].filter(Boolean).length} 个已配置` : "未配置"}</small></span>
+          <span>管理 API 密钥<small>{configuredCredentialCount ? `${configuredCredentialCount} 个已配置` : "未配置"}</small></span>
           <ChevronDown size={14} />
         </button>
         <p className="downloader-security-note"><i />密钥保存在当前浏览器本地存储，下载时仅发送给对应站点，不会写入模型目录或运行日志。</p>
@@ -362,7 +437,7 @@ export default function ModelDownloader({ onDownloaded }) {
             <h2>推荐模型专区</h2>
             <p>按类别浏览推荐模型，查看模型介绍、可下载版本、来源和配套组件。</p>
           </div>
-          <div className="recommended-zone-head-actions"><button type="button" title="刷新推荐模型版本" disabled={recommended.loading} onClick={() => void refreshRecommended(true)}><RefreshCw className={recommended.loading ? "spin" : ""} size={17} /></button><button type="button" className="modal-close" onClick={() => { setRecommendedZoneOpen(false); setRecommendedFamilyId(""); setRecommendedCategoryId(""); }}><X size={21} /></button></div>
+          <div className="recommended-zone-head-actions"><button type="button" title="后台刷新推荐模型版本" disabled={recommended.loading || recommended.refreshing} onClick={() => void refreshRecommended(true)}><RefreshCw className={recommended.loading || recommended.refreshing ? "spin" : ""} size={17} /></button><button type="button" className="modal-close" onClick={() => { setRecommendedZoneOpen(false); setRecommendedFamilyId(""); setRecommendedCategoryId(""); }}><X size={21} /></button></div>
         </header>
         <div className="recommended-zone-layout">
           <nav className="recommended-zone-nav" aria-label="推荐模型类别">
@@ -389,17 +464,17 @@ export default function ModelDownloader({ onDownloaded }) {
                   <aside><span>保存目录</span><code>{selectedRecommendedDirectories.join(" · ")}</code><small>Anima tokenizer 已随项目内置，不进入模型下载队列。</small></aside>
                 </section>
                 <div className="recommended-picker-notices">
-                  {selectedRequiresCivitaiKey && <div className="recommended-civitai-warning"><Key size={16} /><span><strong>Civitai 下载提示</strong>需要开启可访问 Civitai 的 VPN 代理，并填写对应 API Key。</span><button type="button" onClick={() => setKeyManagerOpen(true)}>{civitaiKey ? "API Key 已配置" : "填写 API Key"}</button></div>}
-                  {selectedRequiresHuggingfaceKey && <div className="recommended-civitai-warning"><Key size={16} /><span><strong>Hugging Face 授权仓库</strong>请先在模型主页接受许可协议，再填写 Hugging Face Token。</span><button type="button" onClick={() => setKeyManagerOpen(true)}>{huggingfaceKey ? "Token 已配置" : "填写 Token"}</button></div>}
+                  {selectedRequiresCivitaiKey && <div className="recommended-civitai-warning"><Key size={16} /><span><strong>Civitai 下载提示</strong>需要开启可访问 Civitai 的 VPN 代理，并填写对应 API Key。</span><button type="button" onClick={() => setKeyManagerOpen(true)}>{credentials.civitai ? "API Key 已配置" : "填写 API Key"}</button></div>}
+                  {selectedRequiresHuggingfaceKey && <div className="recommended-civitai-warning"><Key size={16} /><span><strong>Hugging Face 授权仓库</strong>请先在模型主页接受许可协议，再填写 Hugging Face Token。</span><button type="button" onClick={() => setKeyManagerOpen(true)}>{credentials.huggingface ? "Token 已配置" : "填写 Token"}</button></div>}
                 </div>
                 <section className="recommended-artifact-section"><header><div><strong>可下载模型</strong><small>选择一个模型版本或精度</small></div><b>{selectedRecommendedFamily.models.length} OPTIONS</b></header><div className="recommended-artifact-grid">
-                  {selectedRecommendedFamily.models.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.modelId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-model" value={item.id} checked={recommendedSelection.modelId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, modelId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>{item.provider || selectedRecommendedFamily.provider}</span><strong>{item.label}</strong><small>{item.filename || `Civitai Version ${item.versionId}`}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : formatFileSize(item.size)}</b></label>)}
+                  {selectedRecommendedFamily.models.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.modelId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-model" value={item.id} checked={recommendedSelection.modelId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, modelId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>{item.provider || selectedRecommendedFamily.provider}</span><strong>{item.label}</strong><small>{item.filename || `Civitai Version ${item.versionId}`}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : item.installationCached ? "缓存待复核" : formatFileSize(item.size)}</b></label>)}
                 </div></section>
                 {selectedRecommendedFamily.textEncoders.length > 0 && <section className="recommended-artifact-section"><header><div><strong>Text Encoders</strong><small>选择一个兼容文本编码器</small></div><b>{selectedRecommendedFamily.textEncoders.length} OPTIONS</b></header><div className="recommended-artifact-grid dependencies">
-                  {selectedRecommendedFamily.textEncoders.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.textEncoderId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-encoder" value={item.id} checked={recommendedSelection.textEncoderId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, textEncoderId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>TEXT ENCODER</span><strong>{item.label}</strong><small>{item.filename}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : formatFileSize(item.size)}</b></label>)}
+                  {selectedRecommendedFamily.textEncoders.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.textEncoderId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-encoder" value={item.id} checked={recommendedSelection.textEncoderId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, textEncoderId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>TEXT ENCODER</span><strong>{item.label}</strong><small>{item.filename}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : item.installationCached ? "缓存待复核" : formatFileSize(item.size)}</b></label>)}
                 </div></section>}
                 {selectedRecommendedFamily.vaes.length > 0 && <section className="recommended-artifact-section"><header><div><strong>VAE</strong><small>共享 VAE 会按 SHA-256 检测和复用</small></div><b>{selectedRecommendedFamily.vaes.length} OPTIONS</b></header><div className="recommended-artifact-grid dependencies">
-                  {selectedRecommendedFamily.vaes.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.vaeId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-vae" value={item.id} checked={recommendedSelection.vaeId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, vaeId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>VAE</span><strong>{item.label}</strong><small>{item.filename}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : formatFileSize(item.size)}</b></label>)}
+                  {selectedRecommendedFamily.vaes.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.vaeId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-vae" value={item.id} checked={recommendedSelection.vaeId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, vaeId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>VAE</span><strong>{item.label}</strong><small>{item.filename}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : item.installationCached ? "缓存待复核" : formatFileSize(item.size)}</b></label>)}
                 </div></section>}
               </> : !selectedRecommendedCategory ? <div className="recommended-category-grid">
                 {recommendedCategories.map((category) => {
@@ -419,7 +494,7 @@ export default function ModelDownloader({ onDownloaded }) {
           </div>
         </div>
         <footer className="recommended-zone-foot">
-          {selectedRecommendedFamily ? <><span><FolderOpen size={14} />{recommended.checkingInstalled || !recommended.installedChecked ? "正在校验所选文件" : pendingRecommendedArtifacts.length ? `待下载 ${pendingRecommendedArtifacts.map((item) => item.label).join(" + ")} · ${formatFileSize(pendingRecommendedArtifacts.reduce((total, item) => total + (item.size || 0), 0))}${installedSelectedArtifactCount ? ` · 本地已有 ${installedSelectedArtifactCount} 项` : ""}${queuedSelectedArtifactCount ? ` · 队列已有 ${queuedSelectedArtifactCount} 项` : ""}` : queuedSelectedArtifactCount ? `所选缺失资源已有 ${queuedSelectedArtifactCount} 项在队列中` : `所选 ${installedSelectedArtifactCount} 项均已通过本地校验`}</span><button type="button" disabled={submittingDownload || recommended.checkingInstalled || !recommended.installedChecked || !recommendedSelection.modelId || !pendingRecommendedArtifacts.length || (selectedRequiresCivitaiKey && !civitaiKey) || (selectedRequiresHuggingfaceKey && !huggingfaceKey)} onClick={startRecommendedDownload}><Download size={16} />{submittingDownload ? "正在添加到队列" : recommended.checkingInstalled || !recommended.installedChecked ? "正在校验本地文件" : !pendingRecommendedArtifacts.length ? queuedSelectedArtifactCount ? "已在下载队列" : "已全部安装" : selectedRequiresCivitaiKey && !civitaiKey ? "请先填写 API Key" : selectedRequiresHuggingfaceKey && !huggingfaceKey ? "请先填写 HF Token" : isDownloading ? `添加缺失项（${pendingRecommendedArtifacts.length}）` : `下载缺失项（${pendingRecommendedArtifacts.length}）`}</button></> : <><span>{recommended.loading ? "正在读取本地推荐模型目录" : recommended.checkingInstalled ? `${recommendedFamilyCount} 个模型系列已就绪 · 正在后台核对版本与安装状态` : `${recommendedFamilyCount} 个模型系列 · ${recommendedVersionCount} 个可选版本 · 已下载状态按 SHA-256 检测`}</span><button type="button" className="secondary" onClick={() => { setRecommendedZoneOpen(false); setRecommendedFamilyId(""); setRecommendedCategoryId(""); }}>关闭专区</button></>}
+          {selectedRecommendedFamily ? <><span><FolderOpen size={14} />{recommended.checkingInstalled ? "安装状态正在后台复核，可立即提交下载 · " : ""}{pendingRecommendedArtifacts.length ? `待下载 ${pendingRecommendedArtifacts.map((item) => item.label).join(" + ")} · ${formatFileSize(pendingRecommendedArtifacts.reduce((total, item) => total + (item.size || 0), 0))}${installedSelectedArtifactCount ? ` · 本地已有 ${installedSelectedArtifactCount} 项` : ""}${queuedSelectedArtifactCount ? ` · 队列已有 ${queuedSelectedArtifactCount} 项` : ""}` : queuedSelectedArtifactCount ? `所选缺失资源已有 ${queuedSelectedArtifactCount} 项在队列中` : `所选 ${installedSelectedArtifactCount} 项均已通过本地校验`}</span><button type="button" disabled={submittingDownload || !selectedRecommendedModel || !pendingRecommendedArtifacts.length || (selectedRequiresCivitaiKey && !credentials.civitai) || (selectedRequiresHuggingfaceKey && !credentials.huggingface)} onClick={startRecommendedDownload}><Download size={16} />{submittingDownload ? "正在添加到队列" : !selectedRecommendedModel ? "请重新选择模型版本" : !pendingRecommendedArtifacts.length ? queuedSelectedArtifactCount ? "已在下载队列" : "已全部安装" : selectedRequiresCivitaiKey && !credentials.civitai ? "请先填写 API Key" : selectedRequiresHuggingfaceKey && !credentials.huggingface ? "请先填写 HF Token" : isDownloading ? `添加缺失项（${pendingRecommendedArtifacts.length}）` : `下载缺失项（${pendingRecommendedArtifacts.length}）`}</button></> : <><span>{recommended.loading ? "正在读取本地推荐模型目录" : recommended.checkingInstalled ? `${recommendedFamilyCount} 个模型系列已就绪 · 正在后台核对版本与安装状态` : recommended.refreshing ? `${recommendedFamilyCount} 个模型系列已就绪 · 正在后台刷新在线版本` : `${recommendedFamilyCount} 个模型系列 · ${recommendedVersionCount} 个可选版本 · 已下载状态由本进程 SHA-256 复核`}</span><button type="button" className="secondary" onClick={() => { setRecommendedZoneOpen(false); setRecommendedFamilyId(""); setRecommendedCategoryId(""); }}>关闭专区</button></>}
         </footer>
       </section>
     </div>}

@@ -59,6 +59,26 @@ import { descriptionNeedsVersionIdentity, loraMetadataCacheValid, plainTextFromH
 import { pruneCardAssets, readCardAsset, readLoraCardStore, writeCardAsset, writeLoraCardStore } from "./scripts/lora-cards.mjs";
 import { pruneToolboxAssets, readToolboxAsset, readToolboxState, writeToolboxAsset, writeToolboxState } from "./scripts/toolbox-state.mjs";
 import { appendDownloadQueueState, filterPendingRecommendedArtifacts, itemStatusIsTerminal } from "./scripts/model-download-queue.mjs";
+import { fetchModelProviderDownload, fetchProviderMetadataJson } from "./scripts/provider-download-policy.mjs";
+import {
+  assertCivitaiArtifactForFamily,
+  assertCivitaiResolutionForArtifact,
+  createBackgroundSnapshot,
+  createSingleFlight,
+  emptyRecommendedModelCache,
+  indexRecommendedInstallationCandidates,
+  installationEntryForFile,
+  mapWithRecommendedConcurrency,
+  mergeConcurrentCivitaiSnapshots,
+  mergeResolvedCivitaiBinding,
+  raceTrustedCivitaiFamilyVersions,
+  readRecommendedModelCache,
+  recommendedCatalogFingerprint,
+  trustedInstallationsForArtifacts,
+  validateCachedInstallation,
+  verifyRecommendedFileAgainstCatalog,
+  writeRecommendedModelCache,
+} from "./scripts/recommended-model-cache.mjs";
 import { assistantReadiness, mergeAssistantSettings, readAssistantProfileStore, readAssistantSettings, redactAssistantProfileStore, redactAssistantSettings, assistantSettingsPath, writeAssistantProfileStore, writeAssistantSettings } from "./scripts/assistant-settings.mjs";
 import {
   MAXIMUM_PROFILES,
@@ -170,6 +190,7 @@ const inferenceTarget = `http://${inferenceUrlHost}:${inferencePort}`;
 const cacheDirectory = resolveProjectPath(process.env.XIRAI_CACHE_DIR, ".cache");
 const stateDirectory = resolveProjectPath(process.env.XIRAI_STATE_DIR, "state-cache");
 const uiStatePath = path.join(stateDirectory, "ui-state.json");
+const recommendedModelCachePath = path.join(stateDirectory, "recommended-model-cache.json");
 const manualUpdateStatePath = path.join(stateDirectory, "manual-update-state.json");
 const manualUpdateTransactionPath = path.join(stateDirectory, "manual-update-transaction.json");
 const manualUpdateEnvironmentTransactionPath = path.join(stateDirectory, "manual-update-environment-transaction.json");
@@ -1030,7 +1051,7 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   }
 }
 
-async function fetchDownload(url, options = {}, {
+async function fetchUpdateDownload(url, options = {}, {
   fetcher = undiciFetch,
   environment = process.env,
 } = {}) {
@@ -1063,6 +1084,18 @@ async function fetchDownload(url, options = {}, {
       currentUrl = nextUrl;
     }
     throw new Error("更新包下载重定向次数过多");
+  } catch (error) {
+    const cause = error.cause?.message;
+    throw new Error(cause ? `${error.message}: ${cause}` : error.message);
+  }
+}
+
+async function fetchProviderDownload(url, options = {}) {
+  try {
+    return await fetchModelProviderDownload(url, options, {
+      fetcher: undiciFetch,
+      dispatcher: getProxyDispatcher(),
+    });
   } catch (error) {
     const cause = error.cause?.message;
     throw new Error(cause ? `${error.message}: ${cause}` : error.message);
@@ -1153,7 +1186,7 @@ async function fetchBoundedUpdateBody(url, {
 }
 
 // Exported for deterministic network-boundary tests; production callers use updateApiPlugin.
-export const onlineUpdateNetworkInternals = { fetchBoundedUpdateBody, fetchDownload };
+export const onlineUpdateNetworkInternals = { fetchBoundedUpdateBody, fetchDownload: fetchUpdateDownload };
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -1448,11 +1481,14 @@ function isAllowedProviderHost(hostname, domains) {
 }
 
 async function fetchProviderJson(url, headers, timeout = 30000) {
-  const response = await fetchWithTimeout(url, {
+  const result = await fetchProviderMetadataJson(url, {
     headers: { Accept: "application/json", "User-Agent": "XirAI/0.1", ...headers },
-  }, timeout);
-  if (!response.ok) throw Object.assign(new Error(`远程模型信息请求失败（HTTP ${response.status}）`), { statusCode: response.status >= 400 && response.status < 500 ? 400 : 502 });
-  return response.json();
+    timeoutMs: timeout,
+    fetcher: undiciFetch,
+    dispatcher: getProxyDispatcher(),
+  });
+  if (!result.response.ok) throw Object.assign(new Error(`远程模型信息请求失败（HTTP ${result.response.status}）`), { statusCode: result.response.status >= 400 && result.response.status < 500 ? 400 : 502 });
+  return result.body;
 }
 
 function selectDownloadableFile(files, kind, requestedPath = "") {
@@ -1551,20 +1587,21 @@ function civitaiVersionFromUrl(url) {
   return match?.[1] || "";
 }
 
-async function resolveCivitaiDownload(url, kind, apiKey) {
+async function resolveCivitaiDownload(url, kind, apiKey, { metadataTimeout = 30000 } = {}) {
   const headers = providerHeaders(apiKey);
   const domain = isAllowedProviderHost(url.hostname, ["civitai.red"]) ? "civitai.red" : "civitai.com";
+  const fetchCivitaiJson = (target) => fetchProviderJson(target, headers, metadataTimeout);
   let versionId = civitaiVersionFromUrl(url);
   let version;
   if (!versionId) {
     const modelMatch = url.pathname.match(/\/models\/(\d+)/);
     if (!modelMatch) throw Object.assign(new Error("请使用 Civitai 模型版本或文件下载链接"), { statusCode: 400 });
-    const model = await fetchProviderJson(`https://${domain}/api/v1/models/${modelMatch[1]}`, headers);
+    const model = await fetchCivitaiJson(`https://${domain}/api/v1/models/${modelMatch[1]}`);
     version = Array.isArray(model.modelVersions) ? model.modelVersions[0] : null;
     versionId = String(version?.id || "");
   }
   if (!versionId) throw Object.assign(new Error("Civitai 模型页面没有可用版本"), { statusCode: 400 });
-  if (!version) version = await fetchProviderJson(`https://${domain}/api/v1/model-versions/${versionId}`, headers);
+  if (!version) version = await fetchCivitaiJson(`https://${domain}/api/v1/model-versions/${versionId}`);
   const file = selectDownloadableFile(version.files, kind);
   const downloadUrl = typeof file.downloadUrl === "string" ? file.downloadUrl : `https://${domain}/api/download/models/${versionId}`;
   const downloadHost = new URL(downloadUrl).hostname.toLowerCase();
@@ -1576,6 +1613,11 @@ async function resolveCivitaiDownload(url, kind, apiKey) {
     provider: "Civitai",
     filename: file.name,
     expectedSha256: normalizedSha256(file.hashes?.SHA256 || file.hashes?.sha256 || file.sha256),
+    modelId: Number(version.modelId),
+    versionId: Number(version.id || versionId),
+    fileId: Number(file.id),
+    baseModel: version.baseModel || "",
+    size: Math.round(Number(file.sizeKB || 0) * 1024),
     routes: [
       { id: downloadHost, label: downloadHost, url: downloadUrl, headers },
       { id: alternateDomain, label: alternateDomain, url: alternateUrl.toString(), headers },
@@ -2805,10 +2847,21 @@ let backgroundRemovalDownloadJob = null;
 let activeModelDownloadJob = null;
 let storedModelDownloadJob = null;
 let recommendedCatalogCache;
-let recommendedCatalogCachedAt = 0;
+let recommendedCatalogSource;
+let recommendedCatalogFingerprintValue = "";
+let recommendedPersistentCache;
+let recommendedRuntimeReady;
+let recommendedRemoteCatalog;
+let recommendedCachePersistPromise = Promise.resolve();
+let recommendedInstallationCandidates = new Map();
+let recommendedTrustedInstallations = new Map();
+const recommendedTrustedCivitaiBindings = new Set();
 const recommendedHashCache = new Map();
 const recommendedCatalogCacheLifetime = 10 * 60 * 1000;
 const recommendedCivitaiTimeout = 5000;
+const recommendedMaximumFamilies = 128;
+const recommendedMaximumModels = 4096;
+const recommendedHashConcurrency = 16;
 const modelDownloadJobPath = path.join(stateDirectory, "model-download-job.json");
 const backgroundRemovalDownloadJobPath = path.join(stateDirectory, "background-removal-download-job.json");
 const activeDownloadStatuses = new Set(["queued", "resolving", "downloading", "metadata"]);
@@ -2999,7 +3052,8 @@ async function enqueueModelDownloadBatch({ source, kind, engine, items, run }) {
     storedModelDownloadJob = job;
   }
   const wasActive = !isNew && (modelDownloadJobIsActive(job) || job.workerActive || job.workerScheduled);
-  const acceptedItems = items.filter((item) => !item.sha256 || !job.state.items.some((queued) => queued.sha256 === item.sha256 && queued.status !== "complete"));
+  const acceptedItems = items.filter((item) => !job.state.items.some((queued) => queued.status !== "complete"
+    && ((item.sha256 && queued.sha256 === item.sha256) || (item.id && queued.artifactId === item.id))));
   if (!acceptedItems.length) return { job, addedCount: 0 };
   const appended = appendDownloadQueueState(job.state, { source, kind, engine, items: acceptedItems });
   job.state = {
@@ -3064,7 +3118,7 @@ function updateModelDownloadJob(job, event) {
   } else if (event.type === "resolving") {
     job.state = { ...current, status: "resolving", provider: event.provider, modelIndex, message: event.message, items: updateItem({ status: "resolving" }) };
   } else if (event.type === "resolved") {
-    job.state = { ...current, status: "downloading", provider: event.provider || current.provider, modelIndex, filename: event.filename, destination: event.destination, verified: event.verified, message: "正在测速可用下载线路...", items: updateItem({ status: "downloading", filename: event.filename, destination: event.destination }) };
+    job.state = { ...current, status: "downloading", provider: event.provider || current.provider, modelIndex, filename: event.filename, destination: event.destination, verified: event.verified, message: "正在测速可用下载线路...", items: updateItem({ status: "downloading", filename: event.filename, destination: event.destination, ...(event.artifact_id ? { artifactId: String(event.artifact_id).slice(0, 200) } : {}), ...(normalizedSha256(event.sha256) ? { sha256: normalizedSha256(event.sha256) } : {}) }) };
   } else if (event.type === "route") {
     job.state = { ...current, status: "downloading", modelIndex, route: event.label, connections: event.connections || 0, message: event.cached ? "已验证本地同版本模型" : `已选择 ${event.label} 下载线路`, items: updateItem({ route: event.label }) };
   } else if (event.type === "progress") {
@@ -3209,6 +3263,11 @@ async function readRecommendedModelCatalog() {
   if (catalog?.schema !== 1 || !Array.isArray(catalog.civitaiFamilies) || !Array.isArray(catalog.staticFamilies) || !Array.isArray(catalog.artifacts)) {
     throw Object.assign(new Error("推荐模型目录格式无效"), { statusCode: 500 });
   }
+  if (catalog.civitaiFamilies.length + catalog.staticFamilies.length > recommendedMaximumFamilies
+    || catalog.artifacts.length > recommendedMaximumModels
+    || catalog.civitaiFamilies.reduce((count, family) => count + (Array.isArray(family?.versions) ? family.versions.length : recommendedMaximumModels + 1), 0) > recommendedMaximumModels) {
+    throw Object.assign(new Error("推荐模型目录超过允许的系列或版本数量"), { statusCode: 500 });
+  }
   const ids = new Set();
   for (const artifact of catalog.artifacts) {
     if (!artifact || typeof artifact.id !== "string" || !artifact.id || ids.has(artifact.id)) {
@@ -3224,6 +3283,23 @@ async function readRecommendedModelCatalog() {
       throw Object.assign(new Error(`推荐资源 ${artifact.id} 的文件名或 URL 无效`), { statusCode: 500 });
     }
     ids.add(artifact.id);
+  }
+  const familyIds = new Set();
+  for (const family of catalog.civitaiFamilies) {
+    if (!family || typeof family.id !== "string" || !family.id || familyIds.has(family.id)
+      || !Number.isSafeInteger(family.modelId) || family.modelId <= 0
+      || !downloadableModelKinds.has(family.role)
+      || !Array.isArray(family.baseModels) || !family.baseModels.length || !family.baseModels.every((base) => typeof base === "string" && base)
+      || !Array.isArray(family.versions) || family.versions.some((version) => !Array.isArray(version) || !Number.isSafeInteger(version[0]) || version[0] <= 0 || typeof version[1] !== "string" || !version[1])) {
+      throw Object.assign(new Error("推荐模型目录包含无效或重复的 Civitai 系列"), { statusCode: 500 });
+    }
+    familyIds.add(family.id);
+  }
+  for (const family of catalog.staticFamilies) {
+    if (!family || typeof family.id !== "string" || !family.id || familyIds.has(family.id)) {
+      throw Object.assign(new Error("推荐模型目录包含无效或重复的静态系列"), { statusCode: 500 });
+    }
+    familyIds.add(family.id);
   }
   return catalog;
 }
@@ -3252,49 +3328,58 @@ function publicCatalogArtifact(artifact) {
   };
 }
 
-function primaryCivitaiArtifact(family, version) {
-  const file = (Array.isArray(version.files) ? version.files : []).find((item) => item?.primary)
-    || (Array.isArray(version.files) ? version.files : []).find((item) => item?.type === "Model")
-    || version.files?.[0];
-  let filename;
+function civitaiBindingKey(familyId, model) {
+  return `${familyId}\u0000${model.modelId}\u0000${model.versionId}\u0000${model.fileId}\u0000${normalizedSha256(model.sha256)}`;
+}
+
+function boundCivitaiArtifact(family, model) {
+  let filename = "";
   try {
-    filename = file?.name ? safeModelFilename(file.name, family.role) : "";
+    filename = safeModelFilename(model.filename, family.role);
   } catch {
-    filename = "";
+    return null;
   }
-  return {
-    id: `${family.id}-${version.id}`,
+  const artifact = {
+    id: `${family.id}-${model.versionId}`,
+    familyId: family.id,
+    modelId: family.modelId,
     role: family.role,
-    label: version.name || `Version ${version.id}`,
+    label: model.label,
     filename,
-    size: Number(file?.sizeKB || 0) * 1024,
-    sha256: normalizedSha256(file?.hashes?.SHA256 || file?.sha256),
-    url: `https://civitai.red/models/${family.modelId}/${family.slug}?modelVersionId=${version.id}`,
+    size: model.size,
+    sha256: normalizedSha256(model.sha256),
+    url: `https://civitai.red/models/${family.modelId}/${family.slug}?modelVersionId=${model.versionId}`,
     provider: "Civitai",
-    versionId: Number(version.id),
-    baseModel: version.baseModel || "",
+    versionId: model.versionId,
+    fileId: model.fileId,
+    baseModel: model.baseModel,
   };
+  try {
+    return assertCivitaiArtifactForFamily(family, artifact);
+  } catch {
+    return null;
+  }
 }
 
 async function fetchCivitaiRecommendedFamily(family) {
-  let response;
+  let versions;
   try {
-    response = await Promise.any(civitaiDomains.map((domain) => fetchProviderJson(`https://${domain}/api/v1/models/${family.modelId}`, {}, recommendedCivitaiTimeout)));
+    versions = await raceTrustedCivitaiFamilyVersions(family, civitaiDomains.map((domain) => () => (
+      fetchProviderJson(`https://${domain}/api/v1/models/${family.modelId}`, {}, recommendedCivitaiTimeout)
+    )));
   } catch {
     throw new Error(`${family.name} 在线版本暂时不可用`);
   }
-  const allowed = new Set(family.baseModels);
-  const versions = (Array.isArray(response.modelVersions) ? response.modelVersions : [])
-    .filter((version) => allowed.has(version.baseModel))
-    .map((version) => primaryCivitaiArtifact(family, version))
-    .filter((artifact) => artifact.versionId);
-  if (!versions.length) throw new Error(`${family.name} 没有匹配 ${family.baseModels.join(" / ")} 的版本`);
+  versions = versions.map((model) => boundCivitaiArtifact(family, model) ? model : null).filter(Boolean);
+  if (!versions.length) throw new Error(`${family.name} 没有完整绑定且匹配 ${family.baseModels.join(" / ")} 的版本`);
   return versions;
 }
 
 function fallbackCivitaiVersions(family) {
   return family.versions.map(([versionId, name]) => ({
     id: `${family.id}-${versionId}`,
+    familyId: family.id,
+    modelId: family.modelId,
     role: family.role,
     label: name,
     filename: "",
@@ -3306,23 +3391,37 @@ function fallbackCivitaiVersions(family) {
   }));
 }
 
-async function buildRecommendedCatalog(forceRefresh = false) {
-  if (!forceRefresh && recommendedCatalogCache && Date.now() - recommendedCatalogCachedAt < recommendedCatalogCacheLifetime) return recommendedCatalogCache;
-  const source = await readRecommendedModelCatalog();
+function cachedCivitaiArtifact(family, model) {
+  if (Number(model.modelId) !== Number(family.modelId) || !family.baseModels.includes(model.baseModel)) return null;
+  return boundCivitaiArtifact(family, model);
+}
+
+function sanitizeRecommendedRemoteSnapshot(source, snapshot) {
+  if (!snapshot) return null;
+  const sourceFamilies = new Map(source.civitaiFamilies.map((family) => [family.id, family]));
+  const families = [];
+  for (const savedFamily of snapshot.families) {
+    const family = sourceFamilies.get(savedFamily.id);
+    if (!family) continue;
+    const models = savedFamily.models.filter((model) => cachedCivitaiArtifact(family, model));
+    if (!models.length) continue;
+    families.push({ id: family.id, fetchedAt: savedFamily.fetchedAt, complete: savedFamily.complete, models });
+  }
+  return families.length ? { savedAt: snapshot.savedAt, families } : null;
+}
+
+function buildRecommendedCatalogFromSource(source, remoteSnapshot) {
   const artifactMap = new Map(source.artifacts.map((artifact) => [artifact.id, publicCatalogArtifact(artifact)]));
-  const civitaiFamilies = await Promise.all(source.civitaiFamilies.map(async (family) => {
-    let models;
-    let remoteError = "";
-    if (forceRefresh) {
-      try {
-        models = await fetchCivitaiRecommendedFamily(family);
-      } catch (error) {
-        models = fallbackCivitaiVersions(family);
-        remoteError = error.message;
-      }
-    } else {
-      models = fallbackCivitaiVersions(family);
-    }
+  const remoteFamilies = new Map((remoteSnapshot?.families || []).map((family) => [family.id, family]));
+  const civitaiFamilies = source.civitaiFamilies.map((family) => {
+    const remoteFamily = remoteFamilies.get(family.id);
+    const cachedModels = remoteFamily?.models
+      ?.map((model) => cachedCivitaiArtifact(family, model))
+      .filter(Boolean);
+    const fallbackModels = fallbackCivitaiVersions(family);
+    const models = remoteFamily?.complete && cachedModels?.length
+      ? cachedModels
+      : [...(cachedModels || []), ...fallbackModels.filter((fallback) => !cachedModels?.some((model) => model.versionId === fallback.versionId))];
     return {
       id: family.id,
       group: family.group,
@@ -3333,18 +3432,113 @@ async function buildRecommendedCatalog(forceRefresh = false) {
       models,
       textEncoders: catalogArtifactsById(family.textEncoders || [], artifactMap, family.id, "textEncoders"),
       vaes: catalogArtifactsById(family.vaes || [], artifactMap, family.id, "vaes"),
-      remoteError,
+      remoteError: "",
       requiresCivitaiKey: true,
     };
-  }));
+  });
   const staticFamilies = source.staticFamilies.map((family) => ({
       ...family,
       models: catalogArtifactsById(family.models, artifactMap, family.id, "models"),
       textEncoders: catalogArtifactsById(family.textEncoders, artifactMap, family.id, "textEncoders"),
       vaes: catalogArtifactsById(family.vaes, artifactMap, family.id, "vaes"),
     }));
-  recommendedCatalogCache = { schema: 1, remoteRefreshed: forceRefresh, families: [...civitaiFamilies, ...staticFamilies] };
-  recommendedCatalogCachedAt = Date.now();
+  return {
+    schema: 1,
+    remoteRefreshed: Boolean(remoteSnapshot?.families?.length),
+    remoteRefreshedAt: remoteSnapshot?.savedAt || 0,
+    families: [...civitaiFamilies, ...staticFamilies],
+  };
+}
+
+async function fetchRecommendedRemoteSnapshot(source) {
+  const fetchedAt = Date.now();
+  const refreshed = await Promise.all(source.civitaiFamilies.map(async (family) => ({
+    id: family.id,
+    fetchedAt,
+    complete: true,
+    models: await fetchCivitaiRecommendedFamily(family),
+  })));
+  if (refreshed.reduce((count, family) => count + family.models.length, 0) > recommendedMaximumModels) {
+    throw new Error("Civitai 推荐版本数量超过安全上限");
+  }
+  const snapshot = { savedAt: Date.now(), families: refreshed };
+  for (const family of snapshot.families) {
+    for (const model of family.models) recommendedTrustedCivitaiBindings.add(civitaiBindingKey(family.id, model));
+  }
+  return snapshot;
+}
+
+async function recommendedRootForRole(role) {
+  if (role === "checkpoint") return getConfiguredDirectory("iL", "checkpoints");
+  const configKey = role === "diffusion_model" ? "diffusion_models"
+    : role === "text_encoder" ? "text_encoders"
+      : role === "upscaler" ? "upscalers"
+        : role === "embedding" ? "embeddings"
+          : role === "config" ? "configs"
+            : role === "yolo" ? "yolo"
+              : role === "vae" ? "vae" : "";
+  if (!configKey) throw new Error(`Unsupported recommended model cache role: ${role}`);
+  return getAuxiliaryModelDirectory(configKey);
+}
+
+function persistedRecommendedInstallations() {
+  return [...recommendedInstallationCandidates.values()].map((entry) => {
+    const { absolutePath: _absolutePath, ...persisted } = entry;
+    return persisted;
+  });
+}
+
+function persistRecommendedModelRuntimeCache() {
+  const snapshot = JSON.parse(JSON.stringify(recommendedPersistentCache));
+  recommendedCachePersistPromise = recommendedCachePersistPromise
+    .catch(() => {})
+    .then(() => writeRecommendedModelCache(recommendedModelCachePath, snapshot));
+  return recommendedCachePersistPromise;
+}
+
+async function initializeRecommendedModelRuntime() {
+  const source = await readRecommendedModelCatalog();
+  const fingerprint = recommendedCatalogFingerprint(source);
+  const saved = await readRecommendedModelCache(recommendedModelCachePath, fingerprint);
+  const base = saved || emptyRecommendedModelCache(fingerprint);
+  const remoteSnapshot = sanitizeRecommendedRemoteSnapshot(source, base.remoteSnapshot);
+  recommendedCatalogSource = source;
+  recommendedCatalogFingerprintValue = fingerprint;
+  recommendedInstallationCandidates = indexRecommendedInstallationCandidates(base.installations);
+  recommendedTrustedInstallations = new Map();
+  recommendedPersistentCache = {
+    ...base,
+    catalogFingerprint: fingerprint,
+    remoteSnapshot,
+    installations: base.installations,
+  };
+  recommendedCatalogCache = buildRecommendedCatalogFromSource(source, remoteSnapshot);
+  recommendedRemoteCatalog = createBackgroundSnapshot({
+    initialSnapshot: remoteSnapshot,
+    initialState: { ...base.remote, lastSuccessAt: 0 },
+    refresh: () => fetchRecommendedRemoteSnapshot(source),
+    mergeConcurrent: mergeConcurrentCivitaiSnapshots,
+    persist: async (nextSnapshot, remote) => {
+      const sanitized = sanitizeRecommendedRemoteSnapshot(source, nextSnapshot);
+      const changed = sanitized?.savedAt !== recommendedPersistentCache.remoteSnapshot?.savedAt;
+      recommendedPersistentCache = { ...recommendedPersistentCache, remoteSnapshot: sanitized, remote };
+      recommendedCatalogCache = buildRecommendedCatalogFromSource(source, sanitized);
+      await persistRecommendedModelRuntimeCache();
+      if (changed) triggerRecommendedInstallationReview();
+    },
+  });
+  if (saved && remoteSnapshot?.families.length !== saved.remoteSnapshot?.families.length) {
+    void persistRecommendedModelRuntimeCache().catch((error) => console.warn(`Unable to prune recommended model cache: ${error.message}`));
+  }
+}
+
+function ensureRecommendedModelRuntime() {
+  recommendedRuntimeReady ||= initializeRecommendedModelRuntime();
+  return recommendedRuntimeReady;
+}
+
+async function buildRecommendedCatalog() {
+  await ensureRecommendedModelRuntime();
   return recommendedCatalogCache;
 }
 
@@ -3377,9 +3571,19 @@ async function cachedRecommendedFileHash(file) {
   return sha256;
 }
 
+function recommendedArtifactHashIsTrusted(artifact) {
+  if (!artifact.sha256 || !artifact.size) return false;
+  if (artifact.provider === "Civitai") return recommendedTrustedCivitaiBindings.has(civitaiBindingKey(artifact.familyId, artifact));
+  const managed = recommendedCatalogSource?.artifacts?.find((item) => item.id === artifact.id);
+  return Boolean(managed
+    && managed.role === artifact.role
+    && managed.size === artifact.size
+    && normalizedSha256(managed.sha256) === normalizedSha256(artifact.sha256));
+}
+
 async function recommendedArtifactInstallations(catalog) {
   const artifacts = catalog.families.flatMap((family) => [...family.models, ...family.textEncoders, ...family.vaes]);
-  const expected = new Map(artifacts.filter((artifact) => artifact.sha256 && artifact.size).map((artifact) => [artifact.sha256, artifact]));
+  const expected = new Map(artifacts.filter(recommendedArtifactHashIsTrusted).map((artifact) => [artifact.sha256, artifact]));
   const byRole = new Map();
   for (const artifact of expected.values()) {
     const role = artifact.role;
@@ -3388,12 +3592,10 @@ async function recommendedArtifactInstallations(catalog) {
   }
   const installed = new Map();
   for (const [role, sizes] of byRole) {
-    const directory = role === "checkpoint"
-      ? await getConfiguredDirectory("iL", "checkpoints")
-      : await getAuxiliaryModelDirectory(role === "diffusion_model" ? "diffusion_models" : role === "text_encoder" ? "text_encoders" : role === "upscaler" ? "upscalers" : role === "config" ? "configs" : "vae");
+    const directory = await recommendedRootForRole(role);
     const roleArtifacts = [...expected.values()].filter((artifact) => artifact.role === role);
     const candidates = role === "config"
-      ? (await Promise.all(roleArtifacts.map(async (artifact) => {
+      ? (await mapWithRecommendedConcurrency(roleArtifacts, async (artifact) => {
           try {
             const file = path.join(directory, artifact.filename);
             const fileStat = await stat(file);
@@ -3403,30 +3605,118 @@ async function recommendedArtifactInstallations(catalog) {
           } catch {
             return null;
           }
-        }))).filter(Boolean)
+        }, recommendedHashConcurrency)).filter(Boolean)
       : await findFilesBySize(directory, sizes);
-    for (const file of candidates) {
-      const sha256 = await cachedRecommendedFileHash(file);
-      if (expected.has(sha256)) installed.set(sha256, path.relative(projectRoot, file.path).split(path.sep).join("/"));
+    const verified = await mapWithRecommendedConcurrency(candidates, async (file) => {
+      return verifyRecommendedFileAgainstCatalog({
+        file,
+        role,
+        artifactsByDigest: expected,
+        hashFile: cachedRecommendedFileHash,
+        createEntry: async ({ sha256 }) => {
+          const entry = await installationEntryForFile({ sha256, role, filePath: file.path, root: directory });
+          return entry ? { ...entry, absolutePath: file.path } : null;
+        },
+      });
+    }, recommendedHashConcurrency);
+    for (const entry of verified) {
+      if (entry) installed.set(entry.sha256, entry);
     }
   }
   return installed;
 }
 
+const reviewRecommendedInstallations = createSingleFlight(async () => {
+  await ensureRecommendedModelRuntime();
+  const installed = await recommendedArtifactInstallations(recommendedCatalogCache);
+  recommendedInstallationCandidates = new Map(installed);
+  recommendedTrustedInstallations = new Map(installed);
+  recommendedPersistentCache = { ...recommendedPersistentCache, installations: persistedRecommendedInstallations() };
+  await persistRecommendedModelRuntimeCache();
+  return installed;
+});
+let recommendedInstallationReviewAgain = false;
+
+function triggerRecommendedInstallationReview() {
+  if (reviewRecommendedInstallations.active) recommendedInstallationReviewAgain = true;
+  const request = reviewRecommendedInstallations();
+  const settled = () => {
+    if (!recommendedInstallationReviewAgain) return;
+    recommendedInstallationReviewAgain = false;
+    triggerRecommendedInstallationReview();
+  };
+  request.then(settled, (error) => {
+    console.warn(`Unable to review recommended model installations: ${error.message}`);
+    settled();
+  });
+  return request;
+}
+
+function publicRecommendedInstalledPath(entry) {
+  return entry?.absolutePath ? path.relative(projectRoot, entry.absolutePath).split(path.sep).join("/") : "";
+}
+
+async function recommendedInstallationsForArtifacts(artifacts) {
+  await ensureRecommendedModelRuntime();
+  const checked = await trustedInstallationsForArtifacts(artifacts, {
+    candidates: recommendedInstallationCandidates,
+    trusted: recommendedTrustedInstallations,
+    validateCandidate: (candidate) => validateCachedInstallation(candidate, { rootForRole: recommendedRootForRole }),
+  });
+  if (checked.invalidated.size) {
+    recommendedPersistentCache = { ...recommendedPersistentCache, installations: persistedRecommendedInstallations() };
+    void persistRecommendedModelRuntimeCache().catch((error) => console.warn(`Unable to invalidate recommended model cache: ${error.message}`));
+  }
+  return checked.installed;
+}
+
+async function cacheCompletedRecommendedInstallation(artifact, sha256, destination) {
+  const normalized = normalizedSha256(sha256);
+  if (!normalized) return;
+  const root = await recommendedRootForRole(artifact.role);
+  const entry = await installationEntryForFile({ sha256: normalized, role: artifact.role, filePath: destination, root });
+  if (!entry || (artifact.provider !== "Civitai" && artifact.size && entry.size !== artifact.size)) return null;
+  if (artifact.sha256 && artifact.sha256 !== normalized) {
+    recommendedInstallationCandidates.delete(artifact.sha256);
+    recommendedTrustedInstallations.delete(artifact.sha256);
+  }
+  const trustedEntry = { ...entry, absolutePath: destination };
+  recommendedInstallationCandidates.set(normalized, trustedEntry);
+  recommendedTrustedInstallations.set(normalized, trustedEntry);
+  recommendedPersistentCache = { ...recommendedPersistentCache, installations: persistedRecommendedInstallations() };
+  try {
+    await persistRecommendedModelRuntimeCache();
+  } catch (error) {
+    console.warn(`Unable to persist completed recommended model ${artifact.id}: ${error.message}`);
+  }
+  return trustedEntry;
+}
+
 async function sendRecommendedCatalog(url, response) {
-  const remoteRefreshed = url.searchParams.get("refresh") === "1";
-  const catalog = await buildRecommendedCatalog(remoteRefreshed);
-  const checkInstalled = url.searchParams.get("installed") === "1";
-  const installed = checkInstalled ? await recommendedArtifactInstallations(catalog) : new Map();
+  const catalog = await buildRecommendedCatalog();
+  const remote = recommendedRemoteCatalog.read();
+  const remoteStale = !remote.state.lastSuccessAt || Date.now() - remote.state.lastSuccessAt >= recommendedCatalogCacheLifetime;
+  if (url.searchParams.get("refresh") === "1" || remoteStale) void recommendedRemoteCatalog.refresh();
+  if (url.searchParams.get("installed") === "1") triggerRecommendedInstallationReview();
   const families = catalog.families.map((family) => ({
     ...family,
-    models: family.models.map((artifact) => ({ ...artifact, installed: Boolean(artifact.sha256 && installed.has(artifact.sha256)), installedPath: installed.get(artifact.sha256) || "" })),
-    textEncoders: family.textEncoders.map((artifact) => ({ ...artifact, installed: Boolean(artifact.sha256 && installed.has(artifact.sha256)), installedPath: installed.get(artifact.sha256) || "" })),
-    vaes: family.vaes.map((artifact) => ({ ...artifact, installed: Boolean(artifact.sha256 && installed.has(artifact.sha256)), installedPath: installed.get(artifact.sha256) || "" })),
+    models: family.models.map((artifact) => ({ ...artifact, installed: Boolean(artifact.sha256 && recommendedTrustedInstallations.has(artifact.sha256)), installationCached: Boolean(artifact.sha256 && recommendedInstallationCandidates.has(artifact.sha256)), installedPath: publicRecommendedInstalledPath(recommendedTrustedInstallations.get(artifact.sha256)) })),
+    textEncoders: family.textEncoders.map((artifact) => ({ ...artifact, installed: Boolean(artifact.sha256 && recommendedTrustedInstallations.has(artifact.sha256)), installationCached: Boolean(artifact.sha256 && recommendedInstallationCandidates.has(artifact.sha256)), installedPath: publicRecommendedInstalledPath(recommendedTrustedInstallations.get(artifact.sha256)) })),
+    vaes: family.vaes.map((artifact) => ({ ...artifact, installed: Boolean(artifact.sha256 && recommendedTrustedInstallations.has(artifact.sha256)), installationCached: Boolean(artifact.sha256 && recommendedInstallationCandidates.has(artifact.sha256)), installedPath: publicRecommendedInstalledPath(recommendedTrustedInstallations.get(artifact.sha256)) })),
   }));
+  const refreshState = recommendedRemoteCatalog.read();
   response.statusCode = 200;
   response.setHeader("Cache-Control", "no-store");
-  response.end(JSON.stringify({ schema: catalog.schema, families, installed_checked: checkInstalled, remote_refreshed: catalog.remoteRefreshed === true }));
+  response.end(JSON.stringify({
+    schema: catalog.schema,
+    catalog_fingerprint: recommendedCatalogFingerprintValue,
+    families,
+    installed_checked: true,
+    installation_reviewing: reviewRecommendedInstallations.active,
+    remote_refreshed: catalog.remoteRefreshed === true,
+    remote_refreshing: refreshState.refreshing,
+    remote_refresh_deferred_until: refreshState.state.nextAttemptAt || 0,
+  }));
 }
 
 function recommendedArtifactById(catalog, familyId, artifactId, field) {
@@ -3434,13 +3724,47 @@ function recommendedArtifactById(catalog, familyId, artifactId, field) {
   if (!family) throw Object.assign(new Error("推荐模型不存在"), { statusCode: 400 });
   const artifact = family[field].find((item) => item.id === artifactId);
   if (!artifact) throw Object.assign(new Error("所选推荐模型版本无效"), { statusCode: 400 });
+  assertTrustedRecommendedArtifact(familyId, artifact, field);
   return { family, artifact };
 }
 
-async function resolveRecommendedArtifact(artifact, apiKeys) {
+function assertTrustedRecommendedArtifact(familyId, artifact, field) {
+  const civitaiFamily = recommendedCatalogSource.civitaiFamilies.find((family) => family.id === familyId);
+  const staticFamily = recommendedCatalogSource.staticFamilies.find((family) => family.id === familyId);
+  const sourceFamily = civitaiFamily || staticFamily;
+  if (!sourceFamily) throw Object.assign(new Error("推荐模型系列不在受信目录中"), { statusCode: 400 });
+  if (civitaiFamily && field === "models") {
+    try {
+      assertCivitaiArtifactForFamily(civitaiFamily, artifact);
+    } catch {
+      throw Object.assign(new Error("所选 Civitai 版本不属于受信推荐系列"), { statusCode: 400 });
+    }
+    const expectedUrl = `https://civitai.red/models/${civitaiFamily.modelId}/${civitaiFamily.slug}?modelVersionId=${artifact.versionId}`;
+    if (artifact.provider !== "Civitai" || artifact.url !== expectedUrl) throw Object.assign(new Error("所选 Civitai 版本来源无效"), { statusCode: 400 });
+    return civitaiFamily;
+  }
+  if (!Array.isArray(sourceFamily[field]) || !sourceFamily[field].includes(artifact.id)) {
+    throw Object.assign(new Error("所选推荐资源不属于该系列"), { statusCode: 400 });
+  }
+  const managed = recommendedCatalogSource.artifacts.find((item) => item.id === artifact.id);
+  if (!managed || managed.role !== artifact.role || managed.filename !== artifact.filename
+    || managed.size !== artifact.size || normalizedSha256(managed.sha256) !== normalizedSha256(artifact.sha256)
+    || managed.url !== artifact.url) {
+    throw Object.assign(new Error("所选推荐资源与受信目录不一致"), { statusCode: 400 });
+  }
+  return sourceFamily;
+}
+
+async function resolveRecommendedArtifact(family, artifact, apiKeys) {
+  const trustedFamily = assertTrustedRecommendedArtifact(family.id, artifact, family.models.includes(artifact) ? "models" : family.textEncoders.includes(artifact) ? "textEncoders" : "vaes");
   if (artifact.provider === "Civitai") {
     if (!apiKeys.civitai) throw Object.assign(new Error("Civitai 推荐模型需要先填写 Civitai API Key，并开启可访问 Civitai 的 VPN 代理"), { statusCode: 400 });
-    return resolveCivitaiDownload(new URL(artifact.url), artifact.role, apiKeys.civitai);
+    const resolved = await resolveCivitaiDownload(new URL(artifact.url), artifact.role, apiKeys.civitai, { metadataTimeout: recommendedCivitaiTimeout });
+    try {
+      return assertCivitaiResolutionForArtifact(trustedFamily, artifact, resolved);
+    } catch {
+      throw Object.assign(new Error("Civitai 返回的文件不再属于所选推荐系列或版本，请刷新目录后重试"), { statusCode: 409 });
+    }
   }
   if (artifact.provider === "GitHub") {
     const url = new URL(artifact.url);
@@ -3472,6 +3796,16 @@ async function resolveRecommendedArtifact(artifact, apiKeys) {
   };
 }
 
+async function bindCompletedCivitaiArtifact(artifact, resolved, installation) {
+  const family = recommendedCatalogSource.civitaiFamilies.find((item) => item.id === artifact.familyId);
+  if (!family || !installation) return;
+  const current = recommendedRemoteCatalog.read().snapshot;
+  const { snapshot, model } = mergeResolvedCivitaiBinding(current, family, artifact, resolved, installation.size);
+  if (!boundCivitaiArtifact(family, model)) return;
+  recommendedTrustedCivitaiBindings.add(civitaiBindingKey(family.id, model));
+  await recommendedRemoteCatalog.replace(snapshot);
+}
+
 async function downloadRecommendedModels(request, response) {
   if (request.method !== "POST") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
   requireLocalRequest(request, "推荐模型下载仅允许在本机发起");
@@ -3482,7 +3816,7 @@ async function downloadRecommendedModels(request, response) {
   if (selected.family.textEncoders.length) artifacts.push(recommendedArtifactById(catalog, payload.family_id, payload.text_encoder_id, "textEncoders").artifact);
   if (selected.family.vaes.length) artifacts.push(recommendedArtifactById(catalog, payload.family_id, payload.vae_id, "vaes").artifact);
   const uniqueArtifacts = artifacts.filter((artifact, index, all) => all.findIndex((item) => item.sha256 ? item.sha256 === artifact.sha256 : item.id === artifact.id) === index);
-  const installed = await recommendedArtifactInstallations({ families: [{ models: uniqueArtifacts, textEncoders: [], vaes: [] }] });
+  const installed = await recommendedInstallationsForArtifacts(uniqueArtifacts);
   const existingQueueJob = activeModelDownloadJob || (storedModelDownloadJob?.batches?.length ? storedModelDownloadJob : null);
   const pendingArtifacts = filterPendingRecommendedArtifacts(uniqueArtifacts, installed, existingQueueJob?.state?.items || []);
   const apiKeys = {
@@ -3509,7 +3843,7 @@ async function downloadRecommendedModels(request, response) {
     });
     job = queued.job;
     addedModels = queued.addedCount;
-  } else if (existingQueueJob?.state?.items?.some((item) => item.sha256 && uniqueArtifacts.some((artifact) => artifact.sha256 === item.sha256) && item.status !== "complete")) {
+  } else if (existingQueueJob?.state?.items?.some((item) => item.status !== "complete" && uniqueArtifacts.some((artifact) => (item.sha256 && artifact.sha256 === item.sha256) || (item.artifactId && artifact.id === item.artifactId)))) {
     job = existingQueueJob;
   } else if (modelDownloadJobIsActive(activeModelDownloadJob) || activeModelDownloadJob?.workerActive || activeModelDownloadJob?.workerScheduled) {
     job = activeModelDownloadJob;
@@ -3534,28 +3868,33 @@ async function runRecommendedModelDownloadBatch(job, response, startIndex, { sel
       writeDownloadEvent(response, { type: "model", index: modelIndex, total_models: job.state.totalModels });
       try {
         writeDownloadEvent(response, { type: "resolving", model_index: modelIndex, provider: artifact.provider, message: `正在解析 ${artifact.label}...` });
-        const resolved = await resolveRecommendedArtifact(artifact, effectiveApiKeys);
+        const resolved = await resolveRecommendedArtifact(selected.family, artifact, effectiveApiKeys);
+        const expectedSha256 = normalizedSha256(artifact.provider === "Civitai" ? resolved.expectedSha256 : artifact.sha256 || resolved.expectedSha256);
+        if (!expectedSha256) throw new Error("推荐模型来源没有提供可验证的 SHA-256");
         const destination = await getDownloadDestination({ kind: artifact.role, engine: selected.family.group === "Illustrious" ? "iL" : undefined }, resolved.filename);
-        writeDownloadEvent(response, { type: "resolved", model_index: modelIndex, provider: resolved.provider, filename: resolved.filename, destination: path.relative(projectRoot, destination).split(path.sep).join("/"), verified: Boolean(resolved.expectedSha256) });
+        writeDownloadEvent(response, { type: "resolved", model_index: modelIndex, artifact_id: artifact.id, sha256: expectedSha256, provider: resolved.provider, filename: resolved.filename, destination: path.relative(projectRoot, destination).split(path.sep).join("/"), verified: true });
         const result = await downloadFile({
           routes: resolved.routes,
           destination,
-          expectedSha256: artifact.sha256 || resolved.expectedSha256,
+          expectedSha256,
           connections,
           thresholdBytes: 8 * 1024 ** 2,
           maximumBytes: maximumModelDownloadBytes,
-          existingFilePolicy: artifact.sha256 || resolved.expectedSha256 ? "reuse" : "error",
-          fetcher: fetchDownload,
+          existingFilePolicy: "reuse",
+          fetcher: fetchProviderDownload,
           rankRoutes: true,
           onRoute: (route) => writeDownloadEvent(response, { type: "route", model_index: modelIndex, label: route.label, cached: Boolean(route.cached), latency_ms: route.latencyMs, speed_bps: route.speedBps, connections: route.connections }),
           onProgress: (progress) => writeDownloadEvent(response, { type: "progress", model_index: modelIndex, current_bytes: progress.currentBytes, total_bytes: progress.totalBytes, speed_bps: progress.speedBps, connections: progress.connections, cached: Boolean(progress.cached), route: progress.route }),
           onWarning: (message) => writeDownloadEvent(response, { type: "warning", model_index: modelIndex, message }),
         });
+        const trustedInstallation = await cacheCompletedRecommendedInstallation(artifact, expectedSha256, destination);
+        if (artifact.provider === "Civitai") await bindCompletedCivitaiArtifact(artifact, resolved, trustedInstallation);
         writeDownloadEvent(response, { type: "model-complete", model_index: modelIndex, filename: resolved.filename, destination: path.relative(projectRoot, destination).split(path.sep).join("/"), cached: result.cached });
       } catch (error) {
         writeDownloadEvent(response, { type: "model-error", model_index: modelIndex, error: error.message || "推荐模型下载失败" });
       }
   }
+  triggerRecommendedInstallationReview();
 }
 
 async function downloadRecommendedYoloModels(request, response) {
@@ -3588,7 +3927,7 @@ async function downloadRecommendedYoloModels(request, response) {
         destination: path.join(yoloDirectory, model.name),
         connections: Math.max(1, Math.min(16, Number(process.env.XIRAI_DOWNLOAD_CONNECTIONS || 8) || 8)),
         thresholdBytes: 8 * 1024 ** 2,
-        fetcher: fetchDownload,
+        fetcher: fetchProviderDownload,
         rankRoutes: true,
         onRoute: (route) => writeDownloadEvent(response, {
           type: "route",
@@ -3636,7 +3975,7 @@ async function runBackgroundRemovalModelDownload(model) {
       maximumBytes: 1024 * 1024 ** 2,
       connections: 8,
       thresholdBytes: 2 * 1024 ** 2,
-      fetcher: fetchDownload,
+      fetcher: fetchProviderDownload,
       rankRoutes: true,
       onRoute: (route) => updateBackgroundRemovalDownloadJob({
         status: route.cached ? "complete" : "downloading",
@@ -3804,7 +4143,7 @@ async function runModelDownloadBatch(job, response, startIndex, { payload, urls,
           thresholdBytes: 8 * 1024 ** 2,
           maximumBytes: maximumModelDownloadBytes,
           existingFilePolicy: resolved.expectedSha256 ? "reuse" : "error",
-          fetcher: fetchDownload,
+          fetcher: fetchProviderDownload,
           rankRoutes: true,
           onRoute: (route) => writeDownloadEvent(response, {
             type: "route",
@@ -4969,7 +5308,7 @@ export function updateApiPlugin({
               maximumBytes: maximumUpdateArchiveBytes,
               sizeHint: release.asset.bytes,
               connections: 8,
-              fetcher: (downloadUrl, options) => fetchDownload(downloadUrl, options, {
+              fetcher: (downloadUrl, options) => fetchUpdateDownload(downloadUrl, options, {
                 fetcher: updateFetcher,
                 environment: releaseEnvironment,
               }),

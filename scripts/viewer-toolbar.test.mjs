@@ -29,8 +29,10 @@ test("toolbar source keeps all controls grouped, accessible, session-only, and c
   assert.match(app, /id="viewer-alignment-panel"[\s\S]{0,100}role="dialog"[\s\S]{0,80}aria-label="对齐与线条"/);
   assert.match(app, /id="viewer-template-panel"[\s\S]{0,100}role="dialog"[\s\S]{0,80}aria-label="拼图模板"/);
   assert.ok(app.indexOf("viewer-toolbar-popover-backdrop") < app.indexOf("image-viewer-canvas"), "toolbar backdrop is a workspace sibling before the canvas");
-  assert.match(app, /openImageViewer[\s\S]{0,900}setViewerEdgePanelOpen\(false\)[\s\S]{0,100}setViewerTemplatesOpen\(false\)/);
-  assert.match(app, /closeImageViewer[\s\S]{0,450}setViewerEdgePanelOpen\(false\)[\s\S]{0,100}setViewerTemplatesOpen\(false\)/);
+  const closeViewer = app.slice(app.indexOf("const closeImageViewer ="), app.indexOf("const applyViewerToolbarPopoverTransition ="));
+  const openViewer = app.slice(app.indexOf("const openImageViewer ="), app.indexOf("const refreshViewerHistory ="));
+  assert.match(openViewer, /setViewerEdgePanelOpen\(false\)[\s\S]*setViewerTemplatesOpen\(false\)/);
+  assert.match(closeViewer, /setViewerEdgePanelOpen\(false\)[\s\S]*setViewerTemplatesOpen\(false\)/);
   assert.match(app, /const openViewerContextMenu[\s\S]{0,160}applyViewerToolbarPopoverTransition\("none", "context-menu"\)/);
   assert.match(app, /disabled=\{!viewerLayerResizeEnabled\}/);
   for (const button of ["左边缘对齐", "水平居中", "右边缘对齐", "顶边缘对齐", "垂直居中", "底边缘对齐"]) assert.match(app, new RegExp(button));
@@ -42,6 +44,8 @@ test("toolbar source keeps all controls grouped, accessible, session-only, and c
   assert.doesNotMatch(css, /\.viewer-toolbar \{[^}]*overflow-x: hidden/);
   assert.match(css, /\.viewer-toolbar-popover-backdrop \{ position: absolute/);
   assert.match(css, /width: min\(475px, calc\(100% - 16px\)\)/);
+  assert.match(css, /max-height: min\(640px, calc\(100% - var\(--viewer-toolbar-height, 46px\) - 16px\)\)/);
+  assert.match(css, /@container viewer-workspace \(max-width: 1050px\)/);
 });
 
 test("toolbar measured-height state is declared, setter bound to ResizeObserver, and value read into workspace CSS variable", () => {

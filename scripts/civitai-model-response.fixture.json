@@ -1,0 +1,27 @@
+{
+  "id": 34,
+  "name": "Fixture Model",
+  "description": "A shape matching Civitai's parent model endpoint.",
+  "type": "Checkpoint",
+  "modelVersions": [
+    {
+      "id": 12,
+      "name": "Bound",
+      "baseModel": "Illustrious",
+      "publishedAt": "2026-01-01T00:00:00.000Z",
+      "files": [
+        {
+          "id": 56,
+          "sizeKB": 0.0048828125,
+          "name": "model.safetensors",
+          "type": "Model",
+          "primary": true,
+          "hashes": {
+            "SHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "downloadUrl": "https://civitai.com/api/download/models/12"
+        }
+      ]
+    }
+  ]
+}
