@@ -4537,7 +4537,7 @@ function App() {
       const height = Math.max(1, Math.ceil(bottom - top));
       viewerCanvasDimensions(width, height, "手动编辑导出画布");
       const manualLayout = normalizeManualLayout({ version: 2, layers: sourceLayers.map(serializeViewerLayer) }, { trustedCurrentSession: true });
-      if (!manualLayout) throw new Error("当前编辑布局超过图层、文字或笔画安全预算，无法合成");
+      if (!manualLayout) throw new Error("当前编辑布局超过图层或笔画安全预算，无法合成");
       const persistence = persistedManualLayout(manualLayout);
       const hasAnimatedSource = sourceLayers.some(isGifAsset);
       const animated = hasAnimatedSource && !hasViewerEdits(sourceLayers);
