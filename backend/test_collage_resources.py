@@ -117,10 +117,44 @@ class CollageResourceBudgetTests(unittest.TestCase):
         for layout in ({**external, "version": 3}, external):
             with self.assertRaises(ValidationError):
                 inference_server.CollageInput(image_data=placeholder, manual_layout=layout)
-        too_large = {"version": 2, "layers": [{"kind": "text", "text": "界" * 4000} for _ in range(100)]}
-        with self.assertRaises(ValidationError) as caught:
-            inference_server.CollageInput(image_data=placeholder, manual_layout=too_large)
-        self.assertIn("1 MiB", str(caught.exception))
+
+    def test_manual_layout_over_one_mib_is_rejected_after_its_layers_validate(self):
+        placeholder = "data:image/png;base64," + "A" * 32
+        with tempfile.TemporaryDirectory() as temporary:
+            original_output = inference_server.OUTPUT_DIRECTORY
+            inference_server.OUTPUT_DIRECTORY = Path(temporary)
+            try:
+                path = Path(temporary) / "safe.png"
+                Image.new("RGB", (8, 8)).save(path)
+                asset_id = inference_server.history_asset_token(path)
+                source = f"/api/inference/history/assets/{asset_id}"
+                # Every per-layer budget is respected -- 100 layers, 1000 strokes, 50000 points --
+                # so the only thing left to reject the layout for is its own encoded size.
+                point = {"x": 1.2345678, "y": 9.8765432}
+                stroke = {"tool": "brush", "id": "i" * 96, "color": "#c8acfb", "points": [point] * 50}
+                layer = {
+                    "kind": "image", "assetId": asset_id, "url": source, "originalUrl": source,
+                    "name": "界" * 200,
+                    "paintStrokes": [dict(stroke) for _ in range(10)],
+                }
+                too_large = {"version": 2, "layers": [dict(layer) for _ in range(100)]}
+                with self.assertRaises(ValidationError) as caught:
+                    inference_server.CollageInput(image_data=placeholder, manual_layout=too_large)
+                self.assertIn("1 MiB", str(caught.exception))
+            finally:
+                inference_server.OUTPUT_DIRECTORY = original_output
+
+    def test_manual_layout_refuses_withdrawn_text_layers(self):
+        """Text layers were removed from the editor, so no client may submit one again."""
+        placeholder = "data:image/png;base64," + "A" * 32
+        for layer in ({"kind": "text", "text": "x"}, {"type": "text", "text": "x"}):
+            for version in (1, 2):
+                with self.assertRaises(ValidationError) as caught:
+                    inference_server.CollageInput(
+                        image_data=placeholder,
+                        manual_layout={"version": version, "layers": [layer]},
+                    )
+                self.assertIn("cannot contain text layers", str(caught.exception))
 
     def test_manual_layout_enforces_stroke_and_point_limits_before_metadata_write(self):
         with tempfile.TemporaryDirectory() as temporary:

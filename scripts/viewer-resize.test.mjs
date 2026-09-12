@@ -32,21 +32,17 @@ test("resize UI is default-on, resets on open, and every layer scale entry fails
   assert.match(source, /if \(drag\.resizeGesture\.shouldApply\)[\s\S]{0,300}updateViewerLayer\(drag\.id, nextTransform\)/);
 });
 
-test("Viewer DOM/CSS contract keeps image handles and exposes only safe text handles plus a fixed-screen rotation handle", () => {
+test("Viewer DOM/CSS contract keeps image handles and withdraws them from a rotated layer", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.equal(viewerSafeResizeHandles({ kind: "image", rotation: 0 }).length, 8);
   assert.deepEqual(viewerSafeResizeHandles({ kind: "image", rotation: 1 }), []);
-  assert.deepEqual(viewerSafeResizeHandles({ kind: "text", rotation: 0 }), ["tl", "tr", "bl", "br"]);
-  assert.deepEqual(viewerSafeResizeHandles({ kind: "text", rotation: -45 }), []);
   assert.match(app, /return viewerSafeResizeHandles\(layer\)/);
   assert.match(app, /viewerResizeHandles\(layer\)\.map/);
   for (const anchor of ["tl", "tr", "bl", "br", "top", "right", "bottom", "left"]) assert.match(css, new RegExp(`\\.layer-corner-anchor\\.${anchor}`));
   assert.match(css, /width: 20px; height: 20px/);
   assert.match(css, /width: 13px; height: 13px/);
   assert.match(css, /transform: scale\(var\(--viewer-handle-inverse\)\)/);
-  assert.match(app, /className="layer-rotate-anchor"[\s\S]{0,240}className="layer-rotate-handle"/);
-  assert.match(css, /\.layer-rotate-anchor \{[^}]*transform: scale\(var\(--viewer-handle-inverse\)\)/);
 });
 
 test("disable cleanup is idempotent after its decision has cleared the resize drag", () => {

@@ -16,7 +16,6 @@ import {
   mapViewerConcurrent,
   normalizeManualLayout,
   normalizePaintStroke,
-  normalizeTextLayer,
   normalizeViewerEdgeLine,
   persistedManualLayout,
   readViewerFileAsDataUrl,
@@ -44,8 +43,8 @@ import {
   VIEWER_MAX_UNDO_SOURCE_BYTES,
 } from "../src/viewer-editor.js";
 
-test("rotated text uses a rotation-aware AABB", () => {
-  const layer = normalizeTextLayer({ text: "A", naturalWidth: 100, naturalHeight: 40, x: 10, y: -5, scale: 2, rotation: 90 });
+test("a rotated layer uses a rotation-aware AABB", () => {
+  const layer = { naturalWidth: 100, naturalHeight: 40, x: 10, y: -5, scale: 2, rotation: 90 };
   const quarterTurn = viewerEditorLayerBounds(layer);
   assert.ok(Math.abs(quarterTurn.left + 30) < 1e-9);
   assert.ok(Math.abs(quarterTurn.right - 50) < 1e-9);
@@ -95,21 +94,7 @@ test("paint strokes remain immutable and cloned layers do not share point arrays
   assert.equal(original.paintStrokes[0].points[0].x, 1);
 });
 
-test("text normalization preserves semantic aliases and clamps editor properties", () => {
-  const layer = normalizeTextLayer({ text: "hello", font: "serif", size: 999, weight: 700, align: "right", lineHeight: 9, rotation: 540, scale: 99 });
-  assert.equal(layer.font, "serif");
-  assert.equal(layer.fontFamily, "serif");
-  assert.equal(layer.size, 300);
-  assert.equal(layer.fontSize, 300);
-  assert.equal(layer.weight, 700);
-  assert.equal(layer.align, "right");
-  assert.equal(layer.lineHeight, 3);
-  assert.equal(layer.rotation, -180);
-  assert.equal(layer.scale, 8);
-  assert.equal(hasViewerEdits([layer]), true);
-});
-
-test("manualLayout v1 remains readable and v2 round-trips text, rotation, and paint", () => {
+test("manualLayout v1 remains readable and v2 round-trips rotation and paint without text", () => {
   const historyUrl = "/api/inference/history/assets/asset-1";
   const v1 = normalizeManualLayout({ version: 1, layers: [{ assetId: "asset-1", url: historyUrl, x: 3, y: 4, scale: .5 }] });
   assert.equal(v1.version, 1);
@@ -121,9 +106,9 @@ test("manualLayout v1 remains readable and v2 round-trips text, rotation, and pa
   assert.equal(v2.version, 2);
   assert.equal(v2.layers[0].paintStrokes[0].points.length, 1);
   assert.equal(v2.layers[0].rotation, 25);
-  assert.equal(v2.layers[1].text, "semantic");
-  assert.equal(v2.layers[1].align, "center");
-  assert.equal(v2.layers[1].rotation, -30);
+  // Text layers were withdrawn: a layout saved while they existed keeps its pictures and loses only
+  // the text, rather than refusing to reopen at all.
+  assert.equal(v2.layers.length, 1);
   assert.deepEqual(normalizeManualLayout(v2), v2);
   const persisted = persistedManualLayout(v2);
   assert.equal(persisted.layout.version, 2);
@@ -167,9 +152,11 @@ test("manualLayout versions and trust boundary are fail closed", () => {
   assert.equal(normalizeManualLayout({ ...external, version: 3 }), null);
   assert.equal(normalizeManualLayout(external), null);
   assert.equal(normalizeManualLayout(external, { trustedCurrentSession: true }).layers.length, 1);
-  assert.equal(normalizeManualLayout({ version: 2, layers: [{ kind: "text", text: "x".repeat(8001) }] }), null);
-  const oversizedSessionLayout = { version: 2, layers: Array.from({ length: 100 }, () => ({ kind: "text", text: "界".repeat(8000) })) };
-  assert.equal(normalizeManualLayout(oversizedSessionLayout), null, "untrusted layouts above 1 MiB are rejected");
+  // A layout that was nothing but text has nothing left to restore.
+  assert.equal(normalizeManualLayout({ version: 2, layers: [{ kind: "text", text: "x" }] }), null);
+  assert.equal(normalizeManualLayout({ version: 2, layers: [{ kind: "text", text: "x" }] }, { trustedCurrentSession: true }), null);
+  const oversizedSessionLayout = { version: 2, layers: Array.from({ length: 100 }, (_, index) => ({ kind: "image", assetId: `a${index}`, url: "https://example.test/image.png", name: "界".repeat(200) })) };
+  assert.equal(normalizeManualLayout(oversizedSessionLayout), null, "untrusted layouts with unprotected sources are rejected");
   const trustedOversized = normalizeManualLayout(oversizedSessionLayout, { trustedCurrentSession: true });
   assert.equal(trustedOversized.layers.length, 100, "bounded current-session state can remain editable without becoming server metadata");
   assert.equal(persistedManualLayout(trustedOversized).layout, null);
@@ -228,7 +215,6 @@ test("undo metrics include local data URLs and bounded manualLayout contents", (
   const withLayout = viewerUndoSnapshotMetrics({ layers: [{
     kind: "image", url: local, paintStrokes: [], manualLayout: { version: 2, layers: [
       { kind: "image", assetId: "", url: local, paintStrokes: [{ points: [{ x: 1, y: 2 }] }] },
-      { kind: "text", text: "manual semantic text" },
     ] },
   }] });
   assert.equal(withLayout.sourceBytes, plain.sourceBytes, "the same data URL in the layer and manualLayout is charged once");
@@ -304,7 +290,7 @@ test("mapViewerConcurrent links an external parent abort into its worker signal"
 test("rotated images expose no axis-unsafe resize handles while toolbar scale remains independent", () => {
   assert.deepEqual(viewerSafeResizeHandles({ kind: "image", rotation: 30 }), []);
   assert.equal(viewerSafeResizeHandles({ kind: "image", rotation: 0 }).length, 8);
-  assert.deepEqual(viewerSafeResizeHandles({ kind: "text", rotation: 0 }), ["tl", "tr", "bl", "br"]);
+  assert.equal(viewerSafeResizeHandles({ rotation: 0 }).length, 8, "every layer is a picture now");
 });
 
 test("slot confirmation replaces placeholder metadata with decoded intrinsic dimensions", () => {
@@ -326,10 +312,10 @@ test("clipboard paste requires the exact fresh marker or actual image files", ()
 test("edge line validation owns the purple default and the full 50px contract", () => {
   assert.equal(VIEWER_DEFAULT_COLOR, "#c8acfb");
   assert.deepEqual(normalizeViewerEdgeLine({ enabled: true, color: "bad", style: "script", width: 500 }), { enabled: true, color: "#c8acfb", style: "solid", width: 50 });
-  assert.equal(serializeViewerLayer(normalizeTextLayer({ text: "x" })).kind, "text");
+  assert.equal(serializeViewerLayer({ assetId: "a" }).kind, "image");
 });
 
-test("App gesture and text transactions keep cancel separate from one-shot undo commits", async () => {
+test("App gesture transactions keep cancel separate from one-shot undo commits", async () => {
   const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
   const finish = app.slice(app.indexOf("const finishViewerPointer ="), app.indexOf("const finishViewerResizeForDisable ="));
   assert.match(finish, /if \(cancelled\)[\s\S]*restoreViewerSnapshot\(drag\.undoSnapshot\)[\s\S]*return;[\s\S]*if \(drag\?\.changed\) saveViewerUndo\(drag\.undoSnapshot\)/);
@@ -337,11 +323,6 @@ test("App gesture and text transactions keep cancel separate from one-shot undo 
   assert.match(app, /onLostPointerCapture=\{loseViewerPointer\}/);
   assert.match(app, /getCoalescedEvents/);
   assert.match(app, /event\.button !== 0 \|\| event\.isPrimary === false/);
-  const textTransaction = app.slice(app.indexOf("const commitViewerTextEdit ="), app.indexOf("const pickViewerBrushColor ="));
-  assert.match(textTransaction, /saveViewerUndo\(edit\.snapshot\)/);
-  assert.match(textTransaction, /const cancelViewerTextEdit =[\s\S]*restoreViewerSnapshot\(edit\.snapshot\)/);
-  assert.match(app, /event\.key === "Enter" && \(event\.ctrlKey \|\| event\.metaKey\)[\s\S]{0,180}commitViewerTextEdit\(\)/);
-  assert.match(app, /if \(editingViewerText\)[\s\S]{0,120}cancelViewerTextEdit\(\)[\s\S]{0,40}return/);
 });
 
 test("render wiring separates ordinary images, raster replay, and semantic text without edging text", async () => {
@@ -350,23 +331,19 @@ test("render wiring separates ordinary images, raster replay, and semantic text 
     readFile(new URL("../src/ViewerRasterLayer.jsx", import.meta.url), "utf8"),
   ]);
   assert.match(app, /painted[\s\S]{0,120}<ViewerRasterLayer layer=\{layer\}/);
-  assert.match(app, /className="viewer-text-content"/);
-  assert.match(app, /className="viewer-text-editor"/);
-  assert.match(app, /!textLayer && viewerEdgeLine\.enabled/);
+  assert.match(app, /viewerEdgeLine\.enabled && \["top", "right", "bottom", "left"\]/);
   assert.match(app, /rotate\(\$\{normalizeRotation\(layer\.rotation\)\}deg\)/);
-  assert.match(app, /onDoubleClick=[\s\S]{0,180}beginViewerTextEdit\(layer\)/);
   assert.doesNotMatch(raster.match(/useEffect\([\s\S]*?\}, \[[^\]]*\]\);/)?.[0] || "", /onError\]/);
   assert.match(raster, /onErrorRef\.current/);
   assert.match(raster, /\}, \[layer\.originalUrl, layer\.url\]\);/, "stroke replay must not decode the source image again");
   assert.match(raster, /\[loadedImage, layer\.naturalWidth, layer\.naturalHeight, layer\.paintStrokes\]/);
 });
 
-test("static composition draws replayed layers in paint order and GIF editing is explicitly static", async () => {
+test("static composition draws replayed layers in array order and GIF editing is explicitly static", async () => {
   const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
   const collage = app.slice(app.indexOf("const createManualCollage ="), app.indexOf("const selectGeneratedOutput ="));
-  // One pass over the cloned layers, taken in the order the canvas paints them: text over images.
-  assert.match(collage, /sourceLayers = viewerPaintOrder\(cloneViewerLayers\(viewerLayers\)\)/);
-  assert.match(collage, /viewerLayerKind\(layer\) === "text" \? null : await viewerLayerBitmap\(layer, \{ signal: token\.signal \}\)/);
+  assert.match(collage, /sourceLayers = cloneViewerLayers\(viewerLayers\)/);
+  assert.match(collage, /const source = await viewerLayerBitmap\(layer, \{ signal: token\.signal \}\)/);
   assert.match(collage, /nodes\.forEach\(\(item\) => \{[\s\S]*drawViewerLayer\(context, item\.layer, item\.source/);
   assert.match(collage, /hasAnimatedSource && !hasViewerEdits\(sourceLayers\)/);
   assert.match(collage, /GIF 与编辑内容已静态合成为 PNG/);
@@ -399,11 +376,41 @@ test("App admits bytes before reads and threads operation abort signals through 
   assert.match(app, /VIEWER_MAX_OUTPUT_BYTES/);
 });
 
-test("toolbar text cancellation restores both the layer snapshot and text defaults", async () => {
-  const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
-  const start = app.indexOf('className="viewer-property-field viewer-text-content-field"');
-  const field = app.slice(start, app.indexOf('className="viewer-property-color"', start));
-  assert.match(field, /defaults: \{ \.\.\.viewerTextDefaults \}/);
-  assert.match(field, /restoreViewerSnapshot\(edit\.snapshot\)/);
-  assert.match(field, /setViewerTextDefaults\(edit\.defaults\)/);
+
+test("text layers stay withdrawn from the editor, the model and the saved layout", async () => {
+  const [app, editor, css, backend] = await Promise.all([
+    readFile(new URL("../src/App.jsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/viewer-editor.js", import.meta.url), "utf8"),
+    readFile(new URL("../src/styles.css", import.meta.url), "utf8"),
+    readFile(new URL("../backend/inference_server.py", import.meta.url), "utf8"),
+  ]);
+  // The tool, its gestures, its layer model and its stylesheet are gone, not merely hidden.
+  assert.doesNotMatch(app, /viewerTextDefaults|editingViewerText|beginViewerTextEdit|createViewerText|viewerTextBox|measureViewerText|viewerTextMarquee|viewerLayerKind|viewerPaintOrder/);
+  assert.doesNotMatch(editor, /normalizeTextLayer|drawTextLayer|measureTextLayer|wrapTextLines|viewerTextBox|VIEWER_TEXT_STYLES/);
+  assert.doesNotMatch(css, /viewer-text-editor|viewer-text-content|viewer-text-marquee|tool-text|layer-rotate/);
+  assert.doesNotMatch(app, /文字工具|文字图层|文字属性/);
+  // Three tools remain, and the keyboard offers exactly those.
+  assert.match(app, /\{ v: "move", b: "brush", e: "eraser" \}/);
+  assert.match(editor, /VIEWER_TOOLS = Object\.freeze\(\["move", "brush", "eraser"\]\)/);
+  // Every layer is a picture, so an upright one offers all eight handles and none can be rotated.
+  assert.equal(viewerSafeResizeHandles({ rotation: 0 }).length, 8);
+  assert.doesNotMatch(app, /kind: "rotate"|layer-rotate-handle/);
+  // Nothing may submit a text layer any more, and a stored one is dropped on the way back in.
+  assert.match(backend, /manual_layout cannot contain text layers/);
+  assert.doesNotMatch(backend, /_COLLAGE_TEXT_LAYER_KEYS|COLLAGE_MAX_LAYOUT_TEXT/);
+  assert.match(editor, /if \(source\.kind === "text" \|\| source\.type === "text"\) continue;/);
+});
+
+test("every name App.jsx imports from the editor module is really exported by it", async () => {
+  // A deleted export leaves a bare identifier behind: the bundler treats it as a global and builds
+  // happily, so the page only fails when the user reaches that line. This catches it at test time.
+  const [app, module] = await Promise.all([
+    readFile(new URL("../src/App.jsx", import.meta.url), "utf8"),
+    import("../src/viewer-editor.js"),
+  ]);
+  const block = app.slice(app.indexOf("import {"), app.indexOf('} from "./viewer-editor.js";'));
+  const imported = block.split("\n").map((line) => line.trim().replace(/,$/, "")).filter((name) => /^[A-Za-z_$][\w$]*$/.test(name));
+  assert.ok(imported.length > 20, `parsed only ${imported.length} imported names`);
+  const missing = imported.filter((name) => !(name in module));
+  assert.deepEqual(missing, [], "App.jsx imports names the editor module does not export");
 });

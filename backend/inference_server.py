@@ -1241,7 +1241,6 @@ COLLAGE_MAX_GIF_FRAMES = 240
 COLLAGE_MAX_TOTAL_FRAME_PIXELS = 120_000_000
 COLLAGE_MAX_MANUAL_LAYOUT_BYTES = 1024 * 1024
 COLLAGE_MAX_LAYOUT_LAYERS = 100
-COLLAGE_MAX_LAYOUT_TEXT = 8000
 COLLAGE_MAX_LAYOUT_STROKES = 1000
 COLLAGE_MAX_STROKE_POINTS = 10_000
 COLLAGE_MAX_LAYOUT_POINTS = 50_000
@@ -1268,11 +1267,6 @@ _COLLAGE_HISTORY_SOURCE = re.compile(r"^/api/inference/history/assets/[A-Za-z0-9
 _COLLAGE_IMAGE_LAYER_KEYS = {
     "kind", "type", "assetId", "url", "originalUrl", "name", "naturalWidth", "naturalHeight",
     "x", "y", "scale", "rotation", "mimeType", "paintStrokes",
-}
-_COLLAGE_TEXT_LAYER_KEYS = {
-    "kind", "type", "text", "font", "fontFamily", "size", "fontSize", "weight", "fontWeight",
-    "color", "align", "textAlign", "lineHeight", "naturalWidth", "naturalHeight", "x", "y", "scale",
-    "rotation", "name",
 }
 _COLLAGE_STROKE_KEYS = {"id", "tool", "color", "size", "opacity", "points"}
 
@@ -1429,9 +1423,11 @@ def validate_manual_layout_schema(layout: dict | None):
     for layer_index, layer in enumerate(layers):
         if not isinstance(layer, dict):
             raise ValueError(f"manual_layout layer {layer_index} must be an object")
-        is_text = version == 2 and (layer.get("kind") == "text" or layer.get("type") == "text")
-        allowed = _COLLAGE_TEXT_LAYER_KEYS if is_text else _COLLAGE_IMAGE_LAYER_KEYS
-        if not set(layer).issubset(allowed):
+        # Text layers were withdrawn from the editor, so no client may still submit one; a layout
+        # saved while they existed is read back with its text layers dropped, never re-saved.
+        if layer.get("kind") == "text" or layer.get("type") == "text":
+            raise ValueError("manual_layout cannot contain text layers")
+        if not set(layer).issubset(_COLLAGE_IMAGE_LAYER_KEYS):
             raise ValueError(f"manual_layout layer {layer_index} contains unsupported fields")
         for key in ("x", "y", "scale", "rotation", "naturalWidth", "naturalHeight"):
             if key in layer:
@@ -1449,23 +1445,6 @@ def validate_manual_layout_schema(layout: dict | None):
         name = layer.get("name", "")
         if not isinstance(name, str) or len(name) > 200:
             raise ValueError(f"manual_layout layer {layer_index} name is invalid")
-        if is_text:
-            text = layer.get("text")
-            if not isinstance(text, str) or len(text) > COLLAGE_MAX_LAYOUT_TEXT:
-                raise ValueError(f"manual_layout text exceeds {COLLAGE_MAX_LAYOUT_TEXT} characters")
-            for key, maximum in (("font", 160), ("fontFamily", 160), ("color", 16), ("align", 16), ("textAlign", 16)):
-                if key in layer and (not isinstance(layer[key], str) or len(layer[key]) > maximum):
-                    raise ValueError(f"manual_layout text field {key} is invalid")
-            for key in ("size", "fontSize", "weight", "fontWeight", "lineHeight"):
-                if key in layer:
-                    number = _collage_finite_number(layer[key], f"text layer {layer_index}.{key}")
-                    if key in {"size", "fontSize"} and not 8 <= number <= 300:
-                        raise ValueError("manual_layout text size is outside 8 to 300")
-                    if key == "lineHeight" and not 0.8 <= number <= 3:
-                        raise ValueError("manual_layout text lineHeight is outside 0.8 to 3")
-            continue
-        if version == 1 and (layer.get("kind") == "text" or layer.get("type") == "text"):
-            raise ValueError("manual_layout v1 cannot contain text layers")
         asset_id = layer.get("assetId")
         if not isinstance(asset_id, str) or not asset_id or len(asset_id) > 512:
             raise ValueError(f"manual_layout image layer {layer_index} requires assetId")

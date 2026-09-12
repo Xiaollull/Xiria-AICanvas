@@ -15,11 +15,9 @@ import {
   hasLayerPaint,
   hasViewerEdits,
   mapViewerConcurrent,
-  measureTextLayer,
   normalizeManualLayout,
   normalizePaintStroke,
   normalizeRotation,
-  normalizeTextLayer,
   normalizeViewerColor,
   normalizeViewerEdgeLine,
   persistedManualLayout,
@@ -33,18 +31,11 @@ import {
   viewerClipboardPasteIntent,
   viewerDataUrlBytes,
   viewerFileBatchAdmission,
-  viewerLayerKind,
   viewerLayerSourceByteCount,
   viewerSafeResizeHandles,
-  viewerPaintOrder,
   viewerStrokeCount,
   viewerStrokePointCount,
-  viewerTextBox,
-  viewerTextBoxResize,
-  viewerTextStyleFor,
   VIEWER_DEFAULT_COLOR,
-  VIEWER_RESIZE_HANDLES,
-  VIEWER_TEXT_STYLES,
   VIEWER_MAX_LAYOUT_POINTS,
   VIEWER_MAX_LAYOUT_STROKES,
   VIEWER_MAX_FILE_BYTES,
@@ -53,7 +44,6 @@ import {
   VIEWER_MAX_OUTPUT_BYTES,
   VIEWER_MAX_RESTORE_PIXELS,
   VIEWER_MAX_STROKE_POINTS,
-  VIEWER_TEXT_MIN_BOX,
 } from "./viewer-editor.js";
 import ViewerRasterLayer from "./ViewerRasterLayer.jsx";
 import { pluginDiagnosticMessage, pluginRegistrySummary, pluginRemoveConfirmation, pluginStatePresentation, pluginToggleAvailable } from "./plugin-presentation.js";
@@ -100,7 +90,6 @@ import {
   Play,
   Plus,
   RefreshCw,
-  RotateCw,
   Search,
   Save,
   Send,
@@ -112,7 +101,6 @@ import {
   Square,
   Terminal,
   Trash2,
-  Type,
   Upload,
   WandSparkles,
   Wrench,
@@ -685,20 +673,7 @@ async function imageSourceDataUrl(source, { signal } = {}) {
   return readImageFile(blob, { signal });
 }
 
-function measureViewerText(value) {
-  const normalized = normalizeTextLayer(value);
-  viewerCanvasDimensions(300, 150, "文字测量画布");
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-  context.font = `${normalized.fontWeight} ${normalized.fontSize}px ${normalized.fontFamily}`;
-  const measured = measureTextLayer(normalized.text, normalized, (text) => context.measureText(text).width);
-  // The wrapped lines come back with the size: a box renders exactly these lines, so the same font
-  // metrics that laid them out here lay them out again in the exported canvas.
-  return { ...normalized, naturalWidth: measured.naturalWidth, naturalHeight: measured.naturalHeight, lines: measured.lines };
-}
-
 async function viewerLayerBitmap(layer, { signal } = {}) {
-  if (viewerLayerKind(layer) === "text") return null;
   const { image } = await loadBudgetedBrowserImage(layer.originalUrl || layer.url, { signal });
   if (!hasLayerPaint(layer)) return image;
   viewerCanvasDimensions(layer.naturalWidth || image.naturalWidth, layer.naturalHeight || image.naturalHeight, "图片编辑画布");
@@ -723,7 +698,6 @@ async function renderViewerLayerPng(layer, { signal } = {}) {
 }
 
 function drawViewerLayerEdge(context, layer, bounds, options, outputScale = 1, hiddenSides = []) {
-  if (viewerLayerKind(layer) === "text") return;
   const normalized = normalizeViewerEdgeLine(options);
   if (!normalized.enabled) return;
   context.save();
@@ -741,12 +715,6 @@ function isEditableTarget(target) {
 
 function viewerResizeHandles(layer) {
   return viewerSafeResizeHandles(layer);
-}
-
-// A layer moves when it is the one being moved, and text moves with the picture it was written on.
-// Dragging the text itself never carries the picture: the binding points one way only.
-function viewerMovesWithLayer(layer, movedId) {
-  return layer?.id === movedId || (viewerLayerKind(layer) === "text" && Boolean(layer?.attachedTo) && layer.attachedTo === movedId);
 }
 
 function sharedEdgeLineSegments(rectangles, tolerance = 1) {
@@ -1479,9 +1447,6 @@ function App() {
   const [activeViewerLayer, setActiveViewerLayer] = useState("");
   const [viewerTool, setViewerTool] = useState("move");
   const [viewerBrush, setViewerBrush] = useState({ size: 40, opacity: 100, color: VIEWER_DEFAULT_COLOR });
-  const [viewerTextDefaults, setViewerTextDefaults] = useState({ text: "文字图层", fontFamily: "Arial, sans-serif", fontSize: 48, fontWeight: 400, color: VIEWER_DEFAULT_COLOR, textAlign: "left", lineHeight: 1.2, rotation: 0 });
-  const [editingViewerText, setEditingViewerText] = useState("");
-  const [viewerTextMarquee, setViewerTextMarquee] = useState(null);
   const [viewerPointerOverCanvas, setViewerPointerOverCanvas] = useState(false);
   const [viewerGridSize, setViewerGridSize] = useState(16);
   const [viewerGridEnabled, setViewerGridEnabled] = useState(true);
@@ -1514,8 +1479,6 @@ function App() {
   // the app is served to, and only the input is held back when the host has not allowed it.
   const [consoleCommandsAllowed, setConsoleCommandsAllowed] = useState(true);
   const viewerDrag = useRef(null);
-  const viewerTextEdit = useRef(null);
-  const viewerPropertyEdit = useRef(null);
   const viewerNudge = useRef(null);
   const viewerUndo = useRef([]);
   const viewerSourceBytes = useRef(0);
@@ -1536,7 +1499,6 @@ function App() {
   const viewerCanvasRef = useRef(null);
   const viewerBrushCursorRef = useRef(null);
   const viewerBrushCursorAt = useRef(null);
-  const viewerTextEditorRef = useRef(null);
   const viewerToolbarRef = useRef(null);
   const viewerEdgeTriggerRef = useRef(null);
   const viewerTemplateTriggerRef = useRef(null);
@@ -2306,11 +2268,6 @@ function App() {
     void refreshViewerHistory();
     const handleEscape = (event) => {
       if (event.key !== "Escape") return;
-      if (editingViewerText) {
-        event.preventDefault();
-        cancelViewerTextEdit();
-        return;
-      }
       if (isEditableTarget(event.target)) return;
       const action = viewerEscapeAction({ historyDelete, contextMenu: viewerMenu, popover: viewerEdgePanelOpen ? VIEWER_TOOLBAR_POPOVER_LAYOUT : viewerTemplatesOpen ? VIEWER_TOOLBAR_POPOVER_TEMPLATES : "none", historyBatch: viewerHistoryBatch });
       if (action === "historyDelete") setHistoryDelete(null);
@@ -2334,7 +2291,7 @@ function App() {
       window.removeEventListener("keydown", handleEscape);
       window.removeEventListener("pointerdown", closeMenu);
     };
-  }, [imageViewerOpen, historyDelete, viewerMenu, viewerEdgePanelOpen, viewerTemplatesOpen, viewerHistoryBatch, editingViewerText]);
+  }, [imageViewerOpen, historyDelete, viewerMenu, viewerEdgePanelOpen, viewerTemplatesOpen, viewerHistoryBatch]);
 
   useEffect(() => {
     if (!imageViewerOpen) return undefined;
@@ -3635,9 +3592,6 @@ function App() {
     const drag = viewerDrag.current;
     if (drag?.pointerTarget?.hasPointerCapture?.(drag.pointerId)) drag.pointerTarget.releasePointerCapture?.(drag.pointerId);
     viewerDrag.current = null;
-    viewerTextEdit.current = null;
-    viewerPropertyEdit.current = null;
-    setEditingViewerText("");
     viewerFitRaf.current?.cancel();
     viewerFitRaf.current = null;
     viewerSession.current.close();
@@ -3683,9 +3637,6 @@ function App() {
     const token = viewerSession.current.beginReplacement("open", { session });
     setViewerZoom(1);
     setViewerTool("move");
-    setEditingViewerText("");
-    viewerTextEdit.current = null;
-    viewerPropertyEdit.current = null;
     viewerDrag.current = null;
     setViewerLayerResizeEnabled(true);
     setViewerPan({ x: 0, y: 0 });
@@ -3831,7 +3782,6 @@ function App() {
     let loadedLayers;
     try {
       loadedLayers = await mapViewerConcurrent(sourceLayers, 4, async (layer) => {
-        if (viewerLayerKind(layer) === "text") return { layer: measureViewerText(layer), error: null };
         try {
           const loaded = await imageAssetFromSource({ ...layer, url: layer.originalUrl || layer.url }, {
             signal: token.signal,
@@ -3864,7 +3814,7 @@ function App() {
       originalUrl: layer.originalUrl || layer.url || "",
       naturalWidth: layer.naturalWidth,
       naturalHeight: layer.naturalHeight,
-      name: layer.name || (viewerLayerKind(layer) === "text" ? "文字图层" : `图片 ${index + 1}`),
+      name: layer.name || `图片 ${index + 1}`,
       x: Number.isFinite(layer.x) ? layer.x : 0,
       y: Number.isFinite(layer.y) ? layer.y : 0,
       scale: Math.max(.1, Math.min(8, Number(layer.scale) || 1)),
@@ -4038,121 +3988,15 @@ function App() {
     const drag = viewerDrag.current;
     if (!drag) return;
     viewerDrag.current = null;
-    setViewerTextMarquee(null);
     if (drag.undoSnapshot) restoreViewerSnapshot(drag.undoSnapshot);
     if (drag.pointerTarget?.hasPointerCapture?.(drag.pointerId)) drag.pointerTarget.releasePointerCapture?.(drag.pointerId);
   };
 
-  const commitViewerTextEdit = () => {
-    const edit = viewerTextEdit.current;
-    if (!edit) return;
-    viewerTextEdit.current = null;
-    setEditingViewerText("");
-    const current = viewerLayers.find((layer) => layer.id === edit.id);
-    const before = edit.snapshot.layers.find((layer) => layer.id === edit.id);
-    if (edit.isNew || JSON.stringify(serializeViewerLayer(current)) !== JSON.stringify(before && serializeViewerLayer(before))) {
-      saveViewerUndo(edit.snapshot);
-      setViewerNotice(edit.isNew ? "已创建文字图层" : "已更新文字内容");
-    }
-  };
-
-  const cancelViewerTextEdit = () => {
-    const edit = viewerTextEdit.current;
-    if (!edit) {
-      setEditingViewerText("");
-      return;
-    }
-    viewerTextEdit.current = null;
-    setEditingViewerText("");
-    restoreViewerSnapshot(edit.snapshot);
-    setViewerNotice(edit.isNew ? "已取消新建文字" : "已取消文字编辑");
-  };
-
-  const beginViewerTextEdit = (layer, { isNew = false, snapshot = null } = {}) => {
-    if (viewerLayerKind(layer) !== "text") return;
-    if (viewerTextEdit.current?.id === layer.id) {
-      viewerTextEditorRef.current?.focus();
-      return;
-    }
-    if (viewerTextEdit.current) commitViewerTextEdit();
-    viewerTextEdit.current = { id: layer.id, isNew, snapshot: snapshot || viewerSnapshot(layer.id) };
-    setActiveViewerLayer(layer.id);
-    setEditingViewerText(layer.id);
-  };
-
-  const updateViewerText = (id, text) => {
-    invalidateViewerComposition();
-    setViewerLayers((current) => current.map((layer) => layer.id === id ? measureViewerText({ ...layer, text: String(text).slice(0, 8000) }) : layer));
-  };
-
-  const updateViewerTextProperties = (layer, updates, { saveUndo = true } = {}) => {
-    if (!layer || viewerLayerKind(layer) !== "text") return;
-    const next = measureViewerText({ ...layer, ...updates });
-    if (JSON.stringify(serializeViewerLayer(next)) === JSON.stringify(serializeViewerLayer(layer))) return;
-    if (saveUndo) saveViewerUndo(viewerSnapshot(layer.id));
-    updateViewerLayer(layer.id, next);
-    setViewerTextDefaults((current) => ({
-      ...current,
-      text: next.text,
-      fontFamily: next.fontFamily,
-      fontSize: next.fontSize,
-      fontWeight: next.fontWeight,
-      color: next.color,
-      textAlign: next.textAlign,
-      lineHeight: next.lineHeight,
-      rotation: next.rotation,
-    }));
-  };
-
-  // The topmost picture the box was drawn over. Text put on a picture belongs to it: dragging the
-  // picture carries the text with it, so a caption cannot be left behind by moving what it captions.
-  const viewerImageUnderPoint = (point) => {
-    const covering = viewerLayers.filter((layer) => {
-      if (viewerLayerKind(layer) !== "image") return false;
-      const bounds = viewerLayerBounds(layer);
-      return point.x >= bounds.left && point.x <= bounds.right && point.y >= bounds.top && point.y <= bounds.bottom;
-    });
-    return covering.at(-1)?.id || "";
-  };
-
-  // Text is made by drawing the box it goes in, the way Photoshop makes paragraph text. A click
-  // creates nothing: it only puts down the caret that would have been left behind. A new layer is
-  // unscaled, so the swept scene rectangle is already in the layer's own pixels.
-  const createViewerText = (rect) => {
-    if (activeCollage) return;
-    if (rect.width < VIEWER_TEXT_MIN_BOX || rect.height < VIEWER_TEXT_MIN_BOX) {
-      setActiveViewerLayer("");
-      return;
-    }
-    invalidateViewerComposition();
-    const snapshot = viewerSnapshot();
-    const layer = measureViewerText({
-      ...viewerTextDefaults,
-      id: `viewer-text-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      kind: "text",
-      type: "text",
-      name: "文字图层",
-      x: rect.centerX,
-      y: rect.centerY,
-      boxWidth: Math.round(rect.width),
-      boxHeight: Math.round(rect.height),
-      attachedTo: viewerImageUnderPoint({ x: rect.centerX, y: rect.centerY }),
-      scale: 1,
-      rotation: normalizeRotation(viewerTextDefaults.rotation),
-    });
-    setViewerLayers((current) => [...current, layer]);
-    setActiveViewerLayer(layer.id);
-    viewerTextEdit.current = { id: layer.id, isNew: true, snapshot };
-    setEditingViewerText(layer.id);
-  };
-
   const selectViewerTool = (tool) => {
-    if (!["move", "brush", "eraser", "text"].includes(tool) || tool === viewerTool) return;
+    if (!["move", "brush", "eraser"].includes(tool) || tool === viewerTool) return;
     cancelViewerGesture();
-    if (viewerTextEdit.current) commitViewerTextEdit();
     setViewerTool(tool);
     setViewerMenu(null);
-    setViewerTextMarquee(null);
   };
 
   // The ring follows the pointer through the DOM rather than through React state: a repaint of this
@@ -4161,7 +4005,7 @@ function App() {
   const viewerBrushLayerScale = (target) => {
     const id = target?.closest?.("[data-viewer-layer-id]")?.dataset?.viewerLayerId;
     const layer = id ? viewerLayers.find((item) => item.id === id) : null;
-    return layer && viewerLayerKind(layer) === "image" ? layer.scale : 1;
+    return layer ? layer.scale : 1;
   };
 
   const paintViewerBrushCursor = (at = viewerBrushCursorAt.current) => {
@@ -4195,30 +4039,6 @@ function App() {
     paintViewerBrushCursor();
   }, [viewerBrush.size, viewerZoom, viewerTool, viewerPointerOverCanvas]);
 
-  const startViewerTextMarquee = (event) => {
-    if (activeCollage) return;
-    const canvasRect = viewerCanvasRef.current?.getBoundingClientRect();
-    if (!canvasRect) return;
-    event.preventDefault();
-    if (viewerTextEdit.current) commitViewerTextEdit();
-    const origin = clientPointToScene(event, canvasRect, viewerPan, viewerZoom);
-    const rect = viewerMarqueeRect(origin, origin);
-    event.currentTarget.setPointerCapture(event.pointerId);
-    viewerDrag.current = { kind: "text-marquee", origin, rect, pointerId: event.pointerId, pointerTarget: event.currentTarget };
-    setViewerTextMarquee(rect);
-  };
-
-  const moveViewerTextMarquee = (event) => {
-    const drag = viewerDrag.current;
-    if (drag?.kind !== "text-marquee" || drag.pointerId !== event.pointerId) return false;
-    const canvasRect = viewerCanvasRef.current?.getBoundingClientRect();
-    if (!canvasRect) return true;
-    const next = viewerMarqueeRect(drag.origin, clientPointToScene(event, canvasRect, viewerPan, viewerZoom));
-    drag.rect = next;
-    setViewerTextMarquee((current) => current && current.x === next.x && current.y === next.y && current.width === next.width && current.height === next.height ? current : next);
-    return true;
-  };
-
   const pickViewerBrushColor = async () => {
     const token = viewerSession.current.request("brush-eyedropper", { latest: true });
     try {
@@ -4229,17 +4049,6 @@ function App() {
       if (error.name !== "AbortError" && viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
     }
   };
-
-  useEffect(() => {
-    if (!editingViewerText) return undefined;
-    const frame = window.requestAnimationFrame(() => {
-      const editor = viewerTextEditorRef.current;
-      if (!editor) return;
-      editor.focus();
-      editor.select();
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [editingViewerText]);
 
   const scaleViewerLayer = (id, factor) => {
     if (!viewerLayerResizeEnabled) return;
@@ -4275,7 +4084,7 @@ function App() {
     const token = viewerSession.current.request("copy", { latest: true, abortable: true });
     try {
       let blob;
-      if (viewerLayerKind(layer) === "text" || hasLayerPaint(layer) || normalizeRotation(layer.rotation) !== 0) {
+      if (hasLayerPaint(layer) || normalizeRotation(layer.rotation) !== 0) {
         blob = await renderViewerLayerPng(layer, { signal: token.signal });
       } else if (layer.url.startsWith("data:")) {
         blob = dataUrlBlob(layer.url);
@@ -4672,12 +4481,10 @@ function App() {
     const token = beginViewerCollageOperation("manual-collage");
     if (!token) return;
     try {
-      // Composed in paint order, so the exported picture stacks text over images exactly as the
-      // canvas showed it, and the layout it saves replays in that same order.
-      const sourceLayers = viewerPaintOrder(cloneViewerLayers(viewerLayers));
+      const sourceLayers = cloneViewerLayers(viewerLayers);
       if (viewerLayerSourceByteCount(sourceLayers) > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("画布图片源总量超过 256 MiB 上限");
       const nodes = await mapViewerConcurrent(sourceLayers, 4, async (layer) => {
-        const source = viewerLayerKind(layer) === "text" ? null : await viewerLayerBitmap(layer, { signal: token.signal });
+        const source = await viewerLayerBitmap(layer, { signal: token.signal });
         if (!viewerSession.current.isOperationCurrent(token)) throw viewerAbortError();
         return { layer, source };
       }, { signal: token.signal, controller: token.controller });
@@ -4697,9 +4504,9 @@ function App() {
       if (!manualLayout) throw new Error("当前编辑布局超过图层、文字或笔画安全预算，无法合成");
       const persistence = persistedManualLayout(manualLayout);
       const hasAnimatedSource = sourceLayers.some(isGifAsset);
-      const animated = hasAnimatedSource && !hasViewerEdits(sourceLayers) && sourceLayers.every((layer) => viewerLayerKind(layer) === "image");
+      const animated = hasAnimatedSource && !hasViewerEdits(sourceLayers);
       const edgeRectangles = rectangles.map((rect, index) => ({ ...rect, id: nodes[index].layer.id, layer: nodes[index].layer }))
-        .filter((rect) => viewerLayerKind(rect.layer) === "image" && normalizeRotation(rect.layer.rotation) === 0);
+        .filter((rect) => normalizeRotation(rect.layer.rotation) === 0);
       const layerEdges = sharedEdgeHiddenSides(edgeRectangles, Math.max(1, viewerEdgeLine.width));
       if (animated) {
         const animatedLayers = await mapViewerConcurrent(nodes, 4, async (item, index) => {
@@ -4800,7 +4607,7 @@ function App() {
   };
 
   const startViewerPaint = (event, layer) => {
-    if (event.button !== 0 || event.isPrimary === false || viewerLayerKind(layer) !== "image") return false;
+    if (event.button !== 0 || event.isPrimary === false) return false;
     if (isGifAsset({ ...layer, url: layer.originalUrl || layer.url })) {
       setViewerNotice("GIF 动画不能直接画笔编辑；请先合成为静态 PNG，以免静默丢失动画帧");
       return true;
@@ -4872,17 +4679,12 @@ function App() {
       return;
     }
     if (event.button !== 0 || event.isPrimary === false) return;
-    if (viewerTool === "text") {
-      startViewerTextMarquee(event);
-      return;
-    }
     if (viewerTool !== "move") return;
     startViewerPan(event);
   };
 
   const moveViewerImage = (event) => {
     moveViewerBrushCursor(event);
-    if (moveViewerTextMarquee(event)) return;
     if (!viewerDrag.current || viewerDrag.current.kind !== "canvas" || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
     setViewerPan({
       x: viewerDrag.current.panX + event.clientX - viewerDrag.current.x,
@@ -4899,53 +4701,14 @@ function App() {
     if (middleButton) event.preventDefault();
     if (!middleButton && (viewerTool === "brush" || viewerTool === "eraser") && startViewerPaint(event, layer)) return;
     setActiveViewerLayer(layer.id);
-    if (!middleButton && editingViewerText === layer.id && event.target.closest?.(".viewer-text-editor")) return;
-    const rotateHandle = middleButton ? null : event.target.closest?.(".layer-rotate-handle");
     const resizeHandle = middleButton ? null : event.target.closest?.(".layer-corner");
-    if (!middleButton && viewerTool === "text") {
-      // The text tool acts on text: it resizes the box it is pointed at and opens it for editing on
-      // a plain click. Over anything else it draws a new box, so a drag across a picture still
-      // defines one rather than dying on the picture underneath.
-      if (viewerLayerKind(layer) !== "text") {
-        startViewerTextMarquee(event);
-        return;
-      }
-      if (!resizeHandle) {
-        beginViewerTextEdit(layer);
-        return;
-      }
-    } else if (!middleButton && viewerTool !== "move") return;
+    if (!middleButton && viewerTool !== "move") return;
     if (resizeHandle && !viewerLayerResizeEnabled) return;
     const snapToken = viewerSession.current.request("snap", { latest: true });
     window.requestAnimationFrame(() => { if (viewerSession.current.isCurrent(snapToken)) refreshViewerSnapGuide(layer.id); });
     invalidateViewerComposition();
     event.currentTarget.setPointerCapture(event.pointerId);
     const undoSnapshot = viewerSnapshot(layer.id);
-    if (rotateHandle && viewerLayerKind(layer) === "text") {
-      const rect = event.currentTarget.getBoundingClientRect();
-      const centerX = (rect.left + rect.right) / 2;
-      const centerY = (rect.top + rect.bottom) / 2;
-      viewerDrag.current = {
-        kind: "rotate", id: layer.id, centerX, centerY,
-        startAngle: Math.atan2(event.clientY - centerY, event.clientX - centerX) * 180 / Math.PI,
-        rotation: normalizeRotation(layer.rotation), undoSnapshot, changed: false,
-        pointerId: event.pointerId, pointerTarget: event.currentTarget,
-      };
-      return;
-    }
-    const textBox = resizeHandle ? viewerTextBox(layer) : null;
-    if (textBox) {
-      // A text box resizes into a different box -- the text reflows inside it -- rather than into
-      // bigger glyphs, so this gesture changes the box and leaves the layer's scale alone.
-      viewerDrag.current = {
-        kind: "text-box", id: layer.id,
-        handle: VIEWER_RESIZE_HANDLES.find((name) => event.target.classList.contains(name)) || "br",
-        box: textBox, scale: layer.scale, layerX: layer.x, layerY: layer.y,
-        startX: event.clientX, startY: event.clientY, undoSnapshot, changed: false,
-        pointerId: event.pointerId, pointerTarget: event.currentTarget,
-      };
-      return;
-    }
     if (resizeHandle) {
       const rect = event.currentTarget.getBoundingClientRect();
       const handle = ["tl", "tr", "bl", "br", "top", "right", "bottom", "left"].find((name) => event.target.classList.contains(name));
@@ -4993,9 +4756,6 @@ function App() {
     viewerDrag.current = {
       kind: "layer",
       id: layer.id,
-      // Where the text written on this picture started, so each move can be applied from the start
-      // of the gesture rather than accumulated sample by sample.
-      attached: viewerLayers.filter((item) => item.id !== layer.id && viewerMovesWithLayer(item, layer.id)).map((item) => ({ id: item.id, x: item.x, y: item.y })),
       x: event.clientX,
       y: event.clientY,
       layerX: layer.x,
@@ -5011,22 +4771,8 @@ function App() {
     };
   };
 
-  const resizeViewerTextBox = (drag, event) => {
-    const total = Math.max(0.000001, viewerZoom * Math.max(0.1, drag.scale));
-    const next = viewerTextBoxResize(drag.handle, drag.box, { x: (event.clientX - drag.startX) / total, y: (event.clientY - drag.startY) / total });
-    drag.changed = next.boxWidth !== drag.box.width || next.boxHeight !== drag.box.height;
-    invalidateViewerComposition();
-    setViewerLayers((current) => current.map((layer) => layer.id === drag.id
-      ? measureViewerText({ ...layer, boxWidth: next.boxWidth, boxHeight: next.boxHeight, x: drag.layerX + next.dx * drag.scale, y: drag.layerY + next.dy * drag.scale })
-      : layer));
-  };
-
   const moveViewerLayer = (event) => {
-    if (viewerDrag.current?.kind === "text-box" && event.currentTarget.hasPointerCapture(event.pointerId)) {
-      resizeViewerTextBox(viewerDrag.current, event);
-      return;
-    }
-    if (!viewerDrag.current || !["layer", "resize", "rotate", "paint"].includes(viewerDrag.current.kind) || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    if (!viewerDrag.current || !["layer", "resize", "paint"].includes(viewerDrag.current.kind) || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
     if (viewerDrag.current.kind === "paint") {
       const drag = viewerDrag.current;
       const clipped = clipStrokeSamples(viewerStrokePoints(event, drag.layer), drag.layer, drag.previousRawPoint);
@@ -5051,15 +4797,6 @@ function App() {
             : stroke),
         };
       }));
-      return;
-    }
-    if (viewerDrag.current.kind === "rotate") {
-      const drag = viewerDrag.current;
-      const angle = Math.atan2(event.clientY - drag.centerY, event.clientX - drag.centerX) * 180 / Math.PI;
-      let rotation = normalizeRotation(drag.rotation + normalizeRotation(angle - drag.startAngle));
-      if (event.shiftKey) rotation = normalizeRotation(Math.round(rotation / 15) * 15);
-      drag.changed = normalizeRotation(rotation) !== normalizeRotation(drag.rotation);
-      updateViewerLayer(drag.id, { rotation });
       return;
     }
     if (viewerDrag.current.kind === "resize" && !viewerLayerResizeEnabled) return;
@@ -5230,24 +4967,13 @@ function App() {
       drag.unsnapped = true;
     }
     if (x !== drag.layerX || y !== drag.layerY) drag.changed = true;
-    const carried = new Map((drag.attached || []).map((item) => [item.id, item]));
-    invalidateViewerComposition();
-    setViewerLayers((current) => current.map((layer) => {
-      if (layer.id === drag.id) return { ...layer, x, y };
-      const origin = carried.get(layer.id);
-      return origin ? { ...layer, x: origin.x + x - drag.layerX, y: origin.y + y - drag.layerY } : layer;
-    }));
+    updateViewerLayer(drag.id, { x, y });
   };
 
   const finishViewerPointer = (event, cancelled = false) => {
     const drag = viewerDrag.current;
     if (drag && Number.isInteger(drag.pointerId) && event?.pointerId !== undefined && drag.pointerId !== event.pointerId) return;
     viewerDrag.current = null;
-    if (drag?.kind === "text-marquee") {
-      setViewerTextMarquee(null);
-      if (!cancelled && drag.rect) createViewerText(drag.rect);
-      return;
-    }
     if (cancelled) {
       if (drag?.undoSnapshot) restoreViewerSnapshot(drag.undoSnapshot);
       setViewerSnapGuide(null);
@@ -5399,7 +5125,7 @@ function App() {
       return undefined;
     }
     const frame = window.requestAnimationFrame(() => {
-      const rectangles = viewerLayers.filter((layer) => viewerLayerKind(layer) === "image").map((layer) => {
+      const rectangles = viewerLayers.map((layer) => {
         const node = viewerCanvasRef.current?.querySelector(`[data-viewer-layer-id="${layer.id}"]`);
         const rect = node?.getBoundingClientRect();
         return rect && { id: layer.id, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
@@ -5997,7 +5723,7 @@ function App() {
     const handleShortcut = (event) => {
       const editable = isEditableTarget(event.target);
       if (imageViewerOpen && !activeCollage && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
-        const tool = { v: "move", b: "brush", e: "eraser", t: "text" }[event.key.toLowerCase()];
+        const tool = { v: "move", b: "brush", e: "eraser" }[event.key.toLowerCase()];
         if (tool) {
           event.preventDefault();
           if (!event.repeat) selectViewerTool(tool);
@@ -6013,7 +5739,7 @@ function App() {
             viewerNudge.current = { key: event.key, id: activeViewerLayerItem.id };
             saveViewerUndo({ layers: viewerLayers, snappedLayers: viewerSnappedLayers, activeLayer: activeViewerLayer });
           }
-          setViewerLayers((current) => current.map((layer) => viewerMovesWithLayer(layer, activeViewerLayerItem.id)
+          setViewerLayers((current) => current.map((layer) => layer.id === activeViewerLayerItem.id
             ? { ...layer, x: layer.x + adjustment[0], y: layer.y + adjustment[1] }
             : layer));
           return;
@@ -6101,7 +5827,6 @@ function App() {
     ? current.replace(TRANSPARENT_BACKGROUND_PATTERN_ALL, "").replace(/\s*,\s*,+/g, ", ").replace(/^\s*,\s*|\s*,\s*$/g, "").trim()
     : `${current.trim()}${current.trim() ? ", " : ""}${TRANSPARENT_BACKGROUND_TAG}`);
   const activeViewerLayerItem = viewerLayers.find((layer) => layer.id === activeViewerLayer) || viewerLayers.at(-1) || null;
-  const activeViewerTextLayer = viewerLayerKind(activeViewerLayerItem) === "text" ? activeViewerLayerItem : null;
   const viewerHasEditableContent = hasViewerEdits(viewerLayers);
   const activeCollageTemplate = collageTemplates.find((template) => template.id === activeCollage?.templateId) || null;
   const activeCollageLayout = activeCollageTemplate && activeCollage
@@ -7422,69 +7147,14 @@ function App() {
                        <button className={viewerTool === "move" ? "active" : ""} aria-pressed={viewerTool === "move"} title="移动工具 (V)" onClick={() => selectViewerTool("move")}><MousePointer2 size={14} /><span>移动</span></button>
                        <button className={viewerTool === "brush" ? "active" : ""} aria-pressed={viewerTool === "brush"} disabled={Boolean(activeCollage)} title="画笔工具 (B)" onClick={() => selectViewerTool("brush")}><Paintbrush size={14} /><span>画笔</span></button>
                        <button className={viewerTool === "eraser" ? "active" : ""} aria-pressed={viewerTool === "eraser"} disabled={Boolean(activeCollage)} title="橡皮擦工具 (E)" onClick={() => selectViewerTool("eraser")}><Eraser size={14} /><span>橡皮</span></button>
-                       <button className={viewerTool === "text" ? "active" : ""} aria-pressed={viewerTool === "text"} disabled={Boolean(activeCollage)} title="文字工具 (T)" onClick={() => selectViewerTool("text")}><Type size={14} /><span>文字</span></button>
                      </div>
                      {(viewerTool === "brush" || viewerTool === "eraser") && <div className="viewer-toolbar-group viewer-editor-properties" aria-label={`${viewerTool === "brush" ? "画笔" : "橡皮擦"}属性`}>
                        <label className="viewer-property-field"><span>大小</span><BoundedNumberInput value={viewerBrush.size} min={1} max={300} integer onCommit={(size) => setViewerBrush((current) => ({ ...current, size }))} ariaLabel="笔刷大小" /><em>px</em></label>
                        <label className="viewer-property-field"><span>不透明度</span><BoundedNumberInput value={viewerBrush.opacity} min={1} max={100} integer onCommit={(opacity) => setViewerBrush((current) => ({ ...current, opacity }))} ariaLabel="笔刷不透明度" /><em>%</em></label>
                        {viewerTool === "brush" && <><label className="viewer-property-color"><span>颜色</span><input type="color" value={viewerBrush.color} onChange={(event) => setViewerBrush((current) => ({ ...current, color: normalizeViewerColor(event.target.value) }))} aria-label="画笔颜色" /></label><button title="提取屏幕颜色" aria-label="提取屏幕颜色" onClick={pickViewerBrushColor}><Palette size={14} /></button></>}
                      </div>}
-                     {viewerTool === "text" && <div className="viewer-toolbar-group viewer-editor-properties viewer-text-properties" aria-label="文字属性">
-                       <label className="viewer-property-field viewer-text-content-field"><span>内容</span><input
-                         type="text"
-                         value={activeViewerTextLayer?.text ?? viewerTextDefaults.text}
-                         aria-label="文字内容"
-                         onFocus={() => { if (activeViewerTextLayer) viewerPropertyEdit.current = { id: activeViewerTextLayer.id, snapshot: viewerSnapshot(activeViewerTextLayer.id), defaults: { ...viewerTextDefaults }, changed: false }; }}
-                         onChange={(event) => {
-                           const text = event.target.value.slice(0, 8000);
-                           setViewerTextDefaults((current) => ({ ...current, text }));
-                           if (activeViewerTextLayer) {
-                             if (viewerPropertyEdit.current?.id === activeViewerTextLayer.id) viewerPropertyEdit.current.changed = true;
-                             updateViewerText(activeViewerTextLayer.id, text);
-                           }
-                         }}
-                         onBlur={() => { const edit = viewerPropertyEdit.current; viewerPropertyEdit.current = null; if (edit?.changed) saveViewerUndo(edit.snapshot); }}
-                         onKeyDown={(event) => {
-                           if (event.key === "Escape" && viewerPropertyEdit.current) {
-                             event.preventDefault();
-                             event.stopPropagation();
-                             const edit = viewerPropertyEdit.current;
-                             viewerPropertyEdit.current = null;
-                             restoreViewerSnapshot(edit.snapshot);
-                             if (edit.defaults) setViewerTextDefaults(edit.defaults);
-                             event.currentTarget.blur();
-                           } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-                             event.preventDefault();
-                             event.currentTarget.blur();
-                           }
-                         }}
-                       /></label>
-                       <label className="viewer-property-select viewer-font-select"><span>字体</span><select
-                         value={viewerTextStyleFor(activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily).id}
-                         style={{ fontFamily: activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily }}
-                         aria-label="文字字体"
-                         onChange={(event) => {
-                           const style = VIEWER_TEXT_STYLES.find((item) => item.id === event.target.value);
-                           if (!style) return;
-                           if (activeViewerTextLayer) updateViewerTextProperties(activeViewerTextLayer, { fontFamily: style.fontFamily, font: style.fontFamily });
-                           else setViewerTextDefaults((current) => ({ ...current, fontFamily: style.fontFamily }));
-                         }}
-                       >
-                         {/* Each entry is written in the family it names, so the list previews the
-                             font rather than describing it. */}
-                         {VIEWER_TEXT_STYLES.map((style) => <option key={style.id} value={style.id} style={{ fontFamily: style.fontFamily }}>{style.label}</option>)}
-                         {viewerTextStyleFor(activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily).id === "custom" && <option value="custom" disabled>{viewerTextStyleFor(activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily).label}</option>}
-                       </select></label>
-                       <label className="viewer-property-field"><span>字号</span><BoundedNumberInput value={activeViewerTextLayer?.fontSize ?? viewerTextDefaults.fontSize} min={8} max={300} integer onCommit={(fontSize) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { fontSize }) : setViewerTextDefaults((current) => ({ ...current, fontSize }))} ariaLabel="文字字号" /><em>px</em></label>
-                       <label className="viewer-property-color"><span>颜色</span><input type="color" value={activeViewerTextLayer?.color ?? viewerTextDefaults.color} onChange={(event) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { color: event.target.value }) : setViewerTextDefaults((current) => ({ ...current, color: normalizeViewerColor(event.target.value) }))} aria-label="文字颜色" /></label>
-                       <label className="viewer-property-select"><span>字重</span><select value={activeViewerTextLayer?.fontWeight ?? viewerTextDefaults.fontWeight} onChange={(event) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { fontWeight: Number(event.target.value) }) : setViewerTextDefaults((current) => ({ ...current, fontWeight: Number(event.target.value) }))}>{[400, 500, 600, 700, 800, 900].map((weight) => <option key={weight} value={weight}>{weight}</option>)}</select></label>
-                       <div className="viewer-property-align" aria-label="文字对齐">{[["left", AlignLeft], ["center", AlignCenter], ["right", AlignRight]].map(([align, Icon]) => <button key={align} className={(activeViewerTextLayer?.textAlign ?? viewerTextDefaults.textAlign) === align ? "active" : ""} aria-pressed={(activeViewerTextLayer?.textAlign ?? viewerTextDefaults.textAlign) === align} title={{ left: "左对齐", center: "居中", right: "右对齐" }[align]} onClick={() => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { textAlign: align }) : setViewerTextDefaults((current) => ({ ...current, textAlign: align }))}><Icon size={13} /></button>)}</div>
-                       <label className="viewer-property-field"><span>行高</span><BoundedNumberInput value={activeViewerTextLayer?.lineHeight ?? viewerTextDefaults.lineHeight} min={0.8} max={3} fixed={1} onCommit={(lineHeight) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { lineHeight }) : setViewerTextDefaults((current) => ({ ...current, lineHeight }))} ariaLabel="文字行高" /></label>
-                       <label className="viewer-property-field"><span>角度</span><BoundedNumberInput value={activeViewerTextLayer?.rotation ?? viewerTextDefaults.rotation} min={-180} max={180} integer onCommit={(rotation) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { rotation: normalizeRotation(rotation) }) : setViewerTextDefaults((current) => ({ ...current, rotation: normalizeRotation(rotation) }))} ariaLabel="文字旋转角度" /><em>°</em></label>
-                       {activeViewerTextLayer && <button title="编辑多行文字（双击文字也可编辑）" onClick={() => beginViewerTextEdit(activeViewerTextLayer)}><Pencil size={14} /><span>编辑</span></button>}
-                     </div>}
                      <div className="viewer-toolbar-group" aria-label="布局"><button ref={viewerEdgeTriggerRef} className={viewerEdgePanelOpen ? "active" : ""} aria-expanded={viewerEdgePanelOpen} aria-controls="viewer-alignment-panel" aria-haspopup="dialog" title="对齐与线条" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_LAYOUT)}><SlidersHorizontal size={14} /><span>对齐与线条</span></button><button ref={viewerTemplateTriggerRef} className={viewerTemplatesOpen ? "active" : ""} aria-expanded={viewerTemplatesOpen} aria-controls="viewer-template-panel" aria-haspopup="dialog" title="拼图模板" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_TEMPLATES)}><LayoutTemplate size={14} /><span>拼图模板</span></button>{!activeCollage && !collageResult && (viewerLayers.length > 1 || viewerHasEditableContent) && <button disabled={Boolean(viewerCollageBusy)} title={viewerHasEditableContent ? "应用编辑并合成为 PNG" : "一键拼图"} onClick={createManualCollage}><Layers3 size={14} /><span>{viewerCollageBusy === "manual-collage" ? "合成中…" : viewerHasEditableContent ? "应用编辑" : "一键拼图"}</span></button>}</div>
-                     <div className="viewer-toolbar-group" aria-label="图层"><button className={viewerLayerResizeEnabled ? "active" : ""} aria-pressed={viewerLayerResizeEnabled} title={viewerLayerResizeEnabled ? "关闭图片尺寸调整（不影响相机缩放或拖动）" : "开启图片尺寸调整"} onClick={toggleViewerLayerResize}><Move size={14} /><span>图片尺寸调整</span></button>{!activeCollage && activeViewerLayerItem && <div className="viewer-layer-scale"><Move size={13} /><span>选中{viewerLayerKind(activeViewerLayerItem) === "text" ? "文字" : "图片"}</span><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1 / 1.1)}>-</button><BoundedNumberInput value={Math.round(activeViewerLayerItem.scale * 100)} min={10} max={800} integer disabled={!viewerLayerResizeEnabled} onCommit={(percentage) => setViewerLayerScale(activeViewerLayerItem.id, percentage)} ariaLabel={`选中${viewerLayerKind(activeViewerLayerItem) === "text" ? "文字" : "图片"}缩放比例`} /><em>%</em><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1.1)}>+</button></div>}</div>
+                     <div className="viewer-toolbar-group" aria-label="图层"><button className={viewerLayerResizeEnabled ? "active" : ""} aria-pressed={viewerLayerResizeEnabled} title={viewerLayerResizeEnabled ? "关闭图片尺寸调整（不影响相机缩放或拖动）" : "开启图片尺寸调整"} onClick={toggleViewerLayerResize}><Move size={14} /><span>图片尺寸调整</span></button>{!activeCollage && activeViewerLayerItem && <div className="viewer-layer-scale"><Move size={13} /><span>选中图片</span><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1 / 1.1)}>-</button><BoundedNumberInput value={Math.round(activeViewerLayerItem.scale * 100)} min={10} max={800} integer disabled={!viewerLayerResizeEnabled} onCommit={(percentage) => setViewerLayerScale(activeViewerLayerItem.id, percentage)} ariaLabel="选中图片缩放比例" /><em>%</em><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1.1)}>+</button></div>}</div>
                     {activeCollageSlotItem && <div className="viewer-toolbar-group collage-slot-adjust" aria-label={`拼图区块 ${activeCollageSlot + 1}`}><div className="viewer-toolbar-subgroup viewer-layer-scale"><Move size={13} /><span>区块 {activeCollageSlot + 1}</span><button onClick={() => updateCollageSlot(activeCollageSlot, { scale: Math.max(.1, activeCollageSlotItem.scale / 1.1) })}>-</button><output>{Math.round(activeCollageSlotItem.scale * 100)}%</output><button onClick={() => updateCollageSlot(activeCollageSlot, { scale: Math.min(4, activeCollageSlotItem.scale * 1.1) })}>+</button></div><div className="viewer-toolbar-subgroup viewer-tool-group"><button title="左边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: 0 })}>L</button><button title="水平居中" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: .5 })}>C</button><button title="右边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: 1 })}>R</button></div><div className="viewer-toolbar-subgroup viewer-tool-group"><button title="顶边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: 0 })}>T</button><button title="垂直居中" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: .5 })}>M</button><button title="底边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: 1 })}>B</button></div></div>}
                     {(activeCollage || collageResult) && <div className="viewer-toolbar-group viewer-toolbar-results" aria-label="结果">{activeCollage && <button className="viewer-confirm" disabled={Boolean(viewerCollageBusy)} onClick={confirmCollage}><Check size={14} /><span>{viewerCollageBusy === "confirm" ? "合成中…" : "确认拼图"}</span></button>}{collageResult && <><button className="viewer-confirm" disabled={collageResult.saved || Boolean(viewerCollageBusy)} onClick={saveCollage}><Save size={14} /><span>{viewerCollageBusy === "save" ? "保存中…" : collageResult.saved ? "已保存" : "保存拼图"}</span></button><button disabled={Boolean(viewerCollageBusy)} onClick={editCollage}><LayoutTemplate size={14} /><span>重新拼图</span></button><button className="viewer-danger" disabled={Boolean(viewerCollageBusy)} onClick={discardCollage}><Trash2 size={14} /><span>删除拼图</span></button></>}</div>}
                  </div>
@@ -7512,59 +7182,27 @@ function App() {
                   onContextMenu={(event) => { if (event.target === event.currentTarget) event.preventDefault(); }}
                 >
                   <div className="viewer-scene" style={{ transform: `translate(${viewerPan.x}px, ${viewerPan.y}px) scale(${viewerZoom})` }}>
-                    {viewerTextMarquee && <i className="viewer-text-marquee" style={{ width: `${viewerTextMarquee.width}px`, height: `${viewerTextMarquee.height}px`, transform: `translate(${viewerTextMarquee.centerX}px, ${viewerTextMarquee.centerY}px)` }} aria-hidden="true" />}
-                    {!activeCollage && viewerPaintOrder(viewerLayers).map((layer) => {
-                      const kind = viewerLayerKind(layer);
+                    {!activeCollage && viewerLayers.map((layer) => {
                       const painted = hasLayerPaint(layer);
-                      const textLayer = kind === "text";
-                      const nativeCopyLayer = nativeImageCopy && kind === "image" && !painted && normalizeRotation(layer.rotation) === 0;
-                      const edgeClass = !textLayer && viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : "";
-                      const textStyle = textLayer ? {
-                        color: layer.color,
-                        fontFamily: layer.fontFamily,
-                        fontSize: `${layer.fontSize}px`,
-                        fontWeight: layer.fontWeight,
-                        lineHeight: layer.lineHeight,
-                        textAlign: layer.textAlign,
-                      } : undefined;
+                      const nativeCopyLayer = nativeImageCopy && !painted && normalizeRotation(layer.rotation) === 0;
+                      const edgeClass = viewerEdgeLine.enabled ? `has-edge edge-${viewerEdgeLine.style}` : "";
                       return <div
-                        className={`viewer-image-layer ${textLayer ? "viewer-text-layer " : ""}${nativeCopyLayer ? "native-copy " : ""}${activeViewerLayer === layer.id ? "active" : ""} ${edgeClass}`}
+                        className={`viewer-image-layer ${nativeCopyLayer ? "native-copy " : ""}${activeViewerLayer === layer.id ? "active" : ""} ${edgeClass}`}
                         key={layer.id}
                         data-viewer-layer-id={layer.id}
-                        data-viewer-layer-kind={kind}
                         style={{ width: `${layer.naturalWidth}px`, height: `${layer.naturalHeight}px`, transform: `translate(${layer.x}px, ${layer.y}px) rotate(${normalizeRotation(layer.rotation)}deg) scale(${layer.scale})` }}
                         onPointerDown={(event) => startViewerLayerDrag(event, layer)}
                         onPointerMove={moveViewerLayer}
                         onPointerUp={finishViewerPointer}
                         onPointerCancel={(event) => finishViewerPointer(event, true)}
                         onLostPointerCapture={loseViewerPointer}
-                        onDoubleClick={(event) => { if (!textLayer) return; event.preventDefault(); event.stopPropagation(); beginViewerTextEdit(layer); }}
                         onContextMenu={(event) => { event.stopPropagation(); setActiveViewerLayer(layer.id); if (nativeCopyLayer && !event.shiftKey) { hintNativeImageCopy(); return; } event.preventDefault(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "layer", layer }); }}
                       >
-                        {textLayer
-                          ? editingViewerText === layer.id
-                            ? <textarea
-                              ref={viewerTextEditorRef}
-                              className="viewer-text-editor"
-                              value={layer.text}
-                              style={textStyle}
-                              aria-label="编辑文字图层"
-                              spellCheck="false"
-                              onPointerDown={(event) => { if (event.button !== 1) event.stopPropagation(); }}
-                              onChange={(event) => updateViewerText(layer.id, event.target.value)}
-                              onBlur={commitViewerTextEdit}
-                              onKeyDown={(event) => {
-                                if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); cancelViewerTextEdit(); }
-                                else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) { event.preventDefault(); event.stopPropagation(); commitViewerTextEdit(); }
-                              }}
-                            />
-                            : <div className="viewer-text-content" style={textStyle} aria-label={layer.text || "空文字图层"}>{(layer.lines || [layer.text]).join("\n")}</div>
-                          : painted
+                        {painted
                             ? <ViewerRasterLayer layer={layer} onError={handleViewerRasterError} />
                             : <img src={layer.url} alt={layer.name} draggable="false" />}
-                        {!textLayer && viewerEdgeLine.enabled && ["top", "right", "bottom", "left"].filter((side) => !viewerLayerEdges[layer.id]?.includes(side)).map((side) => <i className={`layer-edge ${side}`} key={side} />)}
-                        {(viewerTool === "move" || (viewerTool === "text" && textLayer)) && viewerLayerResizeEnabled && activeViewerLayer === layer.id && viewerResizeHandles(layer).map((handle) => <i className={`layer-corner-anchor ${handle}`} key={handle} style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className={`layer-corner ${handle}`} /></i>)}
-                        {viewerTool === "move" && activeViewerLayer === layer.id && textLayer && <i className="layer-rotate-anchor" style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className="layer-rotate-handle" title="拖动旋转；按住 Shift 以 15° 吸附"><RotateCw size={12} /></i></i>}
+                        {viewerEdgeLine.enabled && ["top", "right", "bottom", "left"].filter((side) => !viewerLayerEdges[layer.id]?.includes(side)).map((side) => <i className={`layer-edge ${side}`} key={side} />)}
+                        {viewerTool === "move" && viewerLayerResizeEnabled && activeViewerLayer === layer.id && viewerResizeHandles(layer).map((handle) => <i className={`layer-corner-anchor ${handle}`} key={handle} style={{ "--viewer-handle-inverse": inverseViewerHandleScale(viewerZoom, layer.scale) }}><i className={`layer-corner ${handle}`} /></i>)}
                       </div>;
                     })}
                     {activeCollage && activeCollageTemplate && activeCollageLayout && <div className={`collage-board ${activeCollageLayout.aspect > 1.35 ? "wide" : "square"}`} style={{ "--collage-aspect": activeCollageLayout.aspect }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); openViewerContextMenu({ x: event.clientX, y: event.clientY, kind: "collage-draft" }); }}>
@@ -7589,7 +7227,7 @@ function App() {
           </section>
           {viewerMenu && <div className="viewer-context-menu" style={{ left: Math.min(viewerMenu.x, window.innerWidth - 230), top: Math.min(viewerMenu.y, window.innerHeight - 180) }} onPointerDown={(event) => event.stopPropagation()}>
             {viewerMenu.kind === "history" && <><button onClick={() => focusViewerAsset(viewerMenu.asset)}><ImageIcon size={14} />切换当前预览</button><button onClick={() => addViewerAsset(viewerMenu.asset)}><ImagePlus size={14} />添加到预览窗口</button>{viewerMenu.asset.manual_layout && <button onClick={() => editCollage({ manualLayout: viewerMenu.asset.manual_layout, manualLayoutTrusted: false })}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => requestHistoryDelete(viewerMenu.files, viewerMenu.label)}><Trash2 size={14} />删除{viewerMenu.files.length > 1 ? "本批次" : "图片"}</button></>}
-            {viewerMenu.kind === "layer" && <>{nativeImageCopy && viewerLayerKind(viewerMenu.layer) === "image" && !hasLayerPaint(viewerMenu.layer) && normalizeRotation(viewerMenu.layer.rotation) === 0 ? <p className="viewer-context-hint"><Copy size={13} />复制请直接右键，用浏览器菜单「复制图片」</p> : <button onClick={() => copyViewerLayer(viewerMenu.layer)}><Copy size={14} />复制实际 PNG</button>}{viewerMenu.layer.isCollage && <button onClick={() => editCollage(viewerMenu.layer)}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => removeViewerLayer(viewerMenu.layer.id)}><Trash2 size={14} />删除当前预览图层</button></>}
+            {viewerMenu.kind === "layer" && <>{nativeImageCopy && !hasLayerPaint(viewerMenu.layer) && normalizeRotation(viewerMenu.layer.rotation) === 0 ? <p className="viewer-context-hint"><Copy size={13} />复制请直接右键，用浏览器菜单「复制图片」</p> : <button onClick={() => copyViewerLayer(viewerMenu.layer)}><Copy size={14} />复制实际 PNG</button>}{viewerMenu.layer.isCollage && <button onClick={() => editCollage(viewerMenu.layer)}><LayoutTemplate size={14} />重新拼图</button>}<button className="danger" onClick={() => removeViewerLayer(viewerMenu.layer.id)}><Trash2 size={14} />删除当前预览图层</button></>}
             {viewerMenu.kind === "collage-draft" && <button className="danger" onClick={cancelCollageDraft}><X size={14} />取消拼图</button>}
           </div>}
           {historyDelete && <div className="viewer-confirm-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setHistoryDelete(null)}><section className="viewer-delete-dialog"><Trash2 size={23} /><strong>删除{historyDelete.count > 1 ? "整组批次" : "图片"}？</strong><p>{historyDelete.label}<br />请选择仅从本次启动的左侧历史中隐藏，或同时永久删除 outputs 中的 {historyDelete.count} 个 PNG 源文件。</p><div><button onClick={() => finishHistoryDelete(false)}>只删除预览卡片</button><button className="danger" onClick={() => finishHistoryDelete(true)}>同时删除源文件</button><button onClick={() => setHistoryDelete(null)}>取消</button></div></section></div>}

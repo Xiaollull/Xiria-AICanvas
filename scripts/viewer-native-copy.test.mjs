@@ -21,7 +21,7 @@ test("a plain right-click on a layer over HTTP reaches the browser's own menu", 
   const bail = body.indexOf("if (nativeCopyLayer && !event.shiftKey) { hintNativeImageCopy(); return; }");
   const cancel = body.indexOf("event.preventDefault()");
   assert.ok(bail > 0 && cancel > bail, "preventDefault must come after the HTTP bail-out, or the browser menu never opens");
-  assert.match(app.slice(app.indexOf("const nativeCopyLayer ="), app.indexOf("const edgeClass =", app.indexOf("const nativeCopyLayer ="))), /nativeImageCopy && kind === "image" && !painted && normalizeRotation\(layer\.rotation\) === 0/,
+  assert.match(app.slice(app.indexOf("const nativeCopyLayer ="), app.indexOf("const edgeClass =", app.indexOf("const nativeCopyLayer ="))), /nativeImageCopy && !painted && normalizeRotation\(layer\.rotation\) === 0/,
     "only an ordinary, unrotated image may delegate copying to the native menu");
 });
 
@@ -35,7 +35,7 @@ test("the picture itself takes the right-click only in that mode, so dragging is
 });
 
 test("Shift+right-click still opens the app menu, which points at the browser copy instead of failing", () => {
-  assert.match(app, /nativeImageCopy && viewerLayerKind\(viewerMenu\.layer\) === "image" && !hasLayerPaint\(viewerMenu\.layer\)/);
+  assert.match(app, /nativeImageCopy && !hasLayerPaint\(viewerMenu\.layer\)/);
   assert.match(app, /复制请直接右键，用浏览器菜单「复制图片」/);
   // The delete action stays reachable: it is only in this menu, and there is no Delete key for layers.
   assert.match(app, /removeViewerLayer\(viewerMenu\.layer\.id\)/);
@@ -58,6 +58,6 @@ test("over HTTPS or localhost the clean-PNG copy is exactly what it was", () => 
   assert.match(app, /includeLayerMarker && !nativeImageCopy[\s\S]{0,180}viewerClipboard\.current = null/,
     "a failed secure-context copy must clear its internal marker");
   assert.match(app, /copyViewerLayer\(viewerMenu\.layer\)[\s\S]{0,100}复制实际 PNG/);
-  assert.match(app, /viewerLayerKind\(layer\) === "text" \|\| hasLayerPaint\(layer\)[\s\S]{0,140}renderViewerLayerPng\(layer, \{ signal: token\.signal \}\)/,
+  assert.match(app, /hasLayerPaint\(layer\)[\s\S]{0,140}renderViewerLayerPng\(layer, \{ signal: token\.signal \}\)/,
     "paint and text copies must encode their rendered PNG instead of the untouched source");
 });

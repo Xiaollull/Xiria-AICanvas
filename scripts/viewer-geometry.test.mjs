@@ -23,7 +23,7 @@ test("fit is order-independent, 100% is source-pixel scale, and does not mutate 
 });
 
 test("scene bounds and fit include rotation-aware AABBs", () => {
-  const rotated = { ...layer(100, 40, 10, -5, 1), rotation: 90, kind: "text" };
+  const rotated = { ...layer(100, 40, 10, -5, 1), rotation: 90 };
   const bounds = viewerSceneBounds([rotated]);
   assert.ok(Math.abs(bounds.left + 10) < 1e-9);
   assert.ok(Math.abs(bounds.right - 30) < 1e-9);

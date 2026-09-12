@@ -15,7 +15,9 @@ const chromeCandidates = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
 ];
-const modules = ["viewer-editor.js", "viewer-geometry.js"];
+// viewer-geometry.js imports viewerEditorLayerBounds, so the fixture has to serve that module too
+// or the import chain 404s and the page never runs.
+const modules = ["viewer-geometry.js", "viewer-editor.js"];
 
 async function chromePath() {
   for (const candidate of chromeCandidates) {
@@ -25,8 +27,8 @@ async function chromePath() {
 }
 
 // The page is assembled from the shipped stylesheet and the shipped modules, so what it measures is
-// what the viewer itself would draw: the ring a real browser paints at a real zoom, the cursor the
-// stylesheet really resolves to, and a text box laid out by the real line-breaking rules.
+// what the viewer itself would draw: the ring a real browser paints at a real zoom, and the cursor
+// the stylesheet really resolves to.
 const fixture = `<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/src/styles.css"><style>
 :root{--n-01:#090a0c;--n-02:#111218;--n-03:#181923;--n-05:#252636;--n-06:#303146;--n-07:#3b3d55;--n-12:#75788f;--n-13:#7d8097;--n-21:#d2d5e4;--n-27:#ececf6;--lime:#c8acfb;--accent-rgb:200 172 251;box-sizing:border-box}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}
 #canvas{position:absolute;left:0;top:0;width:640px;height:420px}
@@ -38,8 +40,7 @@ const fixture = `<!doctype html><html><head><meta charset="utf-8"><link rel="sty
 <pre id="result">pending</pre>
 <script>window.fixtureErrors=[];addEventListener("error",event=>fixtureErrors.push(event.message));addEventListener("unhandledrejection",event=>fixtureErrors.push(String(event.reason)));setTimeout(()=>{const node=document.getElementById("result");if(node.textContent==="pending")node.textContent=JSON.stringify({fatal:"fixture timeout",errors:fixtureErrors})},2500)</script>
 <script type="module">
-import { measureTextLayer, normalizeTextLayer, textCanvasFont, VIEWER_TEXT_PADDING } from "/src/viewer-editor.js";
-import { viewerBrushCursorSize, viewerMarqueeRect } from "/src/viewer-geometry.js";
+import { viewerBrushCursorSize } from "/src/viewer-geometry.js";
 try {
   const canvas = document.getElementById("canvas");
   const scene = document.getElementById("scene");
@@ -49,7 +50,7 @@ try {
 
   // 1. Every tool's cursor, as the stylesheet actually resolves it on the canvas.
   const cursors = {};
-  for (const tool of ["move", "brush", "eraser", "text"]) {
+  for (const tool of ["move", "brush", "eraser"]) {
     canvas.className = "image-viewer-canvas tool-" + tool;
     cursors[tool] = getComputedStyle(canvas).cursor;
   }
@@ -76,72 +77,7 @@ try {
     hidden: ringHiddenStyle,
   };
 
-  // 3. A text box laid out by the browser from the lines the model wrapped for it.
-  const measuringContext = document.createElement("canvas").getContext("2d");
-  const base = normalizeTextLayer({ text: "The quick brown fox jumps over the lazy dog", fontSize: 24, boxWidth: 200, boxHeight: 120, x: 0, y: 0 });
-  measuringContext.font = textCanvasFont(base);
-  const measured = measureTextLayer(base.text, base, (value) => measuringContext.measureText(value).width);
-  const layer = document.createElement("div");
-  layer.className = "viewer-image-layer viewer-text-layer active";
-  layer.style.width = measured.naturalWidth + "px";
-  layer.style.height = measured.naturalHeight + "px";
-  layer.style.transform = "translate(0px, 0px) rotate(0deg) scale(1)";
-  const content = document.createElement("div");
-  content.className = "viewer-text-content";
-  content.style.font = textCanvasFont(base);
-  content.style.lineHeight = base.lineHeight;
-  content.textContent = measured.lines.join("\\n");
-  layer.appendChild(content);
-  scene.appendChild(layer);
-
-  const layerRect = layer.getBoundingClientRect();
-  // Each rendered line is measured on its own, so a line wider than the box it was wrapped for
-  // would show up here. The space a line ends on is dropped first: it hangs past a wrap on screen
-  // and is measured away by the wrapper, so counting it would compare two different things.
-  const lineWidths = measured.lines.map((line) => {
-    const probe = document.createElement("span");
-    probe.style.font = content.style.font;
-    probe.style.whiteSpace = "pre";
-    probe.style.position = "absolute";
-    probe.textContent = line.replace(/\\s+$/, "");
-    document.body.appendChild(probe);
-    const width = probe.getBoundingClientRect().width;
-    probe.remove();
-    return width;
-  });
-  const textBox = {
-    lines: measured.lines,
-    naturalWidth: measured.naturalWidth,
-    naturalHeight: measured.naturalHeight,
-    renderedWidth: layerRect.width,
-    renderedHeight: layerRect.height,
-    contentLimit: measured.naturalWidth - VIEWER_TEXT_PADDING * 2,
-    widest: Math.max(...lineWidths),
-    overflow: getComputedStyle(content).overflow,
-    whiteSpace: getComputedStyle(content).whiteSpace,
-    clipped: content.scrollHeight > content.clientHeight,
-  };
-
-  // 4. The swept rectangle, placed in the scene the way a layer is placed.
-  const rect = viewerMarqueeRect({ x: -60, y: -20 }, { x: 40, y: 30 });
-  const marquee = document.createElement("i");
-  marquee.className = "viewer-text-marquee";
-  marquee.style.width = rect.width + "px";
-  marquee.style.height = rect.height + "px";
-  marquee.style.transform = "translate(" + rect.centerX + "px, " + rect.centerY + "px)";
-  scene.appendChild(marquee);
-  const marqueeRect = marquee.getBoundingClientRect();
-  const marqueeGeometry = {
-    width: marqueeRect.width,
-    height: marqueeRect.height,
-    // Scene origin is the middle of the canvas, so a scene point lands at centre + point x zoom.
-    left: marqueeRect.left - canvasRect.left - canvasRect.width / 2,
-    top: marqueeRect.top - canvasRect.top - canvasRect.height / 2,
-    pointerEvents: getComputedStyle(marquee).pointerEvents,
-  };
-
-  // 5. Stacking and grips, as the real cascade resolves them: a text box has to win over a selected
-  // picture, and its grips have to come out square and smaller than the picture's round ones.
+  // 3. A picture's grips, as the real cascade resolves them.
   const picture = document.createElement("div");
   picture.className = "viewer-image-layer active";
   picture.style.width = "120px";
@@ -158,22 +94,9 @@ try {
     const style = getComputedStyle(corner);
     return { width: style.width, height: style.height, radius: style.borderRadius };
   };
-  layer.classList.add("active");
-  const stacking = {
-    text: getComputedStyle(layer).zIndex,
-    activePicture: getComputedStyle(picture).zIndex,
-    textGrip: grip(layer),
-    pictureGrip: grip(picture),
-    editorRing: (() => {
-      const editor = document.createElement("textarea");
-      editor.className = "viewer-text-editor";
-      layer.appendChild(editor);
-      const style = getComputedStyle(editor);
-      return { shadow: style.boxShadow, outlineWidth: style.outlineWidth, background: style.backgroundColor };
-    })(),
-  };
+  const stacking = { activePicture: getComputedStyle(picture).zIndex, pictureGrip: grip(picture) };
 
-  document.getElementById("result").textContent = JSON.stringify({ cursors, ringGeometry, textBox, marqueeGeometry, stacking, errors: window.fixtureErrors });
+  document.getElementById("result").textContent = JSON.stringify({ cursors, ringGeometry, stacking, errors: window.fixtureErrors });
 } catch (error) {
   document.getElementById("result").textContent = JSON.stringify({ fatal: String(error), errors: window.fixtureErrors });
 }
@@ -203,7 +126,7 @@ async function withServer(run) {
   try { return await run(server.address().port); } finally { await new Promise((resolvePromise) => server.close(resolvePromise)); }
 }
 
-test("real Chromium paints the brush ring, the tool cursors and a text box the way the model describes them", { skip: skipBrowserFixture && "browser fixtures disabled" }, async (context) => {
+test("real Chromium paints the brush ring and the tool cursors the way the model describes them", { skip: skipBrowserFixture && "browser fixtures disabled" }, async (context) => {
   const chrome = await chromePath();
   if (!chrome) { context.skip("Chromium is unavailable"); return; }
   const profile = await mkdtemp(join(tmpdir(), "xirai-paint-tools-"));
@@ -216,9 +139,8 @@ test("real Chromium paints the brush ring, the tool cursors and a text box the w
       assert.equal(result.fatal, undefined, `fixture failed: ${JSON.stringify(result)}`);
       assert.deepEqual(result.errors, [], "browser console errors");
 
-      // The brush and the eraser hand the pointer over to the ring; the text tool positions from a
-      // crosshair; moving still grabs.
-      assert.deepEqual(result.cursors, { move: "grab", brush: "none", eraser: "none", text: "crosshair" });
+      // The brush and the eraser hand the pointer over to the ring; moving still grabs.
+      assert.deepEqual(result.cursors, { move: "grab", brush: "none", eraser: "none" });
 
       // A 40px brush on a half-scale layer at 2x zoom covers 40 screen pixels, and the ring is
       // exactly that wide, centred on the pointer rather than hanging off one corner of it.
@@ -230,31 +152,9 @@ test("real Chromium paints the brush ring, the tool cursors and a text box the w
       assert.equal(result.ringGeometry.pointerEvents, "none", "the ring must never swallow a stroke");
       assert.equal(result.ringGeometry.hidden, "none", "the ring must leave with the pointer");
 
-      // The box keeps the size it was given, and the browser lays out the lines the model wrapped
-      // without breaking any of them again: every line fits inside the padded width.
-      assert.deepEqual([result.textBox.naturalWidth, result.textBox.naturalHeight], [200, 120]);
-      // Zoom scales the box on screen and nothing else: 200 x 120 layer pixels at 2x.
-      assert.deepEqual([result.textBox.renderedWidth, result.textBox.renderedHeight], [400, 240]);
-      assert.ok(result.textBox.lines.length > 1, "a 200px box must wrap this sentence");
-      assert.ok(result.textBox.widest <= result.textBox.contentLimit + 0.5, `line of ${result.textBox.widest}px escaped a ${result.textBox.contentLimit}px box`);
-      assert.equal(result.textBox.whiteSpace, "pre", "the committed box must not re-wrap what was wrapped for it");
-      assert.equal(result.textBox.overflow, "hidden", "a box shows only what fits in it");
-
-      // The swept rectangle lands where the drag put it: scene coordinates, scaled by the zoom.
-      assert.deepEqual([result.marqueeGeometry.width, result.marqueeGeometry.height], [200, 100]);
-      assert.ok(Math.abs(result.marqueeGeometry.left - -120) < 0.5, `marquee left ${result.marqueeGeometry.left}`);
-      assert.ok(Math.abs(result.marqueeGeometry.top - -40) < 0.5, `marquee top ${result.marqueeGeometry.top}`);
-      assert.equal(result.marqueeGeometry.pointerEvents, "none");
-
-      // Text annotates the picture, so a selected text box outranks even a selected picture.
-      assert.ok(Number(result.stacking.text) > Number(result.stacking.activePicture), `text z-index ${result.stacking.text} must beat a selected picture's ${result.stacking.activePicture}`);
-      // A text box's grips are square and smaller; a picture keeps its round 20px ones.
-      assert.deepEqual(result.stacking.textGrip, { width: "13px", height: "13px", radius: "0px" });
+      // A selected picture keeps its round 20px grips, unchanged by the text tool's removal.
       assert.deepEqual(result.stacking.pictureGrip, { width: "20px", height: "20px", radius: "50%" });
-      // Three rings, dark-light-dark, so the box is findable over a pale picture and a dark one.
-      assert.match(result.stacking.editorRing.shadow, /rgba\(9, 10, 12, 0\.85\)[^,]*, rgb\(200, 172, 251\)/);
-      assert.equal(result.stacking.editorRing.outlineWidth, "0px", "the old single hairline must be gone, not merely covered");
-      assert.equal(result.stacking.editorRing.background, "rgba(0, 0, 0, 0)", "nothing may be painted behind the text being typed");
+      assert.equal(result.stacking.activePicture, "8");
     });
   } finally {
     await rm(profile, { recursive: true, force: true });

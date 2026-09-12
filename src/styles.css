@@ -755,22 +755,16 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
 .viewer-editor-tools > button:last-child { border-right: 0; }
 .viewer-editor-tools > button[aria-pressed="true"] { color: #c8acfb; background: rgba(200,172,251,.1); box-shadow: inset 0 -2px #c8acfb; }
 .viewer-editor-properties { flex: 1 1 520px; min-width: min(100%, 280px); flex-wrap: wrap; gap: 5px; padding: 3px; border: 1px solid var(--n-07); background: color-mix(in srgb, #c8acfb 4%, var(--n-02)); }
-.viewer-text-properties { flex-basis: 760px; }
 .viewer-property-field, .viewer-property-color, .viewer-property-select { min-width: 0; height: 30px; display: inline-flex; align-items: center; gap: 5px; padding: 0 7px; color: var(--n-18); background: var(--n-01); font: 8px "DM Mono"; white-space: nowrap; }
 .viewer-property-field > span, .viewer-property-color > span, .viewer-property-select > span { color: var(--n-15); }
 .viewer-property-field .bounded-number { width: 42px; height: 22px; box-sizing: border-box; padding: 0 4px; border: 1px solid var(--n-07); color: var(--n-28); outline: 0; background: var(--n-02); text-align: center; font: 8px "DM Mono"; }
 .viewer-property-field .bounded-number:focus { border-color: #c8acfb; }
 .viewer-property-field em { color: var(--n-13); font-style: normal; }
 .viewer-property-color input[type="color"] { width: 27px; height: 22px; padding: 1px; border: 1px solid var(--n-07); background: var(--n-02); cursor: pointer; }
-.viewer-property-select select, .viewer-text-content-field > input { height: 22px; box-sizing: border-box; border: 1px solid var(--n-07); color: var(--n-27); outline: 0; background: var(--n-02); font: 8px "DM Mono"; }
-.viewer-property-select select:focus, .viewer-text-content-field > input:focus { border-color: #c8acfb; }
+.viewer-property-select select { height: 22px; box-sizing: border-box; border: 1px solid var(--n-07); color: var(--n-27); outline: 0; background: var(--n-02); font: 8px "DM Mono"; }
+.viewer-property-select select:focus { border-color: #c8acfb; }
 /* The font list is its own preview, so it is set in the family each entry names and at a size the
    difference is visible at -- the toolbar's 8px mono would show twelve identical rows. */
-.viewer-font-select select { min-width: 104px; max-width: 156px; font-size: 11px; letter-spacing: 0; }
-.viewer-font-select select option { padding: 3px 6px; color: var(--n-27); background: var(--n-02); font-size: 13px; }
-html[data-theme-mode="light"] .viewer-font-select select option { color: var(--n-05); background: var(--n-31); }
-.viewer-text-content-field { flex: 1 1 180px; }
-.viewer-text-content-field > input { width: 100%; min-width: 90px; padding: 0 6px; }
 .viewer-property-align { height: 30px; display: inline-flex; align-items: center; border: 1px solid var(--n-07); background: var(--n-01); }
 .viewer-property-align > button { width: 28px; height: 28px; padding: 0; border: 0; border-right: 1px solid var(--n-06); }
 .viewer-property-align > button:last-child { border-right: 0; }
@@ -780,13 +774,10 @@ html[data-theme-mode="light"] .viewer-font-select select option { color: var(--n
 .image-viewer-canvas.tool-move { cursor: grab; }
 .image-viewer-canvas.tool-move:active { cursor: grabbing; }
 /* The brush and the eraser hide the arrow and wear the ring below instead, which is drawn at the
-   size of the pixels they will cover; the text tool positions its box from a crosshair, the way a
-   marquee is placed, and keeps the I-beam over text it can edit. Controls floating over the canvas
-   keep a pointer -- a button with no cursor reads as a dead spot. */
+   size of the pixels they will cover. Controls floating over the canvas keep a pointer -- a button
+   with no cursor reads as a dead spot. */
 .image-viewer-canvas.tool-brush, .image-viewer-canvas.tool-brush:active, .image-viewer-canvas.tool-brush .viewer-image-layer { cursor: none; }
 .image-viewer-canvas.tool-eraser, .image-viewer-canvas.tool-eraser:active, .image-viewer-canvas.tool-eraser .viewer-image-layer { cursor: none; }
-.image-viewer-canvas.tool-text, .image-viewer-canvas.tool-text:active, .image-viewer-canvas.tool-text .viewer-image-layer { cursor: crosshair; }
-.image-viewer-canvas.tool-text .viewer-text-layer { cursor: text; }
 .image-viewer-canvas:not(.tool-move) .viewer-image-layer { cursor: inherit; }
 .image-viewer-canvas:is(.tool-brush, .tool-eraser) :is(button, a, input, textarea) { cursor: pointer; }
 .viewer-brush-cursor { position: absolute; z-index: 26; display: block; box-sizing: border-box; translate: -50% -50%; border: 1px solid rgba(255,255,255,.92); border-radius: 50%; box-shadow: 0 0 0 1px rgba(0,0,0,.62), inset 0 0 0 1px rgba(0,0,0,.62); pointer-events: none; }
@@ -794,41 +785,24 @@ html[data-theme-mode="light"] .viewer-font-select select option { color: var(--n
 .viewer-brush-cursor.eraser { border-style: dashed; }
 .viewer-brush-cursor::after { content: ""; position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; translate: -50% -50%; border-radius: 50%; background: rgba(255,255,255,.92); box-shadow: 0 0 0 1px rgba(0,0,0,.62); }
 .viewer-brush-cursor.brush::after { background: var(--viewer-brush-color, rgba(255,255,255,.92)); }
-.viewer-text-marquee { position: absolute; z-index: 20; left: 50%; top: 50%; display: block; box-sizing: border-box; translate: -50% -50%; border: 1px dashed var(--lime); background: rgb(var(--accent-rgb) / .07); pointer-events: none; }
 .viewer-raster-canvas { width: 100%; height: 100%; display: block; pointer-events: none; }
-.viewer-text-layer { box-sizing: border-box; min-width: 1px; min-height: 1px; }
-.viewer-text-content, .viewer-text-editor { width: 100%; height: 100%; box-sizing: border-box; margin: 0; padding: 12px; overflow: hidden; border: 0; color: inherit; background: transparent; white-space: pre-wrap; overflow-wrap: anywhere; }
 /* The committed layer shows the lines the exported PNG will draw, wrapped once in JavaScript
    against the same font metrics, so the box on screen and the picture never break text apart
    differently. Only the textarea still wraps in the browser, while it is being typed into. */
-.viewer-text-content { white-space: pre; pointer-events: none; }
 /* The box sits on top of whatever picture it was written on, so a single lavender hairline
    disappeared against a pale one. A lavender band between two dark ones survives any backdrop, and
    the caret carries the same dark halo. */
-.viewer-text-editor { position: relative; z-index: 10; display: block; resize: none; outline: 0; box-shadow: 0 0 0 1px rgba(9,10,12,.85), 0 0 0 3px #c8acfb, 0 0 0 4px rgba(9,10,12,.65); caret-color: #7a4fe0; user-select: text; -webkit-user-select: text; }
-.viewer-text-editor::selection { color: var(--n-01); background: #c8acfb; }
-.viewer-text-layer.active { outline: 0; box-shadow: 0 0 0 1px rgba(9,10,12,.85), 0 0 0 2px #c8acfb, 0 0 0 3px rgba(9,10,12,.6); }
 /* Text annotates the picture, so it stacks above every image whichever order the layers arrived in;
    `viewerPaintOrder` puts it last in the exported PNG for the same reason. */
-.viewer-text-layer { z-index: 6; }
-.viewer-text-layer.active { z-index: 9; }
 /* Square and smaller than a picture's round grips: a text box is resized against its own edges, and
    a big round knob covers the very glyphs being fitted. */
-.viewer-image-layer.viewer-text-layer .layer-corner { width: 13px; height: 13px; border-radius: 0; border: 1px solid rgba(9,10,12,.85); background: #c8acfb; box-shadow: 0 0 0 1px rgba(255,255,255,.85); }
-.viewer-image-layer.viewer-text-layer .layer-corner::after { width: 7px; height: 7px; border-radius: 0; background: #c8acfb; box-shadow: none; }
-.viewer-image-layer.viewer-text-layer .layer-corner:hover, .viewer-image-layer.viewer-text-layer .layer-corner:active { background: #e8dcff; box-shadow: 0 0 0 1px rgba(255,255,255,.95), 0 0 10px rgb(var(--accent-rgb) / .85); }
-.layer-rotate-anchor { position: absolute; z-index: 14; left: 50%; top: 0; width: 0; height: 0; transform: scale(var(--viewer-handle-inverse)); transform-origin: center; pointer-events: auto; touch-action: none; }
-.layer-rotate-anchor::before { content: ""; position: absolute; left: -.5px; bottom: 8px; width: 1px; height: 22px; background: #c8acfb; pointer-events: none; }
-.layer-rotate-handle { position: absolute; left: 50%; top: -39px; width: 24px; height: 24px; display: grid; place-items: center; translate: -50% 0; box-sizing: border-box; border: 1px solid #e8dcff; border-radius: 50%; color: var(--n-02); background: #c8acfb; box-shadow: 0 0 12px rgba(200,172,251,.55); cursor: grab; touch-action: none; }
-.layer-rotate-handle:active { cursor: grabbing; }
 
 html[data-theme-mode="light"] .viewer-editor-tools, html[data-theme-mode="light"] .viewer-editor-properties { border-color: var(--n-26); background: color-mix(in srgb, #c8acfb 8%, var(--n-32)); }
 html[data-theme-mode="light"] .viewer-property-field, html[data-theme-mode="light"] .viewer-property-color, html[data-theme-mode="light"] .viewer-property-select, html[data-theme-mode="light"] .viewer-property-align { color: var(--n-10); background: var(--n-32); }
-html[data-theme-mode="light"] .viewer-property-field .bounded-number, html[data-theme-mode="light"] .viewer-property-select select, html[data-theme-mode="light"] .viewer-text-content-field > input { color: var(--n-05); border-color: var(--n-26); background: var(--n-31); }
+html[data-theme-mode="light"] .viewer-property-field .bounded-number, html[data-theme-mode="light"] .viewer-property-select select { color: var(--n-05); border-color: var(--n-26); background: var(--n-31); }
 /* No scrim behind the text being typed, in either theme: it tinted the very colour the user is
    choosing, so the box read differently while editing than the picture it exported to. The ring
    around the box is what makes it findable, and that works on any backdrop. */
-html[data-theme-mode="light"] .viewer-text-editor { color: inherit; background: transparent; }
 
 @container viewer-workspace (max-width: 1050px) {
   .viewer-toolbar { gap: 4px; padding: 5px; }
@@ -839,8 +813,6 @@ html[data-theme-mode="light"] .viewer-text-editor { color: inherit; background: 
 @container viewer-workspace (max-width: 760px) {
   .viewer-toolbar-group > button > span, .viewer-editor-tools > button > span { display: none; }
   .viewer-editor-tools > button { width: 32px; min-width: 32px; padding: 0; }
-  .viewer-text-properties { flex-basis: 100%; }
-  .viewer-text-content-field { flex-basis: 140px; }
 }
 @container viewer-workspace (max-width: 520px) {
   .viewer-property-field > span, .viewer-property-color > span, .viewer-property-select > span { display: none; }

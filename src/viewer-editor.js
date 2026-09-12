@@ -1,4 +1,4 @@
-export const VIEWER_TOOLS = Object.freeze(["move", "brush", "eraser", "text"]);
+export const VIEWER_TOOLS = Object.freeze(["move", "brush", "eraser"]);
 export const VIEWER_EDGE_STYLES = Object.freeze(["solid", "dashed", "dotted", "double", "glow"]);
 export const VIEWER_DEFAULT_COLOR = "#c8acfb";
 export const VIEWER_MAX_STROKE_POINTS = 10_000;
@@ -18,30 +18,7 @@ export const VIEWER_MAX_UNDO_STEPS = 50;
 export const VIEWER_MAX_UNDO_POINTS = 200_000;
 export const VIEWER_MAX_UNDO_BYTES = 32 * 1024 * 1024;
 export const VIEWER_MAX_UNDO_SOURCE_BYTES = 256 * 1024 * 1024;
-export const VIEWER_TEXT_PADDING = 12;
-// A text box dragged open keeps the size the drag gave it and wraps its text inside, the way
-// Photoshop's paragraph text does; a plain click still makes a box that grows with its text. Below
-// this edge a drag is a click, not a box.
-export const VIEWER_TEXT_MIN_BOX = 32;
-export const VIEWER_TEXT_MAX_LINES = 4000;
 export const VIEWER_RESIZE_HANDLES = Object.freeze(["tl", "tr", "bl", "br", "top", "right", "bottom", "left"]);
-// Offered in the toolbar as its own preview: each entry is rendered in the family it names, so the
-// list shows what the text will look like rather than describing it. Every family here ships with
-// Windows, and the CJK ones are named the way the user would name them.
-export const VIEWER_TEXT_STYLES = Object.freeze([
-  { id: "sans", label: "无衬线 Sans", fontFamily: "Arial, Helvetica, sans-serif" },
-  { id: "ui", label: "界面 Segoe UI", fontFamily: "\"Segoe UI\", system-ui, sans-serif" },
-  { id: "serif", label: "衬线 Serif", fontFamily: "\"Times New Roman\", Times, serif" },
-  { id: "georgia", label: "优雅 Georgia", fontFamily: "Georgia, \"Times New Roman\", serif" },
-  { id: "impact", label: "粗标题 Impact", fontFamily: "Impact, \"Arial Black\", sans-serif" },
-  { id: "mono", label: "等宽 Mono", fontFamily: "\"Courier New\", Consolas, monospace" },
-  { id: "hand", label: "手写 Comic", fontFamily: "\"Comic Sans MS\", \"Segoe UI\", cursive" },
-  { id: "yahei", label: "微软雅黑", fontFamily: "\"Microsoft YaHei\", \"PingFang SC\", sans-serif" },
-  { id: "songti", label: "宋体", fontFamily: "SimSun, \"Songti SC\", serif" },
-  { id: "heiti", label: "黑体", fontFamily: "SimHei, \"Heiti SC\", sans-serif" },
-  { id: "kaiti", label: "楷体", fontFamily: "KaiTi, \"Kaiti SC\", serif" },
-  { id: "fangsong", label: "仿宋", fontFamily: "FangSong, \"Fangsong SC\", serif" },
-]);
 // Which edges a handle moves: -1 pulls the left/top edge, 1 pushes the right/bottom one, 0 leaves
 // that axis alone. Spelled out because the names overlap as substrings -- "right" contains "t".
 export const VIEWER_RESIZE_HANDLE_AXES = Object.freeze({
@@ -162,7 +139,6 @@ export function viewerFileBatchAdmission(files, { maximumFileBytes = VIEWER_MAX_
 export function viewerLayerSourceByteCount(layers) {
   let total = 0;
   for (const layer of Array.isArray(layers) ? layers : []) {
-    if (viewerLayerKind(layer) === "text") continue;
     const explicit = layer?.sourceBytes;
     const source = layer?.originalUrl || layer?.url;
     const bytes = typeof explicit === "number" && Number.isFinite(explicit) && explicit >= 0
@@ -194,7 +170,6 @@ export function viewerUndoSnapshotMetrics(snapshot) {
     for (const nested of layout.layers) {
       if (!nested || typeof nested !== "object") continue;
       structuralBytes += 512;
-      if (viewerLayerKind(nested) === "text") structuralBytes += new TextEncoder().encode(String(nested.text || "").slice(0, 8000)).byteLength;
       const nestedStrokes = Array.isArray(nested.paintStrokes) ? nested.paintStrokes : [];
       if (nestedStrokes.length > VIEWER_MAX_LAYOUT_STROKES) { structuralBytes = Infinity; return; }
       for (const stroke of nestedStrokes) {
@@ -209,14 +184,11 @@ export function viewerUndoSnapshotMetrics(snapshot) {
   };
   for (const layer of layers) {
     structuralBytes += 512;
-    if (viewerLayerKind(layer) === "text") structuralBytes += new TextEncoder().encode(String(layer?.text || "")).byteLength;
     for (const stroke of Array.isArray(layer?.paintStrokes) ? layer.paintStrokes : []) {
       structuralBytes += 192 + (Array.isArray(stroke?.points) ? stroke.points.length * 24 : 0);
     }
-    if (viewerLayerKind(layer) === "image") {
-      addSource(layer, layer.originalUrl || layer.url, layer.sourceBytes);
-      if (layer.url && layer.url !== layer.originalUrl) addSource(layer, layer.url, 0);
-    }
+    addSource(layer, layer.originalUrl || layer.url, layer.sourceBytes);
+    if (layer.url && layer.url !== layer.originalUrl) addSource(layer, layer.url, 0);
     measureManualLayout(layer?.manualLayout || layer?.manual_layout);
   }
   const sourceBytes = [...sources.values()].reduce((total, value) => total + value, 0);
@@ -348,66 +320,22 @@ export function normalizeRotation(value) {
   return ((raw + 180) % 360 + 360) % 360 - 180;
 }
 
-export function viewerLayerKind(layer) {
-  return layer?.kind === "text" || layer?.type === "text" ? "text" : "image";
-}
 
-export function viewerTextStyleFor(fontFamily) {
-  const candidate = String(fontFamily ?? "").trim();
-  const match = VIEWER_TEXT_STYLES.find((style) => style.fontFamily.toLowerCase() === candidate.toLowerCase());
-  // A layout restored from an older session can name a family this list never offered; it is shown
-  // as itself rather than silently snapped to the nearest entry.
-  return match || { id: "custom", label: candidate || "自定义字体", fontFamily: candidate || VIEWER_TEXT_STYLES[0].fontFamily };
-}
 
-// Text annotates the picture, so it is drawn above every image whatever order the layers arrived
-// in -- on screen and in the exported PNG alike. Each kind keeps its own stacking within itself.
-export function viewerPaintOrder(layers) {
-  const list = Array.isArray(layers) ? layers : [];
-  return [
-    ...list.filter((layer) => viewerLayerKind(layer) !== "text"),
-    ...list.filter((layer) => viewerLayerKind(layer) === "text"),
-  ];
-}
 
-export function viewerTextBox(layer) {
-  if (viewerLayerKind(layer) !== "text") return null;
-  const width = Math.round(finite(layer?.boxWidth, 0));
-  const height = Math.round(finite(layer?.boxHeight, 0));
-  if (width < VIEWER_TEXT_MIN_BOX || height < VIEWER_TEXT_MIN_BOX) return null;
-  return { width: Math.min(width, VIEWER_MAX_CANVAS_EDGE), height: Math.min(height, VIEWER_MAX_CANVAS_EDGE) };
-}
 
-// Resizing a box changes the box, not the glyphs: the text reflows and the opposite edge stays
-// where the user left it, so the returned centre offset is half of what the dragged edge moved.
-export function viewerTextBoxResize(handle, box, delta) {
-  const axis = VIEWER_RESIZE_HANDLE_AXES[handle] || { x: 0, y: 0 };
-  const edge = (size, direction, movement) => Math.round(clamp(size + direction * finite(movement), VIEWER_TEXT_MIN_BOX, VIEWER_MAX_CANVAS_EDGE));
-  const boxWidth = edge(Math.max(VIEWER_TEXT_MIN_BOX, finite(box?.width, VIEWER_TEXT_MIN_BOX)), axis.x, delta?.x);
-  const boxHeight = edge(Math.max(VIEWER_TEXT_MIN_BOX, finite(box?.height, VIEWER_TEXT_MIN_BOX)), axis.y, delta?.y);
-  return {
-    boxWidth,
-    boxHeight,
-    dx: axis.x * (boxWidth - finite(box?.width)) / 2,
-    dy: axis.y * (boxHeight - finite(box?.height)) / 2,
-  };
-}
 
 export function viewerSafeResizeHandles(layer) {
-  if (normalizeRotation(layer?.rotation) !== 0) return [];
-  // A box has a width and a height of its own, so every edge can be dragged; text that is only as
-  // big as its glyphs has no width to pull, and its side handles would scale it unevenly.
-  return viewerLayerKind(layer) === "text" && !viewerTextBox(layer)
-    ? ["tl", "tr", "bl", "br"]
-    : [...VIEWER_RESIZE_HANDLES];
+  // A rotated layer withdraws every handle: the resize maths assumes an upright box.
+  return normalizeRotation(layer?.rotation) !== 0 ? [] : [...VIEWER_RESIZE_HANDLES];
 }
 
 export function hasLayerPaint(layer) {
-  return viewerLayerKind(layer) === "image" && Array.isArray(layer?.paintStrokes) && layer.paintStrokes.length > 0;
+  return Array.isArray(layer?.paintStrokes) && layer.paintStrokes.length > 0;
 }
 
 export function hasViewerEdits(layers) {
-  return Array.isArray(layers) && layers.some((layer) => viewerLayerKind(layer) === "text" || hasLayerPaint(layer) || normalizeRotation(layer?.rotation) !== 0);
+  return Array.isArray(layers) && layers.some((layer) => hasLayerPaint(layer) || normalizeRotation(layer?.rotation) !== 0);
 }
 
 export function clientPointToScene(point, canvasRect, pan = {}, zoom = 1) {
@@ -530,107 +458,9 @@ export function isProtectedViewerHistoryUrl(value) {
   return Boolean(historyAssetIdFromUrl(value));
 }
 
-export function textLayerLines(text) {
-  return String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
-}
 
-// Greedy wrap with the same break opportunities the box shows on screen: after a run of spaces
-// first, and inside a word only when the word cannot fit on a line of its own. Both the box on
-// screen and the exported PNG render these lines, so the two never disagree about where text broke.
-export function wrapTextLines(text, maxWidth, measure = (value) => value.length, maxLines = VIEWER_TEXT_MAX_LINES) {
-  const limit = finite(maxWidth, 0);
-  const ceiling = Math.max(1, Math.min(VIEWER_TEXT_MAX_LINES, Math.floor(finite(maxLines, VIEWER_TEXT_MAX_LINES))));
-  const paragraphs = textLayerLines(text);
-  if (limit <= 0) return paragraphs;
-  const width = (value) => Math.max(0, finite(measure(String(value).replace(/\s+$/, "")), 0));
-  // Width grows with every character kept, so the longest prefix that still fits is a bisection.
-  const longestFit = (value) => {
-    let low = 1;
-    let high = value.length;
-    while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      if (width(value.slice(0, middle)) <= limit) low = middle;
-      else high = middle - 1;
-    }
-    return low;
-  };
-  const lines = [];
-  for (const paragraph of paragraphs) {
-    let line = "";
-    for (const chunk of paragraph.match(/\S+\s*|\s+/g) || []) {
-      if (line && width(line + chunk) > limit) {
-        lines.push(line);
-        line = chunk;
-      } else line += chunk;
-      while (width(line) > limit && line.length > 1 && lines.length < ceiling) {
-        const cut = longestFit(line);
-        lines.push(line.slice(0, cut));
-        line = line.slice(cut);
-      }
-      if (lines.length >= ceiling) break;
-    }
-    lines.push(line);
-    if (lines.length >= ceiling) break;
-  }
-  return lines.slice(0, ceiling);
-}
 
-export function measureTextLayer(text, settings = {}, measure = (value) => value.length * finite(settings.fontSize, 48) * 0.6) {
-  const fontSize = clamp(settings.fontSize ?? 48, 8, 300);
-  const lineHeight = clamp(settings.lineHeight ?? 1.2, 0.8, 3);
-  const box = viewerTextBox({ kind: "text", ...settings });
-  // Only the lines the box can show are wrapped: the rest is clipped on screen and in the export
-  // alike, so a small box full of large text costs the wrap it displays, not the wrap it hides.
-  const visibleLines = box ? Math.ceil((box.height - VIEWER_TEXT_PADDING * 2) / Math.max(1, fontSize * lineHeight)) + 1 : 0;
-  const lines = box ? wrapTextLines(text, box.width - VIEWER_TEXT_PADDING * 2, measure, visibleLines) : textLayerLines(text);
-  const measured = box ? [] : lines.map((line) => Math.max(0, finite(measure(line || " "), 0)));
-  return {
-    naturalWidth: box ? box.width : Math.max(1, Math.ceil(Math.max(...measured, fontSize * 0.5) + VIEWER_TEXT_PADDING * 2)),
-    naturalHeight: box ? box.height : Math.max(1, Math.ceil(lines.length * fontSize * lineHeight + VIEWER_TEXT_PADDING * 2)),
-    lines,
-    fontSize,
-    lineHeight,
-    box,
-  };
-}
 
-export function normalizeTextLayer(value = {}, measure) {
-  const text = String(value.text ?? "文字图层").slice(0, 8000);
-  const requestedFont = value.fontFamily ?? value.font;
-  const fontFamily = typeof requestedFont === "string" && requestedFont.trim() ? requestedFont.trim().slice(0, 160) : "Arial, sans-serif";
-  const fontSize = Math.round(clamp(value.fontSize ?? value.size ?? 48, 8, 300));
-  const fontWeight = [400, 500, 600, 700, 800, 900].includes(Number(value.fontWeight ?? value.weight)) ? Number(value.fontWeight ?? value.weight) : 400;
-  const requestedAlign = value.textAlign ?? value.align;
-  const textAlign = ["left", "center", "right"].includes(requestedAlign) ? requestedAlign : "left";
-  const lineHeight = clamp(value.lineHeight ?? 1.2, 0.8, 3);
-  const box = viewerTextBox({ kind: "text", ...value });
-  const measured = measureTextLayer(text, { fontSize, lineHeight, boxWidth: box?.width, boxHeight: box?.height }, measure);
-  return {
-    ...value,
-    kind: "text",
-    type: "text",
-    text,
-    font: fontFamily,
-    fontFamily,
-    size: fontSize,
-    fontSize,
-    weight: fontWeight,
-    fontWeight,
-    color: normalizeViewerColor(value.color),
-    align: textAlign,
-    textAlign,
-    lineHeight,
-    boxWidth: box?.width,
-    boxHeight: box?.height,
-    lines: measured.lines,
-    naturalWidth: box ? box.width : Math.max(1, Math.round(finite(value.naturalWidth, measured.naturalWidth))),
-    naturalHeight: box ? box.height : Math.max(1, Math.round(finite(value.naturalHeight, measured.naturalHeight))),
-    x: finite(value.x),
-    y: finite(value.y),
-    scale: clamp(value.scale ?? 1, 0.1, 8),
-    rotation: normalizeRotation(value.rotation),
-  };
-}
 
 export function viewerEditorLayerBounds(layer) {
   const width = Math.max(1, finite(layer?.naturalWidth, 1)) * clamp(layer?.scale ?? 1, 0.1, 8);
@@ -665,17 +495,6 @@ export function cloneViewerLayers(layers) {
 }
 
 export function serializeViewerLayer(layer) {
-  if (viewerLayerKind(layer) === "text") {
-    const text = normalizeTextLayer(layer);
-    return Object.fromEntries(Object.entries({
-      kind: "text", type: "text", text: text.text, fontFamily: text.fontFamily, fontSize: text.fontSize,
-      fontWeight: text.fontWeight, color: text.color, textAlign: text.textAlign, lineHeight: text.lineHeight,
-      font: text.font, size: text.size, weight: text.weight, align: text.align,
-      boxWidth: text.boxWidth, boxHeight: text.boxHeight,
-      naturalWidth: text.naturalWidth, naturalHeight: text.naturalHeight, x: text.x, y: text.y,
-      scale: text.scale, rotation: text.rotation, name: String(layer.name || "文字图层").slice(0, 200),
-    }).filter(([, value]) => value !== undefined));
-  }
   const paintStrokes = (Array.isArray(layer?.paintStrokes) ? layer.paintStrokes : [])
     .map((stroke) => normalizePaintStroke(stroke, layer)).filter((stroke) => stroke.points.length);
   return Object.fromEntries(Object.entries({
@@ -695,11 +514,10 @@ export function normalizeManualLayout(layout, { trustedCurrentSession = false } 
   const layers = [];
   for (const source of layout.layers) {
     if (!source || typeof source !== "object" || Array.isArray(source)) return null;
-    if (version >= 2 && viewerLayerKind(source) === "text") {
-      if (typeof source.text !== "string" || source.text.length > 8000) return null;
-      layers.push(serializeViewerLayer(normalizeTextLayer(source)));
-      continue;
-    }
+    // Text layers were withdrawn. A layout saved while they existed still names them, so they are
+    // dropped and the pictures around them are kept -- the alternative is refusing to reopen an
+    // image that is mostly still readable.
+    if (source.kind === "text" || source.type === "text") continue;
     const url = typeof source.originalUrl === "string" && source.originalUrl || typeof source.url === "string" && source.url || "";
     if (!url || (!trustedCurrentSession && !viewerHistorySourcesBound(source))) return null;
     const rawStrokes = source.paintStrokes;
@@ -724,7 +542,7 @@ export function normalizeManualLayout(layout, { trustedCurrentSession = false } 
 export function persistedManualLayout(layout, { maxBytes = VIEWER_MAX_LAYOUT_BYTES, maxPoints = VIEWER_MAX_LAYOUT_POINTS } = {}) {
   const normalized = normalizeManualLayout(layout, { trustedCurrentSession: true });
   if (!normalized) return { layout: null, reason: "布局为空" };
-  const imageLayers = normalized.layers.filter((layer) => viewerLayerKind(layer) === "image");
+  const imageLayers = normalized.layers;
   const protectedSources = imageLayers.every(viewerHistorySourcesBound);
   if (!protectedSources) return { layout: null, reason: "包含本地或非历史图片源" };
   const pointCount = imageLayers.reduce((total, layer) => total + layer.paintStrokes.reduce((sum, stroke) => sum + stroke.points.length, 0), 0);
@@ -783,30 +601,7 @@ export function renderRasterLayer(canvas, image, layer) {
   return canvas;
 }
 
-export function textCanvasFont(layer) {
-  return `${Number(layer?.fontWeight) || 400} ${Math.max(8, finite(layer?.fontSize, 48))}px ${layer?.fontFamily || "Arial, sans-serif"}`;
-}
 
-export function drawTextLayer(context, layer) {
-  context.save();
-  context.font = textCanvasFont(normalizeTextLayer(layer));
-  // The font has to be on the context before the box can wrap against it, so a boxed layer is
-  // measured a second time -- with this context -- and the lines it returns are the ones drawn.
-  const normalized = normalizeTextLayer(layer, (value) => context.measureText(value).width);
-  const lines = normalized.lines || textLayerLines(normalized.text);
-  const x = normalized.textAlign === "left" ? VIEWER_TEXT_PADDING : normalized.textAlign === "right" ? normalized.naturalWidth - VIEWER_TEXT_PADDING : normalized.naturalWidth / 2;
-  // A box shows only what fits in it, so the export must not spill the rest into the picture.
-  if (viewerTextBox(normalized)) {
-    context.beginPath();
-    context.rect(0, 0, normalized.naturalWidth, normalized.naturalHeight);
-    context.clip();
-  }
-  context.fillStyle = normalized.color;
-  context.textAlign = normalized.textAlign;
-  context.textBaseline = "top";
-  lines.forEach((line, index) => context.fillText(line, x, VIEWER_TEXT_PADDING + index * normalized.fontSize * normalized.lineHeight));
-  context.restore();
-}
 
 export function drawViewerLayer(context, layer, source, bounds, outputScale = 1) {
   const scale = clamp(layer?.scale ?? 1, 0.1, 8) * outputScale;
@@ -815,7 +610,6 @@ export function drawViewerLayer(context, layer, source, bounds, outputScale = 1)
   context.rotate(normalizeRotation(layer?.rotation) * Math.PI / 180);
   context.scale(scale, scale);
   context.translate(-Math.max(1, finite(layer?.naturalWidth, 1)) / 2, -Math.max(1, finite(layer?.naturalHeight, 1)) / 2);
-  if (viewerLayerKind(layer) === "text") drawTextLayer(context, layer);
-  else context.drawImage(source, 0, 0, Math.max(1, finite(layer?.naturalWidth, 1)), Math.max(1, finite(layer?.naturalHeight, 1)));
+  context.drawImage(source, 0, 0, Math.max(1, finite(layer?.naturalWidth, 1)), Math.max(1, finite(layer?.naturalHeight, 1)));
   context.restore();
 }
