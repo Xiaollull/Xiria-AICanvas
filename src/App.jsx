@@ -21,6 +21,8 @@ import {
   normalizeViewerColor,
   normalizeViewerEdgeLine,
   persistedManualLayout,
+  raiseViewerLayer,
+  viewerRestoredUndoStack,
   readViewerFileAsDataUrl,
   renderRasterLayer,
   resolvedCollageEntries,
@@ -3658,7 +3660,11 @@ function App() {
     const initialLayer = await imageAssetFromSource({
       id: `generated-${selectedOutput?.asset_id || selectedOutputIndex}`,
       assetId: selectedOutput?.asset_id || "",
-      url: generatedImage,
+      // A freshly generated picture is addressed by its job route, which carries a cache-buster and
+      // so cannot be named in a saved layout. Its asset id is the history token for the very same
+      // file, so the layer is pointed at the history route instead: same bytes, and strokes drawn
+      // on it can be saved as strokes rather than flattened into the output for good.
+      url: selectedOutput?.asset_id ? `/api/inference/history/assets/${selectedOutput.asset_id}` : generatedImage,
       name: generatedName || "XirAI.png",
     }, { signal: token.signal }).then((asset) => ({ ...asset, originalUrl: asset.url, x: 0, y: 0, scale: 1, rotation: 0, paintStrokes: [] })).catch((error) => {
       if (viewerSession.current.isCurrent(token)) setViewerNotice(error.message);
@@ -3824,7 +3830,8 @@ function App() {
       setViewerNotice("布局中的源图均无法读取，未替换当前画布");
       return false;
     }
-    viewerUndo.current = [];
+    // The strokes came back as strokes, so undo gets the history that lets them come back off.
+    viewerUndo.current = viewerRestoredUndoStack(restored, { activeLayer: restored.at(-1).id });
     viewerSourceBytes.current = viewerLayerSourceByteCount(restored);
     setViewerLayers(restored);
     setViewerSnappedLayers([]);
@@ -3835,11 +3842,22 @@ function App() {
     setViewerMenu(null);
     setViewerNotice(failedCount
       ? `已恢复 manualLayout v${normalizedLayout.version} 的 ${restored.length} 个图层；${failedCount} 个历史源读取失败，已跳过`
-      : `已恢复 manualLayout v${normalizedLayout.version} 的图像、笔画与文字，可继续无损编辑`);
+      : `已恢复 ${restored.length} 个图层的图像与笔画，可继续撤销或用画笔修改`);
     return true;
   };
 
+  const viewerAssetLayout = (asset) => asset?.manual_layout || asset?.manualLayout || null;
+
+  // Reopening a saved picture brings its strokes back as strokes, not as pixels already burned in,
+  // so they can still be undone or drawn over. The restored scene renders the same picture the
+  // file shows, so nothing looks different; if a source has since been deleted the restore fails
+  // and the flat file is shown instead.
   const focusViewerAsset = async (asset) => {
+    const layout = viewerAssetLayout(asset);
+    if (layout && await restoreManualCollage(layout, { trustedCurrentSession: asset?.manualLayoutTrusted === true })) {
+      setGeneratedName(asset?.name || asset?.output_name || "XirAI.png");
+      return;
+    }
     invalidateViewerComposition();
     const token = viewerSession.current.beginReplacement("focus");
     const loaded = await imageAssetFromSource(asset, { signal: token.signal }).catch((error) => {
@@ -4439,17 +4457,17 @@ function App() {
     setViewerNotice("已取消未完成的拼图，预览窗口图片已保留");
   };
 
-  const saveCollage = async () => {
-    if (!collageResult) return;
-    const result = collageResult;
+  const saveCollage = async (explicitResult = null) => {
+    const result = explicitResult && explicitResult.dataUrl ? explicitResult : collageResult;
+    if (!result) return false;
     try {
       assertViewerByteBudget(viewerDataUrlBytes(result.dataUrl), VIEWER_MAX_OUTPUT_BYTES, "拼图保存数据");
     } catch (error) {
       setViewerNotice(error.message);
-      return;
+      return false;
     }
     const token = beginViewerCollageOperation("save");
-    if (!token) return;
+    if (!token) return false;
     try {
       const response = await fetch("/api/inference/collages", {
         method: "POST",
@@ -4459,27 +4477,53 @@ function App() {
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "拼图保存失败");
-      if (!viewerSession.current.isOperationCurrent(token)) return;
+      if (!viewerSession.current.isOperationCurrent(token)) return false;
       setViewerLayers((current) => current.map((layer) => layer.isCollage && layer.url === result.dataUrl ? { ...layer, assetId: payload.id, url: payload.url, name: payload.name, manualLayout: result.manualLayout || layer.manualLayout } : layer));
       setCollageResult((current) => current?.idempotencyKey === result.idempotencyKey ? { ...current, saved: true, assetId: payload.id, url: payload.url, name: payload.name } : current);
       setViewerNotice(result.persistedManualLayout
         ? `已保存到当日 outputs：${payload.name}；manualLayout v2 可重新编辑`
         : `已扁平保存到当日 outputs：${payload.name}；${result.persistenceReason || "源图不满足持久恢复条件"}`);
       void refreshViewerHistory(viewerSelectedFolder);
+      return true;
     } catch (error) {
       if (error.name !== "AbortError" && viewerSession.current.isOperationOwned(token)) setViewerNotice(error.message);
+      return false;
     } finally {
       finishViewerCollageOperation(token);
     }
   };
 
-  const createManualCollage = async () => {
-    if (viewerLayers.length < 2 && !hasViewerEdits(viewerLayers)) {
-      setViewerNotice("至少需要两张图片；单层图片需先添加画笔或文字编辑");
+  // One click for the whole of "keep what I drew": the strokes are burned into a PNG and that PNG
+  // is written to today's outputs, carrying the layout that lets the strokes be peeled back off
+  // when the picture is reopened. Composing and saving stay separate underneath, because the
+  // collage flow still uses them one at a time.
+  const saveViewerPainting = async () => {
+    // Composing replaces the canvas with the flattened picture, which is right for the collage flow
+    // but wrong here: the drawing was saved to keep working on it. The layers are put back after
+    // the write, so the canvas is exactly what it was -- same ids, so undo history still applies --
+    // and the flattened copy exists only in the file.
+    const before = cloneViewerLayers(viewerLayers);
+    const activeBefore = activeViewerLayer;
+    const composed = await createManualCollage({ quiet: true });
+    if (!composed) return;
+    const saved = await saveCollage(composed);
+    if (!saved) {
+      setViewerNotice("绘制已合成，但保存失败；可再次点击保存");
       return;
     }
+    viewerSourceBytes.current = viewerLayerSourceByteCount(before);
+    setViewerLayers(before);
+    setActiveViewerLayer(activeBefore);
+    setCollageResult(null);
+  };
+
+  const createManualCollage = async ({ quiet = false } = {}) => {
+    if (viewerLayers.length < 2 && !hasViewerEdits(viewerLayers)) {
+      setViewerNotice("至少需要两张图片；单张图片需先用画笔或橡皮绘制");
+      return null;
+    }
     const token = beginViewerCollageOperation("manual-collage");
-    if (!token) return;
+    if (!token) return null;
     try {
       const sourceLayers = cloneViewerLayers(viewerLayers);
       if (viewerLayerSourceByteCount(sourceLayers) > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("画布图片源总量超过 256 MiB 上限");
@@ -4561,17 +4605,23 @@ function App() {
         canvas.height = 1;
         throw error;
       }
-      if (!viewerSession.current.isOperationCurrent(token)) return;
+      if (!viewerSession.current.isOperationCurrent(token)) return null;
       const layer = { id: `collage-${Date.now()}`, url: dataUrl, originalUrl: dataUrl, sourceBytes: viewerDataUrlBytes(dataUrl), naturalWidth: width, naturalHeight: height, name, x: 0, y: 0, scale: 1, rotation: 0, paintStrokes: [], isCollage: true, mimeType: "image/png", manualLayout, manualLayoutTrusted: true };
-      setCollageResult({ mode: "manual", dataUrl, name, width, height, manualLayout, persistedManualLayout: persistence.layout, persistenceReason: persistence.reason, edgeLine: { ...viewerEdgeLine }, needsConfirmation: false, idempotencyKey: newViewerIdempotencyKey() });
+      const result = { mode: "manual", dataUrl, name, width, height, manualLayout, persistedManualLayout: persistence.layout, persistenceReason: persistence.reason, edgeLine: { ...viewerEdgeLine }, needsConfirmation: false, idempotencyKey: newViewerIdempotencyKey() };
+      setCollageResult(result);
       viewerSourceBytes.current = layer.sourceBytes;
       setViewerLayers([layer]);
       setActiveViewerLayer(layer.id);
-      const animationNotice = hasAnimatedSource ? "GIF 与编辑内容已静态合成为 PNG；" : "";
-      const persistenceNotice = persistence.layout ? "保存后可恢复全部文字、旋转与笔画" : `布局仅在当前会话可编辑，保存时会扁平化（${persistence.reason}）`;
-      setViewerNotice(`${animationNotice}已合成为 ${width} × ${height} PNG，${persistenceNotice}`);
+      if (!quiet) {
+        const animationNotice = hasAnimatedSource ? "GIF 与编辑内容已静态合成为 PNG；" : "";
+        const persistenceNotice = persistence.layout ? "保存后可恢复旋转与笔画" : `布局仅在当前会话可编辑，保存时会扁平化（${persistence.reason}）`;
+        setViewerNotice(`${animationNotice}已合成为 ${width} × ${height} PNG，${persistenceNotice}`);
+      }
+      return result;
+      return null;
     } catch (error) {
       if (error.name !== "AbortError" && viewerSession.current.isOperationOwned(token)) setViewerNotice(`应用编辑失败：${error.message}`);
+      return null;
     } finally {
       finishViewerCollageOperation(token);
     }
@@ -4634,9 +4684,15 @@ function App() {
     const undoSnapshot = viewerSnapshot(layer.id);
     invalidateViewerComposition();
     setActiveViewerLayer(layer.id);
-    setViewerLayers((current) => current.map((item) => item.id === layer.id
-      ? { ...item, originalUrl: item.originalUrl || item.url, paintStrokes: [...(item.paintStrokes || []), stroke] }
-      : item));
+    // Array order is the stacking order, on screen and in the exported PNG alike, so the picture
+    // being drawn on comes to the front: a stroke is never hidden behind a layer that happens to
+    // overlap it, and it stays visible once the selection moves elsewhere.
+    setViewerLayers((current) => {
+      const painted = current.find((item) => item.id === layer.id);
+      return painted
+        ? raiseViewerLayer(current, layer.id, { originalUrl: painted.originalUrl || painted.url, paintStrokes: [...(painted.paintStrokes || []), stroke] })
+        : current;
+    });
     event.currentTarget.setPointerCapture(event.pointerId);
     viewerDrag.current = {
       kind: "paint",
@@ -5828,6 +5884,10 @@ function App() {
     : `${current.trim()}${current.trim() ? ", " : ""}${TRANSPARENT_BACKGROUND_TAG}`);
   const activeViewerLayerItem = viewerLayers.find((layer) => layer.id === activeViewerLayer) || viewerLayers.at(-1) || null;
   const viewerHasEditableContent = hasViewerEdits(viewerLayers);
+  // Strokes on the canvas are unsaved work, so they get their own primary action rather than
+  // sharing the collage's "apply" button: one click keeps them, and the button is the only sign
+  // the user needs that there is something to keep.
+  const viewerHasPaint = viewerLayers.some(hasLayerPaint);
   const activeCollageTemplate = collageTemplates.find((template) => template.id === activeCollage?.templateId) || null;
   const activeCollageLayout = activeCollageTemplate && activeCollage
     ? adaptiveCollageLayout(activeCollageTemplate, activeCollage.slots.map((entry) => entry?.asset))
@@ -7153,7 +7213,8 @@ function App() {
                        <label className="viewer-property-field"><span>不透明度</span><BoundedNumberInput value={viewerBrush.opacity} min={1} max={100} integer onCommit={(opacity) => setViewerBrush((current) => ({ ...current, opacity }))} ariaLabel="笔刷不透明度" /><em>%</em></label>
                        {viewerTool === "brush" && <><label className="viewer-property-color"><span>颜色</span><input type="color" value={viewerBrush.color} onChange={(event) => setViewerBrush((current) => ({ ...current, color: normalizeViewerColor(event.target.value) }))} aria-label="画笔颜色" /></label><button title="提取屏幕颜色" aria-label="提取屏幕颜色" onClick={pickViewerBrushColor}><Palette size={14} /></button></>}
                      </div>}
-                     <div className="viewer-toolbar-group" aria-label="布局"><button ref={viewerEdgeTriggerRef} className={viewerEdgePanelOpen ? "active" : ""} aria-expanded={viewerEdgePanelOpen} aria-controls="viewer-alignment-panel" aria-haspopup="dialog" title="对齐与线条" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_LAYOUT)}><SlidersHorizontal size={14} /><span>对齐与线条</span></button><button ref={viewerTemplateTriggerRef} className={viewerTemplatesOpen ? "active" : ""} aria-expanded={viewerTemplatesOpen} aria-controls="viewer-template-panel" aria-haspopup="dialog" title="拼图模板" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_TEMPLATES)}><LayoutTemplate size={14} /><span>拼图模板</span></button>{!activeCollage && !collageResult && (viewerLayers.length > 1 || viewerHasEditableContent) && <button disabled={Boolean(viewerCollageBusy)} title={viewerHasEditableContent ? "应用编辑并合成为 PNG" : "一键拼图"} onClick={createManualCollage}><Layers3 size={14} /><span>{viewerCollageBusy === "manual-collage" ? "合成中…" : viewerHasEditableContent ? "应用编辑" : "一键拼图"}</span></button>}</div>
+                     <div className="viewer-toolbar-group" aria-label="布局"><button ref={viewerEdgeTriggerRef} className={viewerEdgePanelOpen ? "active" : ""} aria-expanded={viewerEdgePanelOpen} aria-controls="viewer-alignment-panel" aria-haspopup="dialog" title="对齐与线条" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_LAYOUT)}><SlidersHorizontal size={14} /><span>对齐与线条</span></button><button ref={viewerTemplateTriggerRef} className={viewerTemplatesOpen ? "active" : ""} aria-expanded={viewerTemplatesOpen} aria-controls="viewer-template-panel" aria-haspopup="dialog" title="拼图模板" onClick={() => toggleViewerToolbarPopover(VIEWER_TOOLBAR_POPOVER_TEMPLATES)}><LayoutTemplate size={14} /><span>拼图模板</span></button>{!activeCollage && !collageResult && !viewerHasPaint && (viewerLayers.length > 1 || viewerHasEditableContent) && <button disabled={Boolean(viewerCollageBusy)} title={viewerHasEditableContent ? "应用编辑并合成为 PNG" : "一键拼图"} onClick={() => createManualCollage()}><Layers3 size={14} /><span>{viewerCollageBusy === "manual-collage" ? "合成中…" : viewerHasEditableContent ? "应用编辑" : "一键拼图"}</span></button>}</div>
+                     {!activeCollage && !collageResult && viewerHasPaint && <div className="viewer-toolbar-group viewer-toolbar-results" aria-label="绘制"><button className="viewer-confirm" disabled={Boolean(viewerCollageBusy)} title="把画笔与橡皮的绘制保存到当日 outputs；重新打开后仍可撤销与继续绘制" onClick={saveViewerPainting}><Save size={14} /><span>{viewerCollageBusy === "manual-collage" ? "合成中…" : viewerCollageBusy === "save" ? "保存中…" : "保存绘制"}</span></button></div>}
                      <div className="viewer-toolbar-group" aria-label="图层"><button className={viewerLayerResizeEnabled ? "active" : ""} aria-pressed={viewerLayerResizeEnabled} title={viewerLayerResizeEnabled ? "关闭图片尺寸调整（不影响相机缩放或拖动）" : "开启图片尺寸调整"} onClick={toggleViewerLayerResize}><Move size={14} /><span>图片尺寸调整</span></button>{!activeCollage && activeViewerLayerItem && <div className="viewer-layer-scale"><Move size={13} /><span>选中图片</span><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1 / 1.1)}>-</button><BoundedNumberInput value={Math.round(activeViewerLayerItem.scale * 100)} min={10} max={800} integer disabled={!viewerLayerResizeEnabled} onCommit={(percentage) => setViewerLayerScale(activeViewerLayerItem.id, percentage)} ariaLabel="选中图片缩放比例" /><em>%</em><button disabled={!viewerLayerResizeEnabled} onClick={() => scaleViewerLayer(activeViewerLayerItem.id, 1.1)}>+</button></div>}</div>
                     {activeCollageSlotItem && <div className="viewer-toolbar-group collage-slot-adjust" aria-label={`拼图区块 ${activeCollageSlot + 1}`}><div className="viewer-toolbar-subgroup viewer-layer-scale"><Move size={13} /><span>区块 {activeCollageSlot + 1}</span><button onClick={() => updateCollageSlot(activeCollageSlot, { scale: Math.max(.1, activeCollageSlotItem.scale / 1.1) })}>-</button><output>{Math.round(activeCollageSlotItem.scale * 100)}%</output><button onClick={() => updateCollageSlot(activeCollageSlot, { scale: Math.min(4, activeCollageSlotItem.scale * 1.1) })}>+</button></div><div className="viewer-toolbar-subgroup viewer-tool-group"><button title="左边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: 0 })}>L</button><button title="水平居中" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: .5 })}>C</button><button title="右边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignX: 1 })}>R</button></div><div className="viewer-toolbar-subgroup viewer-tool-group"><button title="顶边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: 0 })}>T</button><button title="垂直居中" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: .5 })}>M</button><button title="底边缘对齐" onClick={() => updateCollageSlot(activeCollageSlot, { alignY: 1 })}>B</button></div></div>}
                     {(activeCollage || collageResult) && <div className="viewer-toolbar-group viewer-toolbar-results" aria-label="结果">{activeCollage && <button className="viewer-confirm" disabled={Boolean(viewerCollageBusy)} onClick={confirmCollage}><Check size={14} /><span>{viewerCollageBusy === "confirm" ? "合成中…" : "确认拼图"}</span></button>}{collageResult && <><button className="viewer-confirm" disabled={collageResult.saved || Boolean(viewerCollageBusy)} onClick={saveCollage}><Save size={14} /><span>{viewerCollageBusy === "save" ? "保存中…" : collageResult.saved ? "已保存" : "保存拼图"}</span></button><button disabled={Boolean(viewerCollageBusy)} onClick={editCollage}><LayoutTemplate size={14} /><span>重新拼图</span></button><button className="viewer-danger" disabled={Boolean(viewerCollageBusy)} onClick={discardCollage}><Trash2 size={14} /><span>删除拼图</span></button></>}</div>}

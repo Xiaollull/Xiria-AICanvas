@@ -236,6 +236,27 @@ export function historyAssetIdFromUrl(value) {
   return match?.[1] || "";
 }
 
+// A picture reopened from a saved layout arrives with its strokes already on it and no history
+// behind them, so undo would have nothing to do. This rebuilds that history: one state per stroke,
+// oldest first, each missing the strokes drawn after it -- so undo peels the drawing back off in
+// the order it was made. Strokes carry no global timestamp, so across layers they are peeled from
+// the front-most layer backwards, which is the order they are stacked in.
+export function viewerRestoredUndoStack(layers, { maximumSteps = VIEWER_MAX_UNDO_STEPS, activeLayer = "" } = {}) {
+  const total = viewerStrokeCount(layers);
+  if (!total) return [];
+  const stack = [];
+  let current = cloneViewerLayers(layers);
+  for (let step = 0; step < Math.min(total, maximumSteps); step += 1) {
+    const index = current.findLastIndex((layer) => Array.isArray(layer?.paintStrokes) && layer.paintStrokes.length);
+    if (index < 0) break;
+    current = current.map((layer, layerIndex) => layerIndex === index
+      ? { ...layer, paintStrokes: layer.paintStrokes.slice(0, -1) }
+      : layer);
+    stack.unshift({ layers: cloneViewerLayers(current), snappedLayers: [], activeLayer });
+  }
+  return stack;
+}
+
 export function viewerHistorySourcesBound(layer) {
   const assetId = typeof layer?.assetId === "string" ? layer.assetId : "";
   const sources = [layer?.url, layer?.originalUrl].filter((source) => typeof source === "string" && source.length);
@@ -328,6 +349,15 @@ export function normalizeRotation(value) {
 export function viewerSafeResizeHandles(layer) {
   // A rotated layer withdraws every handle: the resize maths assumes an upright box.
   return normalizeRotation(layer?.rotation) !== 0 ? [] : [...VIEWER_RESIZE_HANDLES];
+}
+
+// Array order is the stacking order, on screen and in the exported PNG alike, so bringing a layer
+// to the front is moving it last. Every other layer keeps its own order.
+export function raiseViewerLayer(layers, id, changes = null) {
+  const list = Array.isArray(layers) ? layers : [];
+  const raised = list.find((layer) => layer?.id === id);
+  if (!raised) return list;
+  return [...list.filter((layer) => layer?.id !== id), changes ? { ...raised, ...changes } : raised];
 }
 
 export function hasLayerPaint(layer) {
