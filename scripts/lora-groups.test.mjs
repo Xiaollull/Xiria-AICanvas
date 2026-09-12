@@ -102,16 +102,18 @@ test("groups are engine scoped, so an SD combination cannot be enabled under Ani
   assert.ok(sameLoraGroups(loraGroupsForScope(map, "SD"), loraGroupsForScope(map, "SD")));
 });
 
-test("enabled groups prepend their preset prompt, in order, ahead of the user's text", () => {
+test("enabled groups prepend their preset prompt, in order, a blank line ahead of the user's text", () => {
   const groups = [
     group("g-1", { enabled: true, presetPrompt: "masterpiece, best quality" }),
     group("g-2", { enabled: false, presetPrompt: "should not appear" }),
     group("g-3", { enabled: true, presetPrompt: "cinematic lighting" }),
   ];
-  assert.equal(composeGroupPrompt(groups, "a cat"), "masterpiece, best quality, cinematic lighting, a cat");
+  // The groups read as one list of words, so they stay comma-joined with each other; the prompt
+  // they lead is a separate thought, so a blank line separates it.
+  assert.equal(composeGroupPrompt(groups, "a cat"), "masterpiece, best quality, cinematic lighting\n\na cat");
   assert.equal(enabledLoraGroups(groups).length, 2);
   // A preset that already ends in a comma must not produce ", ,".
-  assert.equal(composeGroupPrompt([group("g-1", { enabled: true, presetPrompt: "solo, " })], ", a cat"), "solo, a cat");
+  assert.equal(composeGroupPrompt([group("g-1", { enabled: true, presetPrompt: "solo, " })], ", a cat"), "solo\n\na cat");
   // Every empty combination degrades to exactly the user's own prompt.
   assert.equal(composeGroupPrompt([], "a cat"), "a cat");
   assert.equal(composeGroupPrompt([group("g-1", { enabled: true })], "a cat"), "a cat");
@@ -210,10 +212,12 @@ test("the preset prompt reaches the request body and never the prompt box", asyn
   const app = await readSource("src/App.jsx");
   // The request body carries the composed prompt; the groups are resolved once
   // per generation and reused for the gallery record.
-  assert.match(app, /prompt: composeGroupPrompt\(generationGroups, positive\)/);
+  assert.match(app, /prompt: generationPrompt,/);
+  assert.match(app, /const generationPrompt = composeGenerationPrompt\(\{ groupPrompt: generationGroupPrompt,[\s\S]{0,200}prompt: positive \}\);/);
   // Rewriting the box, or storing the composed text as the generated settings,
   // would prepend the presets a second time when the item is restored.
   assert.ok(!/setPositive\([^)]*composeGroupPrompt/.test(app), "the prompt box is never rewritten");
+  assert.ok(!/setPositive\([^)]*composeGenerationPrompt/.test(app), "nor does the preset composition rewrite it");
   // Checked per record rather than file-wide: the image-to-image request body legitimately composes
   // onto `settings.positive` on its way to the server, and only the stored record must stay clean.
   const records = [...app.matchAll(/setGeneratedSettings\(JSON\.parse\(JSON\.stringify\(\{[\s\S]*?\}\)\)\);/g)].map((match) => match[0]);
@@ -337,10 +341,10 @@ test("a gallery card records the combinations its image was generated with", asy
   assert.match(app, /loraGroupPrompt: generationGroupPrompt/);
   // One composition feeds both the request and the record, so a card can never
   // disagree with what was submitted.
-  assert.match(app, /prompt: composeGroupPrompt\(generationGroups, positive\)/);
-  // Exactly five sites, so a sixth cannot appear unnoticed: each page's request body, the frozen
-  // record beside it, and the workspace-built card's derived prefix.
-  assert.equal([...app.matchAll(/composeGroupPrompt\(/g)].length, 5);
+  assert.match(app, /prompt: generationPrompt,/);
+  // Exactly four sites, so a fifth cannot appear unnoticed: the groups' own block for each page's
+  // record, the image-to-image composition, and the workspace-built card's derived prefix.
+  assert.equal([...app.matchAll(/composeGroupPrompt\(/g)].length, 4);
   assert.match(app, /loraGroupPrompt: composeGroupPrompt\(enabled, ""\)/);
   // The record is this run's facts; the group library still stays out.
   assert.match(app, /delete source\.loraGroupsByEngine;/);
@@ -425,7 +429,7 @@ test("every path that builds a card carries the group record", async () => {
     "declaration, the two generation records (text-to-image and image-to-image), the one call inside galleryCardSettings, and the image-reader apply source — which builds an apply overlay, not a card");
   // Image-to-image shares the mounts, so it must also carry the combinations they belong to.
   const imageRun = app.slice(app.indexOf("const generateFromImage = async"), app.indexOf("const releaseLoadedModel"));
-  assert.match(imageRun, /composeGroupPrompt\(runGroups, settings\.positive\)/,
+  assert.match(imageRun, /positive: runPrompt \}/,
     "an enabled group contributes its trigger words to an image-to-image run too");
   assert.match(imageRun, /loraGroupPrompt: composeGroupPrompt\(runGroups, ""\)/);
 });
@@ -454,7 +458,7 @@ test("applying a new mounted list switches off the combinations it replaced", as
   const after = disableUnmountedGroups(groups, applied);
   assert.equal(after.changed, true);
   assert.equal(after.groups[0].enabled, false);
-  assert.equal(composeGroupPrompt(groups, "a lantern"), "kazutake style, a lantern");
+  assert.equal(composeGroupPrompt(groups, "a lantern"), "kazutake style\n\na lantern");
   assert.equal(composeGroupPrompt(after.groups, "a lantern"), "a lantern");
   // The member list is kept: switching the group back on is how it is restored.
   assert.equal(after.groups[0].members.length, 2);

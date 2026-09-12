@@ -51,7 +51,7 @@ test("a Flux generation is guidance distilled: no negative branch, no enhancemen
   assert.match(generate, /const fluxGeneration = model === "Flux"/);
   assert.match(generate, /const nativeGeneration = animaGeneration \|\| fluxGeneration \|\| flux2Generation/);
   assert.match(generate, /\.\.\.\(fluxGeneration\s*\n\s*\? \{ diffusion_model: diffusionModel, text_encoder: textEncoder, text_encoder_2: textEncoder2, vae \}/);
-  assert.match(generate, /negative_prompt: distilledGeneration \? "" : negative\.trim\(\)/);
+  assert.match(generate, /negative_prompt: distilledGeneration \? "" : generationNegative/);
   assert.match(generate, /guidance: distilledGeneration \? "none" : guidance/);
   assert.doesNotMatch(generate, /preview_enabled|processPreview/);
 

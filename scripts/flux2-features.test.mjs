@@ -48,7 +48,7 @@ test("a Flux2 generation is guidance distilled: no negative branch, no enhanceme
   assert.match(generate, /const distilledGeneration = DISTILLED_GUIDANCE_ENGINES\.includes\(model\)/);
   // Flux2 mounts the three-component payload, not the four-component one.
   assert.match(generate, /: nativeGeneration \? \{ diffusion_model: diffusionModel, text_encoder: textEncoder, vae \} : \{ checkpoint \}/);
-  assert.match(generate, /negative_prompt: distilledGeneration \? "" : negative\.trim\(\)/);
+  assert.match(generate, /negative_prompt: distilledGeneration \? "" : generationNegative/);
   assert.match(generate, /guidance: distilledGeneration \? "none" : guidance/);
 
   const selectModel = sourceBetween(app, "  const selectModel = (nextModel)", "  const selectCheckpoint = (nextCheckpoint)");

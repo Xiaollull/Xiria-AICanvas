@@ -7,13 +7,17 @@ import {
   createPromptPresetId,
   deletePromptPreset,
   emptyPromptPresetContainer,
-  insertPromptPreset,
   normalizePromptPresetContainer,
   PROMPT_PRESET_BUILTIN_SEED_VERSION,
   PROMPT_PRESET_SCHEMA_VERSION,
   reorderPromptPreset,
   seededPromptPresetContainer,
   sortPromptPresetRecords,
+  composeGenerationPrompt,
+  joinPromptBlocks,
+  normalizeActivePromptPresetIds,
+  togglePromptPresetId,
+  PROMPT_BLOCK_SEPARATOR,
   updatePromptPreset,
   validatePromptPresetDraft,
 } from "../src/prompt-presets.js";
@@ -179,34 +183,6 @@ test("IDs prefer randomUUID, retry collisions, and use a secure UUIDv4 fallback 
   assert.doesNotMatch(source, /Date\.now|new Date|draft\.name.*id|name.*Date/);
 });
 
-test("start/end insertion normalizes only the adjoining English or Chinese punctuation", () => {
-  assert.deepEqual(insertPromptPreset("cat, dog", "sun", "start"), { text: "sun, cat, dog", caret: 3 });
-  assert.deepEqual(insertPromptPreset("cat, dog", "sun", "end"), { text: "cat, dog, sun", caret: 13 });
-  assert.deepEqual(insertPromptPreset("主体，光线", "电影感", "start"), { text: "电影感，主体，光线", caret: 3 });
-  assert.deepEqual(insertPromptPreset("主体，光线", "电影感", "end"), { text: "主体，光线，电影感", caret: 9 });
-  assert.equal(insertPromptPreset("cat, ", ", sun", "end").text, "cat, sun");
-  assert.equal(insertPromptPreset("主体，，", "，电影感", "end").text, "主体，电影感");
-});
-
-test("middle uses selection replacement, caret insertion, invalid-selection logical midpoint, and exact caret", () => {
-  assert.deepEqual(insertPromptPreset("cat, old, dog", "new", "middle", { start: 5, end: 8 }), { text: "cat, new, dog", caret: 8 });
-  assert.deepEqual(insertPromptPreset("cat, dog", "new", "middle", { start: 3, end: 3 }), { text: "cat, new, dog", caret: 8 });
-  assert.deepEqual(insertPromptPreset("abcdefg", "X", "middle"), { text: "abc, X, defg", caret: 6 });
-  assert.deepEqual(insertPromptPreset("abcdefg", "X", "middle", { start: -1, end: 80 }), { text: "abc, X, defg", caret: 6 });
-  assert.deepEqual(insertPromptPreset("😀abc", "X", "middle"), { text: "😀, X, abc", caret: 5 });
-});
-
-test("newline, mixed punctuation, weights, parentheses, and internal newlines remain local and lossless", () => {
-  assert.equal(insertPromptPreset("first line\nsecond line", "inserted", "end").text, "first line\nsecond line\ninserted");
-  assert.equal(insertPromptPreset("first line\nsecond line", "inserted", "start").text, "inserted\nfirst line\nsecond line");
-  assert.equal(insertPromptPreset("主体，soft light", "(face:1.25)\nno crop", "end").text, "主体，soft light，(face:1.25)\nno crop");
-  assert.equal(insertPromptPreset("cinematic portrait.", "soft light", "end").text, "cinematic portrait. soft light");
-  assert.equal(insertPromptPreset("主体。", "电影感", "end").text, "主体。电影感");
-  assert.equal(insertPromptPreset("(portrait)", "soft light", "middle", { start: 9, end: 9 }).text, "(portrait, soft light)");
-  assert.equal(insertPromptPreset("((masterpiece)), [style], \\(literal\\)", "(eyes:1.2)", "end").text, "((masterpiece)), [style], \\(literal\\), (eyes:1.2)");
-  assert.equal(insertPromptPreset("a,,  b, c", "b", "end").text, "a,,  b, c, b", "does not globally rewrite or semantically deduplicate");
-});
-
 test("App source pairs every new state setter and enforces running, persistence, selection, ARIA, modal, delete, and Gallery exclusion contracts", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   // The card settings schema and the dialog lifecycle live in gallery-core; the page and the
@@ -238,8 +214,12 @@ test("App source pairs every new state setter and enforces running, persistence,
   assert.match(app, /onKeyUp=\{\(event\) => recordPromptSelection/);
   assert.match(app, /onFocus=\{\(event\) => recordPromptSelection/);
   assert.match(app, /revision/);
-  assert.match(app, /requestAnimationFrame[\s\S]{0,500}setSelectionRange/);
-  assert.match(app, /const applyPreset[\s\S]{0,250}status === "running"[\s\S]{0,1800}setPositive\(\(current\)/);
+  assert.match(app, /const applyPreset[\s\S]{0,200}status === "running"[\s\S]{0,260}setActivePromptPresets\(\(current\) => \(\{ \.\.\.current, \[record\.type\]: togglePromptPresetId\(current\[record\.type\], record\.id\) \}\)\);/);
+  // Switching a preset on must never write into the prompt box: the box holds what was typed, and
+  // the preset's words join it only on their way to the job.
+  assert.ok(!/setPositive\([^)]*(?:record\.content|applyPreset)/.test(app), "a preset never rewrites the positive box");
+  assert.ok(!/setNegative\([^)]*(?:record\.content|applyPreset)/.test(app), "a preset never rewrites the negative box");
+  assert.doesNotMatch(app, /insertPromptPreset/, "nothing inserts a preset into the box any more");
   for (const handler of ["openPromptPresetDialog", "savePromptPreset", "requestDeletePromptPreset", "confirmDeletePromptPreset"]) {
     assert.match(app, new RegExp(`const ${handler}[\\s\\S]{0,180}status === "running"`), `${handler} fails closed while running`);
   }
@@ -273,4 +253,77 @@ test("App source pairs every new state setter and enforces running, persistence,
     "no card-producing prop may bypass galleryCardSettings");
   for (const selector of [".prompt-preset-grid", ".prompt-preset-card", ".prompt-preset-menu", ".prompt-preset-backdrop", ".prompt-preset-dialog", ".prompt-preset-segmented", ".prompt-preset-error"]) assert.match(css, new RegExp(selector.replace(".", "\\.")));
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.prompt-preset-grid \{ grid-template-columns: 1fr;/);
+});
+
+test("a switched-on preset joins the prompt at generation, a blank line apart", () => {
+  const records = [
+    { id: "p-head", name: "开头", content: "prompt1, 2, 3, 4", position: "start", type: "positive", order: 0, version: 1 },
+    { id: "p-mid", name: "中间", content: "middle words", position: "middle", type: "positive", order: 1, version: 1 },
+    { id: "p-tail", name: "结尾", content: "tail words", position: "end", type: "positive", order: 2, version: 1 },
+    { id: "n-1", name: "负面", content: "worst quality", position: "end", type: "negative", order: 0, version: 1 },
+  ];
+  // Exactly the shape asked for: the preset, a blank line, then what was typed.
+  assert.equal(composeGenerationPrompt({ records, activeIds: ["p-head"], prompt: "TTTTTTT" }), "prompt1, 2, 3, 4\n\nTTTTTTT");
+  // Nothing switched on leaves the typed prompt exactly as it is.
+  assert.equal(composeGenerationPrompt({ records, activeIds: [], prompt: "TTTTTTT" }), "TTTTTTT");
+  // The LoRA groups' words lead everything, because the mounted weights answer to them.
+  assert.equal(
+    composeGenerationPrompt({ groupPrompt: "kazutake style", records, activeIds: ["p-head", "p-tail"], prompt: "TTTTTTT" }),
+    "kazutake style\n\nprompt1, 2, 3, 4\n\nTTTTTTT\n\ntail words",
+  );
+  // Beginning presets lead the typed prompt whatever order they were switched on in; "middle" has
+  // no caret to sit at any more, so it is a second block ahead of the text.
+  assert.equal(
+    composeGenerationPrompt({ records, activeIds: ["p-mid", "p-head"], prompt: "TTTTTTT" }),
+    "prompt1, 2, 3, 4\n\nmiddle words\n\nTTTTTTT",
+  );
+  // The negative prompt aggregates by the same rule, from its own presets only.
+  assert.equal(composeGenerationPrompt({ records, activeIds: ["n-1"], type: "negative", prompt: "blurry" }), "blurry\n\nworst quality");
+  assert.equal(composeGenerationPrompt({ records, activeIds: ["p-head"], type: "negative", prompt: "blurry" }), "blurry");
+  // An empty prompt box is not an empty paragraph.
+  assert.equal(composeGenerationPrompt({ records, activeIds: ["p-head"], prompt: "   " }), "prompt1, 2, 3, 4");
+  assert.equal(composeGenerationPrompt(), "");
+});
+
+test("the switches survive a reload and cannot outlive the preset they name", () => {
+  const records = [{ id: "p-1", name: "A", content: "a", position: "end", type: "positive", order: 0, version: 1 }];
+  assert.deepEqual(normalizeActivePromptPresetIds(["p-1", "p-1", "ghost", 7, null], records), ["p-1"]);
+  assert.deepEqual(normalizeActivePromptPresetIds("not an array", records), []);
+  assert.deepEqual(normalizeActivePromptPresetIds(["p-1"], []), [], "a deleted preset stops contributing");
+  assert.deepEqual(togglePromptPresetId(["p-1"], "p-1"), []);
+  assert.deepEqual(togglePromptPresetId([], "p-1"), ["p-1"]);
+  assert.deepEqual(togglePromptPresetId(null, "p-1"), ["p-1"]);
+  assert.equal(joinPromptBlocks(["a", "", "  ", "b"]), `a${PROMPT_BLOCK_SEPARATOR}b`);
+  assert.equal(joinPromptBlocks(null), "");
+});
+
+test("the workspace remembers which presets are on, and a gallery card records what ran", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const gallery = fs.readFileSync(new URL("../src/GalleryPage.jsx", import.meta.url), "utf8");
+  // Persisted with the library it points into, and read back through the same normalizer, so a
+  // preset deleted between sessions cannot come back as a dangling switch.
+  assert.match(app, /activePromptPresets: \{\s*positive: normalizeActivePromptPresetIds\(saved\.activePromptPresets\?\.positive/);
+  assert.match(app, /promptPresets: persistedPromptPresets,\s*activePromptPresets,/);
+  assert.match(app, /setActivePromptPresets\(workspace\.activePromptPresets\);/);
+  // Deleting a preset switches it off rather than leaving words nobody can see.
+  assert.match(app, /const confirmDeletePromptPreset[\s\S]{0,400}setActivePromptPresets\(\(current\) => \(\{\s*positive: current\.positive\.filter/);
+  // The switches are workspace state, so they never ride along in a gallery card.
+  assert.match(app, /activePromptPresets: _activePromptPresets,/);
+  // The card records the words that ran, and the inspector shows them whenever they differ from
+  // what was typed -- a preset can now add to the prompt, not only a LoRA group.
+  assert.match(app, /composedPrompt: generationPrompt,/);
+  assert.match(app, /composedNegative: distilledGeneration \? "" : generationNegative,/);
+  assert.match(gallery, /if \(typeof settings\.composedPrompt === "string" && settings\.composedPrompt\) return settings\.composedPrompt;/);
+  assert.match(gallery, /effectivePrompt\(settings\) !== settings\.positive && \(/);
+});
+
+test("a preset card says it is on, in both themes, and the box counts them", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(app, /className=\{`prompt-preset-card \$\{active \? "active" : ""\}`\}/);
+  assert.match(app, /aria-pressed=\{active\}/);
+  assert.match(app, /已启用/);
+  // The accent border is the signal, and hovering an inactive card must not be able to imitate it.
+  assert.match(css, /\.prompt-preset-card\.active, \.prompt-preset-card\.active:hover \{ border-color: var\(--lime\);/);
+  assert.match(css, /html\[data-theme-mode="light"\] \.prompt-preset-card\.active \{ border-color: #7a4fe0;/);
 });

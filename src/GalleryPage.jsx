@@ -156,11 +156,19 @@ function FocusImage({ image, alt, style }) {
   );
 }
 
-/** The prompt as submitted: the enabled groups' prefix ahead of the user's text. */
+/**
+ * The prompt as submitted. A card recorded since presets became switches carries the whole thing;
+ * an older one is rebuilt from the only piece it kept, the enabled groups' prefix ahead of the text.
+ */
 function effectivePrompt(settings) {
+  if (typeof settings.composedPrompt === "string" && settings.composedPrompt) return settings.composedPrompt;
   return settings.loraGroupPrompt
     ? composeGroupPrompt([{ id: "recorded", name: "", enabled: true, presetPrompt: settings.loraGroupPrompt, members: [] }], settings.positive)
     : settings.positive;
+}
+
+function effectiveNegativePrompt(settings) {
+  return typeof settings.composedNegative === "string" && settings.composedNegative ? settings.composedNegative : settings.negative;
 }
 
 function PromptBlock({ tone, label, value, onNotice }) {
@@ -833,11 +841,14 @@ function GalleryInspector({ card, settings, isSplit, onEdit, onDelete, onNotice,
   return <section className="gallery-inspector" aria-label="生成参数">
     <header><div><span>CURATED DETAIL</span><h1 title={card.title || settings.positive}>{displayTitle(card)}</h1><p>{card.collection_id} · 更新于 {formatDate(card.updated_at)}</p></div><div><button type="button" onClick={() => onEdit(card)}><Pencil size={14} />编辑</button><button type="button" className="danger" aria-label="删除精选卡片" onClick={() => onDelete(card)}><Trash2 size={14} /></button></div></header>
     <div className="gallery-inspector-scroll">
-      {settings.loraGroupPrompt && (
+      {effectivePrompt(settings) !== settings.positive && (
         <PromptBlock tone="composed" label="实际提交的正向 Prompt" value={effectivePrompt(settings)} onNotice={onNotice} />
       )}
-      <PromptBlock tone="positive" label={settings.loraGroupPrompt ? "正向 Prompt（手写部分）" : "正向 Prompt"} value={settings.positive} onNotice={onNotice} />
-      <PromptBlock tone="negative" label="负向 Prompt" value={settings.negative} onNotice={onNotice} />
+      <PromptBlock tone="positive" label={effectivePrompt(settings) !== settings.positive ? "正向 Prompt（手写部分）" : "正向 Prompt"} value={settings.positive} onNotice={onNotice} />
+      {effectiveNegativePrompt(settings) !== settings.negative && (
+        <PromptBlock tone="composed" label="实际提交的负向 Prompt" value={effectiveNegativePrompt(settings)} onNotice={onNotice} />
+      )}
+      <PromptBlock tone="negative" label={effectiveNegativePrompt(settings) !== settings.negative ? "负向 Prompt（手写部分）" : "负向 Prompt"} value={settings.negative} onNotice={onNotice} />
       {settings.loraGroups.length > 0 && (
         <section className="gallery-detail-section gallery-group-section">
           <header><span>LORA GROUPS</span><strong>生成时启用的组合</strong></header>

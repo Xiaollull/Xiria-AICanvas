@@ -1,3 +1,4 @@
+import { PROMPT_BLOCK_SEPARATOR } from "./prompt-presets.js";
 import { normalizeMountedLoras } from "./lora-state.js";
 import { READY_LORA_ENGINES, engineScopeKey } from "./lora-model-scope.js";
 
@@ -164,16 +165,14 @@ export function enabledLoraGroups(groups) {
  * the request body only, so what is submitted stays visible in the saved
  * settings while the box the user owns keeps saying what they wrote.
  */
+// A preset that already ends in a comma must not produce ", ," once joined.
+const trimPromptEdges = (value) => String(value ?? "").trim().replace(/^[,\s]+|[,\s]+$/g, "");
+
 export function composeGroupPrompt(groups, basePrompt = "") {
-  const parts = [
-    ...enabledLoraGroups(groups).map((group) => group.presetPrompt),
-    typeof basePrompt === "string" ? basePrompt : "",
-  ];
-  return parts
-    // A preset that already ends in a comma must not produce ", ," once joined.
-    .map((part) => part.trim().replace(/^[,\s]+|[,\s]+$/g, ""))
-    .filter(Boolean)
-    .join(", ");
+  // The enabled groups read as one list of words, so they stay comma-joined with each other; the
+  // prompt they lead is a separate thought and is separated by a blank line.
+  const groupBlock = enabledLoraGroups(groups).map((group) => trimPromptEdges(group.presetPrompt)).filter(Boolean).join(", ");
+  return [groupBlock, trimPromptEdges(basePrompt)].filter(Boolean).join(PROMPT_BLOCK_SEPARATOR);
 }
 
 /** The group a mounted entry belongs to, or "" when it is a standalone mount. */

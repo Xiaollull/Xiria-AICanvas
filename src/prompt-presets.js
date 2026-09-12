@@ -266,64 +266,52 @@ export function reorderPromptPreset(container, id, targetIndex, targetType = nul
   return { ...current, records };
 }
 
-const CJK_PATTERN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 
-function stripLeftBoundary(value) {
-  return value.replace(/[ \t]*(?:(?:,|，)[ \t]*)+$/u, "").replace(/[ \t]+$/u, "");
+// Every contributing piece of a prompt is its own paragraph. A preset that is switched on is not
+// written into the box -- it is joined onto what the user typed only when the job is submitted --
+// so the blank line is what keeps the two readable as separate thoughts.
+export const PROMPT_BLOCK_SEPARATOR = "\n\n";
+
+export function joinPromptBlocks(blocks) {
+  return (Array.isArray(blocks) ? blocks : [])
+    .map((block) => String(block ?? "").trim())
+    .filter(Boolean)
+    .join(PROMPT_BLOCK_SEPARATOR);
 }
 
-function stripRightBoundary(value) {
-  return value.replace(/^(?:[ \t]*(?:,|，))+[ \t]*/u, "").replace(/^[ \t]+/u, "");
+export function normalizeActivePromptPresetIds(value, records = []) {
+  const known = new Set((Array.isArray(records) ? records : []).map((record) => record?.id).filter((id) => typeof id === "string"));
+  const seen = new Set();
+  // A preset that has since been deleted stops being active rather than lingering as a dangling id.
+  return (Array.isArray(value) ? value : [])
+    .filter((id) => typeof id === "string" && known.has(id) && !seen.has(id) && seen.add(id))
+    .slice(0, 200);
 }
 
-function nearestSeparator(value, fromEnd) {
-  const separators = [...value.matchAll(/\r?\n|,|，/gu)];
-  if (!separators.length) return "";
-  return fromEnd ? separators.at(-1)[0] : separators[0][0];
+export function togglePromptPresetId(ids, id) {
+  const list = Array.isArray(ids) ? ids : [];
+  return list.includes(id) ? list.filter((candidate) => candidate !== id) : [...list, id];
 }
 
-function boundarySeparator(rawLeft, rawRight, left, right) {
-  if (!left || !right || /\r?\n$/u.test(left) || /^\r?\n/u.test(right)) return "";
-  const explicitLeft = rawLeft.match(/(,|，)[ \t]*$/u)?.[1];
-  const explicitRight = rawRight.match(/^[ \t]*(,|，)/u)?.[1];
-  if (explicitLeft === "，" || explicitRight === "，") return "，";
-  if (explicitLeft === "," || explicitRight === ",") return ", ";
-  if (/[。；：！？、]$/u.test(left) || /^[。；：！？、）】》」』]/u.test(right)) return "";
-  if (/[.;:!?]$/u.test(left)) return " ";
-  if (/^[.;:!?\)\]\}]/u.test(right) || /[\(\[\{]$/u.test(left)) return "";
-  const leftStyle = nearestSeparator(rawLeft, true);
-  const rightStyle = nearestSeparator(rawRight, false);
-  if (/\r?\n/u.test(leftStyle) || (!leftStyle && /\r?\n/u.test(rightStyle))) return "\n";
-  if (leftStyle === "，" || rightStyle === "，") return "，";
-  const leftHint = left.slice(-24);
-  const rightHint = right.slice(0, 24);
-  return CJK_PATTERN.test(leftHint) || CJK_PATTERN.test(rightHint) ? "，" : ", ";
+// Where a switched-on preset sits relative to what the user typed. Without a caret to insert at,
+// "middle" no longer means anything between two halves of the text: it is a second block ahead of
+// the typed prompt, after the ones marked as the beginning.
+const PRESET_BLOCK_ORDER = Object.freeze({ start: 0, middle: 1, end: 2 });
+
+export function activePromptPresetBlocks(records, activeIds, type = "positive") {
+  const active = new Set(normalizeActivePromptPresetIds(activeIds, records));
+  const chosen = sortPromptPresetRecords(records, type).filter((record) => active.has(record.id));
+  const ordered = [...chosen].sort((first, second) => (PRESET_BLOCK_ORDER[first.position] ?? 2) - (PRESET_BLOCK_ORDER[second.position] ?? 2));
+  return {
+    leading: ordered.filter((record) => record.position !== "end").map((record) => record.content),
+    trailing: ordered.filter((record) => record.position === "end").map((record) => record.content),
+  };
 }
 
-function validSelection(selection, length) {
-  if (!selection || !Number.isInteger(selection.start) || !Number.isInteger(selection.end)) return null;
-  if (selection.start < 0 || selection.end < selection.start || selection.end > length) return null;
-  return { start: selection.start, end: selection.end };
-}
-
-export function insertPromptPreset(text, presetContent, position = "end", selection = null) {
-  const source = String(text ?? "");
-  const content = String(presetContent ?? "").trim();
-  if (!content) return { text: source, caret: Math.max(0, Math.min(source.length, position === "start" ? 0 : source.length)) };
-  let start = position === "start" ? 0 : source.length;
-  let end = start;
-  if (position === "middle") {
-    const selected = validSelection(selection, source.length);
-    start = selected ? selected.start : Math.floor(source.length / 2);
-    end = selected ? selected.end : start;
-  }
-  const rawLeft = source.slice(0, start);
-  const rawRight = source.slice(end);
-  const left = stripLeftBoundary(rawLeft);
-  const insertion = stripRightBoundary(stripLeftBoundary(content));
-  const right = stripRightBoundary(rawRight);
-  const before = boundarySeparator(rawLeft, content, left, insertion);
-  const after = boundarySeparator(content, rawRight, insertion, right);
-  const inserted = `${left}${before}${insertion}`;
-  return { text: `${inserted}${after}${right}`, caret: inserted.length };
+// The whole prompt as the job receives it. The LoRA groups' words come first whatever else is on --
+// they name what the mounted weights were trained to answer to, so they lead -- then the presets
+// switched on for the beginning, then what the user typed, then the presets marked for the end.
+export function composeGenerationPrompt({ groupPrompt = "", records = [], activeIds = [], type = "positive", prompt = "" } = {}) {
+  const { leading, trailing } = activePromptPresetBlocks(records, activeIds, type);
+  return joinPromptBlocks([groupPrompt, ...leading, prompt, ...trailing]);
 }

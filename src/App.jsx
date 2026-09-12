@@ -185,7 +185,9 @@ import { useLoraCards } from "./use-lora-cards.js";
 import {
   createPromptPreset,
   deletePromptPreset,
-  insertPromptPreset,
+  composeGenerationPrompt,
+  normalizeActivePromptPresetIds,
+  togglePromptPresetId,
   normalizePromptPresetContainer,
   seededPromptPresetContainer,
   sortPromptPresetRecords,
@@ -848,6 +850,12 @@ function loadWorkspaceState(saved) {
       positive: typeof saved.positive === "string" ? saved.positive : "",
       negative: typeof saved.negative === "string" ? saved.negative : "",
       promptPresets: promptPresetLibrary.container,
+      // Which presets were switched on. Ids that no longer name a preset are dropped, so deleting
+      // a preset cannot leave it silently contributing words nobody can see.
+      activePromptPresets: {
+        positive: normalizeActivePromptPresetIds(saved.activePromptPresets?.positive, promptPresetLibrary.container.records),
+        negative: normalizeActivePromptPresetIds(saved.activePromptPresets?.negative, promptPresetLibrary.container.records),
+      },
       promptPresetLibraryError: promptPresetLibrary.error,
       promptPresetLibraryWarning: promptPresetLibrary.warning,
       promptPresetLibraryRaw: promptPresetLibrary.fatal ? promptPresetLibrary.raw : null,
@@ -941,7 +949,9 @@ function gallerySettingsWithoutPromptPresets(settings) {
   // the user never asked to change.
   // The per-engine parameter library joins the other workspace-wide libraries here. A card records
   // one run; carrying every engine's parameters in it would let applying the card rewrite them all.
-  const { promptPresets: _promptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, ...gallerySettings } = settings;
+  // Which presets happen to be switched on belongs to the workspace too: a card records the
+  // words that ran, in `composedPrompt`, not the switches that produced them.
+  const { promptPresets: _promptPresets, activePromptPresets: _activePromptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, ...gallerySettings } = settings;
   return gallerySettings;
 }
 
@@ -1060,7 +1070,7 @@ function CountField({ label, detail, value, min = 1, max, disabled = false, onCh
 
 const promptPresetPositionLabels = { start: "开头", middle: "中间", end: "结尾" };
 
-function PresetBox({ title, type, records, disabled, libraryError, libraryWarning, onSelect, onCreate, onEdit, onDelete }) {
+function PresetBox({ title, type, records, activeIds, disabled, libraryError, libraryWarning, onSelect, onCreate, onEdit, onDelete }) {
   const [open, setOpen] = useState(false);
   const [menuId, setMenuId] = useState("");
   const listId = `prompt-preset-${type}-list`;
@@ -1091,7 +1101,7 @@ function PresetBox({ title, type, records, disabled, libraryError, libraryWarnin
       <div className="preset-head">
         <button type="button" aria-expanded={open} aria-controls={listId} onClick={() => { setOpen((current) => !current); setMenuId(""); }}>
           <span>{title}</span>
-          <span className="preset-meta">{records.length} 个预设 <ChevronDown size={15} /></span>
+          <span className="preset-meta">{activeIds.length ? `${activeIds.length}/${records.length} 已启用` : `${records.length} 个预设`} <ChevronDown size={15} /></span>
         </button>
         <button type="button" className="prompt-preset-add" data-prompt-preset-focus-fallback={type} aria-label={`新增${type === "positive" ? "正向" : "负向"} Prompt 预设`} disabled={disabled || Boolean(libraryError)} onClick={onCreate}><Plus size={14} />新增</button>
       </div>
@@ -1099,13 +1109,14 @@ function PresetBox({ title, type, records, disabled, libraryError, libraryWarnin
         <div className="preset-list" id={listId}>
           {libraryError && <p className="prompt-preset-error" role="alert">{libraryError}</p>}
           {!libraryError && libraryWarning && <p className="prompt-preset-warning" role="status">{libraryWarning}</p>}
-          {!libraryError && records.length === 0 && <div className="prompt-preset-empty"><strong>暂无{type === "positive" ? "正向" : "负向"}预设</strong><p>可以新增一个常用 Prompt，并设置默认插入位置。</p><button type="button" disabled={disabled} onClick={onCreate}><Plus size={14} />新增预设</button></div>}
+          {!libraryError && records.length === 0 && <div className="prompt-preset-empty"><strong>暂无{type === "positive" ? "正向" : "负向"}预设</strong><p>可以新增一个常用 Prompt，点击即可启用，生成时自动拼接。</p><button type="button" disabled={disabled} onClick={onCreate}><Plus size={14} />新增预设</button></div>}
           {!libraryError && records.length > 0 && <div className="prompt-preset-grid">
             {records.map((record) => {
               const menuOpen = menuId === record.id;
               const menuControlId = `prompt-preset-menu-${type}-${record.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-              return <article className="prompt-preset-card" key={record.id}>
-                <button type="button" className="prompt-preset-main" aria-label={`插入${type === "positive" ? "正向" : "负向"}预设“${record.name}”到${promptPresetPositionLabels[record.position]}`} disabled={disabled} onClick={() => onSelect(record)}>
+              const active = activeIds.includes(record.id);
+              return <article className={`prompt-preset-card ${active ? "active" : ""}`} key={record.id}>
+                <button type="button" className="prompt-preset-main" aria-pressed={active} aria-label={`${active ? "停用" : "启用"}${type === "positive" ? "正向" : "负向"}预设“${record.name}”（生成时置于${promptPresetPositionLabels[record.position]}）`} disabled={disabled} onClick={() => onSelect(record)}>
                   <span><strong>{record.name}</strong><b>{promptPresetPositionLabels[record.position]}</b></span>
                   <small>{record.content.replace(/\s+/g, " ")}</small>
                 </button>
@@ -1152,7 +1163,7 @@ function PromptPresetDialog({ dialog, records, running, onSave, onRequestClose }
         <label className={validation.errors.name ? "invalid" : ""}><span>预设名称 <small>{draft.name.length} / 48</small></span><input autoFocus data-dialog-autofocus value={draft.name} maxLength={48} disabled={running} aria-invalid={Boolean(validation.errors.name)} onChange={(event) => update("name", event.target.value)} />{validation.errors.name && <em>{validation.errors.name}</em>}</label>
         <label className={`prompt-preset-content-field ${validation.errors.content ? "invalid" : ""}`}><span>Prompt 内容 <small>{draft.content.length} 字符</small></span><textarea value={draft.content} disabled={running} aria-invalid={Boolean(validation.errors.content)} onChange={(event) => update("content", event.target.value)} placeholder="保留权重、括号与内部换行" />{validation.errors.content && <em>{validation.errors.content}</em>}</label>
         <fieldset><legend>Prompt 类型</legend><div className="prompt-preset-segmented two">{[["positive", "正向"], ["negative", "负向"]].map(([value, label]) => <button type="button" className={draft.type === value ? "active" : ""} aria-pressed={draft.type === value} disabled={running} key={value} onClick={() => update("type", value)}>{label}</button>)}</div><small>切换类型后，预设会移动到目标分区末尾。</small></fieldset>
-        <fieldset><legend>默认插入位置</legend><div className="prompt-preset-segmented three">{[["start", "开头"], ["middle", "中间"], ["end", "结尾"]].map(([value, label]) => <button type="button" className={draft.position === value ? "active" : ""} aria-pressed={draft.position === value} disabled={running} key={value} onClick={() => update("position", value)}>{label}</button>)}</div><small>中间优先替换当前选区或插入光标处；没有有效选区时使用文本逻辑中点。</small></fieldset>
+        <fieldset><legend>生成时的拼接位置</legend><div className="prompt-preset-segmented three">{[["start", "开头"], ["middle", "中间"], ["end", "结尾"]].map(([value, label]) => <button type="button" className={draft.position === value ? "active" : ""} aria-pressed={draft.position === value} disabled={running} key={value} onClick={() => update("position", value)}>{label}</button>)}</div><small>启用后不会写入输入框，生成时才拼接：开头与中间排在输入框内容之前，结尾排在其后，各段之间空一行。</small></fieldset>
       </div>
       <footer><span>{dialog.record ? `ID ${dialog.record.id}` : "ID 将由安全随机源生成"}</span><div><button type="button" onClick={requestClose}>取消</button><button type="submit" className="primary" disabled={running || !validation.valid}><Save size={14} />{running ? "生成中已锁定" : "保存预设"}</button></div></footer>
     </form>
@@ -1267,6 +1278,10 @@ function App() {
   const [positive, setPositive] = useState("a quiet observatory above the clouds, lone astronomer, warm light, cinematic composition");
   const [negative, setNegative] = useState("low quality, blurry, malformed hands, oversaturated, watermark");
   const [promptPresets, setPromptPresets] = useState(seededPromptPresetContainer);
+  // Which presets are switched on, per prompt. Clicking one no longer writes it into the box: it
+  // is joined onto the prompt when the job is submitted, so the box keeps only what was typed and
+  // switching a preset off takes its words back out again.
+  const [activePromptPresets, setActivePromptPresets] = useState({ positive: [], negative: [] });
   const [promptPresetLibraryError, setPromptPresetLibraryError] = useState("");
   const [promptPresetLibraryWarning, setPromptPresetLibraryWarning] = useState("");
   const [shouldPersistPromptPresets, setShouldPersistPromptPresets] = useState(true);
@@ -1559,9 +1574,6 @@ function App() {
     positive: { text: positive, revision: 0 },
     negative: { text: negative, revision: 0 },
   });
-  const promptFocusRequest = useRef(null);
-  const promptFocusRaf = useRef(null);
-  const promptFocusSession = useRef(0);
   const workspaceSnapshot = useRef(null);
   const uiStateSnapshot = useRef(null);
   inferenceHealthRef.current = inferenceHealth;
@@ -1655,6 +1667,7 @@ function App() {
   workspaceSnapshot.current = {
     model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     promptPresets: persistedPromptPresets,
+    activePromptPresets,
     sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch,
     // The selected engine's record is the live hooks, which have not been written back to the map
     // yet -- that happens on the way out of an engine. Folding them in here is what makes a reload
@@ -1799,6 +1812,7 @@ function App() {
           setPositive(workspace.positive);
           setNegative(workspace.negative);
           setPromptPresets(workspace.promptPresets);
+          setActivePromptPresets(workspace.activePromptPresets);
           setPromptPresetLibraryError(workspace.promptPresetLibraryError);
           setPromptPresetLibraryWarning(workspace.promptPresetLibraryWarning);
           setPromptPresetLibraryRaw(workspace.promptPresetLibraryRaw);
@@ -1879,44 +1893,13 @@ function App() {
     if (!uiStateReady) return undefined;
     const timer = window.setTimeout(persistUiState, 300);
     return () => window.clearTimeout(timer);
-  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
+  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, activePromptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
 
   useEffect(() => {
     const saveBeforeExit = () => persistUiState(true);
     window.addEventListener("pagehide", saveBeforeExit);
     return () => window.removeEventListener("pagehide", saveBeforeExit);
   }, [uiStateReady]);
-
-  useEffect(() => {
-    const pending = promptFocusRequest.current;
-    if (!pending) return undefined;
-    if (pending.text !== (pending.type === "positive" ? positive : negative)) {
-      promptFocusRequest.current = null;
-      promptFocusSession.current += 1;
-      return undefined;
-    }
-    if (promptFocusRaf.current !== null) window.cancelAnimationFrame(promptFocusRaf.current);
-    promptFocusRaf.current = window.requestAnimationFrame(() => {
-      promptFocusRaf.current = null;
-      if (pending.session !== promptFocusSession.current) return;
-      const node = pending.type === "positive" ? positivePromptRef.current : negativePromptRef.current;
-      if (!node?.isConnected || node.value !== pending.text) return;
-      node.focus();
-      node.setSelectionRange(pending.caret, pending.caret);
-      recordPromptSelection(pending.type, { currentTarget: node });
-    });
-    return () => {
-      if (promptFocusRaf.current !== null) window.cancelAnimationFrame(promptFocusRaf.current);
-      promptFocusRaf.current = null;
-    };
-  }, [positive, negative]);
-
-  useEffect(() => () => {
-    promptFocusSession.current += 1;
-    if (promptFocusRaf.current !== null) window.cancelAnimationFrame(promptFocusRaf.current);
-    promptFocusRaf.current = null;
-    promptFocusRequest.current = null;
-  }, []);
 
   useEffect(() => {
     if (!uiStateReady) return undefined;
@@ -2774,6 +2757,10 @@ function App() {
     // group *library* stays out of the card, only this run's facts go in.
     const generationGroups = enabledLoraGroups(loraGroupsForScope(loraGroupsMapRef.current, activeLoraScopeRef.current));
     const generationGroupPrompt = composeGroupPrompt(generationGroups, "");
+    // The prompt as the job receives it: the LoRA groups' words lead, then the presets switched on,
+    // then what was typed. Each is its own paragraph, and the box itself is never rewritten.
+    const generationPrompt = composeGenerationPrompt({ groupPrompt: generationGroupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: positive });
+    const generationNegative = composeGenerationPrompt({ records: promptPresets.records, activeIds: activePromptPresets.negative, type: "negative", prompt: negative });
     const generationHiresSeed = generationHiresSeedSettings(hires);
     const generationHires = { ...hires, ...generationHiresSeed };
     setSeed(generationSeed);
@@ -2789,6 +2776,10 @@ function App() {
       loras: generationLoras,
       loraGroups: generationGroups.map((group) => ({ id: group.id, name: group.name, presetPrompt: group.presetPrompt })),
       loraGroupPrompt: generationGroupPrompt,
+      // What actually ran, so a gallery card shows the prompt that produced the image rather than
+      // only the part of it that was typed.
+      composedPrompt: generationPrompt,
+      composedNegative: distilledGeneration ? "" : generationNegative,
     })));
     try {
       const response = await fetch("/api/inference/jobs", {
@@ -2799,16 +2790,15 @@ function App() {
           ...(fluxGeneration
             ? { diffusion_model: diffusionModel, text_encoder: textEncoder, text_encoder_2: textEncoder2, vae }
             : nativeGeneration ? { diffusion_model: diffusionModel, text_encoder: textEncoder, vae } : { checkpoint }),
-          // Enabled LoRA groups contribute their preset prompt ahead of what the
-          // user typed. This is composed onto the request body only: the prompt
-          // box is never rewritten, and `generatedSettings` keeps the user's own
-          // text so restoring a gallery item cannot prepend the presets a second
-          // time on the next run.
-          prompt: composeGroupPrompt(generationGroups, positive),
+          // Enabled LoRA groups and switched-on presets contribute ahead of what the user
+          // typed. This is composed onto the request body only: the prompt box is never
+          // rewritten, and `generatedSettings` keeps the user's own text so restoring a gallery
+          // item cannot prepend the same words a second time on the next run.
+          prompt: generationPrompt,
           // Both Flux generations are guidance distilled and have no unconditional branch, so the
           // box keeps what the user typed for the other engines while the request carries nothing
           // to encode.
-          negative_prompt: distilledGeneration ? "" : negative.trim(),
+          negative_prompt: distilledGeneration ? "" : generationNegative,
           width: size.width,
           height: size.height,
           steps,
@@ -2913,6 +2903,7 @@ function App() {
     // and would attribute those to a picture they had nothing to do with. Restoring such a card
     // still lands on the text-to-image page without the source image, which is why the page it
     // came from is recorded alongside the parameters.
+    const runPrompt = composeGenerationPrompt({ groupPrompt: composeGroupPrompt(runGroups, ""), records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: settings.positive });
     setGeneratedSettings(JSON.parse(JSON.stringify({
       ...gallerySettingsWithoutPromptPresets(workspaceSnapshot.current),
       page: "image",
@@ -2936,6 +2927,7 @@ function App() {
       postprocessOrder: settings.postprocessOrder,
       loraGroups: runGroups.map((group) => ({ id: group.id, name: group.name, presetPrompt: group.presetPrompt })),
       loraGroupPrompt: composeGroupPrompt(runGroups, ""),
+      composedPrompt: runPrompt,
     })));
     try {
       const response = await fetch("/api/inference/jobs", {
@@ -2949,7 +2941,7 @@ function App() {
           textEncoder2,
           vae,
            source: imageSource,
-           settings: { ...settings, positive: composeGroupPrompt(runGroups, settings.positive) },
+           settings: { ...settings, positive: runPrompt },
            seed: runSeed,
            hiresSeed: runHiresSeed,
            samplers: activeSamplerNames,
@@ -5329,23 +5321,7 @@ function App() {
     if (status === "running" || promptPresetLibraryError) return;
     const record = promptPresets.records.find((candidate) => candidate.id === requestedRecord?.id);
     if (!record) return;
-    const type = record.type;
-    const state = promptTextRevision.current[type];
-    const node = type === "positive" ? positivePromptRef.current : negativePromptRef.current;
-    const liveSelection = document.activeElement === node && node?.value === state.text
-      ? { start: node.selectionStart, end: node.selectionEnd }
-      : null;
-    const cached = promptSelectionCache.current[type];
-    const cachedSelection = cached?.revision === state.revision ? { start: cached.start, end: cached.end } : null;
-    const selection = liveSelection || cachedSelection;
-    const result = insertPromptPreset(state.text, record.content, record.position, selection);
-    const revision = state.revision + 1;
-    promptTextRevision.current[type] = { text: result.text, revision };
-    promptSelectionCache.current[type] = { start: result.caret, end: result.caret, revision };
-    const session = ++promptFocusSession.current;
-    promptFocusRequest.current = { type, text: result.text, caret: result.caret, session };
-    if (type === "positive") setPositive((current) => current === state.text ? result.text : insertPromptPreset(current, record.content, record.position).text);
-    else setNegative((current) => current === state.text ? result.text : insertPromptPreset(current, record.content, record.position).text);
+    setActivePromptPresets((current) => ({ ...current, [record.type]: togglePromptPresetId(current[record.type], record.id) }));
   };
 
   const openPromptPresetDialog = (type, record = null) => {
@@ -5377,6 +5353,12 @@ function App() {
   const confirmDeletePromptPreset = () => {
     if (status === "running" || promptPresetLibraryError || !promptPresetDelete) return;
     setPromptPresets((current) => deletePromptPreset(current, promptPresetDelete.id));
+    // A deleted preset stops contributing its words, rather than staying switched on as an id
+    // nothing on screen can show or turn off again.
+    setActivePromptPresets((current) => ({
+      positive: current.positive.filter((id) => id !== promptPresetDelete.id),
+      negative: current.negative.filter((id) => id !== promptPresetDelete.id),
+    }));
     setShouldPersistPromptPresets(true);
     setPromptPresetDelete(null);
   };
@@ -6532,7 +6514,7 @@ function App() {
             <div className={`transparent-mode-copy ${backgroundRemovalDownloadForSelection?.status || ""}`} aria-live="polite"><strong>透明背景模式</strong><span>{backgroundRemovalDownloadForSelection?.status === "error" ? backgroundRemovalDownloadForSelection.message : backgroundRemovalDownloadForSelection?.active ? backgroundRemovalDownloadForSelection.message : selectedBackgroundRemovalReady ? `${selectedBackgroundRemovalModel.label} · 已就绪` : selectedBackgroundRemovalModel?.installed ? "模型已安装，等待 ONNX Runtime" : "选择模型后可在下拉栏内下载"}</span>{backgroundRemovalDownloadForSelection?.active && <><i><i style={{ width: `${backgroundRemovalProgress}%` }} /></i><small>{formatFileSize(backgroundRemovalDownloadForSelection.currentBytes || 0)} / {formatFileSize(backgroundRemovalDownloadForSelection.totalBytes || selectedBackgroundRemovalModel?.size || 0)}{backgroundRemovalDownloadForSelection.speedBps > 0 ? ` · ${formatFileSize(backgroundRemovalDownloadForSelection.speedBps)}/s` : ""} · {backgroundRemovalDownloadForSelection.route || "正在测速"} · {backgroundRemovalDownloadForSelection.connections || 8} 路</small></>}</div>
             <button type="button" className={`transparent-mode-switch ${transparentPromptEnabled ? "active" : ""}`} role="switch" aria-checked={transparentPromptEnabled} disabled={status === "running"} onClick={toggleTransparentBackground}><i /><span>{transparentPromptEnabled ? "已启用" : "未启用"}</span></button>
           </div>
-          <PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />
+          <PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} activeIds={activePromptPresets.positive} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />
 
           <label className="prompt-field negative-field">
             <div><span>负向提示词</span><small>{engineAllowsNegativePrompt ? `${negative.length} 字符` : "当前引擎不使用"}</small></div>
@@ -6540,7 +6522,7 @@ function App() {
           </label>
           {/* The text is kept, not cleared: switching back to another engine should find it intact. */}
           {!engineAllowsNegativePrompt && negative.trim() && <p className="guidance-unavailable" role="status">已保留负向提示词，但本次 FLUX.1 生成不会使用它。</p>}
-          <PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />
+          <PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} activeIds={activePromptPresets.negative} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />
 
           <div className="canvas-settings">
             <div className="section-heading"><span>08</span><h2>画布尺寸</h2><div className="dimension"><BoundedNumberInput value={size.width} min={0} max={2048} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(width) => setSize((current) => ({ ...current, width }))} ariaLabel="画布宽度" /><i>×</i><BoundedNumberInput value={size.height} min={0} max={2048} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(height) => setSize((current) => ({ ...current, height }))} ariaLabel="画布高度" /><b>PX</b></div></div>

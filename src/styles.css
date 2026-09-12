@@ -543,6 +543,12 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
 .prompt-preset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .prompt-preset-card { position: relative; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 31px; border: 1px solid var(--n-06); background: var(--n-03); }
 .prompt-preset-card:hover { border-color: #4b5038; }
+.prompt-preset-card.active, .prompt-preset-card.active:hover { border-color: var(--lime); box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / .35); }
+.prompt-preset-card.active .prompt-preset-main strong { color: var(--lime); }
+.prompt-preset-card.active .prompt-preset-main b { color: var(--n-02); background: var(--lime); }
+html[data-theme-mode="light"] .prompt-preset-card.active { border-color: #7a4fe0; box-shadow: inset 0 0 0 1px rgba(122,79,224,.28); }
+html[data-theme-mode="light"] .prompt-preset-card.active .prompt-preset-main strong { color: #5b32bd; }
+html[data-theme-mode="light"] .prompt-preset-card.active .prompt-preset-main b { color: #fff; background: #7a4fe0; }
 .prompt-preset-main { min-width: 0; min-height: 66px; display: block; padding: 9px 7px 8px 9px; overflow: hidden; border: 0; color: var(--n-22); background: transparent; cursor: pointer; text-align: left; }
 .prompt-preset-main > span { min-width: 0; display: flex; align-items: center; gap: 6px; }
 .prompt-preset-main strong { min-width: 0; flex: 1; overflow: hidden; color: var(--n-26); font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
