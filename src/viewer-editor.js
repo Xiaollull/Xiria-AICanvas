@@ -25,6 +25,23 @@ export const VIEWER_TEXT_PADDING = 12;
 export const VIEWER_TEXT_MIN_BOX = 32;
 export const VIEWER_TEXT_MAX_LINES = 4000;
 export const VIEWER_RESIZE_HANDLES = Object.freeze(["tl", "tr", "bl", "br", "top", "right", "bottom", "left"]);
+// Offered in the toolbar as its own preview: each entry is rendered in the family it names, so the
+// list shows what the text will look like rather than describing it. Every family here ships with
+// Windows, and the CJK ones are named the way the user would name them.
+export const VIEWER_TEXT_STYLES = Object.freeze([
+  { id: "sans", label: "无衬线 Sans", fontFamily: "Arial, Helvetica, sans-serif" },
+  { id: "ui", label: "界面 Segoe UI", fontFamily: "\"Segoe UI\", system-ui, sans-serif" },
+  { id: "serif", label: "衬线 Serif", fontFamily: "\"Times New Roman\", Times, serif" },
+  { id: "georgia", label: "优雅 Georgia", fontFamily: "Georgia, \"Times New Roman\", serif" },
+  { id: "impact", label: "粗标题 Impact", fontFamily: "Impact, \"Arial Black\", sans-serif" },
+  { id: "mono", label: "等宽 Mono", fontFamily: "\"Courier New\", Consolas, monospace" },
+  { id: "hand", label: "手写 Comic", fontFamily: "\"Comic Sans MS\", \"Segoe UI\", cursive" },
+  { id: "yahei", label: "微软雅黑", fontFamily: "\"Microsoft YaHei\", \"PingFang SC\", sans-serif" },
+  { id: "songti", label: "宋体", fontFamily: "SimSun, \"Songti SC\", serif" },
+  { id: "heiti", label: "黑体", fontFamily: "SimHei, \"Heiti SC\", sans-serif" },
+  { id: "kaiti", label: "楷体", fontFamily: "KaiTi, \"Kaiti SC\", serif" },
+  { id: "fangsong", label: "仿宋", fontFamily: "FangSong, \"Fangsong SC\", serif" },
+]);
 // Which edges a handle moves: -1 pulls the left/top edge, 1 pushes the right/bottom one, 0 leaves
 // that axis alone. Spelled out because the names overlap as substrings -- "right" contains "t".
 export const VIEWER_RESIZE_HANDLE_AXES = Object.freeze({
@@ -333,6 +350,24 @@ export function normalizeRotation(value) {
 
 export function viewerLayerKind(layer) {
   return layer?.kind === "text" || layer?.type === "text" ? "text" : "image";
+}
+
+export function viewerTextStyleFor(fontFamily) {
+  const candidate = String(fontFamily ?? "").trim();
+  const match = VIEWER_TEXT_STYLES.find((style) => style.fontFamily.toLowerCase() === candidate.toLowerCase());
+  // A layout restored from an older session can name a family this list never offered; it is shown
+  // as itself rather than silently snapped to the nearest entry.
+  return match || { id: "custom", label: candidate || "自定义字体", fontFamily: candidate || VIEWER_TEXT_STYLES[0].fontFamily };
+}
+
+// Text annotates the picture, so it is drawn above every image whatever order the layers arrived
+// in -- on screen and in the exported PNG alike. Each kind keeps its own stacking within itself.
+export function viewerPaintOrder(layers) {
+  const list = Array.isArray(layers) ? layers : [];
+  return [
+    ...list.filter((layer) => viewerLayerKind(layer) !== "text"),
+    ...list.filter((layer) => viewerLayerKind(layer) === "text"),
+  ];
 }
 
 export function viewerTextBox(layer) {

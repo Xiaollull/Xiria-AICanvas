@@ -361,10 +361,11 @@ test("render wiring separates ordinary images, raster replay, and semantic text 
   assert.match(raster, /\[loadedImage, layer\.naturalWidth, layer\.naturalHeight, layer\.paintStrokes\]/);
 });
 
-test("static composition draws replayed layers in array order and GIF editing is explicitly static", async () => {
+test("static composition draws replayed layers in paint order and GIF editing is explicitly static", async () => {
   const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
   const collage = app.slice(app.indexOf("const createManualCollage ="), app.indexOf("const selectGeneratedOutput ="));
-  assert.match(collage, /sourceLayers = cloneViewerLayers\(viewerLayers\)/);
+  // One pass over the cloned layers, taken in the order the canvas paints them: text over images.
+  assert.match(collage, /sourceLayers = viewerPaintOrder\(cloneViewerLayers\(viewerLayers\)\)/);
   assert.match(collage, /viewerLayerKind\(layer\) === "text" \? null : await viewerLayerBitmap\(layer, \{ signal: token\.signal \}\)/);
   assert.match(collage, /nodes\.forEach\(\(item\) => \{[\s\S]*drawViewerLayer\(context, item\.layer, item\.source/);
   assert.match(collage, /hasAnimatedSource && !hasViewerEdits\(sourceLayers\)/);

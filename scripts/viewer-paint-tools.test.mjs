@@ -7,12 +7,15 @@ import {
   normalizeManualLayout,
   normalizeTextLayer,
   serializeViewerLayer,
+  viewerPaintOrder,
   viewerSafeResizeHandles,
   viewerTextBox,
   viewerTextBoxResize,
+  viewerTextStyleFor,
   wrapTextLines,
   VIEWER_TEXT_MIN_BOX,
   VIEWER_TEXT_PADDING,
+  VIEWER_TEXT_STYLES,
 } from "../src/viewer-editor.js";
 
 const tenPixelsPerCharacter = (value) => value.length * 10;
@@ -141,10 +144,11 @@ test("the canvas wires a pointer-following ring, a crosshair text marquee, and t
   for (const tool of ["brush", "eraser"]) assert.match(css, new RegExp(`\\.image-viewer-canvas\\.tool-${tool}[^\\n]*cursor: none;`));
   assert.match(css, /\.image-viewer-canvas\.tool-text[^\n]*cursor: crosshair;/);
   assert.match(css, /\.viewer-brush-cursor\.away \{ display: none; \}/);
-  // The text tool sweeps a box and creates one only on release, so a drag is a box and a click is not.
+  // The text tool sweeps a box and creates one only on release; a click that swept nothing leaves
+  // nothing behind but a cleared selection.
   assert.match(app, /if \(viewerTool === "text"\) \{\s*startViewerTextMarquee\(event\);/);
   assert.match(app, /drag\?\.kind === "text-marquee"[\s\S]{0,160}createViewerText\(drag\.rect\)/);
-  assert.match(app, /const boxed = rect\.width >= VIEWER_TEXT_MIN_BOX && rect\.height >= VIEWER_TEXT_MIN_BOX/);
+  assert.match(app, /if \(rect\.width < VIEWER_TEXT_MIN_BOX \|\| rect\.height < VIEWER_TEXT_MIN_BOX\) \{\s*setActiveViewerLayer\(""\);\s*return;/);
   assert.match(app, /className="viewer-text-marquee"/);
   assert.match(css, /\.viewer-text-marquee \{[^}]*pointer-events: none;/);
   // A box is resized by the same handles a picture uses, but they change the box, not the glyphs.
@@ -162,4 +166,74 @@ test("the canvas wires a pointer-following ring, a crosshair text marquee, and t
   // The committed box shows the lines the export will draw, so neither wraps text the other way.
   assert.match(app, /\(layer\.lines \|\| \[layer\.text\]\)\.join\("\\n"\)/);
   assert.match(css, /\.viewer-text-content \{ white-space: pre;/);
+});
+
+test("text sits above pictures on the canvas and in the exported picture alike", () => {
+  const image = (id) => ({ id, kind: "image", naturalWidth: 10, naturalHeight: 10 });
+  const text = (id) => ({ id, kind: "text", text: id });
+  // Whatever order the layers arrived in, the text is painted last.
+  assert.deepEqual(viewerPaintOrder([text("t1"), image("i1"), text("t2"), image("i2")]).map((layer) => layer.id), ["i1", "i2", "t1", "t2"]);
+  // Each kind keeps its own stacking, so an image raised above another stays above it.
+  assert.deepEqual(viewerPaintOrder([image("i2"), image("i1")]).map((layer) => layer.id), ["i2", "i1"]);
+  assert.deepEqual(viewerPaintOrder([]), []);
+  assert.deepEqual(viewerPaintOrder(null), []);
+
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  // Both renderers take the same order from the same helper, so neither can stack them differently.
+  assert.match(app, /viewerPaintOrder\(viewerLayers\)\.map\(\(layer\) => \{/);
+  assert.match(app, /const sourceLayers = viewerPaintOrder\(cloneViewerLayers\(viewerLayers\)\);/);
+  // On screen the stacking is the stylesheet's: above a plain image (3) and above a selected one (8).
+  assert.match(css, /\.viewer-text-layer \{ z-index: 6; \}/);
+  assert.match(css, /\.viewer-text-layer\.active \{ z-index: 9; \}/);
+});
+
+test("text written on a picture travels with it, and the picture never travels with the text", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  // The binding points one way: a text layer names the picture it was written on, never the reverse.
+  assert.match(app, /function viewerMovesWithLayer\(layer, movedId\) \{\s*return layer\?\.id === movedId \|\| \(viewerLayerKind\(layer\) === "text" && Boolean\(layer\?\.attachedTo\) && layer\.attachedTo === movedId\);/);
+  assert.match(app, /attachedTo: viewerImageUnderPoint\(\{ x: rect\.centerX, y: rect\.centerY \}\)/);
+  // A drag replays from the positions held at the start, so samples cannot accumulate drift.
+  assert.match(app, /attached: viewerLayers\.filter\(\(item\) => item\.id !== layer\.id && viewerMovesWithLayer\(item, layer\.id\)\)\.map/);
+  assert.match(app, /origin \? \{ \.\.\.layer, x: origin\.x \+ x - drag\.layerX, y: origin\.y \+ y - drag\.layerY \} : layer/);
+  // The arrow keys move a picture the same way the pointer does.
+  assert.match(app, /viewerMovesWithLayer\(layer, activeViewerLayerItem\.id\)\s*\?\s*\{ \.\.\.layer, x: layer\.x \+ adjustment\[0\], y: layer\.y \+ adjustment\[1\] \}/);
+});
+
+test("a finished box stops framing itself once attention moves elsewhere, and reads on any backdrop", () => {
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  // Pressing bare canvas clears the selection; pressing another layer moves it there already.
+  assert.match(app, /const startViewerDrag = \(event\) => \{[\s\S]{0,400}setActiveViewerLayer\(""\);/);
+  // A lavender band between two dark ones stays visible over a pale picture and a dark one alike.
+  assert.match(css, /\.viewer-text-editor \{[^}]*box-shadow: 0 0 0 1px rgba\(9,10,12,\.85\), 0 0 0 3px #c8acfb, 0 0 0 4px rgba\(9,10,12,\.65\);/);
+  assert.match(css, /\.viewer-text-layer\.active \{ outline: 0; box-shadow: 0 0 0 1px rgba\(9,10,12,\.85\), 0 0 0 2px #c8acfb, 0 0 0 3px rgba\(9,10,12,\.6\); \}/);
+  // Nothing is painted behind the text being typed, so the box reads as the picture will export it.
+  assert.match(css, /html\[data-theme-mode="light"\] \.viewer-text-editor \{ color: inherit; background: transparent; \}/);
+  // A text box's grips are square and smaller than a picture's round ones (20px hit, 13px visual).
+  assert.match(css, /\.viewer-image-layer\.viewer-text-layer \.layer-corner \{ width: 13px; height: 13px; border-radius: 0;/);
+  assert.match(css, /\.viewer-image-layer\.viewer-text-layer \.layer-corner::after \{ width: 7px; height: 7px; border-radius: 0;/);
+});
+
+test("the font list previews every family it offers, and keeps a family it does not know", () => {
+  assert.ok(VIEWER_TEXT_STYLES.length >= 8, "the list has to be worth opening");
+  // Every entry names a family that ships with Windows, and the CJK ones are named as the user does.
+  for (const style of VIEWER_TEXT_STYLES) {
+    assert.match(style.fontFamily, /,|^[A-Za-z]/, `${style.id} must name a real family stack`);
+    assert.ok(style.label.length > 0 && style.label.length <= 12, `${style.id} label must fit the toolbar`);
+  }
+  assert.equal(new Set(VIEWER_TEXT_STYLES.map((style) => style.id)).size, VIEWER_TEXT_STYLES.length);
+  assert.equal(viewerTextStyleFor("Arial, Helvetica, sans-serif").id, "sans");
+  assert.equal(viewerTextStyleFor("arial, helvetica, sans-serif").id, "sans", "matching must not turn on case");
+  // A layout saved before this list existed keeps the family it was written with.
+  const unknown = viewerTextStyleFor("Papyrus, fantasy");
+  assert.deepEqual([unknown.id, unknown.fontFamily], ["custom", "Papyrus, fantasy"]);
+  assert.equal(viewerTextStyleFor("").id, "custom");
+
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  // Each row is set in the family it names: the list is the preview.
+  assert.match(app, /VIEWER_TEXT_STYLES\.map\(\(style\) => <option key=\{style\.id\} value=\{style\.id\} style=\{\{ fontFamily: style\.fontFamily \}\}>\{style\.label\}<\/option>\)/);
+  assert.match(app, /updateViewerTextProperties\(activeViewerTextLayer, \{ fontFamily: style\.fontFamily, font: style\.fontFamily \}\)/);
+  assert.match(css, /\.viewer-font-select select option \{[^}]*font-size: 13px;/);
 });

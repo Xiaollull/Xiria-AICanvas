@@ -764,6 +764,11 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
 .viewer-property-color input[type="color"] { width: 27px; height: 22px; padding: 1px; border: 1px solid var(--n-07); background: var(--n-02); cursor: pointer; }
 .viewer-property-select select, .viewer-text-content-field > input { height: 22px; box-sizing: border-box; border: 1px solid var(--n-07); color: var(--n-27); outline: 0; background: var(--n-02); font: 8px "DM Mono"; }
 .viewer-property-select select:focus, .viewer-text-content-field > input:focus { border-color: #c8acfb; }
+/* The font list is its own preview, so it is set in the family each entry names and at a size the
+   difference is visible at -- the toolbar's 8px mono would show twelve identical rows. */
+.viewer-font-select select { min-width: 104px; max-width: 156px; font-size: 11px; letter-spacing: 0; }
+.viewer-font-select select option { padding: 3px 6px; color: var(--n-27); background: var(--n-02); font-size: 13px; }
+html[data-theme-mode="light"] .viewer-font-select select option { color: var(--n-05); background: var(--n-31); }
 .viewer-text-content-field { flex: 1 1 180px; }
 .viewer-text-content-field > input { width: 100%; min-width: 90px; padding: 0 6px; }
 .viewer-property-align { height: 30px; display: inline-flex; align-items: center; border: 1px solid var(--n-07); background: var(--n-01); }
@@ -797,10 +802,21 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
    against the same font metrics, so the box on screen and the picture never break text apart
    differently. Only the textarea still wraps in the browser, while it is being typed into. */
 .viewer-text-content { white-space: pre; pointer-events: none; }
-.viewer-text-editor { position: relative; z-index: 10; display: block; resize: none; outline: 1px solid #c8acfb; outline-offset: -1px; caret-color: #c8acfb; user-select: text; -webkit-user-select: text; }
+/* The box sits on top of whatever picture it was written on, so a single lavender hairline
+   disappeared against a pale one. A lavender band between two dark ones survives any backdrop, and
+   the caret carries the same dark halo. */
+.viewer-text-editor { position: relative; z-index: 10; display: block; resize: none; outline: 0; box-shadow: 0 0 0 1px rgba(9,10,12,.85), 0 0 0 3px #c8acfb, 0 0 0 4px rgba(9,10,12,.65); caret-color: #7a4fe0; user-select: text; -webkit-user-select: text; }
 .viewer-text-editor::selection { color: var(--n-01); background: #c8acfb; }
-.viewer-text-layer.active { outline-color: #c8acfb; box-shadow: 0 0 0 4px rgba(200,172,251,.09); }
-.viewer-text-layer .layer-corner::after { background: #c8acfb; box-shadow: 0 0 7px rgba(200,172,251,.8); }
+.viewer-text-layer.active { outline: 0; box-shadow: 0 0 0 1px rgba(9,10,12,.85), 0 0 0 2px #c8acfb, 0 0 0 3px rgba(9,10,12,.6); }
+/* Text annotates the picture, so it stacks above every image whichever order the layers arrived in;
+   `viewerPaintOrder` puts it last in the exported PNG for the same reason. */
+.viewer-text-layer { z-index: 6; }
+.viewer-text-layer.active { z-index: 9; }
+/* Square and smaller than a picture's round grips: a text box is resized against its own edges, and
+   a big round knob covers the very glyphs being fitted. */
+.viewer-image-layer.viewer-text-layer .layer-corner { width: 13px; height: 13px; border-radius: 0; border: 1px solid rgba(9,10,12,.85); background: #c8acfb; box-shadow: 0 0 0 1px rgba(255,255,255,.85); }
+.viewer-image-layer.viewer-text-layer .layer-corner::after { width: 7px; height: 7px; border-radius: 0; background: #c8acfb; box-shadow: none; }
+.viewer-image-layer.viewer-text-layer .layer-corner:hover, .viewer-image-layer.viewer-text-layer .layer-corner:active { background: #e8dcff; box-shadow: 0 0 0 1px rgba(255,255,255,.95), 0 0 10px rgb(var(--accent-rgb) / .85); }
 .layer-rotate-anchor { position: absolute; z-index: 14; left: 50%; top: 0; width: 0; height: 0; transform: scale(var(--viewer-handle-inverse)); transform-origin: center; pointer-events: auto; touch-action: none; }
 .layer-rotate-anchor::before { content: ""; position: absolute; left: -.5px; bottom: 8px; width: 1px; height: 22px; background: #c8acfb; pointer-events: none; }
 .layer-rotate-handle { position: absolute; left: 50%; top: -39px; width: 24px; height: 24px; display: grid; place-items: center; translate: -50% 0; box-sizing: border-box; border: 1px solid #e8dcff; border-radius: 50%; color: var(--n-02); background: #c8acfb; box-shadow: 0 0 12px rgba(200,172,251,.55); cursor: grab; touch-action: none; }
@@ -809,7 +825,10 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
 html[data-theme-mode="light"] .viewer-editor-tools, html[data-theme-mode="light"] .viewer-editor-properties { border-color: var(--n-26); background: color-mix(in srgb, #c8acfb 8%, var(--n-32)); }
 html[data-theme-mode="light"] .viewer-property-field, html[data-theme-mode="light"] .viewer-property-color, html[data-theme-mode="light"] .viewer-property-select, html[data-theme-mode="light"] .viewer-property-align { color: var(--n-10); background: var(--n-32); }
 html[data-theme-mode="light"] .viewer-property-field .bounded-number, html[data-theme-mode="light"] .viewer-property-select select, html[data-theme-mode="light"] .viewer-text-content-field > input { color: var(--n-05); border-color: var(--n-26); background: var(--n-31); }
-html[data-theme-mode="light"] .viewer-text-editor { color: inherit; background: rgba(255,255,255,.72); }
+/* No scrim behind the text being typed, in either theme: it tinted the very colour the user is
+   choosing, so the box read differently while editing than the picture it exported to. The ring
+   around the box is what makes it findable, and that works on any backdrop. */
+html[data-theme-mode="light"] .viewer-text-editor { color: inherit; background: transparent; }
 
 @container viewer-workspace (max-width: 1050px) {
   .viewer-toolbar { gap: 4px; padding: 5px; }

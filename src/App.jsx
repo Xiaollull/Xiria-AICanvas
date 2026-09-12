@@ -36,12 +36,15 @@ import {
   viewerLayerKind,
   viewerLayerSourceByteCount,
   viewerSafeResizeHandles,
+  viewerPaintOrder,
   viewerStrokeCount,
   viewerStrokePointCount,
   viewerTextBox,
   viewerTextBoxResize,
+  viewerTextStyleFor,
   VIEWER_DEFAULT_COLOR,
   VIEWER_RESIZE_HANDLES,
+  VIEWER_TEXT_STYLES,
   VIEWER_MAX_LAYOUT_POINTS,
   VIEWER_MAX_LAYOUT_STROKES,
   VIEWER_MAX_FILE_BYTES,
@@ -738,6 +741,12 @@ function isEditableTarget(target) {
 
 function viewerResizeHandles(layer) {
   return viewerSafeResizeHandles(layer);
+}
+
+// A layer moves when it is the one being moved, and text moves with the picture it was written on.
+// Dragging the text itself never carries the picture: the binding points one way only.
+function viewerMovesWithLayer(layer, movedId) {
+  return layer?.id === movedId || (viewerLayerKind(layer) === "text" && Boolean(layer?.attachedTo) && layer.attachedTo === movedId);
 }
 
 function sharedEdgeLineSegments(rectangles, tolerance = 1) {
@@ -4095,12 +4104,26 @@ function App() {
     }));
   };
 
-  // Photoshop's two text gestures: a drag opens a box of exactly that size which the text wraps
-  // inside, a click drops text that grows with what is typed. A new layer is unscaled, so the swept
-  // scene rectangle is already in the layer's own pixels.
+  // The topmost picture the box was drawn over. Text put on a picture belongs to it: dragging the
+  // picture carries the text with it, so a caption cannot be left behind by moving what it captions.
+  const viewerImageUnderPoint = (point) => {
+    const covering = viewerLayers.filter((layer) => {
+      if (viewerLayerKind(layer) !== "image") return false;
+      const bounds = viewerLayerBounds(layer);
+      return point.x >= bounds.left && point.x <= bounds.right && point.y >= bounds.top && point.y <= bounds.bottom;
+    });
+    return covering.at(-1)?.id || "";
+  };
+
+  // Text is made by drawing the box it goes in, the way Photoshop makes paragraph text. A click
+  // creates nothing: it only puts down the caret that would have been left behind. A new layer is
+  // unscaled, so the swept scene rectangle is already in the layer's own pixels.
   const createViewerText = (rect) => {
     if (activeCollage) return;
-    const boxed = rect.width >= VIEWER_TEXT_MIN_BOX && rect.height >= VIEWER_TEXT_MIN_BOX;
+    if (rect.width < VIEWER_TEXT_MIN_BOX || rect.height < VIEWER_TEXT_MIN_BOX) {
+      setActiveViewerLayer("");
+      return;
+    }
     invalidateViewerComposition();
     const snapshot = viewerSnapshot();
     const layer = measureViewerText({
@@ -4109,10 +4132,11 @@ function App() {
       kind: "text",
       type: "text",
       name: "文字图层",
-      x: boxed ? rect.centerX : rect.x,
-      y: boxed ? rect.centerY : rect.y,
-      boxWidth: boxed ? Math.round(rect.width) : undefined,
-      boxHeight: boxed ? Math.round(rect.height) : undefined,
+      x: rect.centerX,
+      y: rect.centerY,
+      boxWidth: Math.round(rect.width),
+      boxHeight: Math.round(rect.height),
+      attachedTo: viewerImageUnderPoint({ x: rect.centerX, y: rect.centerY }),
       scale: 1,
       rotation: normalizeRotation(viewerTextDefaults.rotation),
     });
@@ -4648,7 +4672,9 @@ function App() {
     const token = beginViewerCollageOperation("manual-collage");
     if (!token) return;
     try {
-      const sourceLayers = cloneViewerLayers(viewerLayers);
+      // Composed in paint order, so the exported picture stacks text over images exactly as the
+      // canvas showed it, and the layout it saves replays in that same order.
+      const sourceLayers = viewerPaintOrder(cloneViewerLayers(viewerLayers));
       if (viewerLayerSourceByteCount(sourceLayers) > VIEWER_MAX_LAYER_SOURCE_BYTES) throw new Error("画布图片源总量超过 256 MiB 上限");
       const nodes = await mapViewerConcurrent(sourceLayers, 4, async (layer) => {
         const source = viewerLayerKind(layer) === "text" ? null : await viewerLayerBitmap(layer, { signal: token.signal });
@@ -4836,6 +4862,9 @@ function App() {
 
   const startViewerDrag = (event) => {
     if (event.target.closest?.(".viewer-image-layer, .collage-slot")) return;
+    // Pressing on bare canvas drops the selection, so the box and handles around a finished piece
+    // of text stop framing it the moment attention moves elsewhere.
+    setActiveViewerLayer("");
     // The middle button drags the view whichever tool is selected, so the canvas can be moved
     // without putting the brush down.
     if (event.button === 1) {
@@ -4964,6 +4993,9 @@ function App() {
     viewerDrag.current = {
       kind: "layer",
       id: layer.id,
+      // Where the text written on this picture started, so each move can be applied from the start
+      // of the gesture rather than accumulated sample by sample.
+      attached: viewerLayers.filter((item) => item.id !== layer.id && viewerMovesWithLayer(item, layer.id)).map((item) => ({ id: item.id, x: item.x, y: item.y })),
       x: event.clientX,
       y: event.clientY,
       layerX: layer.x,
@@ -5198,7 +5230,13 @@ function App() {
       drag.unsnapped = true;
     }
     if (x !== drag.layerX || y !== drag.layerY) drag.changed = true;
-    updateViewerLayer(viewerDrag.current.id, { x, y });
+    const carried = new Map((drag.attached || []).map((item) => [item.id, item]));
+    invalidateViewerComposition();
+    setViewerLayers((current) => current.map((layer) => {
+      if (layer.id === drag.id) return { ...layer, x, y };
+      const origin = carried.get(layer.id);
+      return origin ? { ...layer, x: origin.x + x - drag.layerX, y: origin.y + y - drag.layerY } : layer;
+    }));
   };
 
   const finishViewerPointer = (event, cancelled = false) => {
@@ -5975,7 +6013,7 @@ function App() {
             viewerNudge.current = { key: event.key, id: activeViewerLayerItem.id };
             saveViewerUndo({ layers: viewerLayers, snappedLayers: viewerSnappedLayers, activeLayer: activeViewerLayer });
           }
-          setViewerLayers((current) => current.map((layer) => layer.id === activeViewerLayerItem.id
+          setViewerLayers((current) => current.map((layer) => viewerMovesWithLayer(layer, activeViewerLayerItem.id)
             ? { ...layer, x: layer.x + adjustment[0], y: layer.y + adjustment[1] }
             : layer));
           return;
@@ -7421,6 +7459,22 @@ function App() {
                            }
                          }}
                        /></label>
+                       <label className="viewer-property-select viewer-font-select"><span>字体</span><select
+                         value={viewerTextStyleFor(activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily).id}
+                         style={{ fontFamily: activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily }}
+                         aria-label="文字字体"
+                         onChange={(event) => {
+                           const style = VIEWER_TEXT_STYLES.find((item) => item.id === event.target.value);
+                           if (!style) return;
+                           if (activeViewerTextLayer) updateViewerTextProperties(activeViewerTextLayer, { fontFamily: style.fontFamily, font: style.fontFamily });
+                           else setViewerTextDefaults((current) => ({ ...current, fontFamily: style.fontFamily }));
+                         }}
+                       >
+                         {/* Each entry is written in the family it names, so the list previews the
+                             font rather than describing it. */}
+                         {VIEWER_TEXT_STYLES.map((style) => <option key={style.id} value={style.id} style={{ fontFamily: style.fontFamily }}>{style.label}</option>)}
+                         {viewerTextStyleFor(activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily).id === "custom" && <option value="custom" disabled>{viewerTextStyleFor(activeViewerTextLayer?.fontFamily ?? viewerTextDefaults.fontFamily).label}</option>}
+                       </select></label>
                        <label className="viewer-property-field"><span>字号</span><BoundedNumberInput value={activeViewerTextLayer?.fontSize ?? viewerTextDefaults.fontSize} min={8} max={300} integer onCommit={(fontSize) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { fontSize }) : setViewerTextDefaults((current) => ({ ...current, fontSize }))} ariaLabel="文字字号" /><em>px</em></label>
                        <label className="viewer-property-color"><span>颜色</span><input type="color" value={activeViewerTextLayer?.color ?? viewerTextDefaults.color} onChange={(event) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { color: event.target.value }) : setViewerTextDefaults((current) => ({ ...current, color: normalizeViewerColor(event.target.value) }))} aria-label="文字颜色" /></label>
                        <label className="viewer-property-select"><span>字重</span><select value={activeViewerTextLayer?.fontWeight ?? viewerTextDefaults.fontWeight} onChange={(event) => activeViewerTextLayer ? updateViewerTextProperties(activeViewerTextLayer, { fontWeight: Number(event.target.value) }) : setViewerTextDefaults((current) => ({ ...current, fontWeight: Number(event.target.value) }))}>{[400, 500, 600, 700, 800, 900].map((weight) => <option key={weight} value={weight}>{weight}</option>)}</select></label>
@@ -7459,7 +7513,7 @@ function App() {
                 >
                   <div className="viewer-scene" style={{ transform: `translate(${viewerPan.x}px, ${viewerPan.y}px) scale(${viewerZoom})` }}>
                     {viewerTextMarquee && <i className="viewer-text-marquee" style={{ width: `${viewerTextMarquee.width}px`, height: `${viewerTextMarquee.height}px`, transform: `translate(${viewerTextMarquee.centerX}px, ${viewerTextMarquee.centerY}px)` }} aria-hidden="true" />}
-                    {!activeCollage && viewerLayers.map((layer) => {
+                    {!activeCollage && viewerPaintOrder(viewerLayers).map((layer) => {
                       const kind = viewerLayerKind(layer);
                       const painted = hasLayerPaint(layer);
                       const textLayer = kind === "text";

@@ -140,7 +140,40 @@ try {
     pointerEvents: getComputedStyle(marquee).pointerEvents,
   };
 
-  document.getElementById("result").textContent = JSON.stringify({ cursors, ringGeometry, textBox, marqueeGeometry, errors: window.fixtureErrors });
+  // 5. Stacking and grips, as the real cascade resolves them: a text box has to win over a selected
+  // picture, and its grips have to come out square and smaller than the picture's round ones.
+  const picture = document.createElement("div");
+  picture.className = "viewer-image-layer active";
+  picture.style.width = "120px";
+  picture.style.height = "80px";
+  picture.style.transform = "translate(0px, 0px) rotate(0deg) scale(1)";
+  scene.appendChild(picture);
+  const grip = (host) => {
+    const anchor = document.createElement("i");
+    anchor.className = "layer-corner-anchor br";
+    const corner = document.createElement("i");
+    corner.className = "layer-corner br";
+    anchor.appendChild(corner);
+    host.appendChild(anchor);
+    const style = getComputedStyle(corner);
+    return { width: style.width, height: style.height, radius: style.borderRadius };
+  };
+  layer.classList.add("active");
+  const stacking = {
+    text: getComputedStyle(layer).zIndex,
+    activePicture: getComputedStyle(picture).zIndex,
+    textGrip: grip(layer),
+    pictureGrip: grip(picture),
+    editorRing: (() => {
+      const editor = document.createElement("textarea");
+      editor.className = "viewer-text-editor";
+      layer.appendChild(editor);
+      const style = getComputedStyle(editor);
+      return { shadow: style.boxShadow, outlineWidth: style.outlineWidth, background: style.backgroundColor };
+    })(),
+  };
+
+  document.getElementById("result").textContent = JSON.stringify({ cursors, ringGeometry, textBox, marqueeGeometry, stacking, errors: window.fixtureErrors });
 } catch (error) {
   document.getElementById("result").textContent = JSON.stringify({ fatal: String(error), errors: window.fixtureErrors });
 }
@@ -212,6 +245,16 @@ test("real Chromium paints the brush ring, the tool cursors and a text box the w
       assert.ok(Math.abs(result.marqueeGeometry.left - -120) < 0.5, `marquee left ${result.marqueeGeometry.left}`);
       assert.ok(Math.abs(result.marqueeGeometry.top - -40) < 0.5, `marquee top ${result.marqueeGeometry.top}`);
       assert.equal(result.marqueeGeometry.pointerEvents, "none");
+
+      // Text annotates the picture, so a selected text box outranks even a selected picture.
+      assert.ok(Number(result.stacking.text) > Number(result.stacking.activePicture), `text z-index ${result.stacking.text} must beat a selected picture's ${result.stacking.activePicture}`);
+      // A text box's grips are square and smaller; a picture keeps its round 20px ones.
+      assert.deepEqual(result.stacking.textGrip, { width: "13px", height: "13px", radius: "0px" });
+      assert.deepEqual(result.stacking.pictureGrip, { width: "20px", height: "20px", radius: "50%" });
+      // Three rings, dark-light-dark, so the box is findable over a pale picture and a dark one.
+      assert.match(result.stacking.editorRing.shadow, /rgba\(9, 10, 12, 0\.85\)[^,]*, rgb\(200, 172, 251\)/);
+      assert.equal(result.stacking.editorRing.outlineWidth, "0px", "the old single hairline must be gone, not merely covered");
+      assert.equal(result.stacking.editorRing.background, "rgba(0, 0, 0, 0)", "nothing may be painted behind the text being typed");
     });
   } finally {
     await rm(profile, { recursive: true, force: true });
