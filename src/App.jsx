@@ -147,6 +147,12 @@ import {
 } from "./image-to-image";
 import SizeGrid from "./SizeGrid";
 import WorkspaceSelect from "./WorkspaceSelect";
+import TransparentBackgroundControl from "./TransparentBackgroundControl.jsx";
+import {
+  transparentBackgroundEnabled,
+  transparentBackgroundSubject,
+  toggleTransparentBackground,
+} from "./transparent-background.js";
 import { LORA_SYNC_CHANNEL, sameMountedLoras } from "./lora-state";
 import {
   applyMountedLoraSync,
@@ -232,10 +238,6 @@ const SharedModelDirectories = lazy(() => import("./SharedModelDirectories"));
 // out of the workspace chunk until the user actually asks for it.
 const AiAssistantOverlay = lazy(() => import("./AiAssistantOverlay"));
 
-const TRANSPARENT_BACKGROUND_TAG = "({Transparent background})";
-const TRANSPARENT_BACKGROUND_PATTERN = /\(\{\s*transparent\s+background\s*\}\)/i;
-const TRANSPARENT_BACKGROUND_PATTERN_ALL = /\(\{\s*transparent\s+background\s*\}\)/gi;
-
 const models = [
   { name: "SD", detail: "Stable Diffusion", ready: true },
   { name: "iL", detail: "Illustrious", ready: true },
@@ -289,20 +291,34 @@ function queueDuration(job) {
   return "";
 }
 
-function QueueList({ jobs, counts, error, watching, onCancel, onSelect, onClose }) {
+function generationJobIdentity(job) {
+  const engine = job?.requested_engine || job?.engine || "";
+  const assets = job?.requested_model_assets || job?.model_assets || {};
+  return engine ? {
+    engine,
+    checkpoint: job?.requested_checkpoint || job?.checkpoint || "",
+    assets,
+  } : null;
+}
+
+function modelAssetName(value) {
+  return typeof value === "string" && value ? value.split(/[\\/]/).pop() : "";
+}
+
+function QueueList({ jobs, counts, error, watching, onCancel, onClose, onSelect }) {
   const ordered = [...jobs].reverse();
   return (
     <div className="queue-dropdown" role="dialog" aria-label="任务队列">
       <header>
-        <div><strong>任务队列</strong><small>本次会话共 {jobs.length} 个任务</small></div>
+        <div><span>GENERATION QUEUE</span><strong>任务队列</strong><small>本次会话 · {jobs.length} 个任务</small></div>
         <button type="button" className="icon-button" title="关闭队列" onClick={onClose}><X size={15} /></button>
       </header>
       {counts && <div className="queue-counts">
-        <span className="waiting">等待 {counts.queued}</span>
-        <span className="running">生成中 {counts.running}</span>
-        <span className="done">完成 {counts.complete}</span>
-        <span className="failed">失败 {counts.error}</span>
-        <span className="stopped">取消 {counts.cancelled}</span>
+        <span className="waiting"><small>等待</small><b>{counts.queued}</b></span>
+        <span className="running"><small>生成中</small><b>{counts.running}</b></span>
+        <span className="done"><small>完成</small><b>{counts.complete}</b></span>
+        <span className="failed"><small>失败</small><b>{counts.error}</b></span>
+        <span className="stopped"><small>取消</small><b>{counts.cancelled}</b></span>
       </div>}
       {error && <p className="queue-error">{error}</p>}
       {ordered.length === 0 && <p className="queue-empty">还没有提交过任务。提交后即使正在生成，也可以继续排队。</p>}
@@ -310,15 +326,23 @@ function QueueList({ jobs, counts, error, watching, onCancel, onSelect, onClose 
         {ordered.map((job) => {
           const status = job.status;
           const finished = status === "complete";
-          const thumbnail = finished && job.outputs?.[0]?.image_url ? `${job.outputs[0].image_url}?v=${job.completed_at || 0}` : "";
+          const live = job.active && status !== "queued";
+          const selectable = (finished && Boolean(job.output?.image_url)) || live;
+          const stageThumbnail = job.stage_preview?.url;
+          const thumbnail = finished && job.output?.image_url
+            ? `${job.output.image_url}?v=${job.completed_at || 0}`
+            : stageThumbnail || "";
           return (
             <li key={job.id} className={`queue-item ${status} ${job.id === watching ? "watching" : ""}`}>
               <button
                 type="button"
                 className="queue-item-main"
-                disabled={!finished}
-                title={finished ? "查看这张结果" : QUEUE_STATUS_TEXT[status] || status}
-                onClick={() => finished && onSelect(job)}
+                disabled={!selectable}
+                title={finished ? "查看生成结果" : live ? "切换到这个任务的实时进度" : QUEUE_STATUS_TEXT[status] || status}
+                onClick={() => {
+                  if (!selectable) return;
+                  onSelect(job);
+                }}
               >
                 <span className="queue-index">#{job.sequence}</span>
                 {thumbnail ? <img className="queue-thumb" src={thumbnail} alt="" /> : <span className={`queue-dot ${status}`} />}
@@ -326,19 +350,20 @@ function QueueList({ jobs, counts, error, watching, onCancel, onSelect, onClose 
                   <b>{QUEUE_STATUS_TEXT[status] || status}{job.engine ? ` · ${job.engine}` : ""}</b>
                   <small>
                     {finished
-                      ? `${job.outputs?.[0]?.output_name || "已生成"}${queueDuration(job) ? ` · ${queueDuration(job)}` : ""}`
+                      ? `${job.output?.output_name || "已生成"}${queueDuration(job) ? ` · ${queueDuration(job)}` : ""}`
                       : status === "error"
                         ? job.error || "生成失败"
                         : status === "cancelled"
                           ? "已取消，未保存图片"
                           : status === "queued"
                             ? `${job.width || "?"} × ${job.height || "?"} · 等待前面的任务完成`
-                            : job.phase || "正在生成"}
+                            : `${job.phase || "正在生成"}${job.width && job.height ? ` · ${job.width} × ${job.height}` : ""}`}
                   </small>
                 </span>
                 {!finished && status !== "error" && status !== "cancelled" && <span className="queue-progress">{job.progress || 0}%</span>}
               </button>
               {job.active && <button type="button" className="queue-item-cancel" title="取消这个任务" onClick={() => onCancel(job.id)}><X size={13} /></button>}
+              {live && <span className="queue-progress-line" aria-hidden="true"><i style={{ width: `${job.progress || 0}%` }} /></span>}
             </li>
           );
         })}
@@ -355,6 +380,16 @@ function pagAvailableForEngine(health, engine) {
 }
 
 const MAX_SEED = 0xFFFFFFFFFFFFFFFFn;
+const MAX_GALLERY_JOB_SNAPSHOT_BYTES = 128 * 1024;
+const GALLERY_JOB_ACCESS_STORAGE_PREFIX = "xirai_gallery_job_access_v1:";
+
+function galleryJobSnapshotPayload(settings) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(settings)).byteLength <= MAX_GALLERY_JOB_SNAPSHOT_BYTES ? settings : null;
+  } catch {
+    return null;
+  }
+}
 const DEFAULT_PERFORMANCE = {
   memory_mode: "auto",
   attention_backend: "auto",
@@ -1068,6 +1103,19 @@ function CountField({ label, detail, value, min = 1, max, disabled = false, onCh
   );
 }
 
+function PostprocessStageHeader({ title, detail, enabled, expanded, onToggleExpanded, onToggleEnabled, switchDisabled }) {
+  const expandLabel = `${expanded ? "收起" : "展开"} ${title} 参数`;
+  return <div className="postprocess-stage-head">
+    <button type="button" className="postprocess-stage-summary" aria-expanded={expanded} onClick={onToggleExpanded}>
+      <strong>{title}</strong><small>{detail}</small>
+    </button>
+    <div className="postprocess-stage-head-actions">
+      <button type="button" role="switch" aria-label={`启用 ${title}`} aria-checked={enabled} className={enabled ? "active" : ""} disabled={switchDisabled} onClick={onToggleEnabled}><i /></button>
+      <button type="button" className="postprocess-stage-expand" aria-label={expandLabel} title={expandLabel} onClick={onToggleExpanded}><ChevronDown size={15} /></button>
+    </div>
+  </div>;
+}
+
 const promptPresetPositionLabels = { start: "开头", middle: "中间", end: "结尾" };
 
 function PresetBox({ title, type, records, activeIds, disabled, libraryError, libraryWarning, onSelect, onCreate, onEdit, onDelete }) {
@@ -1136,7 +1184,7 @@ function PresetBox({ title, type, records, activeIds, disabled, libraryError, li
   );
 }
 
-function PromptPresetDialog({ dialog, records, running, onSave, onRequestClose }) {
+function PromptPresetDialog({ dialog, records, onSave, onRequestClose }) {
   const original = dialog.record ? {
     name: dialog.record.name,
     content: dialog.record.content,
@@ -1155,27 +1203,26 @@ function PromptPresetDialog({ dialog, records, running, onSave, onRequestClose }
   const titleId = `prompt-preset-dialog-title-${dialog.record ? "edit" : "new"}`;
   const update = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
   return <div className="prompt-preset-backdrop" onMouseDown={(event) => event.target === event.currentTarget && requestClose()}>
-    <form ref={dialogRef} className="prompt-preset-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex="-1" onSubmit={(event) => { event.preventDefault(); if (!running && validation.valid) setOperationError(onSave(draft) || ""); }}>
+    <form ref={dialogRef} className="prompt-preset-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex="-1" onSubmit={(event) => { event.preventDefault(); if (validation.valid) setOperationError(onSave(draft) || ""); }}>
       <header><div><span>PROMPT PRESET LIBRARY</span><h2 id={titleId}>{dialog.record ? "编辑 Prompt 预设" : "新增 Prompt 预设"}</h2><p>{dialog.record ? `保留固定 ID · 保存后版本 ${dialog.record.version + 1}` : "保存常用内容并指定点击卡片时的插入位置"}</p></div><button type="button" aria-label="关闭 Prompt 预设窗口" onClick={requestClose}><X size={18} /></button></header>
       <div className="prompt-preset-dialog-body">
-        {running && <p className="prompt-preset-readonly" role="status">生成任务运行期间只能查看；编辑项与保存操作已锁定。</p>}
         {operationError && <p className="prompt-preset-error" role="alert">{operationError}</p>}
-        <label className={validation.errors.name ? "invalid" : ""}><span>预设名称 <small>{draft.name.length} / 48</small></span><input autoFocus data-dialog-autofocus value={draft.name} maxLength={48} disabled={running} aria-invalid={Boolean(validation.errors.name)} onChange={(event) => update("name", event.target.value)} />{validation.errors.name && <em>{validation.errors.name}</em>}</label>
-        <label className={`prompt-preset-content-field ${validation.errors.content ? "invalid" : ""}`}><span>Prompt 内容 <small>{draft.content.length} 字符</small></span><textarea value={draft.content} disabled={running} aria-invalid={Boolean(validation.errors.content)} onChange={(event) => update("content", event.target.value)} placeholder="保留权重、括号与内部换行" />{validation.errors.content && <em>{validation.errors.content}</em>}</label>
-        <fieldset><legend>Prompt 类型</legend><div className="prompt-preset-segmented two">{[["positive", "正向"], ["negative", "负向"]].map(([value, label]) => <button type="button" className={draft.type === value ? "active" : ""} aria-pressed={draft.type === value} disabled={running} key={value} onClick={() => update("type", value)}>{label}</button>)}</div><small>切换类型后，预设会移动到目标分区末尾。</small></fieldset>
-        <fieldset><legend>生成时的拼接位置</legend><div className="prompt-preset-segmented three">{[["start", "开头"], ["middle", "中间"], ["end", "结尾"]].map(([value, label]) => <button type="button" className={draft.position === value ? "active" : ""} aria-pressed={draft.position === value} disabled={running} key={value} onClick={() => update("position", value)}>{label}</button>)}</div><small>启用后不会写入输入框，生成时才拼接：开头与中间排在输入框内容之前，结尾排在其后，各段之间空一行。</small></fieldset>
+        <label className={validation.errors.name ? "invalid" : ""}><span>预设名称 <small>{draft.name.length} / 48</small></span><input autoFocus data-dialog-autofocus value={draft.name} maxLength={48} aria-invalid={Boolean(validation.errors.name)} onChange={(event) => update("name", event.target.value)} />{validation.errors.name && <em>{validation.errors.name}</em>}</label>
+        <label className={`prompt-preset-content-field ${validation.errors.content ? "invalid" : ""}`}><span>Prompt 内容 <small>{draft.content.length} 字符</small></span><textarea value={draft.content} aria-invalid={Boolean(validation.errors.content)} onChange={(event) => update("content", event.target.value)} placeholder="保留权重、括号与内部换行" />{validation.errors.content && <em>{validation.errors.content}</em>}</label>
+        <fieldset><legend>Prompt 类型</legend><div className="prompt-preset-segmented two">{[["positive", "正向"], ["negative", "负向"]].map(([value, label]) => <button type="button" className={draft.type === value ? "active" : ""} aria-pressed={draft.type === value} key={value} onClick={() => update("type", value)}>{label}</button>)}</div><small>切换类型后，预设会移动到目标分区末尾。</small></fieldset>
+        <fieldset><legend>生成时的拼接位置</legend><div className="prompt-preset-segmented three">{[["start", "开头"], ["middle", "中间"], ["end", "结尾"]].map(([value, label]) => <button type="button" className={draft.position === value ? "active" : ""} aria-pressed={draft.position === value} key={value} onClick={() => update("position", value)}>{label}</button>)}</div><small>启用后不会写入输入框，生成时才拼接：开头与中间排在输入框内容之前，结尾排在其后，各段之间空一行。</small></fieldset>
       </div>
-      <footer><span>{dialog.record ? `ID ${dialog.record.id}` : "ID 将由安全随机源生成"}</span><div><button type="button" onClick={requestClose}>取消</button><button type="submit" className="primary" disabled={running || !validation.valid}><Save size={14} />{running ? "生成中已锁定" : "保存预设"}</button></div></footer>
+      <footer><span>{dialog.record ? `ID ${dialog.record.id}` : "ID 将由安全随机源生成"}</span><div><button type="button" onClick={requestClose}>取消</button><button type="submit" className="primary" disabled={!validation.valid}><Save size={14} />保存预设</button></div></footer>
     </form>
   </div>;
 }
 
-function PromptPresetDeleteDialog({ record, running, onConfirm, onClose }) {
+function PromptPresetDeleteDialog({ record, onConfirm, onClose }) {
   const dialogRef = useDialogLifecycle(true, onClose, `[data-prompt-preset-focus-fallback="${record.type}"]`);
   return <div className="prompt-preset-backdrop prompt-preset-delete-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <section ref={dialogRef} className="prompt-preset-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="prompt-preset-delete-title" tabIndex="-1">
-      <Trash2 size={25} /><h2 id="prompt-preset-delete-title">删除“{record.name}”？</h2><p>预设删除后不会自动恢复，包括原有内置预设。此操作不会改写当前 Prompt 文本。</p>{running && <p className="prompt-preset-readonly" role="status">生成任务运行期间不能删除预设。</p>}
-      <div><button type="button" autoFocus onClick={onClose}>取消</button><button type="button" className="danger" disabled={running} onClick={onConfirm}>确认删除</button></div>
+      <Trash2 size={25} /><h2 id="prompt-preset-delete-title">删除“{record.name}”？</h2><p>预设删除后不会自动恢复，包括原有内置预设。此操作不会改写当前 Prompt 文本。</p>
+      <div><button type="button" autoFocus onClick={onClose}>取消</button><button type="button" className="danger" onClick={onConfirm}>确认删除</button></div>
     </section>
   </div>;
 }
@@ -1335,6 +1382,7 @@ function App() {
   const [generationControlBusy, setGenerationControlBusy] = useState("");
   const [generationProgressCollapsed, setGenerationProgressCollapsed] = useState(true);
   const [generationJob, setGenerationJob] = useState("");
+  const [generationRunIdentity, setGenerationRunIdentity] = useState(null);
   // Every job this session has submitted, newest last, as the service reports it. The service owns
   // the queue — it is the thing that runs them — so this is a view of that list rather than a
   // second copy the page tries to keep in step.
@@ -1442,7 +1490,6 @@ function App() {
   const [adetailerDownload, setADetailerDownload] = useState(null);
   const [backgroundRemovalDownload, setBackgroundRemovalDownload] = useState(null);
   const [backgroundRemovalModel, setBackgroundRemovalModel] = useState("");
-  const [backgroundRemovalPickerOpen, setBackgroundRemovalPickerOpen] = useState(false);
   const [hardwareStats, setHardwareStats] = useState(null);
   const [hardwareHistory, setHardwareHistory] = useState(EMPTY_HARDWARE_HISTORY);
   const [imageViewerOpen, setImageViewerOpen] = useState(false);
@@ -1533,6 +1580,30 @@ function App() {
   // Guards the submit request itself, so a double click sends one job rather than two. It is
   // released as soon as the service has the job, not when the job finishes.
   const submissionInFlight = useRef(false);
+  // Gallery metadata belongs to the job that produced an image, not to whichever draft the user
+  // edits while that job runs. The server retains the finished snapshot; this map avoids a detail
+  // request until a page refresh, and the token prevents a late read from replacing a newer view.
+  const generationSettingsByJob = useRef(new Map());
+  const galleryAccessTokensByJob = useRef(new Map());
+  const queueSettingsRequestToken = useRef(0);
+  const rememberGalleryAccessToken = (jobId, token) => {
+    if (!jobId || typeof token !== "string" || !token) return;
+    galleryAccessTokensByJob.current.set(jobId, token);
+    try { sessionStorage.setItem(`${GALLERY_JOB_ACCESS_STORAGE_PREFIX}${jobId}`, token); } catch {}
+  };
+  const galleryAccessTokenForJob = (jobId) => {
+    if (!jobId) return "";
+    const known = galleryAccessTokensByJob.current.get(jobId);
+    if (known) return known;
+    try {
+      const restored = sessionStorage.getItem(`${GALLERY_JOB_ACCESS_STORAGE_PREFIX}${jobId}`) || "";
+      if (restored) galleryAccessTokensByJob.current.set(jobId, restored);
+      return restored;
+    } catch {
+      return "";
+    }
+  };
+  const queueViewPinned = useRef(false);
   const completedModelDownloadJob = useRef("");
   const inferenceHealthRef = useRef(inferenceHealth);
   const currentModel = useRef(model);
@@ -1566,7 +1637,6 @@ function App() {
   const activeJobRecoveryToken = useRef(0);
   const consoleLatest = useRef(0);
   const consoleOutputRef = useRef(null);
-  const backgroundRemovalPickerRef = useRef(null);
   const positivePromptRef = useRef(null);
   const negativePromptRef = useRef(null);
   const promptSelectionCache = useRef({ positive: null, negative: null });
@@ -1717,7 +1787,7 @@ function App() {
   };
 
   const commitMountedLoras = (updater, scopeKey = activeLoraScopeRef.current || activeLoraScopeKey) => {
-    if (status === "running" || modelSwitching || loraWorkspaceLocked || !scopeKey || !shouldPersistMountedLoras) return false;
+    if (modelSwitching || loraWorkspaceLocked || !scopeKey || !shouldPersistMountedLoras) return false;
     const result = updateMountedLorasForScope(mountedLorasMapRef.current, scopeKey, updater);
     if (!result.changed) return false;
     commitMountedLoraMap(result.container);
@@ -1728,10 +1798,10 @@ function App() {
     return true;
   };
 
-  // Groups follow the mounted library's locks: a combination cannot be switched
-  // on while a job is running any more than a LoRA can be mounted.
+  // Groups follow the mounted library's workspace locks. Running jobs already own frozen copies,
+  // so edits here compose the next queued request without mutating work in progress.
   const commitLoraGroups = (updater, scopeKey = activeLoraScopeRef.current || activeLoraScopeKey) => {
-    if (status === "running" || modelSwitching || loraWorkspaceLocked || !scopeKey) return false;
+    if (modelSwitching || loraWorkspaceLocked || !scopeKey) return false;
     const result = updateLoraGroupsForScope(loraGroupsMapRef.current, scopeKey, updater);
     if (!result.changed) return false;
     loraGroupsMapRef.current = result.container;
@@ -2183,7 +2253,7 @@ function App() {
       const payload = event.data;
       if (payload?.type === "request-workspace-loras") {
         const scopeKey = activeLoraScopeRef.current;
-        channel.postMessage({ type: "workspace-loras", engine: scopeKey, loras: mountedLorasForScope(mountedLorasMapRef.current, scopeKey), locked: status === "running" || modelSwitching });
+        channel.postMessage({ type: "workspace-loras", engine: scopeKey, loras: mountedLorasForScope(mountedLorasMapRef.current, scopeKey), locked: modelSwitching });
         return;
       }
       if (payload?.type === "workspace-lora-lock") {
@@ -2196,7 +2266,7 @@ function App() {
       const locked = payload.locked === true;
       loraDragGateRef.current = { ...(loraDragGateRef.current || {}), loraWorkspaceLocked: locked };
       setLoraWorkspaceLocked(locked);
-      if (locked || status === "running" || modelSwitching || !shouldPersistMountedLoras) return;
+      if (locked || modelSwitching || !shouldPersistMountedLoras) return;
       const synced = applyMountedLoraSync(mountedLorasMapRef.current, { engine: payload.engine || payload.scopeKey, loras: payload.loras }, { activeEngine: activeLoraScopeRef.current, locked: false });
       if (!synced.applied) return;
       const mapChanged = !sameMountedLoraMap(mountedLorasMapRef.current, synced.container);
@@ -2225,13 +2295,13 @@ function App() {
       return;
     }
     const scopeKey = activeLoraScopeRef.current;
-    if (!scopeKey || status === "running" || modelSwitching || loraWorkspaceLocked) return;
+    if (!scopeKey || modelSwitching || loraWorkspaceLocked) return;
     loraSyncChannel.current.postMessage({ type: "workspace-loras", engine: scopeKey, loras: mountedLorasForScope(mountedLorasMapRef.current, scopeKey), locked: false });
   }, [uiStateReady, activeLoraScopeKey, mountedLorasByEngine, loras, status, modelSwitching, loraWorkspaceLocked]);
 
   useEffect(() => {
     if (!uiStateReady || !loraSyncChannel.current) return;
-    loraSyncChannel.current.postMessage({ type: "workspace-lora-lock", locked: status === "running" || modelSwitching });
+    loraSyncChannel.current.postMessage({ type: "workspace-lora-lock", locked: modelSwitching });
   }, [uiStateReady, status, modelSwitching]);
 
   useEffect(() => {
@@ -2386,21 +2456,6 @@ function App() {
   }, [inferenceHealth?.background_removal?.models]);
 
   useEffect(() => {
-    if (!backgroundRemovalPickerOpen) return undefined;
-    const close = (event) => {
-      if (event.type === "keydown" && event.key !== "Escape") return;
-      if (event.type === "pointerdown" && backgroundRemovalPickerRef.current?.contains(event.target)) return;
-      setBackgroundRemovalPickerOpen(false);
-    };
-    window.addEventListener("pointerdown", close);
-    window.addEventListener("keydown", close);
-    return () => {
-      window.removeEventListener("pointerdown", close);
-      window.removeEventListener("keydown", close);
-    };
-  }, [backgroundRemovalPickerOpen]);
-
-  useEffect(() => {
     const controller = new AbortController();
     let retryTimer;
     let attempts = 0;
@@ -2497,6 +2552,7 @@ function App() {
         if (stopped || !job?.id) return;
         generationLocked.current = true;
         setGenerationJob(job.id);
+        setGenerationRunIdentity(generationJobIdentity(job));
         setStatus("running");
         setGenerationTaskStatus(job.status || "running");
         setGenerationPhase(job.phase || "正在恢复生成任务");
@@ -2513,7 +2569,11 @@ function App() {
     let failures = 0;
     const poll = async () => {
       try {
-        const response = await fetch(`/api/inference/jobs/${generationJob}`, { cache: "no-store" });
+        const galleryAccessToken = galleryAccessTokenForJob(generationJob);
+        const response = await fetch(`/api/inference/jobs/${generationJob}`, {
+          cache: "no-store",
+          ...(galleryAccessToken ? { headers: { "X-XirAI-Gallery-Access": galleryAccessToken } } : {}),
+        });
         const job = await response.json();
         if (!response.ok) {
           const error = new Error(job.detail || "无法获取生成进度");
@@ -2523,6 +2583,7 @@ function App() {
         if (stopped) return;
         failures = 0;
         setProgress(job.progress ?? 0);
+        setGenerationRunIdentity(generationJobIdentity(job));
         setGenerationTaskStatus(job.status || "running");
         setGenerationPhase(job.phase || "正在生成");
         setGenerationStage(job.stage || "");
@@ -2586,6 +2647,9 @@ function App() {
           setSelectedOutputIndex(0);
           setGeneratedImage(outputs[0]?.url || "");
           setGeneratedName(outputs[0]?.output_name || `XirAI-${generationJob}.png`);
+          const completedSettings = generationSettingsByJob.current.get(generationJob) || job.gallery_settings || null;
+          if (completedSettings) generationSettingsByJob.current.set(generationJob, completedSettings);
+          setGeneratedSettings(completedSettings);
           setStatus("complete");
           setProgress(100);
           setGenerationPhase(`完成 · ${job.elapsed_seconds ?? 0}s`);
@@ -2653,6 +2717,7 @@ function App() {
   // restart this effect on every refresh, and each restart fires an immediate poll, which is a
   // request loop rather than an interval.
   const queueOutstanding = queue.some((job) => job.active);
+  const queueBusy = status === "running" || queueOutstanding;
   useEffect(() => {
     if (!queueOutstanding && !queueOpen) return undefined;
     let stopped = false;
@@ -2668,6 +2733,7 @@ function App() {
 
   // How many jobs are still waiting to start — what a user about to submit actually wants to know.
   const queuePendingCount = queue.filter((job) => job.waiting).length;
+  const canAddGeneratedToGallery = Boolean(generatedSettings) && generatedOutputs.some((output) => output.asset_id);
   // The most recent finished stage. It is what the panel shows while the next stage runs.
   const latestStagePreview = stagePreviews.length ? stagePreviews[stagePreviews.length - 1] : null;
   const cancelQueuedJob = async (jobId) => {
@@ -2679,13 +2745,85 @@ function App() {
     refreshQueue();
   };
 
+  const loadQueueJobDetail = async (jobId) => {
+    const galleryAccessToken = galleryAccessTokenForJob(jobId);
+    const response = await fetch(`/api/inference/jobs/${jobId}`, {
+      cache: "no-store",
+      ...(galleryAccessToken ? { headers: { "X-XirAI-Gallery-Access": galleryAccessToken } } : {}),
+    });
+    const detail = await response.json();
+    if (!response.ok) throw new Error(detail.detail || "无法读取任务详情");
+    return detail;
+  };
+
+  const selectQueueJob = async (job) => {
+    if (job.status === "complete" && job.output?.image_url) {
+      const settingsRequestToken = ++queueSettingsRequestToken.current;
+      setGeneratedSettings(null);
+      try {
+        const detail = await loadQueueJobDetail(job.id);
+        if (queueSettingsRequestToken.current !== settingsRequestToken) return;
+        const outputs = (detail.outputs || []).map((output, index) => ({
+        ...output,
+        index: output.index ?? index,
+          url: `${output.image_url}?v=${detail.completed_at || 0}`,
+      }));
+        if (!outputs[0]?.url) throw new Error("该任务没有可打开的生成结果");
+      setGeneratedOutputs(outputs);
+      setSelectedOutputIndex(0);
+      setGeneratedImage(outputs[0].url);
+      setGeneratedName(outputs[0].output_name || "");
+        setGenerationElapsed(detail.elapsed_seconds || 0);
+        setStagePreviews(detail.stage_previews || []);
+        const completedSettings = generationSettingsByJob.current.get(job.id) || detail.gallery_settings || null;
+      setGeneratedSettings(completedSettings);
+      queueViewPinned.current = true;
+      setGenerationJob(job.id);
+        setGenerationRunIdentity(generationJobIdentity(detail));
+      setStatus("complete");
+      setQueueOpen(false);
+      } catch (error) {
+        if (queueSettingsRequestToken.current === settingsRequestToken) setQueueError(error.message);
+      }
+      return;
+    }
+    if (!job.active || job.status === "queued") return;
+    setGeneratedSettings(null);
+    queueViewPinned.current = false;
+    generationLocked.current = true;
+    setGenerationJob(job.id);
+    setGenerationRunIdentity(generationJobIdentity(job));
+    setStatus("running");
+    setGenerationTaskStatus(job.status || "running");
+    setGenerationPhase(job.phase || "正在生成");
+    setGenerationStage(job.stage || "queued");
+    setGenerationStageStep(job.stage_step || 0);
+    setGenerationStageTotal(job.stage_total || 0);
+    setProgress(job.progress || 0);
+    setGenerationStep(job.step || 0);
+    setGenerationTotal(job.total_steps || 0);
+    setGenerationBatchIndex(job.batch_index || 0);
+    setGenerationBatchCount(job.batch_count || 1);
+    setGenerationCompletedImages(job.completed_images || 0);
+    setGenerationTotalImages(job.total_images || 1);
+    setStagePreviews(job.stage_preview ? [job.stage_preview] : []);
+    setEnlargedStage(null);
+    setGeneratedOutputs([]);
+    setGeneratedImage("");
+    setGeneratedName("");
+    setGenerationProgressCollapsed(false);
+    setQueueOpen(false);
+  };
+
   // When the watched job ends, follow whatever the service moved on to. Without this the panel
   // would sit on a finished result while the next queued job ran unobserved.
   useEffect(() => {
     if (status === "running") return;
+    if (queueViewPinned.current) return;
     const next = queue.find((job) => job.active && job.id !== generationJob);
     if (!next) return;
     setGenerationJob(next.id);
+    setGenerationRunIdentity(generationJobIdentity(next));
     setStagePreviews([]);
     setEnlargedStage(null);
     setStatus("running");
@@ -2700,6 +2838,7 @@ function App() {
   // working on. Submitting while that job runs queues the new one instead of taking the panel over,
   // so this only clears the board when there is nothing already being watched.
   const beginGenerationRun = ({ totalSteps, batches, totalImages }) => {
+    queueViewPinned.current = false;
     generationLocked.current = true;
     setStagePreviews([]);
     setEnlargedStage(null);
@@ -2736,7 +2875,7 @@ function App() {
     // service, which queuing does not fix. What no longer blocks a submission is another job being
     // in flight: that one queues behind whatever is running.
     if (submissionInFlight.current || generationDisabledReason) return;
-    const watching = generationJob && status === "running";
+    const watching = queueBusy;
     const animaGeneration = model === "Anima";
     const tiledHiresGeneration = supportsUsduTiled(model);
     const fluxGeneration = model === "Flux";
@@ -2748,6 +2887,12 @@ function App() {
     const distilledGeneration = DISTILLED_GUIDANCE_ENGINES.includes(model);
     submissionInFlight.current = true;
     if (!watching) {
+      queueSettingsRequestToken.current += 1;
+      setGenerationRunIdentity(generationJobIdentity({
+        engine: model,
+        checkpoint,
+        model_assets: { diffusion_model: diffusionModel, text_encoder: textEncoder, text_encoder_2: textEncoder2, vae },
+      }));
       beginGenerationRun({ totalSteps: steps, batches: batchCount, totalImages: imagesPerBatch * batchCount });
     }
     const generationSeed = seedMode === "random" ? randomSeed() : normalizeSeed(seed);
@@ -2764,7 +2909,7 @@ function App() {
     const generationHiresSeed = generationHiresSeedSettings(hires);
     const generationHires = { ...hires, ...generationHiresSeed };
     setSeed(generationSeed);
-    setGeneratedSettings(JSON.parse(JSON.stringify({
+    const submittedSettings = JSON.parse(JSON.stringify({
       ...gallerySettingsWithoutPromptPresets(workspaceSnapshot.current),
       seed: generationSeed,
       sampler: nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
@@ -2780,7 +2925,9 @@ function App() {
       // only the part of it that was typed.
       composedPrompt: generationPrompt,
       composedNegative: distilledGeneration ? "" : generationNegative,
-    })));
+    }));
+    const gallerySettings = galleryJobSnapshotPayload(submittedSettings);
+    if (!watching) setGeneratedSettings(submittedSettings);
     try {
       const response = await fetch("/api/inference/jobs", {
         method: "POST",
@@ -2842,6 +2989,7 @@ function App() {
           },
           postprocess_order: normalizePostprocessOrder(postprocessOrder),
           loras: generationLoras.filter((lora) => lora.enabled !== false).map((lora) => ({ path: lora.value, weight: lora.weight })),
+          gallery_settings: gallerySettings,
         }),
       });
       const job = await response.json();
@@ -2850,6 +2998,8 @@ function App() {
         throw new Error(detail || job.error || "任务提交失败");
       }
       submissionInFlight.current = false;
+      rememberGalleryAccessToken(job.id, job.gallery_access_token);
+      generationSettingsByJob.current.set(job.id, submittedSettings);
       refreshQueue();
       // Only follow the new job if the panel was free. If a job is already being watched, this one
       // waits its turn and the panel switches to it when its turn comes.
@@ -2880,7 +3030,9 @@ function App() {
   };
 
   const generateFromImage = async () => {
-    if (generationLocked.current || status === "running" || !imageSource) return;
+    if (submissionInFlight.current || !imageSource) return;
+    const watching = queueBusy;
+    const runSource = imageSource;
     const settings = normalizeImageToImageSettings(imageToImage, {
       samplers: activeSamplerNames,
       schedulers: activeSchedulerNames,
@@ -2892,19 +3044,14 @@ function App() {
     // the prompt box is never rewritten — exactly as on the text-to-image page.
     const runLoras = frozenMountedLorasForScope(mountedLorasMapRef.current, activeLoraScopeRef.current);
     const runGroups = enabledLoraGroups(loraGroupsForScope(loraGroupsMapRef.current, activeLoraScopeRef.current));
-    beginGenerationRun({
-      totalSteps: settings.steps,
-      batches: settings.batchCount,
-      totalImages: settings.imagesPerBatch * settings.batchCount,
-    });
-    setImageToImage({ ...settings, seed: runSeed });
     // What a gallery card records has to be what produced the image. Left alone, the dialog falls
     // back to the *workspace* snapshot — the text-to-image composer's prompt, steps and denoise —
     // and would attribute those to a picture they had nothing to do with. Restoring such a card
     // still lands on the text-to-image page without the source image, which is why the page it
     // came from is recorded alongside the parameters.
-    const runPrompt = composeGenerationPrompt({ groupPrompt: composeGroupPrompt(runGroups, ""), records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: settings.positive });
-    setGeneratedSettings(JSON.parse(JSON.stringify({
+    const runGroupPrompt = composeGroupPrompt(runGroups, "");
+    const runPrompt = composeGenerationPrompt({ groupPrompt: runGroupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: settings.positive });
+    const submittedSettings = JSON.parse(JSON.stringify({
       ...gallerySettingsWithoutPromptPresets(workspaceSnapshot.current),
       page: "image",
       positive: settings.positive,
@@ -2917,7 +3064,7 @@ function App() {
       sampler: settings.sampler,
       scheduler: settings.scheduler,
       guidance: "none",
-      size: outputSize(imageSource, settings),
+      size: outputSize(runSource, settings),
       imagesPerBatch: settings.imagesPerBatch,
       batchCount: settings.batchCount,
       imageToImage: { ...settings, hires: { ...settings.hires, ...runHiresSeed } },
@@ -2925,10 +3072,27 @@ function App() {
       adetailer: settings.adetailer,
       rtx: settings.rtx,
       postprocessOrder: settings.postprocessOrder,
+      loras: runLoras,
       loraGroups: runGroups.map((group) => ({ id: group.id, name: group.name, presetPrompt: group.presetPrompt })),
-      loraGroupPrompt: composeGroupPrompt(runGroups, ""),
+      loraGroupPrompt: runGroupPrompt,
       composedPrompt: runPrompt,
-    })));
+    }));
+    const gallerySettings = galleryJobSnapshotPayload(submittedSettings);
+    submissionInFlight.current = true;
+    if (!watching) {
+      queueSettingsRequestToken.current += 1;
+      setGenerationRunIdentity(generationJobIdentity({
+        engine: model,
+        checkpoint,
+        model_assets: { diffusion_model: diffusionModel, text_encoder: textEncoder, text_encoder_2: textEncoder2, vae },
+      }));
+      beginGenerationRun({
+        totalSteps: settings.steps,
+        batches: settings.batchCount,
+        totalImages: settings.imagesPerBatch * settings.batchCount,
+      });
+      setGeneratedSettings(submittedSettings);
+    }
     try {
       const response = await fetch("/api/inference/jobs", {
         method: "POST",
@@ -2940,13 +3104,15 @@ function App() {
           textEncoder,
           textEncoder2,
           vae,
-           source: imageSource,
-           settings: { ...settings, positive: runPrompt },
-           seed: runSeed,
-           hiresSeed: runHiresSeed,
-           samplers: activeSamplerNames,
-           schedulers: activeSchedulerNames,
-           loras: runLoras,
+          source: runSource,
+          settings: { ...settings, positive: runPrompt },
+          seed: runSeed,
+          hiresSeed: runHiresSeed,
+          gallerySettings,
+          samplers: activeSamplerNames,
+          schedulers: activeSchedulerNames,
+          loras: runLoras,
+          backgroundRemovalModel,
         })),
       });
       const job = await response.json();
@@ -2954,15 +3120,25 @@ function App() {
         const detail = Array.isArray(job.detail) ? job.detail.map((item) => item.msg || String(item)).join("；") : job.detail;
         throw new Error(detail || job.error || "任务提交失败");
       }
-      setGenerationJob(job.id);
-      setGenerationTaskStatus(job.status || "queued");
-      setGenerationPhase(job.phase || "已进入队列");
+      submissionInFlight.current = false;
+      rememberGalleryAccessToken(job.id, job.gallery_access_token);
+      generationSettingsByJob.current.set(job.id, submittedSettings);
+      refreshQueue();
+      if (!watching) {
+        setGenerationJob(job.id);
+        setGenerationTaskStatus(job.status || "queued");
+        setGenerationPhase(job.phase || "已进入队列");
+      }
       setImageToImage({ ...settings, seed: nextImageToImageSeed(settings, runSeed) });
     } catch (error) {
-      generationLocked.current = false;
-      setStatus("error");
-      setGenerationError(error.message);
-      setGenerationPhase("任务提交失败");
+      submissionInFlight.current = false;
+      if (!watching) {
+        generationLocked.current = false;
+        setStatus("error");
+        setGenerationError(error.message);
+        setGenerationPhase("任务提交失败");
+      }
+      setQueueError(error.message);
       logClientGenerationFailure("job-submission", error.message);
     }
   };
@@ -3007,7 +3183,7 @@ function App() {
   };
 
   const applyGallerySettings = async (savedSettings, groups, { page = "generate", label = "精选参数", fillMissingAssets = false } = {}) => {
-    if (status === "running" || modelSwitching || modelLoading) throw new Error(`生成或模型切换期间不能应用${label}`);
+    if (modelSwitching || modelLoading) throw new Error(`模型切换期间不能应用${label}`);
     const selectedGroups = new Set(groups);
     const current = workspaceSnapshot.current;
     const source = savedSettings && typeof savedSettings === "object" ? { ...savedSettings } : {};
@@ -3147,7 +3323,8 @@ function App() {
       }
     }
     const modelIdentityChanged = engineChanged || checkpointChanged || splitAssetsChanged;
-    if (modelIdentityChanged) {
+    const releaseIdleModel = modelIdentityChanged && !queueBusy;
+    if (releaseIdleModel) {
       setModelSwitching(true);
       if (!(await releaseLoadedModel())) {
         setModelSwitching(false);
@@ -3257,7 +3434,7 @@ function App() {
       setGalleryFocus(null);
     }
     setAppNotice({ message: `已应用 ${selectedGroups.size} 组${label}`, error: false });
-    if (modelIdentityChanged) setModelSwitching(false);
+    if (releaseIdleModel) setModelSwitching(false);
   };
 
   /**
@@ -3318,7 +3495,7 @@ function App() {
   // and a selection changed and changed back reuses the cache instead of re-reading it. Freeing on
   // demand is what 卸载模型 is for, and the health panel keeps saying what is actually resident.
   const selectModel = (nextModel) => {
-    if (nextModel === model || status === "running" || modelSwitching) return;
+    if (nextModel === model || modelSwitching) return;
     // Engine changes restore that engine's independent list; asset changes
     // below deliberately leave it untouched.
     transitionActiveLoraScope(nextModel);
@@ -3336,14 +3513,14 @@ function App() {
   };
 
   const selectCheckpoint = (nextCheckpoint) => {
-    if (nextCheckpoint === checkpoint || status === "running" || modelSwitching) return;
+    if (nextCheckpoint === checkpoint || modelSwitching) return;
     setCheckpoint(nextCheckpoint);
     setCheckpointMissing(false);
   };
 
   const selectSplitModelAsset = (kind, nextValue) => {
     const currentValue = { diffusionModel, textEncoder, textEncoder2, vae }[kind];
-    if (nextValue === currentValue || status === "running" || modelSwitching) return;
+    if (nextValue === currentValue || modelSwitching) return;
     if (kind === "diffusionModel") { setDiffusionModel(nextValue); setDiffusionModelMissing(false); }
     if (kind === "textEncoder") { setTextEncoder(nextValue); setTextEncoderMissing(false); }
     if (kind === "textEncoder2") { setTextEncoder2(nextValue); setTextEncoder2Missing(false); }
@@ -3351,7 +3528,7 @@ function App() {
   };
 
   const refreshCheckpoints = async () => {
-    if (modelsRefreshInFlight.current || modelsRefreshing || status === "running" || modelSwitching) return;
+    if (modelsRefreshInFlight.current || modelsRefreshing || modelSwitching) return;
     const engine = model;
     modelsRefreshInFlight.current = true;
     setModelsRefreshing(true);
@@ -5259,7 +5436,6 @@ function App() {
   };
 
   const applyPromptLibraryEntry = async (entry, target) => {
-    if (status === "running") throw new Error("生成期间不能应用词库 Prompt");
     const nextPositive = typeof entry?.positive_prompt === "string" ? entry.positive_prompt : "";
     const nextNegative = typeof entry?.negative_prompt === "string" ? entry.negative_prompt : "";
     if (target === "image") {
@@ -5318,19 +5494,19 @@ function App() {
   };
 
   const applyPreset = (requestedRecord) => {
-    if (status === "running" || promptPresetLibraryError) return;
+    if (promptPresetLibraryError) return;
     const record = promptPresets.records.find((candidate) => candidate.id === requestedRecord?.id);
     if (!record) return;
     setActivePromptPresets((current) => ({ ...current, [record.type]: togglePromptPresetId(current[record.type], record.id) }));
   };
 
   const openPromptPresetDialog = (type, record = null) => {
-    if (status === "running" || promptPresetLibraryError) return;
+    if (promptPresetLibraryError) return;
     setPromptPresetDialog({ type, record });
   };
 
   const savePromptPreset = (draft) => {
-    if (status === "running" || promptPresetLibraryError) return "生成任务运行期间不能保存 Prompt 预设";
+    if (promptPresetLibraryError) return "Prompt 预设库暂时不可写";
     try {
       const result = promptPresetDialog?.record
         ? updatePromptPreset(promptPresets, promptPresetDialog.record.id, draft)
@@ -5346,12 +5522,12 @@ function App() {
   };
 
   const requestDeletePromptPreset = (record) => {
-    if (status === "running" || promptPresetLibraryError) return;
+    if (promptPresetLibraryError) return;
     setPromptPresetDelete(record);
   };
 
   const confirmDeletePromptPreset = () => {
-    if (status === "running" || promptPresetLibraryError || !promptPresetDelete) return;
+    if (promptPresetLibraryError || !promptPresetDelete) return;
     setPromptPresets((current) => deletePromptPreset(current, promptPresetDelete.id));
     // A deleted preset stops contributing its words, rather than staying switched on as an id
     // nothing on screen can show or turn off again.
@@ -5373,7 +5549,7 @@ function App() {
   const updateHires = (updates) => setHires((current) => ({ ...current, ...updates }));
   const updateRtx = (updates) => setRtx((current) => ({ ...current, ...updates }));
   const movePostprocessStage = (stage, direction) => {
-    if (status === "running") return;
+    if (modelSwitching) return;
     setPostprocessOrder((current) => {
       const normalized = normalizePostprocessOrder(current);
       const from = normalized.indexOf(stage);
@@ -5850,20 +6026,11 @@ function App() {
   const visibleLoras = loraCategory === "mounted" ? [] : activeLoraCategory?.models.filter(matchesLoraSearch) ?? [];
   const displayedGenerationProgress = progress;
   const selectedOutput = generatedOutputs[selectedOutputIndex] || null;
-  const transparentPromptEnabled = TRANSPARENT_BACKGROUND_PATTERN.test(positive);
-  const transparentPromptSubject = positive.replace(TRANSPARENT_BACKGROUND_PATTERN_ALL, "").replace(/^\s*,\s*|\s*,\s*$/g, "").trim();
+  const transparentPromptEnabled = transparentBackgroundEnabled(positive);
+  const transparentPromptSubject = transparentBackgroundSubject(positive);
   const backgroundRemovalModels = (inferenceHealth?.background_removal?.models || []).filter((item) => item.selectable !== false);
-  const recommendedBackgroundRemovalModels = backgroundRemovalModels.filter((item) => !item.local);
-  const localBackgroundRemovalModels = backgroundRemovalModels.filter((item) => item.local);
   const selectedBackgroundRemovalModel = backgroundRemovalModels.find((item) => item.id === backgroundRemovalModel) || null;
-  const selectedBackgroundRemovalReady = Boolean(selectedBackgroundRemovalModel?.installed && inferenceHealth?.background_removal?.runtime_available);
-  const backgroundRemovalDownloadForSelection = backgroundRemovalDownload?.modelId === backgroundRemovalModel ? backgroundRemovalDownload : null;
-  const backgroundRemovalProgress = backgroundRemovalDownloadForSelection?.totalBytes > 0
-    ? Math.min(100, backgroundRemovalDownloadForSelection.currentBytes / backgroundRemovalDownloadForSelection.totalBytes * 100)
-    : 0;
-  const toggleTransparentBackground = () => setPositive((current) => TRANSPARENT_BACKGROUND_PATTERN.test(current)
-    ? current.replace(TRANSPARENT_BACKGROUND_PATTERN_ALL, "").replace(/\s*,\s*,+/g, ", ").replace(/^\s*,\s*|\s*,\s*$/g, "").trim()
-    : `${current.trim()}${current.trim() ? ", " : ""}${TRANSPARENT_BACKGROUND_TAG}`);
+  const toggleTextToImageTransparentBackground = () => setPositive(toggleTransparentBackground);
   const activeViewerLayerItem = viewerLayers.find((layer) => layer.id === activeViewerLayer) || viewerLayers.at(-1) || null;
   const viewerHasEditableContent = hasViewerEdits(viewerLayers);
   // Strokes on the canvas are unsaved work, so they get their own primary action rather than
@@ -5929,6 +6096,19 @@ function App() {
   // and it is what most of the engine-conditional UI below actually branches on.
   const isSplitModel = SPLIT_MODEL_ENGINES.includes(model);
   const engineLabel = model === "SD" ? "Stable Diffusion" : model === "iL" ? "Illustrious" : model;
+  const displayedRunIdentity = status === "idle" ? null : generationRunIdentity;
+  const displayedRunEngine = displayedRunIdentity?.engine || model;
+  const displayedRunIsSplit = SPLIT_MODEL_ENGINES.includes(displayedRunEngine);
+  const displayedRunEngineLabel = displayedRunEngine === "SD" ? "Stable Diffusion" : displayedRunEngine === "iL" ? "Illustrious" : displayedRunEngine;
+  const displayedRunAssets = displayedRunIdentity?.assets || {};
+  const displayedRunDiffusionModel = displayedRunIdentity ? displayedRunAssets.diffusion_model || "" : diffusionModel;
+  const displayedRunTextEncoder = displayedRunIdentity ? displayedRunAssets.text_encoder || "" : textEncoder;
+  const displayedRunTextEncoder2 = displayedRunIdentity ? displayedRunAssets.text_encoder_2 || "" : textEncoder2;
+  const displayedRunVae = displayedRunIdentity ? displayedRunAssets.vae || "" : vae;
+  const displayedRunCheckpoint = displayedRunIdentity ? displayedRunIdentity.checkpoint || "" : checkpoint;
+  const displayedRunTitle = displayedRunIsSplit
+    ? [displayedRunDiffusionModel, displayedRunTextEncoder, displayedRunTextEncoder2, displayedRunVae].filter(Boolean).join(" · ")
+    : displayedRunCheckpoint;
   const selectedEngineHealth = inferenceHealth?.engines?.[model] || {};
   const selectedEngineFeatures = selectedEngineHealth.features || {};
   const nativeSamplerNames = isFlux ? FLUX_SAMPLERS : isFlux2 ? FLUX2_SAMPLERS : isKrea2 ? KREA2_SAMPLERS : ANIMA_SAMPLERS;
@@ -5961,7 +6141,7 @@ function App() {
     ? adetailerStageIssue(adetailer, steps, (detector) => adetailerModels.some((item) => item.value === detector), model)
     : "";
   const adetailerReady = !adetailer.enabled || (adetailerInfo.available && !adetailerIssue);
-  const adetailerLocked = status === "running";
+  const adetailerLocked = modelSwitching;
   const upscalerModels = inferenceHealth?.upscalers?.models || [];
   const compatibleUpscalers = upscalerModels.filter((item) => item.compatible);
   const selectedUpscaler = upscalerModels.find((item) => item.id === hires.model) || null;
@@ -5969,7 +6149,7 @@ function App() {
   const hiresConfigurationReady = hiresEffectiveSteps >= 1 && hires.tileOverlap <= Math.floor(hires.tileSize / 2);
   const hiresSeedReady = hires.seedMode !== "fixed" || normalizeUint64Seed(hires.seed) !== null;
   const hiresReady = !hires.enabled || Boolean(inferenceHealth?.upscalers?.runtime_available && selectedUpscaler?.compatible && hiresConfigurationReady && hiresSeedReady);
-  const hiresControlsLocked = !hires.enabled || status === "running";
+  const hiresControlsLocked = modelSwitching;
   const normalizedPostprocessOrder = normalizePostprocessOrder(postprocessOrder);
   const postprocessSettings = { hires, adetailer, rtx };
   const postprocessDimensions = postprocessTargetSize(size, normalizedPostprocessOrder, postprocessSettings);
@@ -6025,8 +6205,7 @@ function App() {
   const imageEngineReady = !modelSwitching && !modelLoading && !modelError && loraResourcesReady && (isSplitModel
     ? Boolean(splitModelAssetsReady && !animaTokenizerMissing.length && !ultraLowMode && loraReady)
     : Boolean(checkpoint && !checkpointMissing));
-  const generationDisabledReason = status === "running" ? "正在生成"
-    : modelSwitching ? "正在切换或释放模型"
+  const generationDisabledReason = modelSwitching ? "正在切换或释放模型"
       : modelLoading ? "正在读取模型目录"
         : modelError ? `模型目录不可用：${modelError}`
           : isSplitModel && !diffusionModel ? `请先选择 ${engineLabel} 扩散模型`
@@ -6122,8 +6301,8 @@ function App() {
     const metadata = item.metadata;
     const presentation = loraPresentationFor(item);
     return <article
-      aria-disabled={status === "running" || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras}
-      className={`lora-library-card ${mounted ? "mounted" : ""} ${presentation.customized ? "customized" : ""} ${status === "running" || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras ? "locked" : ""}`}
+      aria-disabled={modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras}
+      className={`lora-library-card ${mounted ? "mounted" : ""} ${presentation.customized ? "customized" : ""} ${modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras ? "locked" : ""}`}
       key={item.value}
       role="button"
       tabIndex="0"
@@ -6199,7 +6378,7 @@ function App() {
               {models.map((item) => (
                 <button
                   key={item.name}
-                  disabled={!item.ready || status === "running" || modelSwitching}
+                  disabled={!item.ready || modelSwitching}
                   title={`${item.name} · ${item.detail}`}
                   className={`model-seg ${model === item.name ? "active" : ""}`}
                   onClick={() => selectModel(item.name)}
@@ -6210,7 +6389,7 @@ function App() {
               ))}
             </div>
             {isSplitModel ? <div className={`checkpoint-picker split-model-picker ${modelError || diffusionModelMissing || textEncoderMissing || (isFlux && textEncoder2Missing) || vaeMissing ? "error" : ""}`}>
-              <span className="checkpoint-label"><b>模型组件</b><span className="asset-list-actions"><small>{modelLoading ? "扫描中" : `${diffusionModels.length + textEncoders.length + (isFlux ? textEncoders2.length : 0) + vaes.length} 个资源`}</small><button type="button" className="asset-refresh" title={`刷新 ${engineLabel} 模型组件`} aria-label={`刷新 ${engineLabel} 模型组件`} disabled={modelLoading || modelsRefreshing || status === "running" || modelSwitching} onClick={(event) => { event.preventDefault(); refreshCheckpoints(); }}><RefreshCw className={modelsRefreshing ? "spin" : ""} size={13} /></button></span></span>
+              <span className="checkpoint-label"><b>模型组件</b><span className="asset-list-actions"><small>{modelLoading ? "扫描中" : `${diffusionModels.length + textEncoders.length + (isFlux ? textEncoders2.length : 0) + vaes.length} 个资源`}</small><button type="button" className="asset-refresh" title={`刷新 ${engineLabel} 模型组件`} aria-label={`刷新 ${engineLabel} 模型组件`} disabled={modelLoading || modelsRefreshing || modelSwitching} onClick={(event) => { event.preventDefault(); refreshCheckpoints(); }}><RefreshCw className={modelsRefreshing ? "spin" : ""} size={13} /></button></span></span>
               {[
                 ["diffusionModel", "扩散模型", diffusionModel, diffusionModels, diffusionModelDirectory, diffusionModelMissing],
                 ["textEncoder", isFlux ? "文本编码器 · CLIP-L" : isFlux2 || isKrea2 ? "文本编码器 · 大语言模型" : "文本编码器", textEncoder, textEncoders, textEncoderDirectory, textEncoderMissing],
@@ -6218,7 +6397,7 @@ function App() {
                 ["vae", "VAE", vae, vaes, vaeDirectory, vaeMissing],
               ].map(([kind, label, value, catalog, directory, missing]) => <label className="split-model-field" key={kind}>
                 <span>{label}<small>{modelLoading ? "扫描中" : `${catalog.length} 个`}</small></span>
-                <span className="checkpoint-select"><WorkspaceSelect ariaLabel={label} value={value} disabled={status === "running" || modelSwitching || modelLoading || catalog.length === 0} onChange={(nextValue) => selectSplitModelAsset(kind, nextValue)} options={[
+                <span className="checkpoint-select"><WorkspaceSelect ariaLabel={label} value={value} disabled={modelSwitching || modelLoading || catalog.length === 0} onChange={(nextValue) => selectSplitModelAsset(kind, nextValue)} options={[
                   ...(modelLoading ? [{ value: "", label: "正在加载模型目录...", disabled: true }] : []),
                   ...(!modelLoading && catalog.length === 0 ? [{ value: "", label: "未检测到可用资源", disabled: true }] : []),
                   ...(missing && value ? [{ value, label: `${value}（文件已删除）` }] : []),
@@ -6227,8 +6406,8 @@ function App() {
                 <span className="checkpoint-path" title={modelError || (missing ? `${label}文件已删除，请选择其他资源` : directory)}>{modelError || (missing ? `${label}文件已删除，请选择其他资源` : directory || "正在解析模型路径...")}</span>
               </label>)}
             </div> : <div className={`checkpoint-picker ${modelError || checkpointMissing ? "error" : ""}`}>
-              <span className="checkpoint-label"><b>底模选择</b><span className="asset-list-actions"><small>{modelLoading ? "扫描中" : `${checkpoints.length} 个模型`}</small><button type="button" className="asset-refresh" title="刷新底模列表" aria-label="刷新底模列表" disabled={modelLoading || modelsRefreshing || status === "running" || modelSwitching} onClick={(event) => { event.preventDefault(); refreshCheckpoints(); }}><RefreshCw className={modelsRefreshing ? "spin" : ""} size={13} /></button></span></span>
-              <span className="checkpoint-select"><WorkspaceSelect ariaLabel="底模选择" value={checkpoint} disabled={status === "running" || modelSwitching || modelLoading || checkpoints.length === 0} onChange={selectCheckpoint} options={[
+              <span className="checkpoint-label"><b>底模选择</b><span className="asset-list-actions"><small>{modelLoading ? "扫描中" : `${checkpoints.length} 个模型`}</small><button type="button" className="asset-refresh" title="刷新底模列表" aria-label="刷新底模列表" disabled={modelLoading || modelsRefreshing || modelSwitching} onClick={(event) => { event.preventDefault(); refreshCheckpoints(); }}><RefreshCw className={modelsRefreshing ? "spin" : ""} size={13} /></button></span></span>
+              <span className="checkpoint-select"><WorkspaceSelect ariaLabel="底模选择" value={checkpoint} disabled={modelSwitching || modelLoading || checkpoints.length === 0} onChange={selectCheckpoint} options={[
                 ...(modelLoading ? [{ value: "", label: "正在加载模型目录...", disabled: true }] : []),
                 ...(!modelLoading && checkpoints.length === 0 ? [{ value: "", label: "未检测到可用底模", disabled: true }] : []),
                 ...(checkpointMissing && checkpoint ? [{ value: checkpoint, label: `${checkpoint}（文件已删除）` }] : []),
@@ -6258,11 +6437,11 @@ function App() {
             </div>}
             {isSplitModel && !engineAllowsLora && <p className="guidance-unavailable" role="status">当前推理服务未声明 {engineLabel} LoRA 能力；可管理现有组合，但启用后不能生成。</p>}
 
-            <label className="guidance-select"><span><b>引导增强（Guidance）</b><small>{isDistilledGuidance ? `${distilledEngineLabel} 蒸馏引导，无无条件分支` : guidanceOptions.find((item) => item.id === guidance)?.detail}</small></span><WorkspaceSelect ariaLabel="引导增强" value={guidance} disabled={status === "running" || isDistilledGuidance} ariaInvalid={!guidanceReady} ariaDescribedBy={!guidanceReady ? "guidance-compatibility-note" : undefined} onChange={setGuidance} options={(isDistilledGuidance ? guidanceOptions.filter((item) => item.id === "none") : guidanceOptions).map((item) => ({ value: item.id, label: item.label }))} /></label>
+            <label className="guidance-select"><span><b>引导增强（Guidance）</b><small>{isDistilledGuidance ? `${distilledEngineLabel} 蒸馏引导，无无条件分支` : guidanceOptions.find((item) => item.id === guidance)?.detail}</small></span><WorkspaceSelect ariaLabel="引导增强" value={guidance} disabled={modelSwitching || isDistilledGuidance} ariaInvalid={!guidanceReady} ariaDescribedBy={!guidanceReady ? "guidance-compatibility-note" : undefined} onChange={setGuidance} options={(isDistilledGuidance ? guidanceOptions.filter((item) => item.id === "none") : guidanceOptions).map((item) => ({ value: item.id, label: item.label }))} /></label>
             {isDistilledGuidance && <p className="guidance-unavailable" role="status">{distilledEngineLabel} 经过引导蒸馏，每一步只跑一次前向，没有可供 PAG 或 CFG-Zero* 作用的无条件分支。</p>}
             {guidance === "pag" && <div className="guidance-settings">
-              <Slider label="PAG 强度" value={pag.scale} min={0} max={5} step={0.1} inputStep={0.01} fixed={2} disabled={status === "running"} onChange={(value) => setPag((current) => ({ ...current, scale: value }))} />
-              <label><span>PAG 作用层</span><WorkspaceSelect ariaLabel="PAG 作用层" value={pag.appliedLayers} disabled={status === "running"} onChange={(appliedLayers) => setPag((current) => ({ ...current, appliedLayers }))} options={[{ value: "mid", label: "Mid（推荐）" }, { value: "all", label: "全部自注意力层（高风险）" }]} /></label>
+              <Slider label="PAG 强度" value={pag.scale} min={0} max={5} step={0.1} inputStep={0.01} fixed={2} disabled={modelSwitching} onChange={(value) => setPag((current) => ({ ...current, scale: value }))} />
+              <label><span>PAG 作用层</span><WorkspaceSelect ariaLabel="PAG 作用层" value={pag.appliedLayers} disabled={modelSwitching} onChange={(appliedLayers) => setPag((current) => ({ ...current, appliedLayers }))} options={[{ value: "mid", label: "Mid（推荐）" }, { value: "all", label: "全部自注意力层（高风险）" }]} /></label>
               <small>建议从 0.3 开始；全部层会显著放大对比、描边和色彩，动漫模型尤其容易失真。</small>
             </div>}
             {guidance === "pag" && !guidancePagCompatible && <p id="guidance-compatibility-note" className="guidance-unavailable" role="status" aria-live="polite">当前 {model} 推理运行时未声明 PAG 可用，请切换为“无”后生成。</p>}
@@ -6280,8 +6459,8 @@ function App() {
                 <Slider label="降噪强度" value={denoise} min={0} max={1} step={0.05} inputStep={0.01} onChange={setDenoise} />
               </div>
               <div className="generation-count-grid">
-                <CountField label="单批图片数" detail="一次批量推理同时生成" value={imagesPerBatch} max={10} disabled={status === "running"} onChange={setImagesPerBatch} />
-                <CountField label="生成批次数" detail="批次之间按顺序排队" value={batchCount} max={20} disabled={status === "running"} onChange={setBatchCount} />
+                <CountField label="单批图片数" detail="一次批量推理同时生成" value={imagesPerBatch} max={10} disabled={modelSwitching} onChange={setImagesPerBatch} />
+                <CountField label="生成批次数" detail="批次之间按顺序排队" value={batchCount} max={20} disabled={modelSwitching} onChange={setBatchCount} />
               </div>
               <p className="generation-count-summary">本任务共生成 <b>{imagesPerBatch * batchCount}</b> 张 · 每批一次推理，最多同时生成 10 张</p>
               <label className="seed-field"><span>随机种子</span><div><input inputMode="numeric" maxLength="20" value={seed} onChange={(event) => setSeed(event.target.value.replace(/\D/g, ""))} onBlur={() => setSeed(normalizeSeed(seed))} /><button title="生成随机种子" onClick={() => setSeed(randomSeed())}><RefreshCw size={15} /></button></div></label>
@@ -6291,17 +6470,25 @@ function App() {
               <p className="seed-range">范围 0 ～ 18446744073709551615</p>
             </div>}
 
-            <button type="button" className={`section-heading parameter-title parameter-toggle ${hires.expanded ? "expanded" : ""}`} aria-expanded={hires.expanded} onClick={() => updateHires({ expanded: !hires.expanded })}><span>04</span><h2>Hires.fix</h2><small>{hires.enabled ? `${hires.scale.toFixed(1)}x · ${hiresTargetSize.width} × ${hiresTargetSize.height}` : "关闭"}</small><ZoomIn size={15} /><ChevronDown className="parameter-chevron" size={15} /></button>
+            <section className="postprocess-stage-stack" aria-labelledby="postprocess-stage-title">
+              <div className="section-heading"><span>04</span><h2 id="postprocess-stage-title">后处理增强</h2><small>生成后按顺序执行</small></div>
+              <section className={`postprocess-stage-card ${hires.enabled ? "enabled" : ""} ${hires.expanded ? "expanded" : ""}`}>
+                <PostprocessStageHeader
+                  title="Hires.fix"
+                  detail={hires.enabled ? `${hires.scale.toFixed(1)}x · ${hiresTargetSize.width} × ${hiresTargetSize.height}` : "关闭"}
+                  enabled={hires.enabled}
+                  expanded={hires.expanded}
+                  onToggleExpanded={() => updateHires({ expanded: !hires.expanded })}
+                  onToggleEnabled={() => (engineAllowsHires || hires.enabled) && updateHires({ enabled: !hires.enabled })}
+                  switchDisabled={modelSwitching || (!engineAllowsHires && !hires.enabled) || ultraLowMode || (!inferenceHealth?.upscalers?.runtime_available && !hires.enabled)}
+                />
             {hires.expanded && <div className={`hires-parameters ${hires.enabled ? "enabled" : ""}`}>
-              <div className="hires-enable">
-                <div><strong>超分放大 + 扩散精修</strong><small>像素模型预放大后，使用当前底模、LoRA 和提示词进行第二次 img2img</small></div>
-                <button type="button" role="switch" aria-label="启用 Hires.fix" aria-checked={hires.enabled} className={hires.enabled ? "active" : ""} disabled={status === "running" || (!engineAllowsHires && !hires.enabled) || ultraLowMode || (!inferenceHealth?.upscalers?.runtime_available && !hires.enabled)} onClick={() => (engineAllowsHires || hires.enabled) && updateHires({ enabled: !hires.enabled })}><i /></button>
-              </div>
+              <p className="postprocess-stage-description">超分放大后，使用当前底模、LoRA 和提示词进行第二次扩散精修。</p>
               {!engineAllowsHires && <p className="hires-unavailable">当前推理服务未声明 {model} Hires.fix 能力。</p>}
               {ultraLowMode && <p className="hires-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
               {engineAllowsHires && !inferenceHealth?.upscalers?.runtime_available && <p className="hires-unavailable">超分运行库尚未安装，请重新运行 Setup-XirAI 配置环境。</p>}
               {engineAllowsHires && inferenceHealth?.upscalers?.runtime_available && compatibleUpscalers.length === 0 && <p className="hires-unavailable">尚无兼容超分模型。请前往模型下载器下载推荐模型，或手动放入 models/upscalers 后刷新。</p>}
-              <label className="hires-model">超分模型<span><WorkspaceSelect ariaLabel="超分模型" value={hires.model} disabled={!hires.enabled || status === "running" || compatibleUpscalers.length === 0} onChange={(modelValue) => updateHires({ model: modelValue })} options={compatibleUpscalers.length ? compatibleUpscalers.map((item) => ({ value: item.id, label: `${item.label} · ${item.architecture} · ${item.scale}x` })) : [{ value: "", label: "暂无兼容模型", disabled: true }]} /><button type="button" title="重新扫描超分模型" disabled={upscalersRefreshing || status === "running"} onClick={() => void refreshUpscalers()}><RefreshCw className={upscalersRefreshing ? "spin" : ""} size={12} /></button></span></label>
+              <label className="hires-model">超分模型<span><WorkspaceSelect ariaLabel="超分模型" value={hires.model} disabled={modelSwitching || compatibleUpscalers.length === 0} onChange={(modelValue) => updateHires({ model: modelValue })} options={compatibleUpscalers.length ? compatibleUpscalers.map((item) => ({ value: item.id, label: `${item.label} · ${item.architecture} · ${item.scale}x` })) : [{ value: "", label: "暂无兼容模型", disabled: true }]} /><button type="button" title="重新扫描超分模型" disabled={upscalersRefreshing || modelSwitching} onClick={() => void refreshUpscalers()}><RefreshCw className={upscalersRefreshing ? "spin" : ""} size={12} /></button></span></label>
               <div className="hires-scale"><Slider label="放大倍率" value={hires.scale} min={1} max={4} step={0.1} inputStep={0.1} fixed={1} disabled={hiresControlsLocked} onChange={(scale) => updateHires({ scale: Math.round(scale * 10) / 10 })} suffix="x" /><p><span>INPUT {hiresStageTrace?.input.width || size.width} × {hiresStageTrace?.input.height || size.height}</span><b>OUTPUT {hiresTargetSize.width} × {hiresTargetSize.height}</b></p></div>
               <div className="hires-sliders">
                 <Slider label="二次重绘强度" value={hires.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} disabled={hiresControlsLocked} onChange={(value) => updateHires({ denoise: value })} />
@@ -6328,13 +6515,20 @@ function App() {
               {upscalerModels.some((item) => !item.compatible) && <p className="hires-incompatible">检测到 {upscalerModels.filter((item) => !item.compatible).length} 个不兼容文件；已从选择列表隐藏。</p>}
               <p className="hires-path" title={inferenceHealth?.upscalers?.directory}>模型目录 · {inferenceHealth?.upscalers?.directory || "models/upscalers"} · 支持 PTH / PT / CKPT 权重字典及 Safetensors，不加载 TorchScript</p>
             </div>}
+              </section>
 
-            <button type="button" className={`section-heading parameter-title parameter-toggle ${adetailer.expanded ? "expanded" : ""}`} aria-expanded={adetailer.expanded} onClick={() => updateADetailer({ expanded: !adetailer.expanded })}><span>05</span><h2>ADetailer</h2><small>{adetailer.enabled ? adetailerSummary(adetailer) : "关闭"}</small><Sparkles size={15} /><ChevronDown className="parameter-chevron" size={15} /></button>
+              <section className={`postprocess-stage-card ${adetailer.enabled ? "enabled" : ""} ${adetailer.expanded ? "expanded" : ""}`}>
+                <PostprocessStageHeader
+                  title="ADetailer"
+                  detail={adetailer.enabled ? adetailerSummary(adetailer) : "关闭"}
+                  enabled={adetailer.enabled}
+                  expanded={adetailer.expanded}
+                  onToggleExpanded={() => updateADetailer({ expanded: !adetailer.expanded })}
+                  onToggleEnabled={() => (engineAllowsADetailer || adetailer.enabled) && updateADetailer({ enabled: !adetailer.enabled })}
+                  switchDisabled={adetailerLocked || (!engineAllowsADetailer && !adetailer.enabled) || ultraLowMode || (!adetailerInfo.runtimeAvailable && !adetailer.enabled)}
+                />
             {adetailer.expanded && <div className={`adetailer-parameters ${adetailer.enabled ? "enabled" : ""}`}>
-              <div className="adetailer-enable">
-                <div><strong>检测后局部重绘</strong><small>按所选后处理顺序修复面部、手部或人物区域</small></div>
-                <button type="button" role="switch" aria-label="启用 ADetailer" aria-checked={adetailer.enabled} className={adetailer.enabled ? "active" : ""} disabled={adetailerLocked || (!engineAllowsADetailer && !adetailer.enabled) || ultraLowMode || (!adetailerInfo.runtimeAvailable && !adetailer.enabled)} onClick={() => (engineAllowsADetailer || adetailer.enabled) && updateADetailer({ enabled: !adetailer.enabled })}><i /></button>
-              </div>
+              <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
               {!engineAllowsADetailer && <p className="adetailer-unavailable">当前推理服务未声明 {model} ADetailer 能力。</p>}
               {ultraLowMode && <p className="adetailer-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
               {engineAllowsADetailer && !adetailerInfo.available && <p className="adetailer-unavailable">{adetailerInfo.loading ? "正在读取检测模型..." : adetailerInfo.error || (adetailerInfo.runtimeAvailable ? "尚未安装 YOLO 检测模型，请从下方模型库下载或手动放入 models/yolo" : "项目 YOLO 运行环境不可用，请重新运行环境配置")}</p>}
@@ -6353,7 +6547,7 @@ function App() {
                 <small>{adetailerDownload.currentBytes > 0 ? `${formatFileSize(adetailerDownload.currentBytes)} / ${formatFileSize(adetailerDownload.totalBytes)}` : ""}{adetailerDownload.speedBps > 0 ? ` · ${formatFileSize(adetailerDownload.speedBps)}/s` : ""}{adetailerDownload.connections > 1 ? ` · ${adetailerDownload.connections} 路分片` : ""}</small>
               </div>}
               {(() => {
-                const unitLocked = !adetailer.enabled || adetailerLocked;
+                const unitLocked = adetailerLocked;
                 const index = adetailerPageIndex(adetailerUnits, adetailerPage);
                 const unit = adetailerUnits[index];
                 if (!unit) return null;
@@ -6425,13 +6619,20 @@ function App() {
               </div>
               <p className="adetailer-path" title={adetailerInfo.directory}>CPU 检测 · 重绘继承当前采样器、调度器、底模与 LoRA</p>
             </div>}
+              </section>
 
-            <button type="button" className={`section-heading parameter-title parameter-toggle ${rtx.expanded ? "expanded" : ""}`} aria-expanded={rtx.expanded} onClick={() => updateRtx({ expanded: !rtx.expanded })}><span>06</span><h2>RTX VSR</h2><small>{rtx.enabled ? `${rtx.scale.toFixed(2)}x · ${rtxStageTrace?.output.width || size.width} × ${rtxStageTrace?.output.height || size.height}` : "关闭"}</small><Zap size={15} /><ChevronDown className="parameter-chevron" size={15} /></button>
+              <section className={`postprocess-stage-card ${rtx.enabled ? "enabled" : ""} ${rtx.expanded ? "expanded" : ""}`}>
+                <PostprocessStageHeader
+                  title="RTX VSR"
+                  detail={rtx.enabled ? `${rtx.scale.toFixed(2)}x · ${rtxStageTrace?.output.width || size.width} × ${rtxStageTrace?.output.height || size.height}` : "关闭"}
+                  enabled={rtx.enabled}
+                  expanded={rtx.expanded}
+                  onToggleExpanded={() => updateRtx({ expanded: !rtx.expanded })}
+                  onToggleEnabled={() => (engineAllowsRtx || rtx.enabled) && updateRtx({ enabled: !rtx.enabled })}
+                  switchDisabled={modelSwitching || (!engineAllowsRtx && !rtx.enabled) || ultraLowMode || ((!rtxHealth.available || !rtxPreviewDimensions.valid) && !rtx.enabled)}
+                />
             {rtx.expanded && <div className={`rtx-parameters ${rtx.enabled ? "enabled" : ""}`}>
-              <div className="rtx-enable">
-                <div><strong>NVIDIA RTX 超分</strong><small>执行最终或中间像素超分</small></div>
-                <button type="button" role="switch" aria-label="启用 RTX VSR" aria-checked={rtx.enabled} className={rtx.enabled ? "active" : ""} disabled={status === "running" || (!engineAllowsRtx && !rtx.enabled) || ultraLowMode || ((!rtxHealth.available || !rtxPreviewDimensions.valid) && !rtx.enabled)} onClick={() => (engineAllowsRtx || rtx.enabled) && updateRtx({ enabled: !rtx.enabled })}><i /></button>
-              </div>
+              <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
               {!engineAllowsRtx && <p className="rtx-unavailable">当前推理服务未声明 {model} RTX VSR 能力。</p>}
               {ultraLowMode && <p className="rtx-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
               {engineAllowsRtx && !rtxHealth.available && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`} role="status" aria-live="polite">{rtxStatusReason}</p>}
@@ -6444,21 +6645,23 @@ function App() {
                 <div><span>CUDA 能力</span><strong>{rtxHealth.compute_capability || "--"}</strong></div>
                 <div><span>驱动</span><strong>{rtxHealth.driver_version || "--"}</strong></div>
               </div>
-              <div className="rtx-scale"><Slider label="放大倍率" value={rtx.scale} min={1} max={4} step={0.01} inputStep={0.01} fixed={2} disabled={status === "running"} onChange={(scale) => updateRtx({ scale: Math.round(scale * 100) / 100 })} suffix="x" /><p><span>INPUT {rtxStageTrace?.input.width || size.width} × {rtxStageTrace?.input.height || size.height}</span><b>OUTPUT {rtxStageTrace?.output.width || size.width} × {rtxStageTrace?.output.height || size.height}</b></p><p><span>ORDERED FINAL</span><b>{rtxPreviewDimensions.width} × {rtxPreviewDimensions.height}</b></p></div>
-              <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={rtx.quality} disabled={status === "running"} onChange={(quality) => updateRtx({ quality })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
+              <div className="rtx-scale"><Slider label="放大倍率" value={rtx.scale} min={1} max={4} step={0.01} inputStep={0.01} fixed={2} disabled={modelSwitching} onChange={(scale) => updateRtx({ scale: Math.round(scale * 100) / 100 })} suffix="x" /><p><span>INPUT {rtxStageTrace?.input.width || size.width} × {rtxStageTrace?.input.height || size.height}</span><b>OUTPUT {rtxStageTrace?.output.width || size.width} × {rtxStageTrace?.output.height || size.height}</b></p><p><span>ORDERED FINAL</span><b>{rtxPreviewDimensions.width} × {rtxPreviewDimensions.height}</b></p></div>
+              <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={rtx.quality} disabled={modelSwitching} onChange={(quality) => updateRtx({ quality })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
               <p className="rtx-proprietary">RTX VSR 依赖 NVIDIA 专有 Video Effects 运行时，仅在受支持的 x64 Windows / Linux NVIDIA RTX 设备上可用；生成内容仍在本机处理。</p>
             </div>}
+              </section>
 
             <section className="postprocess-order" aria-labelledby="postprocess-order-title">
-              <header><div><span>07</span><strong id="postprocess-order-title">后处理顺序</strong><small>禁用阶段仍可排序；生成期间锁定</small></div><b>FINAL {postprocessDimensions.width} × {postprocessDimensions.height}</b></header>
+              <header><div><span>05</span><strong id="postprocess-order-title">后处理顺序</strong><small>禁用阶段仍可排序；生成期间锁定</small></div><b>FINAL {postprocessDimensions.width} × {postprocessDimensions.height}</b></header>
               <div className="postprocess-order-list">
                 {normalizedPostprocessOrder.map((stage, index) => {
                   const stageSettings = postprocessSettings[stage];
                   const labels = { hires: ["Hires.fix", "扩散精修"], adetailer: ["ADetailer", "局部重绘"], rtx: ["RTX VSR", "NVIDIA 超分"] };
-                  return <div className={stageSettings.enabled ? "enabled" : "disabled"} key={stage}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{labels[stage][0]}</strong><small>{labels[stage][1]} · {stageSettings.enabled ? "启用" : "关闭"}</small></div><div className="postprocess-order-actions"><button type="button" aria-label={`上移 ${labels[stage][0]}`} title={`上移 ${labels[stage][0]}`} disabled={status === "running" || index === 0} onClick={() => movePostprocessStage(stage, -1)}><ArrowUp size={13} /></button><button type="button" aria-label={`下移 ${labels[stage][0]}`} title={`下移 ${labels[stage][0]}`} disabled={status === "running" || index === normalizedPostprocessOrder.length - 1} onClick={() => movePostprocessStage(stage, 1)}><ArrowDown size={13} /></button></div></div>;
+                  return <div className={stageSettings.enabled ? "enabled" : "disabled"} key={stage}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{labels[stage][0]}</strong><small>{labels[stage][1]} · {stageSettings.enabled ? "启用" : "关闭"}</small></div><div className="postprocess-order-actions"><button type="button" aria-label={`上移 ${labels[stage][0]}`} title={`上移 ${labels[stage][0]}`} disabled={modelSwitching || index === 0} onClick={() => movePostprocessStage(stage, -1)}><ArrowUp size={13} /></button><button type="button" aria-label={`下移 ${labels[stage][0]}`} title={`下移 ${labels[stage][0]}`} disabled={modelSwitching || index === normalizedPostprocessOrder.length - 1} onClick={() => movePostprocessStage(stage, 1)}><ArrowDown size={13} /></button></div></div>;
                 })}
               </div>
               {!postprocessDimensions.valid && <p>RTX VSR 中间目标超过 8192 边长或 32 MP 安全限制。</p>}
+            </section>
             </section>
           </div>
         </aside>
@@ -6495,26 +6698,19 @@ function App() {
             <textarea ref={positivePromptRef} value={positive} onChange={(event) => changePromptText("positive", event)} onSelect={(event) => recordPromptSelection("positive", event)} onClick={(event) => recordPromptSelection("positive", event)} onKeyUp={(event) => recordPromptSelection("positive", event)} onFocus={(event) => recordPromptSelection("positive", event)} placeholder="描述画面主体、环境、光线与风格..." spellCheck={false} />
             <Sparkles className="field-watermark" size={46} />
           </label>
-          <div className={`transparent-tag-control ${transparentPromptEnabled ? "active" : ""}`}>
-            <div className="transparent-model-picker" ref={backgroundRemovalPickerRef}>
-              <button type="button" className="transparent-model-select" aria-haspopup="listbox" aria-expanded={backgroundRemovalPickerOpen} disabled={status === "running"} onClick={() => setBackgroundRemovalPickerOpen((current) => !current)}>
-                <span><b>{selectedBackgroundRemovalModel?.label || "选择透明背景模型"}</b><small>{selectedBackgroundRemovalModel ? `${selectedBackgroundRemovalModel.installed ? "已安装" : formatFileSize(selectedBackgroundRemovalModel.size)}${selectedBackgroundRemovalModel.local ? " · 本地模型" : ""}` : "推荐模型与本地 ONNX"}</small></span>
-                <ChevronDown size={14} />
-              </button>
-              {backgroundRemovalPickerOpen && <div className="transparent-model-menu" role="listbox" aria-label="透明背景模型">
-                <header><span>推荐模型</span><small>固定哈希 · 下载默认 8 路</small></header>
-                {recommendedBackgroundRemovalModels.map((item) => <div className={`transparent-model-option ${backgroundRemovalModel === item.id ? "selected" : ""}`} role="option" aria-selected={backgroundRemovalModel === item.id} key={item.id}>
-                  <button type="button" className="transparent-model-choice" onClick={() => { setBackgroundRemovalModel(item.id); if (item.installed) setBackgroundRemovalPickerOpen(false); }}><i /><span><b>{item.label}</b><small>{item.description}</small><em>{formatFileSize(item.size)} · {item.license || "本地使用"}</em></span></button>
-                  {item.installed ? <strong><Check size={12} />已安装</strong> : <button type="button" className="transparent-model-download" disabled={status === "running" || backgroundRemovalDownload?.active} onClick={() => downloadBackgroundRemovalModel(item.id)}>{backgroundRemovalDownload?.active && backgroundRemovalDownload.modelId === item.id ? <RefreshCw className="spin" size={12} /> : <Download size={12} />}{backgroundRemovalDownload?.active && backgroundRemovalDownload.modelId === item.id ? "下载中" : "下载"}</button>}
-                </div>)}
-                <header><span>本地模型</span><small title={inferenceHealth?.background_removal?.directory}>放入 models/background-removal</small></header>
-                {localBackgroundRemovalModels.length ? localBackgroundRemovalModels.map((item) => <div className={`transparent-model-option ${backgroundRemovalModel === item.id ? "selected" : ""}`} role="option" aria-selected={backgroundRemovalModel === item.id} key={item.id}><button type="button" className="transparent-model-choice" onClick={() => { setBackgroundRemovalModel(item.id); setBackgroundRemovalPickerOpen(false); }}><i /><span><b>{item.label}</b><small>{item.description}</small><em>{formatFileSize(item.size)} · 本地 ONNX</em></span></button><strong><Check size={12} />已发现</strong></div>) : <p>未发现额外 ONNX 模型</p>}
-              </div>}
-            </div>
-            <div className={`transparent-mode-copy ${backgroundRemovalDownloadForSelection?.status || ""}`} aria-live="polite"><strong>透明背景模式</strong><span>{backgroundRemovalDownloadForSelection?.status === "error" ? backgroundRemovalDownloadForSelection.message : backgroundRemovalDownloadForSelection?.active ? backgroundRemovalDownloadForSelection.message : selectedBackgroundRemovalReady ? `${selectedBackgroundRemovalModel.label} · 已就绪` : selectedBackgroundRemovalModel?.installed ? "模型已安装，等待 ONNX Runtime" : "选择模型后可在下拉栏内下载"}</span>{backgroundRemovalDownloadForSelection?.active && <><i><i style={{ width: `${backgroundRemovalProgress}%` }} /></i><small>{formatFileSize(backgroundRemovalDownloadForSelection.currentBytes || 0)} / {formatFileSize(backgroundRemovalDownloadForSelection.totalBytes || selectedBackgroundRemovalModel?.size || 0)}{backgroundRemovalDownloadForSelection.speedBps > 0 ? ` · ${formatFileSize(backgroundRemovalDownloadForSelection.speedBps)}/s` : ""} · {backgroundRemovalDownloadForSelection.route || "正在测速"} · {backgroundRemovalDownloadForSelection.connections || 8} 路</small></>}</div>
-            <button type="button" className={`transparent-mode-switch ${transparentPromptEnabled ? "active" : ""}`} role="switch" aria-checked={transparentPromptEnabled} disabled={status === "running"} onClick={toggleTransparentBackground}><i /><span>{transparentPromptEnabled ? "已启用" : "未启用"}</span></button>
-          </div>
-          <PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} activeIds={activePromptPresets.positive} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />
+          <TransparentBackgroundControl
+            enabled={transparentPromptEnabled}
+            disabled={modelSwitching}
+            modelId={backgroundRemovalModel}
+            models={backgroundRemovalModels}
+            runtimeAvailable={inferenceHealth?.background_removal?.runtime_available}
+            directory={inferenceHealth?.background_removal?.directory}
+            downloadJob={backgroundRemovalDownload}
+            onModelChange={setBackgroundRemovalModel}
+            onDownload={downloadBackgroundRemovalModel}
+            onToggle={toggleTextToImageTransparentBackground}
+          />
+          <PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} activeIds={activePromptPresets.positive} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />
 
           <label className="prompt-field negative-field">
             <div><span>负向提示词</span><small>{engineAllowsNegativePrompt ? `${negative.length} 字符` : "当前引擎不使用"}</small></div>
@@ -6522,7 +6718,7 @@ function App() {
           </label>
           {/* The text is kept, not cleared: switching back to another engine should find it intact. */}
           {!engineAllowsNegativePrompt && negative.trim() && <p className="guidance-unavailable" role="status">已保留负向提示词，但本次 FLUX.1 生成不会使用它。</p>}
-          <PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} activeIds={activePromptPresets.negative} disabled={status === "running"} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />
+          <PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} activeIds={activePromptPresets.negative} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />
 
           <div className="canvas-settings">
             <div className="section-heading"><span>08</span><h2>画布尺寸</h2><div className="dimension"><BoundedNumberInput value={size.width} min={0} max={2048} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(width) => setSize((current) => ({ ...current, width }))} ariaLabel="画布宽度" /><i>×</i><BoundedNumberInput value={size.height} min={0} max={2048} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(height) => setSize((current) => ({ ...current, height }))} ariaLabel="画布高度" /><b>PX</b></div></div>
@@ -6538,7 +6734,24 @@ function App() {
         </section>
 
         <aside className="preview-panel panel">
-          <div className="preview-head"><span className="eyebrow">OUTPUT</span><div><button type="button" className="unload-model-button" title="释放已加载底模占用的 GPU/内存" disabled={status === "running" || modelSwitching || !inferenceHealth?.model_cached} onClick={unloadLoadedModel}><Trash2 size={13} /><span>{modelSwitching ? "正在卸载" : "卸载模型"}</span></button><button type="button" className="unload-model-button gallery-preview-add" title="把一张或多张生成结果加入画廊" disabled={!generatedOutputs.some((output) => output.asset_id)} onClick={() => setGalleryAddOpen(true)}><ImagePlus size={13} /><span>加入画廊</span></button><div className="queue-control"><button type="button" className={`unload-model-button queue-button ${queueOutstanding ? "busy" : ""}`} aria-expanded={queueOpen} title="查看本次会话的任务队列" onClick={() => setQueueOpen((current) => !current)}><ListChecks size={13} /><span>队列</span>{queue.length > 0 && <b className="queue-badge">{queuePendingCount > 0 ? `${queuePendingCount} 等待` : queue.length}</b>}</button>{queueOpen && <QueueList jobs={queue} counts={queueCounts} error={queueError} watching={generationJob} onCancel={cancelQueuedJob} onClose={() => setQueueOpen(false)} onSelect={(job) => { if (job.outputs?.[0]?.image_url) { setGeneratedOutputs(job.outputs.map((output, index) => ({ ...output, index: output.index ?? index, url: `${output.image_url}?v=${job.completed_at || 0}` }))); setSelectedOutputIndex(0); setGeneratedImage(`${job.outputs[0].image_url}?v=${job.completed_at || 0}`); setGeneratedName(job.outputs[0].output_name || ""); setStatus("complete"); setQueueOpen(false); } }} />}</div><button type="button" className={`icon-button ${runInfoVisible ? "active" : ""}`} aria-pressed={runInfoVisible} aria-controls="generation-run-info" title={runInfoVisible ? "隐藏模型、显存与条件信息" : "显示模型、显存与条件信息"} onClick={() => setRunInfoVisible((current) => !current)}>{runInfoVisible ? <Eye size={17} /> : <EyeOff size={17} />}</button><button className="icon-button" title="打开图片预览与拼图工作区" onClick={openImageViewer}><Maximize2 size={17} /></button><button className="icon-button" disabled={!generatedImage} onClick={() => { if (!generatedImage) return; const link = document.createElement("a"); link.href = generatedImage; link.download = generatedName || `XirAI-${generationJob}.png`; link.click(); }}><Download size={17} /></button></div></div>
+          <div className="preview-head">
+            <span className="eyebrow">OUTPUT</span>
+            <div>
+              <button type="button" className="unload-model-button" title="释放已加载底模占用的 GPU/内存" disabled={status === "running" || modelSwitching || !inferenceHealth?.model_cached} onClick={unloadLoadedModel}><Trash2 size={13} /><span>{modelSwitching ? "正在卸载" : "卸载模型"}</span>
+              </button>
+              <button type="button" className="unload-model-button gallery-preview-add" title={canAddGeneratedToGallery ? "把一张或多张生成结果加入画廊" : "该旧任务没有可验证的参数快照"} disabled={!canAddGeneratedToGallery} onClick={() => setGalleryAddOpen(true)}><ImagePlus size={13} /><span>加入画廊</span></button>
+              <div className="queue-control">
+                <button type="button" className={`unload-model-button queue-button ${queueOutstanding ? "busy" : ""}`} aria-expanded={queueOpen} title="查看本次会话的任务队列" onClick={() => setQueueOpen((current) => !current)}><ListChecks size={13} /><span>队列</span>
+                  {queue.length > 0 && <b className="queue-badge">{queuePendingCount > 0 ? `${queuePendingCount} 等待` : queue.length}</b>}
+                </button>
+                {queueOpen && <QueueList jobs={queue} counts={queueCounts} error={queueError} watching={generationJob} onCancel={cancelQueuedJob} onClose={() => setQueueOpen(false)} onSelect={selectQueueJob} />}
+              </div>
+              <button type="button" className={`icon-button ${runInfoVisible ? "active" : ""}`} aria-pressed={runInfoVisible} aria-controls="generation-run-info" title={runInfoVisible ? "隐藏模型、显存与条件信息" : "显示模型、显存与条件信息"} onClick={() => setRunInfoVisible((current) => !current)}>{runInfoVisible ? <Eye size={17} /> : <EyeOff size={17} />}</button>
+              <button className="icon-button" title="打开图片预览与拼图工作区" onClick={openImageViewer}><Maximize2 size={17} /></button>
+              <button className="icon-button" disabled={!generatedImage} onClick={() => { if (!generatedImage) return; const link = document.createElement("a"); link.href = generatedImage; link.download = generatedName || `XirAI-${generationJob}.png`; link.click(); }}><Download size={17} />
+              </button>
+            </div>
+          </div>
           <div className={`preview-stage ${status}`}>
             <div className="preview-grid" />
             {status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>等待生成</strong><p>也可以直接打开 outputs 图片<br />进入预览与拼图工作区</p><button type="button" onClick={openImageViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
@@ -6581,16 +6794,16 @@ function App() {
               intent -- it is diagnostic, and hiding it is the user's decision to make. */}
           <div id="generation-run-info" hidden={!runInfoVisible}>
           <div className="generation-info">
-            <div title={isSplitModel ? [diffusionModel, textEncoder, textEncoder2, vae].filter(Boolean).join(" · ") : checkpoint}><span>当前模型</span><strong>{isSplitModel ? `${engineLabel} · ${diffusionModel ? diffusionModel.split(/[\\/]/).pop() : "未选择扩散模型"}` : engineLabel}</strong>{isSplitModel && <small>{textEncoder ? textEncoder.split(/[\\/]/).pop() : "未选择编码器"} · {vae ? vae.split(/[\\/]/).pop() : "未选择 VAE"}</small>}</div>
+            <div title={displayedRunTitle}><span>当前任务模型</span><strong>{displayedRunIsSplit ? `${displayedRunEngineLabel} · ${modelAssetName(displayedRunDiffusionModel) || "未选择扩散模型"}` : displayedRunEngineLabel}</strong>{displayedRunIsSplit && <small>{modelAssetName(displayedRunTextEncoder) || "未选择编码器"} · {modelAssetName(displayedRunVae) || "未选择 VAE"}</small>}</div>
             <div title={inferenceHealth?.memory_reason || "首次生成加载模型时自动评估"}><span>显存档位</span><strong>{inferenceHealth?.memory_label || "AUTO 待评估"}</strong></div>
             <div><span>底模缓存</span><strong>{inferenceHealth?.model_resident ? "GPU 常驻" : inferenceHealth?.model_cached ? "内存缓存" : "未加载"}</strong></div>
           </div>
-          {promptConditioning && <p className="conditioning-info">{isAnima ? "Qwen3 + T5 Tokenizer 条件" : isFlux ? "T5-XXL + CLIP-L 条件" : isFlux2 ? "大语言模型三层取样条件" : isKrea2 ? "Qwen3-VL 十二层取样条件" : "CLIP 条件"}：正向 {promptConditioning.tokens} tokens / {promptConditioning.blocks} blocks{promptConditioning.weightedTokens ? ` / ${promptConditioning.weightedTokens} 加权` : ""}；负向 {promptConditioning.negativeTokens} tokens / {promptConditioning.negativeBlocks} blocks{promptConditioning.negativeWeightedTokens ? ` / ${promptConditioning.negativeWeightedTokens} 加权` : ""}</p>}
+          {promptConditioning && <p className="conditioning-info">{displayedRunEngine === "Anima" ? "Qwen3 + T5 Tokenizer 条件" : displayedRunEngine === "Flux" ? "T5-XXL + CLIP-L 条件" : displayedRunEngine === "Flux2" ? "大语言模型三层取样条件" : displayedRunEngine === "Krea2" ? "Qwen3-VL 十二层取样条件" : "CLIP 条件"}：正向 {promptConditioning.tokens} tokens / {promptConditioning.blocks} blocks{promptConditioning.weightedTokens ? ` / ${promptConditioning.weightedTokens} 加权` : ""}；负向 {promptConditioning.negativeTokens} tokens / {promptConditioning.negativeBlocks} blocks{promptConditioning.negativeWeightedTokens ? ` / ${promptConditioning.negativeWeightedTokens} 加权` : ""}</p>}
           {generationWarning && <p className="generation-warning">{generationWarning}</p>}
           </div>
-          <button className={`generate-button ${status === "running" ? "queueing" : ""}`} title={generationDisabledReason || (status === "running" ? "按当前参数排队一个新任务" : "开始生成")} onClick={generate} disabled={Boolean(generationDisabledReason)}>
-            <span className="generate-icon">{status === "running" ? <ListPlus size={18} /> : <Zap size={18} />}</span>
-            <span><strong>{generationDisabledReason ? "暂时无法生成" : status === "running" ? "加入队列" : "开始生成"}</strong><small>{generationDisabledReason || (status === "running" ? `使用当前参数排队 · 前面还有 ${queuePendingCount} 个任务` : `${imagesPerBatch} 张 × ${batchCount} 批 · 共 ${imagesPerBatch * batchCount} 张`)}</small></span>
+          <button className={`generate-button ${queueBusy ? "queueing" : ""}`} title={generationDisabledReason || (queueBusy ? "按当前参数排队一个新任务" : "开始生成")} onClick={generate} disabled={Boolean(generationDisabledReason)}>
+            <span className="generate-icon">{queueBusy ? <ListPlus size={18} /> : <Zap size={18} />}</span>
+            <span><strong>{generationDisabledReason ? "暂时无法生成" : queueBusy ? "加入队列" : "开始生成"}</strong><small>{generationDisabledReason || (queueBusy ? `使用当前参数排队 · 前面还有 ${queuePendingCount} 个任务` : `${imagesPerBatch} 张 × ${batchCount} 批 · 共 ${imagesPerBatch * batchCount} 张`)}</small></span>
             <kbd>Ctrl/⌘ ↵</kbd>
           </button>
           <p className={`backend-note ${inferenceHealth?.status === "ready" && inferenceHealth.cuda ? "online" : ""}`}><span />项目内推理服务 · <b>{inferenceHealth?.status === "ready" ? inferenceHealth.cuda ? inferenceHealth.device : "CUDA 不可用" : inferenceHealth?.status === "error" ? `启动失败：${inferenceHealth.error}` : inferenceHealth?.status === "offline" ? "离线" : "正在启动"}</b></p>
@@ -6661,17 +6874,40 @@ function App() {
         onOpenViewer={openImageViewer}
         onOpenLoraManager={() => { setLoraCategory("mounted"); setLoraManagerOpen(true); }}
         loraPresentationFor={loraPresentationFor}
-         onAddToGallery={() => setGalleryAddOpen(true)}
-         onNotice={(message, error = false) => setAppNotice({ message, error })}
-         postprocess={{
-           upscalers: compatibleUpscalers,
-           upscalerRuntime: inferenceHealth?.upscalers?.runtime_available === true,
-           adetailerModels,
-           adetailerInfo,
-           rtxHealth,
-           ultraLow: ultraLowMode,
-         }}
-       /></Suspense> : activePage === "gallery" ? <Suspense fallback={<PageLoading label="正在加载画廊" />}><GalleryPage
+        onAddToGallery={() => setGalleryAddOpen(true)}
+        canAddToGallery={canAddGeneratedToGallery}
+        onNotice={(message, error = false) => setAppNotice({ message, error })}
+        queueBusy={queueBusy}
+        queuePendingCount={queuePendingCount}
+        runInfoVisible={runInfoVisible}
+        onToggleRunInfo={() => setRunInfoVisible((current) => !current)}
+        runInfo={{
+          memoryLabel: inferenceHealth?.memory_label || "AUTO 待评估",
+          memoryReason: inferenceHealth?.memory_reason || "首次生成加载模型时自动评估",
+          cacheLabel: inferenceHealth?.model_resident ? "GPU 常驻" : inferenceHealth?.model_cached ? "内存缓存" : "未加载",
+          conditioning: promptConditioning,
+          conditioningLabel: isAnima ? "Qwen3 + T5 Tokenizer 条件" : isFlux ? "T5-XXL + CLIP-L 条件" : isFlux2 ? "大语言模型三层取样条件" : isKrea2 ? "Qwen3-VL 十二层取样条件" : "CLIP 条件",
+        }}
+        transparentBackground={{
+          modelId: backgroundRemovalModel,
+          models: backgroundRemovalModels,
+          runtimeAvailable: inferenceHealth?.background_removal?.runtime_available,
+          directory: inferenceHealth?.background_removal?.directory,
+          downloadJob: backgroundRemovalDownload,
+          onModelChange: setBackgroundRemovalModel,
+          onDownload: downloadBackgroundRemovalModel,
+        }}
+        positivePromptPresets={<PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} activeIds={activePromptPresets.positive} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />}
+        negativePromptPresets={<PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} activeIds={activePromptPresets.negative} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />}
+        postprocess={{
+          upscalers: compatibleUpscalers,
+          upscalerRuntime: inferenceHealth?.upscalers?.runtime_available === true,
+          adetailerModels,
+          adetailerInfo,
+          rtxHealth,
+          ultraLow: ultraLowMode,
+        }}
+        /></Suspense> : activePage === "gallery" ? <Suspense fallback={<PageLoading label="正在加载画廊" />}><GalleryPage
         currentSettings={galleryCardSettings(workspaceSnapshot.current)}
         focus={galleryFocus}
          onApplySettings={applyGallerySettings}
@@ -6693,7 +6929,7 @@ function App() {
       {galleryAddOpen && <AddToGalleryDialog
         outputs={generatedOutputs}
         selectedOutputIndex={selectedOutputIndex}
-        settings={generatedSettings ? galleryCardSettings(generatedSettings, { record: true }) : galleryCardSettings(workspaceSnapshot.current)}
+        settings={generatedSettings ? galleryCardSettings(generatedSettings, { record: true }) : null}
         onClose={() => setGalleryAddOpen(false)}
         onSaved={({ collectionId, cardId, count, imageCount }) => {
           setGalleryAddOpen(false);
@@ -6701,15 +6937,15 @@ function App() {
           setAppNotice({ message: `已将 ${imageCount} 张图片加入精选集${count > 1 ? `，创建 ${count} 张卡片` : ""}`, error: false });
         }}
       />}
-      {promptPresetDialog && <PromptPresetDialog dialog={promptPresetDialog} records={promptPresets.records} running={status === "running"} onSave={savePromptPreset} onRequestClose={() => setPromptPresetDialog(null)} />}
-      {promptPresetDelete && <PromptPresetDeleteDialog record={promptPresetDelete} running={status === "running"} onConfirm={confirmDeletePromptPreset} onClose={() => setPromptPresetDelete(null)} />}
+      {promptPresetDialog && <PromptPresetDialog dialog={promptPresetDialog} records={promptPresets.records} onSave={savePromptPreset} onRequestClose={() => setPromptPresetDialog(null)} />}
+      {promptPresetDelete && <PromptPresetDeleteDialog record={promptPresetDelete} onConfirm={confirmDeletePromptPreset} onClose={() => setPromptPresetDelete(null)} />}
       {loraManagerOpen && (
         <div className="lora-modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setLoraManagerOpen(false)}>
           <section className={`lora-modal ${loraManagerMaximized ? "maximized" : ""}`} ref={loraManagerDialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="lora-manager-title">
             <header className="lora-modal-head">
               <div><span className="eyebrow">MODEL ASSET LIBRARY</span><h2 id="lora-manager-title">LoRA 管理</h2><p>{model} 引擎 · 已挂载 {loras.length} 个</p></div>
               <div className="lora-modal-actions">
-                <button type="button" className="asset-refresh" title="刷新 LoRA 列表" aria-label="刷新 LoRA 列表" disabled={status === "running" || lorasRefreshing || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras} onClick={refreshLoras}><RefreshCw className={lorasRefreshing ? "spin" : ""} size={16} /></button>
+                <button type="button" className="asset-refresh" title="刷新 LoRA 列表" aria-label="刷新 LoRA 列表" disabled={lorasRefreshing || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras} onClick={refreshLoras}><RefreshCw className={lorasRefreshing ? "spin" : ""} size={16} /></button>
                 <button type="button" className="modal-close" title={loraManagerMaximized ? "还原窗口" : "最大化窗口"} aria-label={loraManagerMaximized ? "还原 LoRA 管理器窗口" : "最大化 LoRA 管理器窗口"} onClick={() => setLoraManagerMaximized((current) => !current)}>{loraManagerMaximized ? <Minimize2 size={18} /> : <Maximize2 size={18} />}</button>
                 <button type="button" className="modal-close" title="在新标签页打开完整 LoRA 资产页" aria-label="在新标签页打开 LoRA 管理器" onClick={openLoraManagerPage}><ExternalLink size={18} /></button>
                 <button type="button" className="modal-close" aria-label="关闭 LoRA 管理器" onClick={() => setLoraManagerOpen(false)}><X size={20} /></button>

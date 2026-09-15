@@ -155,14 +155,14 @@ test("a stale scan survives a semantic no-op but loses after a real mutation", (
   assert.equal(changedRevision, revision + 1);
   assert.equal(shouldApplyMountedLoraScan({ requestToken: 3, latestToken: 3, capturedRevision: revision, latestRevision: changedRevision, responseEngine: "iL", activeEngine: "iL" }), false);
 });
-test("scan gate permits idle, rejects running or locks before completion, then permits one unlock retry", () => {
+test("scan gate permits queued-run drafting but rejects workspace locks before completion", () => {
   const idle = { uiStateReady: true, status: "idle", modelSwitching: false, workspaceLocked: false, shouldPersist: true };
   assert.equal(canStartMountedLoraScan(idle), true);
   assert.equal(shouldApplyMountedLoraScan({ ...idle, requestToken: 7, latestToken: 7, capturedRevision: 4, latestRevision: 4, responseEngine: "iL", activeEngine: "iL" }), true);
   const lockedBeforeCompletion = { ...idle, workspaceLocked: true };
   assert.equal(canStartMountedLoraScan(lockedBeforeCompletion), false);
   assert.equal(shouldApplyMountedLoraScan({ ...lockedBeforeCompletion, requestToken: 7, latestToken: 7, capturedRevision: 4, latestRevision: 4, responseEngine: "iL", activeEngine: "iL" }), false);
-  assert.equal(canStartMountedLoraScan({ ...idle, status: "running" }), false);
+  assert.equal(canStartMountedLoraScan({ ...idle, status: "running" }), true);
   assert.equal(canStartMountedLoraScan({ ...idle, modelSwitching: true }), false);
   assert.equal(canStartMountedLoraScan({ ...idle, shouldPersist: false }), false);
   assert.equal(shouldApplyMountedLoraScan({ ...idle, requestToken: 8, latestToken: 8, capturedRevision: 5, latestRevision: 5, responseEngine: "iL", activeEngine: "iL" }), true);
@@ -175,14 +175,14 @@ test("cold active-job recovery gate blocks every engine until active request set
   const noActive = { ...recovery, activeJobRecoveryPending: false };
   assert.equal(canStartMountedLoraScan(noActive), true, "settled no-active response permits one normal scan");
   const active = { ...noActive, status: "running" };
-  assert.equal(canStartMountedLoraScan(active), false, "settled active response stays locked by running status");
+  assert.equal(canStartMountedLoraScan(active), true, "a frozen active request does not lock the next draft");
 });
-test("App wiring uses named engine transition fields, preserves asset changes, and locks refresh while running", async () => {
+test("App wiring uses named engine transition fields and keeps next-run LoRA drafting live", async () => {
   const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
   assert.match(app, /sourceEngine: activeLoraScopeRef\.current,\s+sourceLoras: lorasRef\.current,\s+targetEngine: targetScopeKey/);
   assert.doesNotMatch(app, /sourceScopeKey:|targetScopeKey:/);
   assert.match(app, /const refreshLoras = async \(\) => \{\s+if \(lorasRefreshing \|\| !canStartMountedLoraScan\(loraScanGate\.current\)\) return;/);
-  assert.match(app, /disabled=\{status === "running" \|\| lorasRefreshing \|\| modelSwitching \|\| loraWorkspaceLocked \|\| !shouldPersistMountedLoras\}/);
+  assert.match(app, /disabled=\{lorasRefreshing \|\| modelSwitching \|\| loraWorkspaceLocked \|\| !shouldPersistMountedLoras\}/);
   assert.match(app, /if \(!canStartMountedLoraScan\(\{ uiStateReady, \.\.\.loraScanGate\.current \}\)\) \{\s+setLoraLoading\(false\);\s+setLorasRefreshing\(false\);\s+return undefined;/);
   assert.match(app, /const \[activeJobRecoveryPending, setActiveJobRecoveryPending\] = useState\(true\);/);
   assert.match(app, /loraScanGate\.current = \{ activeJobRecoveryPending,/);

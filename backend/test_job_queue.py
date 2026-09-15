@@ -12,6 +12,7 @@ The registry is manipulated directly rather than through a running server, which
 an HTTP server would test FastAPI instead.
 """
 
+import inspect
 import time
 import unittest
 from unittest.mock import patch
@@ -62,6 +63,10 @@ class RegistryTestCase(unittest.TestCase):
 
 
 class QueueListingTests(RegistryTestCase):
+    def test_submit_snapshots_the_response_before_starting_the_worker(self):
+        source = inspect.getsource(inference_server.create_job)
+        self.assertLess(source.index("response = public_job_view"), source.index("executor.submit"))
+
     def test_the_list_is_oldest_first_and_counts_every_state(self):
         self.install(
             job_record(1, "complete"),
@@ -90,13 +95,30 @@ class QueueListingTests(RegistryTestCase):
         self.assertFalse(entries[1]["running_ahead"])
         self.assertTrue(entries[2]["running_ahead"])
 
-    def test_a_completed_row_carries_what_it_produced(self):
-        outputs = [{"index": 0, "output_name": "XirAI-1.png", "image_url": "/x/0", "seed": "7"}]
+    def test_a_completed_row_carries_one_bounded_output_summary(self):
+        outputs = [{"index": 0, "output_name": "XirAI-1.png", "image_url": "/x/0", "seed": "7",
+                    "width": 1024, "height": 768, "asset_id": "asset-1"},
+                   {"index": 1, "output_name": "XirAI-2.png", "image_url": "/x/1"}]
         self.install(job_record(1, "complete", outputs=outputs, elapsed_seconds=12.5))
         entry = inference_server.list_jobs()["jobs"][0]
         self.assertEqual(entry["elapsed_seconds"], 12.5)
-        self.assertEqual(entry["outputs"][0]["output_name"], "XirAI-1.png")
-        self.assertEqual(entry["outputs"][0]["image_url"], "/x/0")
+        self.assertEqual(entry["output_count"], 2)
+        self.assertEqual(entry["output"]["output_name"], "XirAI-1.png")
+        self.assertEqual(entry["output"]["image_url"], "/x/0")
+        self.assertEqual(entry["output"]["asset_id"], "asset-1")
+        self.assertEqual((entry["output"]["width"], entry["output"]["height"]), (1024, 768))
+        self.assertNotIn("outputs", entry)
+
+    def test_a_running_row_carries_live_stage_state_for_immediate_reselection(self):
+        preview = {"index": 0, "stage": "base", "url": "/api/stage/0", "label": "基础采样"}
+        self.install(job_record(1, "running", stage="hires", stage_step=3, stage_total=8,
+                                step=3, total_steps=8, progress=37, stage_previews=[preview],
+                                batch_index=1, batch_count=2, completed_images=0, total_images=2))
+        entry = inference_server.list_jobs()["jobs"][0]
+        self.assertEqual(entry["stage_preview"], preview)
+        self.assertNotIn("stage_previews", entry)
+        self.assertEqual((entry["stage_step"], entry["stage_total"]), (3, 8))
+        self.assertEqual((entry["batch_index"], entry["batch_count"]), (1, 2))
 
     def test_a_failed_row_carries_its_reason(self):
         self.install(job_record(1, "error", error="CUDA out of memory"))
@@ -198,6 +220,23 @@ class PublicViewTests(RegistryTestCase):
             self.assertNotIn(field, view)
         # The stage list itself is public: it carries urls, not filenames.
         self.assertEqual(view["stage_previews"][0]["url"], "/api/x")
+
+    def test_completed_gallery_settings_require_the_submitting_browser_token(self):
+        settings = {"model": "iL", "positive": "a queued subject", "seed": "42"}
+        token = "gallery-owner-token"
+        self.install(job_record(1, "complete", gallery_settings=settings,
+                                gallery_access_token_digest=inference_server.gallery_access_digest(token)))
+        self.assertNotIn("gallery_settings", inference_server.get_job("job-1"))
+        self.assertNotIn("gallery_settings", inference_server.get_job("job-1", x_xirai_gallery_access="wrong"))
+        self.assertEqual(inference_server.get_job("job-1", x_xirai_gallery_access=token)["gallery_settings"], settings)
+        self.assertNotIn("gallery_settings", inference_server.list_jobs()["jobs"][0])
+
+    def test_gallery_snapshot_validation_bounds_structure_and_size(self):
+        self.assertEqual(inference_server.validated_gallery_settings_payload({"prompt": "cat", "steps": 20}), {"prompt": "cat", "steps": 20})
+        with self.assertRaisesRegex(ValueError, "object"):
+            inference_server.validated_gallery_settings_payload(["not", "an", "object"])
+        with self.assertRaisesRegex(ValueError, "128 KiB"):
+            inference_server.validated_gallery_settings_payload({"prompt": "x" * (128 * 1024)})
 
     def test_a_queue_entry_reports_the_model_the_job_captured(self):
         job = job_record(1, "queued", requested_engine="Krea2", requested_checkpoint=None,

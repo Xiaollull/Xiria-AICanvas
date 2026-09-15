@@ -156,5 +156,5 @@ test("the image-to-image page opens its split picker and negative-prompt lock fo
   const page = await readSource("src/ImageToImagePage.jsx");
   assert.match(page, /\["Anima", "Flux", "Flux2", "Krea2"\]\.includes\(engine\.name\)/);
   assert.match(page, /const distilledPageLabel = engine\.name === "Flux2" \? "FLUX\.2" : "FLUX\.1"/);
-  assert.match(page, /disabled=\{running \|\| !pageAllowsNegativePrompt\}/);
+  assert.match(page, /disabled=\{editingLocked \|\| !pageAllowsNegativePrompt\}/);
 });

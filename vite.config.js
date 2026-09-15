@@ -221,7 +221,7 @@ const loraPreviewRequests = new Map();
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 34;
+const inferenceProtocol = 35;
 export const inferenceWorkspaceId = workspaceId;
 const maximumUpdateArchiveBytes = 4 * 1024 ** 3;
 // The saved workspace carries the prompt, the negative prompt and every prompt preset, none of

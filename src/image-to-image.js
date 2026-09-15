@@ -19,6 +19,7 @@ import { POSTPROCESS_STAGE_IDS, normalizePostprocessOrder, postprocessTargetSize
 import { formatFileSize } from "./format-size.js";
 import { DISTILLED_GUIDANCE_ENGINES, adetailerPayload, adetailerStageIssue, normalizeADetailerStage } from "./adetailer-units.js";
 import { generationHiresSeedSettings, hiresSeedPayload, normalizeUint64Seed, supportsUsduTiled } from "./hires-settings.js";
+import { transparentBackgroundEnabled, transparentBackgroundSubject } from "./transparent-background.js";
 
 export const IMAGE_TO_IMAGE_SCHEMA_VERSION = 1;
 
@@ -287,7 +288,7 @@ export function sourceImageSummary(source) {
 
 // Why the run button is off, in the order the user can act on: no picture, then no model, then a
 // service that is not up, then a run already in flight.
-export function imageToImageBlockers({ source, settings, engine, engineReady = true, serviceReady = true, running = false, postprocess = {} }) {
+export function imageToImageBlockers({ source, settings, engine, engineReady = true, serviceReady = true, postprocess = {}, backgroundRemoval = {} }) {
   const config = normalizeImageToImageSettings(settings);
   const postprocessOnly = config.mode === "postprocess";
   if (!source) return "请先选择一张来源图片";
@@ -295,9 +296,12 @@ export function imageToImageBlockers({ source, settings, engine, engineReady = t
   // the server refuses an empty prompt, so post-processing without one is not a shortcut available
   // here — even a run whose only stage is RTX carries it.
   if (!config.positive.trim()) return "请填写正向提示词";
+  if (transparentBackgroundEnabled(config.positive) && !transparentBackgroundSubject(config.positive)) return "透明背景标签之外还需要填写主体提示词";
+  if (transparentBackgroundEnabled(config.positive) && !backgroundRemoval.model) return "请选择透明背景模型";
+  if (transparentBackgroundEnabled(config.positive) && !backgroundRemoval.model.installed) return "所选透明背景模型尚未下载";
+  if (transparentBackgroundEnabled(config.positive) && !backgroundRemoval.runtimeAvailable) return "ONNX Runtime 尚未就绪，请重新运行环境配置器";
   if (!engineReady) return "请先在文生图页面选择可用的模型";
   if (!serviceReady) return "推理服务尚未就绪";
-  if (running) return "已有任务正在生成";
   if (postprocessOnly) {
     const sourceIssue = postprocessSourceIssue(source);
     if (sourceIssue) return sourceIssue;
@@ -336,14 +340,16 @@ export function imageToImageRequestBody({
   textEncoder,
   textEncoder2,
   vae,
-    source,
-    settings,
-    seed,
-    loras = [],
-    hiresSeed,
-    samplers = [],
-    schedulers = [],
-  }) {
+  source,
+  settings,
+  seed,
+  loras = [],
+  hiresSeed,
+  gallerySettings = null,
+  backgroundRemovalModel = null,
+  samplers = [],
+  schedulers = [],
+}) {
   const config = normalizeImageToImageSettings(settings, { samplers, schedulers });
   const size = outputSize(source, config);
   const anima = engine === "Anima";
@@ -365,6 +371,7 @@ export function imageToImageRequestBody({
         ? { diffusion_model: diffusionModel, text_encoder: textEncoder, vae }
         : { checkpoint }),
     prompt: config.positive.trim(),
+    background_removal_model: transparentBackgroundEnabled(config.positive) ? backgroundRemovalModel : null,
     // Both Flux generations are guidance distilled and have no unconditional branch to encode a
     // negative prompt into.
     negative_prompt: distilled ? "" : config.negative.trim(),
@@ -410,6 +417,7 @@ export function imageToImageRequestBody({
     rtx: { enabled: config.rtx.enabled, scale: config.rtx.scale, quality: config.rtx.quality },
     postprocess_order: normalizePostprocessOrder(config.postprocessOrder),
     loras: loras.filter((lora) => lora.enabled !== false).map((lora) => ({ path: lora.value, weight: lora.weight })),
+    gallery_settings: gallerySettings,
   };
 }
 

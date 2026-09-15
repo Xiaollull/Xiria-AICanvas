@@ -4,7 +4,7 @@
 export const LORA_SORT_TRANSFER_TYPE = "application/x-xiria-lora-sort";
 
 export function appLoraDragLocked({ status, modelSwitching, loraWorkspaceLocked, shouldPersistMountedLoras }) {
-  return status === "running" || Boolean(modelSwitching) || Boolean(loraWorkspaceLocked) || !shouldPersistMountedLoras;
+  return Boolean(modelSwitching) || Boolean(loraWorkspaceLocked) || !shouldPersistMountedLoras;
 }
 
 export function pageLoraDragLocked({ workspaceLocked, syncReady, canPersist, scopeKey }) {

@@ -20,6 +20,11 @@ import {
   sourceImageSummary,
   validateSourceFile,
 } from "../src/image-to-image.js";
+import {
+  toggleTransparentBackground,
+  transparentBackgroundEnabled,
+  transparentBackgroundSubject,
+} from "../src/transparent-background.js";
 
 const readSource = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 const source = (width, height, extra = {}) => ({ width, height, dataUrl: "data:image/png;base64,AAAA", name: "a.png", type: "image/png", size: 1024, ...extra });
@@ -99,14 +104,14 @@ test("a source file is refused for type and for size, with a readable reason", (
   assert.match(sourceImageSummary(source(800, 600)), /800 × 600/);
 });
 
-test("the run blocker names the first thing the user can act on", () => {
-  const ready = { source: source(512, 512), settings: { positive: "a lantern" }, engineReady: true, serviceReady: true, running: false };
+test("the run blocker names the first thing the user can act on, never another queued job", () => {
+  const ready = { source: source(512, 512), settings: { positive: "a lantern" }, engineReady: true, serviceReady: true };
   assert.equal(imageToImageBlockers(ready), "");
   assert.match(imageToImageBlockers({ ...ready, source: null }), /来源图片/);
   assert.match(imageToImageBlockers({ ...ready, settings: { positive: "   " } }), /提示词/);
   assert.match(imageToImageBlockers({ ...ready, engineReady: false }), /模型/);
   assert.match(imageToImageBlockers({ ...ready, serviceReady: false }), /推理服务/);
-  assert.match(imageToImageBlockers({ ...ready, running: true }), /正在生成/);
+  assert.equal(imageToImageBlockers({ ...ready, running: true }), "");
 });
 
 test("the request body carries the picture, the strength and nothing the page does not own", () => {
@@ -117,6 +122,7 @@ test("the request body carries the picture, the strength and nothing the page do
     settings: { positive: "  a lantern  ", negative: " blurry ", denoise: 0.45, steps: 24, cfg: 7, sampler: "dpmpp_2m", scheduler: "karras", resizeMode: "contain" },
     seed: "99",
     loras: [{ value: "a.safetensors", weight: 0.8 }, { value: "b.safetensors", weight: 1, enabled: false }],
+    gallerySettings: { page: "image", positive: "a lantern", seed: "99" },
   });
   assert.equal(body.engine, "SD");
   assert.equal(body.checkpoint, "model.safetensors");
@@ -138,7 +144,42 @@ test("the request body carries the picture, the strength and nothing the page do
   assert.equal(body.hires.enabled, false);
   assert.equal(body.adetailer.enabled, false);
   assert.equal(body.rtx.enabled, false);
+  assert.equal(body.background_removal_model, null);
+  assert.deepEqual(body.gallery_settings, { page: "image", positive: "a lantern", seed: "99" });
   for (const key of ["diffusion_model", "text_encoder", "vae"]) assert.equal(key in body, false, `${key} must not be sent`);
+});
+
+test("i2i transparent background validates and sends the selected local model", () => {
+  const settings = { positive: "portrait, ({Transparent background})" };
+  const ready = {
+    source: source(512, 512),
+    settings,
+    engineReady: true,
+    serviceReady: true,
+    backgroundRemoval: { model: { id: "birefnet", installed: true }, runtimeAvailable: true },
+  };
+  assert.equal(imageToImageBlockers(ready), "");
+  assert.match(imageToImageBlockers({ ...ready, settings: { positive: "({Transparent background})" } }), /主体提示词/);
+  assert.match(imageToImageBlockers({ ...ready, backgroundRemoval: {} }), /选择透明背景模型/);
+  assert.match(imageToImageBlockers({ ...ready, backgroundRemoval: { model: { id: "birefnet", installed: false }, runtimeAvailable: true } }), /尚未下载/);
+  assert.match(imageToImageBlockers({ ...ready, backgroundRemoval: { model: { id: "birefnet", installed: true }, runtimeAvailable: false } }), /ONNX Runtime/);
+  const body = imageToImageRequestBody({
+    engine: "SD",
+    checkpoint: "model.safetensors",
+    source: source(512, 512),
+    settings,
+    seed: "7",
+    backgroundRemovalModel: "birefnet",
+  });
+  assert.equal(body.background_removal_model, "birefnet");
+});
+
+test("both generation pages share one reversible transparent Prompt directive", () => {
+  const enabled = toggleTransparentBackground("portrait, studio light");
+  assert.equal(enabled, "portrait, studio light, ({Transparent background})");
+  assert.equal(transparentBackgroundEnabled(enabled), true);
+  assert.equal(transparentBackgroundSubject(enabled), "portrait, studio light");
+  assert.equal(toggleTransparentBackground(enabled), "portrait, studio light");
 });
 
 test("i2i owns independent postprocess settings and emits the existing stage contract", () => {
@@ -202,12 +243,12 @@ test("both generate surfaces page through ADetailer units instead of stacking ca
   const page = await readSource("src/ImageToImagePage.jsx");
   const styles = await readSource("src/styles.css");
 
-  for (const [name, source, prefix] of [["App.jsx", app, "adetailer"], ["ImageToImagePage.jsx", page, "i2i-adetailer"]]) {
+  for (const [name, source] of [["App.jsx", app], ["ImageToImagePage.jsx", page]]) {
     // One unit is on screen; the rest are pages behind it. A `.map` over the
     // units into unit sections would be the stacked layout coming back.
     assert.doesNotMatch(source, /adetailerUnits\.map\(\((?:unit|entry), index\)/, `${name} must render one unit, not every unit`);
     // Nothing declares a page count: it is however many units exist.
-    assert.match(source, new RegExp(`adetailerUnits\\.length > 1 && <nav className="${prefix}-pager"`), `${name} needs an automatic pager`);
+    assert.match(source, /adetailerUnits\.length > 1 && <nav className="adetailer-pager"/, `${name} needs an automatic pager`);
     assert.match(source, /adetailerUnits\.map\(\(entry, position\) =>[\s\S]*?onClick=\{\(\) => setADetailerPage\(entry\.id\)\}/, `${name} needs one page control per unit`);
     // The arrows stop at the ends rather than wrapping past them.
     assert.match(source, /aria-label="上一个检测单元" disabled=\{(?:adetailerIndex|index) < 1\}/, `${name} must disable the left arrow on the first page`);
@@ -222,7 +263,7 @@ test("both generate surfaces page through ADetailer units instead of stacking ca
     // The number inputs hold an uncommitted draft of their own, so the unit has
     // to key its controls: reused ones would show one unit's half-typed value on
     // the next unit's field.
-    assert.match(source, new RegExp(`<section className=\\{\`${prefix}-unit \\$\\{unit\\.enabled \\? "on" : ""\\}\`\\} key=\\{unit\\.id\\}>`), `${name} must key the unit section by unit id`);
+    assert.match(source, /<section className=\{`adetailer-unit \$\{unit\.enabled \? "on" : ""\}`\} key=\{unit\.id\}>/, `${name} must key the unit section by unit id`);
   }
   // The footer states how the stage runs rather than offering an add control.
   for (const source of [app, page]) assert.match(source, /个检测单元 · 已启用 \{activeADetailerUnits\([^)]*\)\.length\} 个 · 按编号顺序依次执行/);
@@ -230,7 +271,7 @@ test("both generate surfaces page through ADetailer units instead of stacking ca
   assert.doesNotMatch(app, /adetailerPage:/);
   assert.doesNotMatch(page, /adetailerPage:/);
 
-  for (const rule of [".adetailer-pager", ".i2i-adetailer-pager", ".adetailer-pager ol button.current", ".i2i-adetailer-pager ol button.current"]) {
+  for (const rule of [".adetailer-pager", ".adetailer-pager ol button.current"]) {
     assert.ok(styles.includes(rule), `${rule} must be styled`);
   }
   assert.match(styles, /html\[data-theme-mode="light"\] \.adetailer-pager,/);
@@ -346,12 +387,16 @@ test("a gallery card records this page's parameters, not the text-to-image compo
   // other page's prompt, steps and denoise on a picture they had nothing to do with.
   const app = await readSource("src/App.jsx");
   const run = app.slice(app.indexOf("const generateFromImage = async"), app.indexOf("const releaseLoadedModel"));
-  assert.match(run, /setGeneratedSettings\(JSON\.parse\(JSON\.stringify\(\{/);
+  assert.match(run, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{/);
+  assert.match(run, /setGeneratedSettings\(submittedSettings\);/);
+  assert.match(run, /generationSettingsByJob\.current\.set\(job\.id, submittedSettings\);/);
   assert.match(run, /page: "image"/);
   for (const field of ["positive", "negative", "steps", "cfg", "denoise", "sampler", "scheduler"]) {
     assert.match(run, new RegExp(`${field}: settings\\.${field}`), `${field} must come from this page`);
   }
   for (const stage of ["hires", "adetailer", "rtx"]) assert.match(run, new RegExp(`${stage}: (?:settings\\.${stage}|\\{ \\.\\.\\.settings\\.${stage})`), `${stage} must be recorded from i2i settings`);
+  assert.match(run, /const gallerySettings = galleryJobSnapshotPayload\(submittedSettings\);/);
+  assert.match(run, /gallerySettings,/);
 });
 
 test("the run shortcut starts the run of the page that is on screen", async () => {

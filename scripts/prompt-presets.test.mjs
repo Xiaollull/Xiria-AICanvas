@@ -183,7 +183,7 @@ test("IDs prefer randomUUID, retry collisions, and use a secure UUIDv4 fallback 
   assert.doesNotMatch(source, /Date\.now|new Date|draft\.name.*id|name.*Date/);
 });
 
-test("App source pairs every new state setter and enforces running, persistence, selection, ARIA, modal, delete, and Gallery exclusion contracts", () => {
+test("App source pairs every state setter and enforces queued editing, persistence, selection, ARIA, modal, delete, and Gallery exclusion contracts", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   // The card settings schema and the dialog lifecycle live in gallery-core; the page and the
   // add-to-gallery dialog import them, so the preset library must stay absent from all three.
@@ -214,15 +214,17 @@ test("App source pairs every new state setter and enforces running, persistence,
   assert.match(app, /onKeyUp=\{\(event\) => recordPromptSelection/);
   assert.match(app, /onFocus=\{\(event\) => recordPromptSelection/);
   assert.match(app, /revision/);
-  assert.match(app, /const applyPreset[\s\S]{0,200}status === "running"[\s\S]{0,260}setActivePromptPresets\(\(current\) => \(\{ \.\.\.current, \[record\.type\]: togglePromptPresetId\(current\[record\.type\], record\.id\) \}\)\);/);
+  assert.match(app, /const applyPreset[\s\S]{0,320}setActivePromptPresets\(\(current\) => \(\{ \.\.\.current, \[record\.type\]: togglePromptPresetId\(current\[record\.type\], record\.id\) \}\)\);/);
+  assert.doesNotMatch(app, /const applyPreset[\s\S]{0,200}status === "running"/);
   // Switching a preset on must never write into the prompt box: the box holds what was typed, and
   // the preset's words join it only on their way to the job.
   assert.ok(!/setPositive\([^)]*(?:record\.content|applyPreset)/.test(app), "a preset never rewrites the positive box");
   assert.ok(!/setNegative\([^)]*(?:record\.content|applyPreset)/.test(app), "a preset never rewrites the negative box");
   assert.doesNotMatch(app, /insertPromptPreset/, "nothing inserts a preset into the box any more");
   for (const handler of ["openPromptPresetDialog", "savePromptPreset", "requestDeletePromptPreset", "confirmDeletePromptPreset"]) {
-    assert.match(app, new RegExp(`const ${handler}[\\s\\S]{0,180}status === "running"`), `${handler} fails closed while running`);
+    assert.doesNotMatch(app, new RegExp(`const ${handler}[\\s\\S]{0,180}status === "running"`), `${handler} remains available while another task runs`);
   }
+  assert.match(app, /<PresetBox[^>]*disabled=\{modelSwitching\}/);
   assert.match(app, /jobs\/active[\s\S]{0,500}setStatus\("running"\)/, "active-job recovery enters the same running lock");
   assert.match(app, /aria-expanded=\{open\}[\s\S]{0,100}aria-controls=\{listId\}/);
   assert.match(app, /aria-haspopup="menu"[\s\S]{0,100}aria-expanded=/);
@@ -233,7 +235,7 @@ test("App source pairs every new state setter and enforces running, persistence,
   assert.match(gallery, /querySelector\("\[autofocus\], \[data-dialog-autofocus\]"\)/);
   assert.match(app, /预设删除后不会自动恢复/);
   assert.match(app, /草稿尚未保存/);
-  assert.match(app, /生成任务运行期间只能查看/);
+  assert.doesNotMatch(app, /生成任务运行期间只能查看/);
   assert.match(app, /prompt-preset-main[\s\S]{0,500}prompt-preset-more/);
   assert.match(app, /data-prompt-preset-focus-fallback/);
   assert.match(gallery, /focusReturnSelector[\s\S]{0,1800}document\.querySelector\(focusReturnSelectorRef\.current\)\?\.focus\(\)/);
@@ -248,7 +250,7 @@ test("App source pairs every new state setter and enforces running, persistence,
   // calls the stripping helper — the exclusion is unchanged, its caller is not.
   assert.match(app, /const galleryCardSettings = [\s\S]{0,240}gallerySettingsWithoutPromptPresets\(source\)/);
   assert.match(app, /currentSettings=\{galleryCardSettings\(workspaceSnapshot\.current\)\}/);
-  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : galleryCardSettings\(workspaceSnapshot\.current\)\}/);
+  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/);
   assert.ok(!/(?:currentSettings|settings)=\{gallerySettingsWithoutPromptPresets\(/.test(app),
     "no card-producing prop may bypass galleryCardSettings");
   for (const selector of [".prompt-preset-grid", ".prompt-preset-card", ".prompt-preset-menu", ".prompt-preset-backdrop", ".prompt-preset-dialog", ".prompt-preset-segmented", ".prompt-preset-error"]) assert.match(css, new RegExp(selector.replace(".", "\\.")));

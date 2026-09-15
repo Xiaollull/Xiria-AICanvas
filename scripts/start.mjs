@@ -24,7 +24,7 @@ const stateDirectory = path.resolve(projectRoot, process.env.XIRAI_STATE_DIR || 
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 34;
+const inferenceProtocol = 35;
 
 function fail(message) {
   writeDiagnosticLog(projectRoot, {

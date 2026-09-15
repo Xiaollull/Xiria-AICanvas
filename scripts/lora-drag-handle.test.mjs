@@ -74,7 +74,9 @@ test("LoRA drag permission is fail-closed for every App and dedicated-page lock"
       for (const loraWorkspaceLocked of [false, true]) {
         for (const shouldPersistMountedLoras of [false, true]) {
           const state = { status, modelSwitching, loraWorkspaceLocked, shouldPersistMountedLoras };
-          const expected = status === "running" || modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras;
+          // A running render owns an immutable request. The mounted list remains an editable draft
+          // for the next queued render; only actual workspace locks stop interaction.
+          const expected = modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras;
           assert.equal(appLoraDragLocked(state), expected, `App lock permutation ${JSON.stringify(state)}`);
         }
       }

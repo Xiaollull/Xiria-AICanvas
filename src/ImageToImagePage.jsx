@@ -3,17 +3,22 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Download,
+  Eye,
+  EyeOff,
   FolderOpen,
   ImageIcon,
   ImagePlus,
   Layers3,
+  ListPlus,
   Maximize2,
   Pause,
   Play,
   RefreshCw,
+  Sparkles,
   Square,
   Upload,
   X,
@@ -39,16 +44,8 @@ import { hiresEffectiveSteps, secureRandomUint64Seed, supportsUsduTiled } from "
 import { formatWeight } from "./lora-weight";
 import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
 import { loraCardPresentation } from "./lora-cards.js";
-import {
-  DEFAULT_IMAGE_WORKSPACE_LAYOUT,
-  imageWorkspaceLayoutClassName,
-  imageWorkspaceLayoutStyle,
-  readImageWorkspaceLayout,
-  resizeImageControlsPanel,
-  steppedImageControlsPanel,
-  toggleImageControlsPanel,
-  writeImageWorkspaceLayout,
-} from "./workspace-layout";
+import TransparentBackgroundControl from "./TransparentBackgroundControl.jsx";
+import { toggleTransparentBackground, transparentBackgroundEnabled } from "./transparent-background.js";
 import {
   ADETAILER_UNIT_LIMIT,
   DISTILLED_GUIDANCE_ENGINES,
@@ -78,10 +75,23 @@ function RangeField({ label, hint, value, min, max, step, onChange, disabled, fo
   );
 }
 
-function NumberInput({ value, min, max, step = 1, integer = false, disabled, onChange, ariaLabel }) {
+function PostprocessSlider({ label, value, min, max, step = 1, inputStep = step, integer = false, fixed = null, suffix = "", disabled, onChange }) {
+  const progress = ((value - min) / (max - min)) * 100;
+  const rangeValue = Math.max(min, Math.min(max, Math.round((value - min) / step) * step + min));
+  return (
+    <label className="slider-field">
+      <span>{label}</span>
+      <span className="slider-value"><NumberInput value={value} min={min} max={max} step={inputStep} integer={integer} fixed={fixed} className="bounded-number" ariaLabel={`${label}数值`} disabled={disabled} onChange={onChange} />{suffix}</span>
+      <input type="range" min={min} max={max} step={step} value={rangeValue} disabled={disabled} style={{ "--progress": `${Math.max(0, Math.min(100, progress))}%` }} onChange={(event) => onChange(integer ? Math.round(Number(event.target.value)) : Number(event.target.value))} />
+    </label>
+  );
+}
+
+function NumberInput({ value, min, max, step = 1, integer = false, fixed = null, className = "", disabled, onChange, ariaLabel }) {
   const inputRef = useRef(null);
   const cancelBlurRef = useRef(false);
-  const displayValue = (next) => String(next);
+  const displayValue = (next) => fixed === null ? String(next) : Number(next).toFixed(fixed);
+  const precision = Math.max(fixed || 0, (String(step).split(".")[1] || "").length);
   const [draft, setDraft] = useState(displayValue(value));
 
   useEffect(() => {
@@ -93,22 +103,18 @@ function NumberInput({ value, min, max, step = 1, integer = false, disabled, onC
     const parsed = Number(draft);
     if (!draft.trim() || !Number.isFinite(parsed)) { reset(); return; }
     const stepped = Math.round(parsed / step) * step;
-    const next = Math.max(min, Math.min(max, integer ? Math.round(stepped) : Math.round(stepped * 100) / 100));
+    const next = Math.max(min, Math.min(max, integer ? Math.round(stepped) : Math.round(stepped * (10 ** precision)) / (10 ** precision)));
     setDraft(displayValue(next));
     onChange(next);
   };
 
-  return <input ref={inputRef} className="i2i-number-input" type="text" inputMode={integer ? "numeric" : "decimal"} value={draft} disabled={disabled} aria-label={ariaLabel} onChange={(event) => setDraft(event.target.value)} onBlur={() => {
+  return <input ref={inputRef} className={className || "i2i-number-input"} type="text" inputMode={integer ? "numeric" : "decimal"} value={draft} disabled={disabled} aria-label={ariaLabel} onChange={(event) => setDraft(event.target.value)} onBlur={() => {
     if (cancelBlurRef.current) { cancelBlurRef.current = false; reset(); return; }
     commit();
   }} onKeyDown={(event) => {
     if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
     if (event.key === "Escape") { event.preventDefault(); cancelBlurRef.current = true; reset(); event.currentTarget.blur(); }
   }} />;
-}
-
-function NumberField({ label, ...props }) {
-  return <label className="i2i-number-field"><span>{label}</span><NumberInput ariaLabel={`${label}数值`} {...props} /></label>;
 }
 
 function readSourceFile(file) {
@@ -133,20 +139,22 @@ function readSourceFile(file) {
   });
 }
 
-function StageHeader({ title, detail, enabled, disabled, onToggle, children }) {
+function StageHeader({ title, detail, enabled, disabled, expanded, onToggle, onToggleExpanded, children }) {
+  const expandLabel = `${expanded ? "收起" : "展开"} ${title} 参数`;
   return (
     <div className="i2i-stage-head">
-      <div><strong>{title}</strong><small>{detail}</small></div>
-      <div className="i2i-stage-head-actions">{children}<button type="button" role="switch" aria-checked={enabled} disabled={disabled} onClick={onToggle}><i /></button></div>
+      <button type="button" className="i2i-stage-summary" aria-expanded={expanded} onClick={onToggleExpanded}><strong>{title}</strong><small>{detail}</small></button>
+      <div className="i2i-stage-head-actions">{children}<button type="button" role="switch" aria-label={`启用 ${title}`} aria-checked={enabled} disabled={disabled} onClick={onToggle}><i /></button><button type="button" className="i2i-stage-expand" aria-label={expandLabel} title={expandLabel} onClick={onToggleExpanded}><ChevronDown size={15} /></button></div>
     </div>
   );
 }
 
-function PostprocessControls({ config, engine, postprocess, running, dimensions, updateStage, moveStage, order, postprocessOnly }) {
+function PostprocessControls({ config, engine, postprocess, running, canvas, dimensions, updateStage, moveStage, order, postprocessOnly }) {
   // Which unit the ADetailer pager is showing. View state, not configuration: it
   // is never persisted, because where the user last paged to says nothing about
   // the render.
   const [adetailerPage, setADetailerPage] = useState("");
+  const [expandedStages, setExpandedStages] = useState({ hires: false, adetailer: false, rtx: false });
   const upscalers = Array.isArray(postprocess.upscalers) ? postprocess.upscalers : [];
   const adetailerModels = Array.isArray(postprocess.adetailerModels) ? postprocess.adetailerModels : [];
   const upscalerRuntime = postprocess.upscalerRuntime !== false;
@@ -179,88 +187,140 @@ function PostprocessControls({ config, engine, postprocess, running, dimensions,
   });
   const adetailerIndex = adetailerPageIndex(adetailerUnits, adetailerPage);
   const adetailerUnit = adetailerUnits[adetailerIndex];
+  const toggleStageExpanded = (stage) => setExpandedStages((current) => ({ ...current, [stage]: !current[stage] }));
+  const stagePreview = (stage) => postprocessTargetSize(canvas, order, {
+    ...config,
+    [stage]: { ...config[stage], enabled: true },
+  }).trace.find((entry) => entry.stage === stage);
+  const hiresPreview = stagePreview("hires");
+  const rtxPreview = stagePreview("rtx");
+  const rtxHealth = postprocess.rtxHealth || {};
 
   return (
     <div className="i2i-postprocess-stack">
       <div className="section-heading"><span>06</span><h2>后处理增强</h2><small className="i2i-section-kicker">{postprocessOnly ? "直接作用于来源图" : "生成后按顺序执行"}</small></div>
       {postprocessOnly && <p className="i2i-note">后处理模式下这里就是本次任务的全部内容：至少启用一个阶段，未启用的阶段会被跳过。</p>}
-      <section className={`i2i-stage-card ${config.hires.enabled ? "enabled" : ""}`}>
-        <StageHeader title="Hires.fix" detail={config.hires.enabled ? `${config.hires.scale.toFixed(1)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("hires") || "关闭"} enabled={config.hires.enabled} disabled={stageLocked("hires") || (!upscalerRuntime && !config.hires.enabled)} onToggle={() => updateStage("hires", { enabled: !config.hires.enabled })} />
-        {config.hires.enabled && <div className="i2i-stage-body i2i-hires-body">
-          <label>超分模型<WorkspaceSelect ariaLabel="超分模型" value={config.hires.model} disabled={running} onChange={(value) => updateStage("hires", { model: value })} options={upscalers.filter((item) => item.compatible !== false).map((item) => ({ value: item.id, label: item.label || item.id })).concat(upscalers.some((item) => item.compatible !== false) ? [] : [{ value: "", label: "暂无兼容模型", disabled: true }])} /></label>
-          <RangeField label="放大倍率" value={config.hires.scale} min={1} max={4} step={0.1} disabled={running} onChange={(value) => updateStage("hires", { scale: Math.round(value * 10) / 10 })} format={(value) => `${value.toFixed(1)}×`} />
-          <div className="i2i-compact-grid"><RangeField label="二次重绘" value={config.hires.denoise} min={0.05} max={1} step={0.05} disabled={running} onChange={(value) => updateStage("hires", { denoise: value })} format={(value) => value.toFixed(2)} /><RangeField label="Hires 步数" value={config.hires.steps} min={1} max={100} step={1} disabled={running} onChange={(value) => updateStage("hires", { steps: value })} /></div>
-          <RangeField label="Hires CFG" value={config.hires.cfg} min={0} max={30} step={0.5} disabled={running} onChange={(value) => updateStage("hires", { cfg: value })} format={(value) => value.toFixed(1)} />
-          <label>Hires Seed 模式<WorkspaceSelect ariaLabel="Hires Seed 模式" value={config.hires.seedMode} disabled={running} onChange={(value) => updateStage("hires", { seedMode: value, seed: value === "fixed" ? config.hires.seed : "" })} options={[{ value: "inherit", label: "继承首轮 Seed" }, { value: "fixed", label: "固定 Hires Seed" }, { value: "random", label: "每张安全随机" }]} /></label>
-          {config.hires.seedMode === "fixed" && <label className="i2i-fixed-seed">固定 Hires Seed<span><input className="i2i-inline-input" inputMode="numeric" maxLength="20" value={config.hires.seed} disabled={running} onChange={(event) => updateStage("hires", { seed: event.target.value.replace(/\D/g, "") })} placeholder="0–18446744073709551615" /><button type="button" title="生成固定 Hires Seed" disabled={running} onClick={() => updateStage("hires", { seed: secureRandomUint64Seed() })}><RefreshCw size={13} /></button></span></label>}
-          {supportsUsduTiled(engine.name) && <label>重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={config.hires.executionMode} disabled={running} onChange={(value) => updateStage("hires", { executionMode: value })} options={[{ value: "usdu_tiled", label: "USDU 分块" }, { value: "full_frame", label: "整图" }]} /></label>}
-          <div className="i2i-compact-grid i2i-select-grid">
+      <section className={`i2i-stage-card ${config.hires.enabled ? "enabled" : ""} ${expandedStages.hires ? "expanded" : ""}`}>
+        <StageHeader title="Hires.fix" detail={config.hires.enabled ? `${config.hires.scale.toFixed(1)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("hires") || "关闭"} enabled={config.hires.enabled} disabled={stageLocked("hires") || (!upscalerRuntime && !config.hires.enabled)} expanded={expandedStages.hires} onToggle={() => updateStage("hires", { enabled: !config.hires.enabled })} onToggleExpanded={() => toggleStageExpanded("hires")} />
+        {expandedStages.hires && <div className="hires-parameters">
+          <p className="postprocess-stage-description">超分放大后，使用当前底模、LoRA 和提示词进行第二次扩散精修。</p>
+          {stageReason("hires") && <p className="hires-unavailable">{stageReason("hires")}</p>}
+          <label className="hires-model">超分模型<WorkspaceSelect ariaLabel="超分模型" value={config.hires.model} disabled={running} onChange={(value) => updateStage("hires", { model: value })} options={upscalers.filter((item) => item.compatible !== false).map((item) => ({ value: item.id, label: item.label || item.id })).concat(upscalers.some((item) => item.compatible !== false) ? [] : [{ value: "", label: "暂无兼容模型", disabled: true }])} /></label>
+          <div className="hires-scale">
+            <PostprocessSlider label="放大倍率" value={config.hires.scale} min={1} max={4} step={0.1} inputStep={0.1} fixed={1} suffix="×" disabled={running} onChange={(value) => updateStage("hires", { scale: Math.round(value * 10) / 10 })} />
+            <p><span>INPUT {hiresPreview?.input?.width || canvas.width} × {hiresPreview?.input?.height || canvas.height}</span><b>OUTPUT {hiresPreview?.output?.width || canvas.width} × {hiresPreview?.output?.height || canvas.height}</b></p>
+          </div>
+          <div className="hires-sliders">
+            <PostprocessSlider label="二次重绘强度" value={config.hires.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateStage("hires", { denoise: value })} />
+            <PostprocessSlider label="Hires 步数" value={config.hires.steps} min={1} max={100} integer disabled={running} onChange={(value) => updateStage("hires", { steps: value })} />
+            <PostprocessSlider label="Hires CFG" value={config.hires.cfg} min={0} max={30} step={0.5} inputStep={0.1} fixed={1} disabled={running} onChange={(value) => updateStage("hires", { cfg: value })} />
+          </div>
+          <div className="hires-seed-settings">
+            <label>Hires Seed 模式<WorkspaceSelect ariaLabel="Hires Seed 模式" value={config.hires.seedMode} disabled={running} onChange={(value) => updateStage("hires", { seedMode: value, seed: value === "fixed" ? config.hires.seed : "" })} options={[{ value: "inherit", label: "继承每张首轮 Seed" }, { value: "fixed", label: "固定 Hires Seed" }, { value: "random", label: "每张安全随机" }]} /></label>
+            {config.hires.seedMode === "fixed" && <label className="hires-seed-field">Hires Seed<span><input inputMode="numeric" maxLength="20" value={config.hires.seed} disabled={running} onChange={(event) => updateStage("hires", { seed: event.target.value.replace(/\D/g, "") })} placeholder="0–18446744073709551615" /><button type="button" title="生成固定 Hires Seed" disabled={running} onClick={() => updateStage("hires", { seed: secureRandomUint64Seed() })}><RefreshCw size={13} /></button></span></label>}
+            <small>{config.hires.seedMode === "inherit" ? "每张结果继承该张首轮 Seed" : config.hires.seedMode === "fixed" ? "所有结果使用同一个无损 uint64 Hires Seed" : "每张结果在后端独立解析一次安全 uint64 Hires Seed"}</small>
+          </div>
+          {supportsUsduTiled(engine.name) && <label className="hires-model">重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={config.hires.executionMode} disabled={running} onChange={(value) => updateStage("hires", { executionMode: value })} options={[{ value: "usdu_tiled", label: "USDU 分块重绘（推荐）" }, { value: "full_frame", label: "整图重绘（兼容）" }]} /></label>}
+          <div className="hires-tile-grid">
             <label>Hires 采样器<WorkspaceSelect ariaLabel="Hires 采样器" value={config.hires.sampler || ""} disabled={running} onChange={(value) => updateStage("hires", { sampler: value || null })} options={[{ value: "", label: "跟随首轮" }, ...engine.samplers.map((name) => ({ value: name, label: name }))]} /></label>
             <label>Hires 调度器<WorkspaceSelect ariaLabel="Hires 调度器" value={config.hires.scheduler || ""} disabled={running} onChange={(value) => updateStage("hires", { scheduler: value || null })} options={[{ value: "", label: "跟随首轮" }, ...engine.schedulers.map((name) => ({ value: name, label: name }))]} /></label>
           </div>
-          {supportsUsduTiled(engine.name) && config.hires.executionMode === "usdu_tiled" && <><div className="i2i-readonly-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div><p className="i2i-note">Auto 使用首轮源图宽高；padding 32 · mask blur 8 · uniform tiles · tiled decode。</p></>}
-          <div className="i2i-number-grid two"><NumberField label="像素放大分块" value={config.hires.tileSize} min={32} max={2048} integer disabled={running} onChange={(tileSize) => updateStage("hires", { tileSize, tileOverlap: Math.min(config.hires.tileOverlap, Math.floor(tileSize / 2)) })} /><NumberField label="分块重叠" value={config.hires.tileOverlap} min={0} max={Math.min(512, Math.floor(config.hires.tileSize / 2))} integer disabled={running} onChange={(tileOverlap) => updateStage("hires", { tileOverlap })} /></div>
-          {!selectedUpscaler && <p className="i2i-stage-warning">请选择兼容的超分模型</p>}
-          {config.hires.seedMode === "fixed" && !config.hires.seed && <p className="i2i-stage-warning">固定 Hires Seed 需要填写 0 ～ 18446744073709551615</p>}
-          {hiresSteps < 1 && <p className="i2i-stage-warning">Hires 有效步数至少需要 1 步</p>}
+          {supportsUsduTiled(engine.name) && config.hires.executionMode === "usdu_tiled" && <><div className="hires-tile-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div><p className="hires-incompatible">Auto = 首轮源图宽高；padding 32；mask blur 8；uniform tiles；per-tile VAE tiled decode；seam None；每 tile 执行 Hires steps。</p></>}
+          <div className="hires-tile-grid">
+            <label>RealESRGAN / SR 像素放大分块<NumberInput ariaLabel="像素放大分块" value={config.hires.tileSize} min={32} max={2048} integer className="bounded-number" disabled={running} onChange={(tileSize) => updateStage("hires", { tileSize, tileOverlap: Math.min(config.hires.tileOverlap, Math.floor(tileSize / 2)) })} /></label>
+            <label>RealESRGAN / SR 像素放大分块重叠<NumberInput ariaLabel="分块重叠" value={config.hires.tileOverlap} min={0} max={Math.min(512, Math.floor(config.hires.tileSize / 2))} integer className="bounded-number" disabled={running} onChange={(tileOverlap) => updateStage("hires", { tileOverlap })} /></label>
+          </div>
+          {!selectedUpscaler && <p className="hires-unavailable">请选择兼容的超分模型</p>}
+          {config.hires.seedMode === "fixed" && !config.hires.seed && <p className="hires-unavailable">固定 Hires Seed 需要填写 0 ～ 18446744073709551615</p>}
+          {hiresSteps < 1 && <p className="hires-unavailable">Hires 有效步数至少需要 1 步</p>}
+          <p className="hires-path">模型目录 · models/upscalers · 支持 PTH / PT / CKPT 权重字典及 Safetensors，不加载 TorchScript</p>
         </div>}
       </section>
 
-      <section className={`i2i-stage-card ${config.adetailer.enabled ? "enabled" : ""}`}>
-        <StageHeader title="ADetailer" detail={config.adetailer.enabled ? adetailerSummary(config.adetailer) : stageReason("adetailer") || "关闭"} enabled={config.adetailer.enabled} disabled={stageLocked("adetailer") || (!adetailerRuntime && !config.adetailer.enabled)} onToggle={() => updateStage("adetailer", { enabled: !config.adetailer.enabled })} />
-        {config.adetailer.enabled && <div className="i2i-stage-body i2i-adetailer-body">
-          {adetailerUnits.length > 1 && <nav className="i2i-adetailer-pager" aria-label="ADetailer 检测单元">
-            <button type="button" aria-label="上一个检测单元" disabled={adetailerIndex < 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, -1))}><ChevronLeft size={14} /></button>
-            <ol>
-              {adetailerUnits.map((entry, position) => <li key={entry.id}>
-                <button
-                  type="button"
-                  className={`${position === adetailerIndex ? "current" : ""} ${entry.enabled ? "on" : ""}`}
-                  aria-current={position === adetailerIndex ? "true" : undefined}
-                  aria-label={`第 ${position + 1} 个检测单元${entry.enabled ? "" : "（已关闭）"}`}
-                  onClick={() => setADetailerPage(entry.id)}
-                >{position + 1}</button>
-              </li>)}
-            </ol>
-            <button type="button" aria-label="下一个检测单元" disabled={adetailerIndex >= adetailerUnits.length - 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, 1))}><ChevronRight size={14} /></button>
-          </nav>}
-          {adetailerUnit && (() => {
-            const unit = adetailerUnit;
-            const index = adetailerIndex;
-            const unitSteps = adetailerUnitSteps(unit, config.steps, engine.name);
-            // Keyed by the unit so paging *replaces* the controls rather than reusing
-            // them: `NumberInput` holds an uncommitted draft of its own, and reused
-            // controls would carry one unit's half-typed value onto the next unit's field.
-            return <section className={`i2i-adetailer-unit ${unit.enabled ? "on" : ""}`} key={unit.id}>
-              <header>
-                <span>{String(index + 1).padStart(2, "0")}</span>
-                <strong>{adetailerUnitLabel(index, adetailerUnits.length)}</strong>
-                <small>{unit.detector ? unit.detector.split("/").pop() : "未选择模型"}</small>
-                <button type="button" role="switch" aria-label={`启用第 ${index + 1} 个 ADetailer 单元`} aria-checked={unit.enabled} className={unit.enabled ? "active" : ""} disabled={running} onClick={() => updateUnit(unit.id, { enabled: !unit.enabled })}><i /></button>
-              </header>
-              <div className="i2i-adetailer-unit-body">
-                <label>检测模型<WorkspaceSelect ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`} value={unit.detector} disabled={running} onChange={(value) => updateUnit(unit.id, { detector: value })} options={adetailerModels.map((item) => ({ value: item.value, label: item.label || item.name })).concat(adetailerModels.length ? [] : [{ value: "", label: "暂无模型", disabled: true }])} /></label>
-                <div className="i2i-compact-grid"><RangeField label="检测置信度" value={unit.confidence} min={0.05} max={1} step={0.05} disabled={running} onChange={(value) => updateUnit(unit.id, { confidence: value })} format={(value) => value.toFixed(2)} /><RangeField label="最多处理区域" value={unit.maxDetections} min={1} max={8} step={1} disabled={running} onChange={(value) => updateUnit(unit.id, { maxDetections: value })} /></div>
-                <div className="i2i-compact-grid"><RangeField label="最小区域比例" value={unit.maskMinRatio} min={0} max={0.5} step={0.01} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMinRatio: value, maskMaxRatio: Math.max(value, unit.maskMaxRatio) })} format={(value) => value.toFixed(2)} /><RangeField label="最大区域比例" value={unit.maskMaxRatio} min={0.05} max={1} step={0.05} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMaxRatio: value, maskMinRatio: Math.min(value, unit.maskMinRatio) })} format={(value) => value.toFixed(2)} /></div>
-                <div className="i2i-number-grid three"><NumberField label="膨胀 / 腐蚀" value={unit.dilateErode} min={-128} max={128} integer disabled={running} onChange={(dilateErode) => updateUnit(unit.id, { dilateErode })} /><NumberField label="蒙版模糊" value={unit.maskBlur} min={0} max={64} integer disabled={running} onChange={(maskBlur) => updateUnit(unit.id, { maskBlur })} /><NumberField label="局部边距" value={unit.padding} min={0} max={256} integer disabled={running} onChange={(padding) => updateUnit(unit.id, { padding })} /></div>
-                <RangeField label="局部重绘强度" value={unit.denoise} min={0.05} max={1} step={0.05} disabled={running} onChange={(value) => updateUnit(unit.id, { denoise: value })} format={(value) => value.toFixed(2)} />
-                <div className="i2i-override-grid"><label><input type="checkbox" checked={unit.useSteps} disabled={running} onChange={(event) => updateUnit(unit.id, { useSteps: event.target.checked })} /><span>独立步数</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立步数`} value={unit.steps} min={1} max={100} integer disabled={running || !unit.useSteps} onChange={(value) => updateUnit(unit.id, { steps: value })} /></label><label><input type="checkbox" checked={unit.useCfg} disabled={running} onChange={(event) => updateUnit(unit.id, { useCfg: event.target.checked })} /><span>独立 CFG</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立 CFG`} value={unit.cfg} min={0} max={30} step={0.1} disabled={running || !unit.useCfg} onChange={(cfg) => updateUnit(unit.id, { cfg })} /></label></div>
-                <div className="i2i-detail-prompts"><label>正向提示词<textarea value={unit.prompt} disabled={running} onChange={(event) => updateUnit(unit.id, { prompt: event.target.value })} placeholder="留空继承主提示词；[PROMPT] 插入主提示词" /></label><label>负向提示词<textarea value={unit.negativePrompt} disabled={running || !engineAllowsNegativePrompt} onChange={(event) => updateUnit(unit.id, { negativePrompt: event.target.value })} placeholder={engineAllowsNegativePrompt ? "留空继承主负向提示词" : `${distilledEngineLabel} 没有无条件分支，负向提示词不会参与生成`} /></label></div>
-                <p className="i2i-note">{unitSteps} 个有效检测重绘步数</p>
-                {unit.enabled && unitSteps < 1 && <p className="i2i-stage-warning">该单元有效步数至少需要 1 步</p>}
-              </div>
-            </section>;
-          })()}
-          <div className="i2i-adetailer-add">
+      <section className={`i2i-stage-card ${config.adetailer.enabled ? "enabled" : ""} ${expandedStages.adetailer ? "expanded" : ""}`}>
+        <StageHeader title="ADetailer" detail={config.adetailer.enabled ? adetailerSummary(config.adetailer) : stageReason("adetailer") || "关闭"} enabled={config.adetailer.enabled} disabled={stageLocked("adetailer") || (!adetailerRuntime && !config.adetailer.enabled)} expanded={expandedStages.adetailer} onToggle={() => updateStage("adetailer", { enabled: !config.adetailer.enabled })} onToggleExpanded={() => toggleStageExpanded("adetailer")} />
+        {expandedStages.adetailer && <div className="adetailer-parameters">
+          <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
+          {stageReason("adetailer") && <p className="adetailer-unavailable">{stageReason("adetailer")}</p>}
+          {adetailerRuntime && adetailerModels.length === 0 && <p className="adetailer-unavailable">尚未安装 YOLO 检测模型，请手动放入 models/yolo 后刷新。</p>}
+          <div className="adetailer-units">
+            {adetailerUnits.length > 1 && <nav className="adetailer-pager" aria-label="ADetailer 检测单元">
+              <button type="button" aria-label="上一个检测单元" disabled={adetailerIndex < 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, -1))}><ChevronLeft size={14} /></button>
+              <ol>
+                {adetailerUnits.map((entry, position) => <li key={entry.id}>
+                  <button
+                    type="button"
+                    className={`${position === adetailerIndex ? "current" : ""} ${entry.enabled ? "on" : ""}`}
+                    aria-current={position === adetailerIndex ? "true" : undefined}
+                    aria-label={`第 ${position + 1} 个检测单元${entry.enabled ? "" : "（已关闭）"}`}
+                    onClick={() => setADetailerPage(entry.id)}
+                  >{position + 1}</button>
+                </li>)}
+              </ol>
+              <button type="button" aria-label="下一个检测单元" disabled={adetailerIndex >= adetailerUnits.length - 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, 1))}><ChevronRight size={14} /></button>
+            </nav>}
+            {adetailerUnit && (() => {
+              const unit = adetailerUnit;
+              const index = adetailerIndex;
+              const unitSteps = adetailerUnitSteps(unit, config.steps, engine.name);
+              // Keyed by the unit so paging replaces the controls and cannot retain
+              // one unit's uncommitted number draft in the next unit.
+              return <section className={`adetailer-unit ${unit.enabled ? "on" : ""}`} key={unit.id}>
+                <header>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <strong>{adetailerUnitLabel(index, adetailerUnits.length)}</strong>
+                  <small>{unit.detector ? unit.detector.split("/").pop() : "未选择模型"}</small>
+                  <button type="button" role="switch" aria-label={`启用第 ${index + 1} 个 ADetailer 单元`} aria-checked={unit.enabled} className={unit.enabled ? "active" : ""} disabled={running} onClick={() => updateUnit(unit.id, { enabled: !unit.enabled })}><i /></button>
+                </header>
+                <div className="adetailer-unit-body">
+                  <label className="adetailer-model">检测模型<WorkspaceSelect ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`} value={unit.detector} disabled={running} onChange={(value) => updateUnit(unit.id, { detector: value })} options={adetailerModels.map((item) => ({ value: item.value, label: item.label || item.name })).concat(adetailerModels.length ? [] : [{ value: "", label: "暂无模型", disabled: true }])} /></label>
+                  <div className="adetailer-sliders">
+                    <PostprocessSlider label="检测置信度" value={unit.confidence} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { confidence: value })} />
+                    <PostprocessSlider label="最多处理区域" value={unit.maxDetections} min={1} max={8} integer disabled={running} onChange={(value) => updateUnit(unit.id, { maxDetections: value })} />
+                    <PostprocessSlider label="最小区域比例" value={unit.maskMinRatio} min={0} max={0.5} step={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMinRatio: value, maskMaxRatio: Math.max(value, unit.maskMaxRatio) })} />
+                    <PostprocessSlider label="最大区域比例" value={unit.maskMaxRatio} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMaxRatio: value, maskMinRatio: Math.min(value, unit.maskMinRatio) })} />
+                  </div>
+                  <div className="adetailer-mask-grid">
+                    <label>膨胀 / 腐蚀<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 膨胀或腐蚀`} value={unit.dilateErode} min={-128} max={128} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { dilateErode: value })} /></label>
+                    <label>蒙版模糊<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 蒙版模糊`} value={unit.maskBlur} min={0} max={64} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { maskBlur: value })} /></label>
+                    <label>局部边距<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 局部边距`} value={unit.padding} min={0} max={256} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { padding: value })} /></label>
+                  </div>
+                  <div className="adetailer-denoise"><PostprocessSlider label="重绘强度" value={unit.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { denoise: value })} /></div>
+                  <div className="adetailer-overrides"><label><input type="checkbox" checked={unit.useSteps} disabled={running} onChange={(event) => updateUnit(unit.id, { useSteps: event.target.checked })} /><span>独立步数</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立步数`} value={unit.steps} min={1} max={100} integer className="bounded-number" disabled={running || !unit.useSteps} onChange={(value) => updateUnit(unit.id, { steps: value })} /></label><label><input type="checkbox" checked={unit.useCfg} disabled={running} onChange={(event) => updateUnit(unit.id, { useCfg: event.target.checked })} /><span>独立 CFG</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立 CFG`} value={unit.cfg} min={0} max={30} step={0.1} fixed={1} className="bounded-number" disabled={running || !unit.useCfg} onChange={(value) => updateUnit(unit.id, { cfg: value })} /></label></div>
+                  <div className="adetailer-prompts"><label>正向提示词<textarea value={unit.prompt} disabled={running} onChange={(event) => updateUnit(unit.id, { prompt: event.target.value })} placeholder="留空继承主提示词；[PROMPT] 插入主提示词" /></label><label>负向提示词<textarea value={unit.negativePrompt} disabled={running || !engineAllowsNegativePrompt} onChange={(event) => updateUnit(unit.id, { negativePrompt: event.target.value })} placeholder={engineAllowsNegativePrompt ? "留空继承主负向提示词" : `${distilledEngineLabel} 没有无条件分支，负向提示词不会参与生成`} /></label></div>
+                  {unit.enabled && unitSteps < 1 && <p className="adetailer-unavailable">该单元有效步数至少需要 1 步</p>}
+                </div>
+              </section>;
+            })()}
+          </div>
+          <div className="adetailer-unit-add">
             <small>{ADETAILER_UNIT_LIMIT} 个检测单元 · 已启用 {activeADetailerUnits(config.adetailer).length} 个 · 按编号顺序依次执行，后一个在前一个的结果上继续修复</small>
           </div>
-          <p className="i2i-note">重绘继承当前采样器、调度器、底模与 LoRA。</p>
+          <p className="adetailer-path">CPU 检测 · 重绘继承当前采样器、调度器、底模与 LoRA</p>
         </div>}
       </section>
 
-      <section className={`i2i-stage-card ${config.rtx.enabled ? "enabled" : ""}`}>
-        <StageHeader title="RTX VSR" detail={config.rtx.enabled ? `${config.rtx.scale.toFixed(2)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("rtx") || "关闭"} enabled={config.rtx.enabled} disabled={stageLocked("rtx") || (!rtxAvailable && !config.rtx.enabled)} onToggle={() => updateStage("rtx", { enabled: !config.rtx.enabled })} />
-        {config.rtx.enabled && <div className="i2i-stage-body"><div className="i2i-compact-grid"><RangeField label="放大倍率" value={config.rtx.scale} min={1} max={4} step={0.01} disabled={running} onChange={(value) => updateStage("rtx", { scale: Math.round(value * 100) / 100 })} format={(value) => `${value.toFixed(2)}×`} /><label>处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={config.rtx.quality} disabled={running} onChange={(value) => updateStage("rtx", { quality: value })} options={[{ value: "low", label: "LOW" }, { value: "medium", label: "MEDIUM" }, { value: "high", label: "HIGH" }, { value: "ultra", label: "ULTRA" }]} /></label></div><p className="i2i-note">最终预估 {dimensions.width} × {dimensions.height} · 上限 8192 边 / 32MP</p></div>}
+      <section className={`i2i-stage-card ${config.rtx.enabled ? "enabled" : ""} ${expandedStages.rtx ? "expanded" : ""}`}>
+        <StageHeader title="RTX VSR" detail={config.rtx.enabled ? `${config.rtx.scale.toFixed(2)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("rtx") || "关闭"} enabled={config.rtx.enabled} disabled={stageLocked("rtx") || (!rtxAvailable && !config.rtx.enabled)} expanded={expandedStages.rtx} onToggle={() => updateStage("rtx", { enabled: !config.rtx.enabled })} onToggleExpanded={() => toggleStageExpanded("rtx")} />
+        {expandedStages.rtx && <div className="rtx-parameters">
+          <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
+          {stageReason("rtx") && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`}>{stageReason("rtx")}</p>}
+          {rtxHealth.warning && <p className="rtx-unavailable">{rtxHealth.warning}</p>}
+          <div className="rtx-runtime-grid" aria-label="RTX VSR 运行环境">
+            <div><span>状态</span><strong>{rtxHealth.probing ? "PROBING" : rtxAvailable ? "READY" : rtxHealth.supported ? "RUNTIME REQUIRED" : "UNSUPPORTED"}</strong></div>
+            <div><span>运行时</span><strong>{rtxHealth.runtime_version || "--"}</strong></div>
+            <div><span>设备</span><strong title={rtxHealth.device}>{rtxHealth.device || "--"}</strong></div>
+            <div><span>CUDA 能力</span><strong>{rtxHealth.compute_capability || "--"}</strong></div>
+            <div><span>驱动</span><strong>{rtxHealth.driver_version || "--"}</strong></div>
+          </div>
+          <div className="rtx-scale">
+            <PostprocessSlider label="放大倍率" value={config.rtx.scale} min={1} max={4} step={0.01} fixed={2} suffix="×" disabled={running} onChange={(value) => updateStage("rtx", { scale: Math.round(value * 100) / 100 })} />
+            <p><span>INPUT {rtxPreview?.input?.width || canvas.width} × {rtxPreview?.input?.height || canvas.height}</span><b>OUTPUT {rtxPreview?.output?.width || canvas.width} × {rtxPreview?.output?.height || canvas.height}</b></p>
+            <p><span>ORDERED FINAL</span><b>{rtxPreview?.output?.width || dimensions.width} × {rtxPreview?.output?.height || dimensions.height}</b></p>
+          </div>
+          <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={config.rtx.quality} disabled={running} onChange={(value) => updateStage("rtx", { quality: value })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
+          <p className="rtx-proprietary">RTX VSR 依赖 NVIDIA 专有 Video Effects 运行时，仅在受支持的 x64 Windows / Linux NVIDIA RTX 设备上可用；生成内容仍在本机处理。</p>
+        </div>}
       </section>
 
       <div className="i2i-order-card"><div className="i2i-order-head"><span>07</span><strong>处理顺序</strong><b>FINAL {dimensions.width} × {dimensions.height}</b></div>{order.map((stage, index) => <div className={`i2i-order-row ${config[stage].enabled ? "enabled" : ""}`} key={stage}><span>{String(index + 1).padStart(2, "0")}</span><strong>{stage === "hires" ? "Hires.fix" : stage === "adetailer" ? "ADetailer" : "RTX VSR"}</strong><small>{config[stage].enabled ? "启用" : "关闭"}</small><div><button type="button" title="上移" disabled={running || index === 0} onClick={() => moveStage(stage, -1)}><ArrowUp size={13} /></button><button type="button" title="下移" disabled={running || index === order.length - 1} onClick={() => moveStage(stage, 1)}><ArrowDown size={13} /></button></div></div>)}</div>
@@ -287,8 +347,17 @@ export default function ImageToImagePage({
   // the store still lists the mounts instead of failing to render at all.
   loraPresentationFor = (lora) => loraCardPresentation({ item: lora }),
   onAddToGallery,
+  canAddToGallery = false,
   onNotice,
   postprocess = {},
+  runInfoVisible = true,
+  onToggleRunInfo = () => {},
+  runInfo = {},
+  transparentBackground = {},
+  positivePromptPresets = null,
+  negativePromptPresets = null,
+  queueBusy = false,
+  queuePendingCount = 0,
 }) {
   const config = normalizeImageToImageSettings(settings, { samplers: engine.samplers, schedulers: engine.schedulers });
   const postprocessOnly = config.mode === "postprocess";
@@ -302,6 +371,9 @@ export default function ImageToImagePage({
   // is disabled and the request drops the text while the text itself survives an engine switch.
   const pageAllowsNegativePrompt = !DISTILLED_GUIDANCE_ENGINES.includes(engine.name);
   const distilledPageLabel = engine.name === "Flux2" ? "FLUX.2" : "FLUX.1";
+  const transparentPromptEnabled = transparentBackgroundEnabled(config.positive);
+  const backgroundRemovalModels = transparentBackground.models || [];
+  const selectedBackgroundRemovalModel = backgroundRemovalModels.find((item) => item.id === transparentBackground.modelId) || null;
   const hiresReady = !config.hires.enabled || (engine.features?.hires !== false && postprocess.upscalerRuntime !== false && Boolean(selectedUpscaler) && hiresSteps >= 1 && config.hires.tileOverlap <= Math.floor(config.hires.tileSize / 2));
   const adetailerIssue = config.adetailer.enabled
     ? adetailerStageIssue(config.adetailer, config.steps, (detector) => postprocess.adetailerModels?.some((item) => item.value === detector), engine.name)
@@ -310,56 +382,16 @@ export default function ImageToImagePage({
   const rtxReady = !config.rtx.enabled || (engine.features?.rtx !== false && postprocess.rtxHealth?.available === true && dimensions.valid);
   const [dragging, setDragging] = useState(false);
   const [loadingSource, setLoadingSource] = useState(false);
-  const [imageWorkspaceLayout, setImageWorkspaceLayout] = useState(() => readImageWorkspaceLayout(typeof window === "undefined" ? null : window.localStorage));
-  const [controlsResizing, setControlsResizing] = useState(false);
   const fileInputRef = useRef(null);
   const sourceTokenRef = useRef(0);
-  const controlsPanelRef = useRef(null);
-  const controlsResizeRef = useRef(null);
   const running = job.status === "running";
+  // The job being watched is immutable on the server. Keep this page editable so its
+  // controls describe the next queued request, not the one already rendering.
+  const editingLocked = modelPicker.switching;
   const update = (patch) => onSettingsChange({ ...config, ...patch });
   const updateStage = (stage, patch) => update({ [stage]: { ...config[stage], ...patch } });
-  const measuredControlsPanelWidth = () => controlsPanelRef.current?.getBoundingClientRect().width || 0;
-  const commitImageWorkspaceLayout = (next) => {
-    setImageWorkspaceLayout((current) => writeImageWorkspaceLayout(window.localStorage, typeof next === "function" ? next(current) : next));
-  };
-  const beginControlsResize = (event) => {
-    if (event.button !== 0) return;
-    controlsResizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: measuredControlsPanelWidth() };
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    setControlsResizing(true);
-  };
-  const continueControlsResize = (event) => {
-    const session = controlsResizeRef.current;
-    if (!session || session.pointerId !== event.pointerId) return;
-    setImageWorkspaceLayout((current) => resizeImageControlsPanel(current, session.startWidth, event.clientX - session.startX));
-  };
-  const endControlsResize = (event) => {
-    const session = controlsResizeRef.current;
-    if (!session || session.pointerId !== event.pointerId) return;
-    controlsResizeRef.current = null;
-    setControlsResizing(false);
-    event.currentTarget.releasePointerCapture?.(event.pointerId);
-    commitImageWorkspaceLayout((current) => current);
-  };
-  const controlsResizeKeyDown = (event) => {
-    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-      event.preventDefault();
-      commitImageWorkspaceLayout((current) => steppedImageControlsPanel(current, event.key === "ArrowLeft" ? 1 : -1, measuredControlsPanelWidth()));
-      return;
-    }
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      commitImageWorkspaceLayout(toggleImageControlsPanel);
-      return;
-    }
-    if (event.key === "Home") {
-      event.preventDefault();
-      commitImageWorkspaceLayout({ ...DEFAULT_IMAGE_WORKSPACE_LAYOUT });
-    }
-  };
   const moveStage = (stage, direction) => {
-    if (running) return;
+    if (editingLocked) return;
     const index = order.indexOf(stage);
     const target = index + direction;
     if (index < 0 || target < 0 || target >= order.length) return;
@@ -368,14 +400,14 @@ export default function ImageToImagePage({
     update({ postprocessOrder: next });
   };
   const acceptFile = async (file) => {
-    if (running) return;
+    if (editingLocked) return;
     const problem = validateSourceFile(file);
     if (problem) { onNotice(problem, true); return; }
     const token = ++sourceTokenRef.current;
     setLoadingSource(true);
     try {
       const nextSource = await readSourceFile(file);
-      if (token === sourceTokenRef.current && !running) onSourceChange(nextSource);
+      if (token === sourceTokenRef.current) onSourceChange(nextSource);
     } catch (error) {
       if (token === sourceTokenRef.current) onNotice(error.message, true);
     } finally {
@@ -383,7 +415,7 @@ export default function ImageToImagePage({
     }
   };
   const useLastOutput = async () => {
-    if (running) return;
+    if (editingLocked) return;
     const output = job.outputs[job.selectedIndex] || job.outputs[0];
     if (!output?.url) return;
     const token = ++sourceTokenRef.current;
@@ -401,7 +433,7 @@ export default function ImageToImagePage({
   };
   useEffect(() => {
     const onPaste = (event) => {
-      if (running) return;
+      if (editingLocked) return;
       const file = [...(event.clipboardData?.files || [])][0];
       if (file) { event.preventDefault(); void acceptFile(file); }
     };
@@ -414,7 +446,6 @@ export default function ImageToImagePage({
     engine: engine.name,
     engineReady: engine.ready,
     serviceReady: engine.serviceReady,
-    running,
     postprocess: {
       hiresReady,
       hiresReason: postprocess.upscalerRuntime === false ? "Hires.fix 运行环境尚未配置" : "Hires 参数或超分模型未就绪",
@@ -424,6 +455,10 @@ export default function ImageToImagePage({
       rtxReason: postprocess.rtxHealth?.reason || "RTX VSR 运行时不可用",
       dimensions,
     },
+    backgroundRemoval: {
+      model: selectedBackgroundRemovalModel,
+      runtimeAvailable: transparentBackground.runtimeAvailable,
+    },
   });
   const totalImages = config.imagesPerBatch * config.batchCount;
   const selectedOutput = job.outputs[job.selectedIndex];
@@ -432,7 +467,7 @@ export default function ImageToImagePage({
   const sourceIssue = postprocessOnly ? postprocessSourceIssue(source) : "";
 
   return (
-    <section className={`${imageWorkspaceLayoutClassName(imageWorkspaceLayout)}${controlsResizing ? " panel-resizing" : ""}`} style={imageWorkspaceLayoutStyle(imageWorkspaceLayout)}>
+    <section className="image-workspace">
       <header className="i2i-page-head">
         <h1 className="eyebrow">{postprocessOnly ? "IMAGE POST-PROCESSING WORKBENCH" : "IMAGE TRANSFORMATION WORKBENCH"}</h1>
         <div className="i2i-head-status"><span className={source ? "ready" : ""}><i />{source ? "来源图已就绪" : "等待来源图"}</span><b>{canvas.width} × {canvas.height}</b></div>
@@ -452,7 +487,7 @@ export default function ImageToImagePage({
               key={mode.id}
               className={config.mode === mode.id ? "active" : ""}
               aria-pressed={config.mode === mode.id}
-              disabled={running}
+              disabled={editingLocked}
               onClick={() => update({ mode: mode.id })}
             ><strong>{mode.label}</strong><small>{mode.detail}</small></button>)}
           </div>
@@ -464,11 +499,18 @@ export default function ImageToImagePage({
                 : <div><span>重绘强度</span><strong>{config.denoise.toFixed(2)}</strong></div>}
               <div><span>最终预估</span><strong>{dimensions.width} × {dimensions.height}</strong></div>
             </div>
-            <button className="generate-button" title={blocker || (postprocessOnly ? "开始后处理" : "开始生成")} onClick={onGenerate} disabled={Boolean(blocker)}>
-              <span className="generate-icon">{running ? <RefreshCw className="spin" size={18} /> : <Zap size={18} />}</span>
-              <span><strong>{running ? (postprocessOnly ? "正在后处理" : "正在生成") : blocker ? "暂时无法执行" : postprocessOnly ? "开始后处理" : "开始图生图"}</strong><small>{running ? `批次 ${job.batchIndex || 1}/${job.batchCount} · ${job.completedImages}/${job.totalImages} 张` : blocker || `${config.imagesPerBatch} 张 × ${config.batchCount} 批 · 共 ${totalImages} 张`}</small></span>
+            <button className={`generate-button ${queueBusy ? "queueing" : ""}`} title={blocker || (queueBusy ? "按当前参数排队一个新任务" : postprocessOnly ? "开始后处理" : "开始生成")} onClick={onGenerate} disabled={Boolean(blocker)}>
+              <span className="generate-icon">{queueBusy ? <ListPlus size={18} /> : <Zap size={18} />}</span>
+              <span><strong>{blocker ? "暂时无法执行" : queueBusy ? "加入队列" : postprocessOnly ? "开始后处理" : "开始图生图"}</strong><small>{blocker || (queueBusy ? `使用当前参数排队 · 前面还有 ${queuePendingCount} 个任务` : `${config.imagesPerBatch} 张 × ${config.batchCount} 批 · 共 ${totalImages} 张`)}</small></span>
               <kbd>Ctrl/⌘ ↵</kbd>
-            </button>
+           </button>
+          </div>
+          <div id="generation-run-info" className="i2i-run-info" hidden={!runInfoVisible}>
+            <div className="generation-info">
+              <div title={runInfo.memoryReason || "首次生成加载模型时自动评估"}><span>显存档位</span><strong>{runInfo.memoryLabel || "AUTO 待评估"}</strong></div>
+              <div><span>底模缓存</span><strong>{runInfo.cacheLabel || "未加载"}</strong></div>
+            </div>
+            {runInfo.conditioning && <p className="conditioning-info">{runInfo.conditioningLabel || "CLIP 条件"}：正向 {runInfo.conditioning.tokens} tokens / {runInfo.conditioning.blocks} blocks{runInfo.conditioning.weightedTokens ? ` / ${runInfo.conditioning.weightedTokens} 加权` : ""}；负向 {runInfo.conditioning.negativeTokens} tokens / {runInfo.conditioning.negativeBlocks} blocks{runInfo.conditioning.negativeWeightedTokens ? ` / ${runInfo.conditioning.negativeWeightedTokens} 加权` : ""}</p>}
           </div>
           {running && <div className="generation-progress-dock">
             <div className="generation-progress-line"><i style={{ width: `${job.progress}%` }} /></div>
@@ -484,27 +526,53 @@ export default function ImageToImagePage({
 
         <div className="i2i-prompt-deck">
           <div className="section-heading"><span>01</span><h2>提示词</h2><small className="i2i-section-kicker">{postprocessOnly ? "供各阶段重绘继承" : "描述改变方向"}</small></div>
-          <label className="i2i-prompt"><span>正向提示词</span><textarea value={config.positive} disabled={running} placeholder="描述你希望这张图变成什么样" onChange={(event) => update({ positive: event.target.value })} /></label>
-          <label className="i2i-prompt"><span>反向提示词</span><textarea className="negative" value={config.negative} disabled={running || !pageAllowsNegativePrompt} placeholder={pageAllowsNegativePrompt ? "不希望出现的内容" : `${distilledPageLabel} 没有无条件分支，负向提示词不会参与生成`} onChange={(event) => update({ negative: event.target.value })} /></label>
+          <div className="i2i-prompt-column">
+            <label className={`prompt-field positive-field ${transparentPromptEnabled ? "transparent-enabled" : ""}`}>
+              <div><span>正向提示词{transparentPromptEnabled && <b className="special-tag-mark">TRANSPARENT PNG</b>}</span><small>{config.positive.length} 字符</small></div>
+              <textarea value={config.positive} disabled={editingLocked} placeholder="描述你希望这张图变成什么样" spellCheck={false} onChange={(event) => update({ positive: event.target.value })} />
+              <Sparkles className="field-watermark" size={46} />
+            </label>
+            {positivePromptPresets}
+          </div>
+          <div className="i2i-prompt-column">
+            <label className="prompt-field negative-field">
+              <div><span>反向提示词</span><small>{pageAllowsNegativePrompt ? `${config.negative.length} 字符` : "当前引擎不使用"}</small></div>
+              <textarea value={config.negative} disabled={editingLocked || !pageAllowsNegativePrompt} placeholder={pageAllowsNegativePrompt ? "不希望出现的内容" : `${distilledPageLabel} 没有无条件分支，负向提示词不会参与生成`} spellCheck={false} onChange={(event) => update({ negative: event.target.value })} />
+            </label>
+            {negativePromptPresets}
+          </div>
+          <TransparentBackgroundControl
+            className="i2i-transparent-control"
+            enabled={transparentPromptEnabled}
+            disabled={editingLocked}
+            modelId={transparentBackground.modelId}
+            models={backgroundRemovalModels}
+            runtimeAvailable={transparentBackground.runtimeAvailable}
+            directory={transparentBackground.directory}
+            downloadJob={transparentBackground.downloadJob}
+            onModelChange={transparentBackground.onModelChange}
+            onDownload={transparentBackground.onDownload}
+            onToggle={() => update({ positive: toggleTransparentBackground(config.positive) })}
+          />
         </div>
         <div className="i2i-compare">
           <article className="i2i-compare-pane">
             <header className="i2i-compare-head">
               <div><span className="eyebrow">SOURCE</span><h2>来源图片</h2></div>
               <div className="i2i-compare-actions">
-                <button type="button" title="把上一次生成结果作为来源" aria-label="把上一次生成结果作为来源" disabled={running || loadingSource || !job.outputs.length} onClick={useLastOutput}><ArrowLeft size={15} /></button>
-                <button type="button" title="选择来源图片" aria-label="选择来源图片" disabled={running || loadingSource} onClick={() => fileInputRef.current?.click()}><Upload size={15} /></button>
-                <button type="button" title="移除来源图片" aria-label="移除来源图片" disabled={running || !source} onClick={() => onSourceChange(null)}><X size={15} /></button>
+                <button type="button" title="把上一次生成结果作为来源" aria-label="把上一次生成结果作为来源" disabled={editingLocked || loadingSource || !job.outputs.length} onClick={useLastOutput}><ArrowLeft size={15} /></button>
+                <button type="button" title="选择来源图片" aria-label="选择来源图片" disabled={editingLocked || loadingSource} onClick={() => fileInputRef.current?.click()}><Upload size={15} /></button>
+                <button type="button" title="移除来源图片" aria-label="移除来源图片" disabled={editingLocked || !source} onClick={() => onSourceChange(null)}><X size={15} /></button>
               </div>
             </header>
             <div
               className={`i2i-compare-figure i2i-dropzone ${dragging ? "dragging" : ""} ${source ? "filled" : ""}`}
-              onDragOver={(event) => { if (!running) { event.preventDefault(); setDragging(true); } }}
+              onDragOver={(event) => { if (!editingLocked) { event.preventDefault(); setDragging(true); } }}
               onDragLeave={() => setDragging(false)}
-              onDrop={(event) => { if (running) return; event.preventDefault(); setDragging(false); const file = [...(event.dataTransfer?.files || [])][0]; if (file) void acceptFile(file); }}
+              onDrop={(event) => { if (editingLocked) return; event.preventDefault(); setDragging(false); const file = [...(event.dataTransfer?.files || [])][0]; if (file) void acceptFile(file); }}
             >
               {source ? <img src={source.dataUrl} alt={`来源图片 ${source.name}`} /> : <div className="i2i-dropzone-empty"><Upload size={26} /><strong>{loadingSource ? "正在读取图片" : "拖入、粘贴或点击选择图片"}</strong><small>PNG · JPEG · WebP</small></div>}
-              <button type="button" className="i2i-dropzone-hit" disabled={running || loadingSource} onClick={() => fileInputRef.current?.click()} aria-label="选择来源图片" />
+              <button type="button" className="i2i-dropzone-hit" disabled={editingLocked || loadingSource} onClick={() => fileInputRef.current?.click()} aria-label="选择来源图片" />
               <input ref={fileInputRef} type="file" accept={SOURCE_IMAGE_ACCEPT} hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void acceptFile(file); }} />
               <div className="corner corner-tl" /><div className="corner corner-tr" /><div className="corner corner-bl" /><div className="corner corner-br" />
             </div>
@@ -519,7 +587,8 @@ export default function ImageToImagePage({
             <header className="i2i-compare-head">
               <div><span className="eyebrow">RESULT</span><h2>生成结果</h2></div>
               <div className="i2i-compare-actions">
-                <button type="button" title="把结果加入画廊" aria-label="把结果加入画廊" disabled={!job.outputs.some((output) => output.asset_id)} onClick={onAddToGallery}><ImagePlus size={15} /></button>
+                <button type="button" className={`i2i-run-info-toggle ${runInfoVisible ? "active" : ""}`} aria-pressed={runInfoVisible} aria-controls="generation-run-info" aria-label={runInfoVisible ? "隐藏显存、缓存与条件信息" : "显示显存、缓存与条件信息"} title={runInfoVisible ? "隐藏显存、缓存与条件信息" : "显示显存、缓存与条件信息"} onClick={onToggleRunInfo}>{runInfoVisible ? <Eye size={15} /> : <EyeOff size={15} />}</button>
+                <button type="button" title={canAddToGallery ? "把结果加入画廊" : "该旧任务没有可验证的参数快照"} aria-label="把结果加入画廊" disabled={!canAddToGallery} onClick={onAddToGallery}><ImagePlus size={15} /></button>
                 <button type="button" title="打开图片预览与拼图工作区" aria-label="打开图片预览与拼图工作区" onClick={onOpenViewer}><Maximize2 size={15} /></button>
                 <button type="button" title="下载当前结果" aria-label="下载当前结果" disabled={!selectedOutput?.url} onClick={() => {
                   if (!selectedOutput?.url) return;
@@ -557,23 +626,7 @@ export default function ImageToImagePage({
             what it produces and read as the supporting pair below it. */}
       </section>
 
-      <div
-        className="panel-resizer i2i-controls-resizer"
-        role="separator"
-        aria-orientation="vertical"
-        aria-expanded={!imageWorkspaceLayout.controlsCollapsed}
-        aria-label={imageWorkspaceLayout.controlsCollapsed ? "展开右侧参数面板" : "调整右侧参数面板宽度"}
-        tabIndex={0}
-        onPointerDown={beginControlsResize}
-        onPointerMove={continueControlsResize}
-        onPointerUp={endControlsResize}
-        onPointerCancel={endControlsResize}
-        onKeyDown={controlsResizeKeyDown}
-        onDoubleClick={() => commitImageWorkspaceLayout(toggleImageControlsPanel)}
-        title={imageWorkspaceLayout.controlsCollapsed ? "双击或向左拖动展开右侧参数面板" : "拖动调整宽度 · 双击折叠"}
-      />
-
-      <aside className="i2i-controls-panel panel" ref={controlsPanelRef}>
+      <aside className="i2i-controls-panel panel">
         <div className="panel-scroll">
           <div className="section-heading"><span>02</span><h2>模型引擎</h2><small className="i2i-section-kicker">与文生图共享</small></div>
           <div className="i2i-model-picker">
@@ -581,17 +634,17 @@ export default function ImageToImagePage({
               {modelPicker.engines.map((item) => <button
                 type="button"
                 key={item.name}
-                disabled={!item.ready || running || modelPicker.switching}
+                disabled={!item.ready || modelPicker.switching}
                 title={`${item.name} · ${item.detail}`}
                 className={`model-seg ${engine.name === item.name ? "active" : ""}`}
                 onClick={() => modelPicker.onSelectEngine(item.name)}
               ><span className="seg-name">{item.name}</span><span className="seg-detail">{item.ready ? item.detail : "即将支持"}</span></button>)}
             </div>
             {["Anima", "Flux", "Flux2", "Krea2"].includes(engine.name) ? <div className={`checkpoint-picker split-model-picker ${modelPicker.error || modelPicker.assets.some((item) => item.missing) ? "error" : ""}`}>
-              <span className="checkpoint-label"><b>模型组件</b><span className="asset-list-actions"><small>{modelPicker.loading ? "扫描中" : `${modelPicker.assets.reduce((total, item) => total + item.options.length, 0)} 个资源`}</small><button type="button" className="asset-refresh" title={`刷新 ${engine.name} 模型组件`} aria-label={`刷新 ${engine.name} 模型组件`} disabled={modelPicker.loading || modelPicker.refreshing || running || modelPicker.switching} onClick={() => modelPicker.onRefresh()}><RefreshCw className={modelPicker.refreshing ? "spin" : ""} size={13} /></button></span></span>
+              <span className="checkpoint-label"><b>模型组件</b><span className="asset-list-actions"><small>{modelPicker.loading ? "扫描中" : `${modelPicker.assets.reduce((total, item) => total + item.options.length, 0)} 个资源`}</small><button type="button" className="asset-refresh" title={`刷新 ${engine.name} 模型组件`} aria-label={`刷新 ${engine.name} 模型组件`} disabled={modelPicker.loading || modelPicker.refreshing || modelPicker.switching} onClick={() => modelPicker.onRefresh()}><RefreshCw className={modelPicker.refreshing ? "spin" : ""} size={13} /></button></span></span>
               {modelPicker.assets.map((asset) => <label className="split-model-field" key={asset.kind}>
                 <span>{asset.label}<small>{modelPicker.loading ? "扫描中" : `${asset.options.length} 个`}</small></span>
-                <span className="checkpoint-select"><WorkspaceSelect ariaLabel={asset.label} value={asset.value} disabled={running || modelPicker.switching || modelPicker.loading || asset.options.length === 0} onChange={(value) => modelPicker.onSelectAsset(asset.kind, value)} options={[
+                <span className="checkpoint-select"><WorkspaceSelect ariaLabel={asset.label} value={asset.value} disabled={modelPicker.switching || modelPicker.loading || asset.options.length === 0} onChange={(value) => modelPicker.onSelectAsset(asset.kind, value)} options={[
                   ...(modelPicker.loading ? [{ value: "", label: "正在加载模型目录...", disabled: true }] : []),
                   ...(!modelPicker.loading && asset.options.length === 0 ? [{ value: "", label: "未检测到可用资源", disabled: true }] : []),
                   ...(asset.missing && asset.value ? [{ value: asset.value, label: `${asset.value}（文件已删除）` }] : []),
@@ -600,8 +653,8 @@ export default function ImageToImagePage({
                 <span className="checkpoint-path" title={modelPicker.error || (asset.missing ? `${asset.label}文件已删除，请选择其他资源` : asset.directory)}>{modelPicker.error || (asset.missing ? `${asset.label}文件已删除，请选择其他资源` : asset.directory || "正在解析模型路径...")}</span>
               </label>)}
             </div> : <div className={`checkpoint-picker ${modelPicker.error || modelPicker.checkpointMissing ? "error" : ""}`}>
-              <span className="checkpoint-label"><b>底模选择</b><span className="asset-list-actions"><small>{modelPicker.loading ? "扫描中" : `${modelPicker.checkpoints.length} 个模型`}</small><button type="button" className="asset-refresh" title="刷新底模列表" aria-label="刷新底模列表" disabled={modelPicker.loading || modelPicker.refreshing || running || modelPicker.switching} onClick={() => modelPicker.onRefresh()}><RefreshCw className={modelPicker.refreshing ? "spin" : ""} size={13} /></button></span></span>
-              <span className="checkpoint-select"><WorkspaceSelect ariaLabel="图生图底模选择" value={modelPicker.checkpoint} disabled={running || modelPicker.switching || modelPicker.loading || modelPicker.checkpoints.length === 0} onChange={modelPicker.onSelectCheckpoint} options={[
+              <span className="checkpoint-label"><b>底模选择</b><span className="asset-list-actions"><small>{modelPicker.loading ? "扫描中" : `${modelPicker.checkpoints.length} 个模型`}</small><button type="button" className="asset-refresh" title="刷新底模列表" aria-label="刷新底模列表" disabled={modelPicker.loading || modelPicker.refreshing || modelPicker.switching} onClick={() => modelPicker.onRefresh()}><RefreshCw className={modelPicker.refreshing ? "spin" : ""} size={13} /></button></span></span>
+              <span className="checkpoint-select"><WorkspaceSelect ariaLabel="图生图底模选择" value={modelPicker.checkpoint} disabled={modelPicker.switching || modelPicker.loading || modelPicker.checkpoints.length === 0} onChange={modelPicker.onSelectCheckpoint} options={[
                 ...(modelPicker.loading ? [{ value: "", label: "正在加载模型目录...", disabled: true }] : []),
                 ...(!modelPicker.loading && modelPicker.checkpoints.length === 0 ? [{ value: "", label: "未检测到可用底模", disabled: true }] : []),
                 ...(modelPicker.checkpointMissing && modelPicker.checkpoint ? [{ value: modelPicker.checkpoint, label: `${modelPicker.checkpoint}（文件已删除）` }] : []),
@@ -616,25 +669,25 @@ export default function ImageToImagePage({
               act on and is left out rather than shown as a control with no effect. Steps, CFG,
               sampler, scheduler and seed stay: every stage that redraws inherits them. */}
           {!postprocessOnly && <div className="i2i-denoise">
-            <RangeField label="重绘强度" hint="越低越接近原图" value={config.denoise} min={0.05} max={1} step={0.05} disabled={running} onChange={(value) => update({ denoise: Math.round(value * 100) / 100 })} format={(value) => value.toFixed(2)} />
+            <RangeField label="重绘强度" hint="越低越接近原图" value={config.denoise} min={0.05} max={1} step={0.05} disabled={editingLocked} onChange={(value) => update({ denoise: Math.round(value * 100) / 100 })} format={(value) => value.toFixed(2)} />
             <div className="i2i-denoise-scale"><span>保留构图</span><span>改动结构</span><span>几乎重画</span></div>
           </div>}
           <div className="i2i-slider-grid">
-            <RangeField label="采样步数" value={config.steps} min={1} max={60} step={1} disabled={running} onChange={(value) => update({ steps: value })} />
-            <RangeField label="CFG 引导" value={config.cfg} min={1} max={15} step={0.5} disabled={running} onChange={(value) => update({ cfg: value })} format={(value) => value.toFixed(1)} />
+            <RangeField label="采样步数" value={config.steps} min={1} max={60} step={1} disabled={editingLocked} onChange={(value) => update({ steps: value })} />
+            <RangeField label="CFG 引导" value={config.cfg} min={1} max={15} step={0.5} disabled={editingLocked} onChange={(value) => update({ cfg: value })} format={(value) => value.toFixed(1)} />
           </div>
           <p className="i2i-note">{postprocessOnly
             ? <>后处理不执行基础采样：这里的步数与 CFG 只在 ADetailer 未单独设置时被继承，Hires 使用自己的步数与 CFG。</>
             : <>实际执行步数约为采样步数 × 重绘强度，当前约 <b>{Math.max(1, Math.floor(config.steps * config.denoise))}</b> 步。</>}</p>
           <div className="i2i-select-row">
-            <label>采样器<WorkspaceSelect ariaLabel="采样器" value={config.sampler} disabled={running} onChange={(value) => update({ sampler: value })} options={engine.samplers.map((name) => ({ value: name, label: name }))} /></label>
-            <label>调度器<WorkspaceSelect ariaLabel="调度器" value={config.scheduler} disabled={running} onChange={(value) => update({ scheduler: value })} options={engine.schedulers.map((name) => ({ value: name, label: name }))} /></label>
+            <label>采样器<WorkspaceSelect ariaLabel="采样器" value={config.sampler} disabled={editingLocked} onChange={(value) => update({ sampler: value })} options={engine.samplers.map((name) => ({ value: name, label: name }))} /></label>
+            <label>调度器<WorkspaceSelect ariaLabel="调度器" value={config.scheduler} disabled={editingLocked} onChange={(value) => update({ scheduler: value })} options={engine.schedulers.map((name) => ({ value: name, label: name }))} /></label>
           </div>
-          <label className="i2i-seed"><span>随机种子</span><div><input inputMode="numeric" maxLength="20" value={config.seed} disabled={running} onChange={(event) => update({ seed: event.target.value.replace(/\D/g, "") })} /><button type="button" title="生成随机种子" disabled={running} onClick={() => update({ seed: String(Math.floor(Math.random() * 4294967296)) })}><RefreshCw size={15} /></button></div></label>
-          <div className="i2i-mode-row" role="group" aria-label="种子生成模式">{SEED_MODES.map((mode) => <button key={mode.id} type="button" className={config.seedMode === mode.id ? "active" : ""} disabled={running} onClick={() => update({ seedMode: mode.id })}>{mode.label}</button>)}</div>
+          <label className="i2i-seed"><span>随机种子</span><div><input inputMode="numeric" maxLength="20" value={config.seed} disabled={editingLocked} onChange={(event) => update({ seed: event.target.value.replace(/\D/g, "") })} /><button type="button" title="生成随机种子" disabled={editingLocked} onClick={() => update({ seed: String(Math.floor(Math.random() * 4294967296)) })}><RefreshCw size={15} /></button></div></label>
+          <div className="i2i-mode-row" role="group" aria-label="种子生成模式">{SEED_MODES.map((mode) => <button key={mode.id} type="button" className={config.seedMode === mode.id ? "active" : ""} disabled={editingLocked} onClick={() => update({ seedMode: mode.id })}>{mode.label}</button>)}</div>
           <div className="i2i-slider-grid">
-            <RangeField label="单批图片数" value={config.imagesPerBatch} min={1} max={10} step={1} disabled={running} onChange={(value) => update({ imagesPerBatch: value })} />
-            <RangeField label="生成批次数" value={config.batchCount} min={1} max={20} step={1} disabled={running} onChange={(value) => update({ batchCount: value })} />
+            <RangeField label="单批图片数" value={config.imagesPerBatch} min={1} max={10} step={1} disabled={editingLocked} onChange={(value) => update({ imagesPerBatch: value })} />
+            <RangeField label="生成批次数" value={config.batchCount} min={1} max={20} step={1} disabled={editingLocked} onChange={(value) => update({ batchCount: value })} />
           </div>
           <p className="i2i-note">{postprocessOnly
             ? <>本任务共输出 <b>{totalImages}</b> 张：同一张来源图会按不同 Seed 各走一遍处理链，纯 RTX 链没有随机性，结果会完全一致。</>
@@ -649,12 +702,12 @@ export default function ImageToImagePage({
             <p className="i2i-note">后处理不重采样来源图：原始像素直接进入第一个阶段，最终尺寸由启用的阶段依次决定。</p>
             {sourceIssue && <p className="i2i-stage-warning">{sourceIssue}</p>}
           </> : <>
-            <div className="i2i-mode-row" role="group" aria-label="输出尺寸模式">{SIZE_MODES.map((mode) => <button key={mode.id} type="button" className={config.sizeMode === mode.id ? "active" : ""} title={mode.detail} disabled={running} onClick={() => update({ sizeMode: mode.id, ...(mode.id === "custom" ? { width: canvas.width, height: canvas.height } : {}) })}>{mode.label}</button>)}</div>
-            {config.sizeMode === "scale" && <RangeField label="缩放倍数" value={config.scale} min={0.25} max={4} step={0.05} disabled={running} onChange={(value) => update({ scale: value })} format={(value) => `${value.toFixed(2)}×`} />}
-            {config.sizeMode === "custom" && <div className="i2i-canvas-picker"><div className="i2i-canvas-picker-head"><span>拖拽右下角调整画布</span><b>{canvas.width} × {canvas.height}</b></div><SizeGrid width={config.width} height={config.height} min={64} max={2048} step={64} disabled={running} onChange={(width, height) => update({ width, height })} /></div>}
+            <div className="i2i-mode-row" role="group" aria-label="输出尺寸模式">{SIZE_MODES.map((mode) => <button key={mode.id} type="button" className={config.sizeMode === mode.id ? "active" : ""} title={mode.detail} disabled={editingLocked} onClick={() => update({ sizeMode: mode.id, ...(mode.id === "custom" ? { width: canvas.width, height: canvas.height } : {}) })}>{mode.label}</button>)}</div>
+            {config.sizeMode === "scale" && <RangeField label="缩放倍数" value={config.scale} min={0.25} max={4} step={0.05} disabled={editingLocked} onChange={(value) => update({ scale: value })} format={(value) => `${value.toFixed(2)}×`} />}
+            {config.sizeMode === "custom" && <div className="i2i-canvas-picker"><div className="i2i-canvas-picker-head"><span>拖拽右下角调整画布</span><b>{canvas.width} × {canvas.height}</b></div><SizeGrid width={config.width} height={config.height} min={64} max={2048} step={64} disabled={editingLocked} onChange={(width, height) => update({ width, height })} /></div>}
             <p className="i2i-canvas-readout"><span>{source ? `${source.width} × ${source.height}` : "未选择图片"}</span><i>→</i><b>{canvas.width} × {canvas.height}</b></p>
             <p className="i2i-note">输出尺寸对齐到 64 的倍数，最长边不超过 2048。</p>
-            <div className="i2i-mode-row" role="group" aria-label="缩放方式">{RESIZE_MODES.map((mode) => <button key={mode.id} type="button" className={config.resizeMode === mode.id ? "active" : ""} title={mode.detail} disabled={running} onClick={() => update({ resizeMode: mode.id })}>{mode.label}</button>)}</div>
+            <div className="i2i-mode-row" role="group" aria-label="缩放方式">{RESIZE_MODES.map((mode) => <button key={mode.id} type="button" className={config.resizeMode === mode.id ? "active" : ""} title={mode.detail} disabled={editingLocked} onClick={() => update({ resizeMode: mode.id })}>{mode.label}</button>)}</div>
             <p className="i2i-note">{resizeModeMatters(source, canvas) ? RESIZE_MODES.find((mode) => mode.id === config.resizeMode)?.detail : "画布与原图比例一致，缩放方式暂时没有区别。"}</p>
           </>}
 
@@ -682,7 +735,7 @@ export default function ImageToImagePage({
           </div>}
           <p className="i2i-note">切换引擎或底模会同步到文生图；LoRA 挂载按引擎隔离并随之切换。</p>
 
-          <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={running} dimensions={dimensions} updateStage={updateStage} moveStage={moveStage} order={order} postprocessOnly={postprocessOnly} />
+          <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={editingLocked} canvas={canvas} dimensions={dimensions} updateStage={updateStage} moveStage={moveStage} order={order} postprocessOnly={postprocessOnly} />
         </div>
       </aside>
       <LoraHoverPreview preview={loraSummaryHover.preview} />

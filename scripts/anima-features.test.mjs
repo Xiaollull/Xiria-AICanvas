@@ -39,7 +39,7 @@ test("Anima workspace restore and generation preserve supported feature settings
   assert.doesNotMatch(restore, /loras: isAnima \? \[\]/);
   assert.doesNotMatch(restore, /saved\.guidance !== "pag"/);
 
-  assert.match(generate, /setGeneratedSettings\([\s\S]*?guidance: distilledGeneration \? "none" : guidance,\s+hires:/);
+  assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?guidance: distilledGeneration \? "none" : guidance,\s+hires: generationHires,/);
   assert.match(generate, /hires: \{\s+(?:\/\/[^\n]*\n\s+)?enabled: hires\.enabled,/);
   assert.match(generate, /adetailer: adetailerPayload\(adetailer, model\)/);
   assert.match(generate, /rtx: \{\s+enabled: rtx\.enabled,/);
@@ -89,20 +89,20 @@ test("Hires migrates execution mode by engine and sends the independent tiled-re
   assert.match(galleryPage, /像素放大分块/);
   for (const source of [galleryCore, galleryPage]) assert.doesNotMatch(source, /tileWidth:\s*512|tileHeight:\s*512/);
   assert.doesNotMatch(app, /Protocol 25 backend integration may return 422/);
-  assert.match(app, /const hiresControlsLocked = !hires\.enabled \|\| status === "running"/);
+  assert.match(app, /const hiresControlsLocked = modelSwitching;/);
   assert.match(app, /RealESRGAN \/ SR 像素放大分块[\s\S]*?disabled=\{hiresControlsLocked\}/);
   assert.match(app, /Auto = 首轮源图宽高[\s\S]*?mask blur 8[\s\S]*?uniform tiles[\s\S]*?per-tile VAE tiled decode[\s\S]*?seam None[\s\S]*?每 tile 执行 Hires steps/);
   assert.match(galleryPage, /aria-pressed=\{selected\.has\(id\)\} disabled=\{busy\}/);
   assert.match(galleryPage, /USDU 分块重绘/);
 });
 
-test("ADetailer request controls are locked while generation runs without locking task controls", async () => {
+test("ADetailer request controls stay editable for the next queued task", async () => {
   const app = await readSource("src/App.jsx");
   const units = await readSource("src/adetailer-units.js");
   const generate = sourceBetween(app, "  const generate = async () => {", "  const releaseLoadedModel = async () => {");
-  const adetailer = sourceBetween(app, "            <button type=\"button\" className={`section-heading parameter-title parameter-toggle ${adetailer.expanded", "            <button type=\"button\" className={`section-heading parameter-title parameter-toggle ${rtx.expanded");
+  const adetailer = sourceBetween(app, "              <section className={`postprocess-stage-card ${adetailer.enabled", "              <section className={`postprocess-stage-card ${rtx.enabled");
 
-  assert.match(app, /const adetailerLocked = status === "running"/);
+  assert.match(app, /const adetailerLocked = modelSwitching/);
   // Every field still reaches the request; the payload is built in one place so
   // the two generate surfaces cannot send different shapes.
   assert.match(generate, /adetailer: adetailerPayload\(adetailer, model\)/);
@@ -117,10 +117,12 @@ test("ADetailer request controls are locked while generation runs without lockin
   // And a stage that is switched off carries no units at all: the wire is the run plan.
   assert.match(units, /return \{ enabled, units: enabled \? adetailerUnitsPayload\(stage, engine\) : \[\] \};/);
 
-  // Every per-unit control is gated on the same lock, through `unitLocked`.
-  assert.match(adetailer, /const unitLocked = !adetailer\.enabled \|\| adetailerLocked;/);
+  // A disabled stage is still configurable before it is enabled. Every per-unit
+  // control therefore follows only an actual model-switch transaction through `unitLocked`.
+  assert.match(adetailer, /const unitLocked = adetailerLocked;/);
+  assert.doesNotMatch(adetailer, /const unitLocked = !adetailer\.enabled/);
   for (const control of [
-    "aria-label=\"启用 ADetailer\"[\\s\\S]*?disabled=\\{adetailerLocked",
+    "switchDisabled=\\{adetailerLocked",
     "value=\\{unit\\.detector\\} disabled=\\{unitLocked\\}",
     "label=\"检测置信度\"[\\s\\S]*?disabled=\\{unitLocked\\}",
     "label=\"最多处理区域\"[\\s\\S]*?disabled=\\{unitLocked\\}",
@@ -136,7 +138,7 @@ test("ADetailer request controls are locked while generation runs without lockin
     "value=\\{unit\\.cfg\\}[\\s\\S]*?unitLocked",
     "value=\\{unit\\.prompt\\} disabled=\\{unitLocked\\}",
     // The negative prompt carries a second gate: a guidance-distilled engine has no branch to
-    // encode one into. The run lock is still the first term.
+    // encode one into. The model-switch lock is still the first term.
     "value=\\{unit\\.negativePrompt\\} disabled=\\{unitLocked \\|\\| !engineAllowsNegativePrompt\\}",
     // A unit's own switch is a request control too. There is nothing to add or
     // remove: every slot exists from the start, so the switch is the whole gate.
@@ -297,7 +299,7 @@ test("changing the selection does not tear the loaded pipeline down", async () =
     assert.doesNotMatch(body, /await /, `${name} has nothing to wait for`);
   }
   // Switching away and back must therefore find the cache still there.
-  assert.match(selectModel, /if \(nextModel === model \|\| status === "running" \|\| modelSwitching\) return;/);
+  assert.match(selectModel, /if \(nextModel === model \|\| modelSwitching\) return;/);
   // Freeing on demand is what the explicit control is for, and it is the one place that still asks.
   const unload = sourceBetween(app, "  const unloadLoadedModel = async", "  const applyGallerySettings = async");
   assert.match(unload, /releaseLoadedModel/);

@@ -121,9 +121,9 @@ export function sameMountedLoraIdentity(first, second) {
 export function nextMountedLoraRevision(revision, previous, next) {
   return sameMountedLoraIdentity(previous, next) ? revision : revision + 1;
 }
-/** Scans are never allowed while a live/restored job or workspace lock exists. */
+/** A queued render owns a frozen request, so only recovery and workspace mutation locks block scans. */
 export function canStartMountedLoraScan({ uiStateReady = true, activeJobRecoveryPending = false, status = "idle", modelSwitching = false, workspaceLocked = false, shouldPersist = true } = {}) {
-  return uiStateReady === true && activeJobRecoveryPending !== true && status !== "running" && modelSwitching !== true && workspaceLocked !== true && shouldPersist === true;
+  return uiStateReady === true && activeJobRecoveryPending !== true && modelSwitching !== true && workspaceLocked !== true && shouldPersist === true;
 }
 /**
  * Response admission is deliberately stricter than request admission.  A

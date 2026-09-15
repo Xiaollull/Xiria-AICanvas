@@ -4,6 +4,7 @@ import binascii
 import copy
 import gc
 import hashlib
+import hmac
 import io
 import itertools
 import json
@@ -626,7 +627,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="XiriaCanvas AI Inference", docs_url=None, redoc_url=None, lifespan=lifespan)
-INFERENCE_PROTOCOL = 34
+INFERENCE_PROTOCOL = 35
 WORKSPACE_ID = os.environ.get("INFERENCE_WORKSPACE_ID")
 
 
@@ -1001,6 +1002,58 @@ class PagInput(BaseModel):
         return round(value, 2)
 
 
+MAX_GALLERY_SETTINGS_BYTES = 128 * 1024
+MAX_GALLERY_SETTINGS_DEPTH = 12
+MAX_GALLERY_SETTINGS_ITEMS = 128
+
+
+def normalize_gallery_settings_payload(value, depth: int = 0):
+    """Keep gallery-only metadata bounded without imposing a limit on inference prompts."""
+    if depth > MAX_GALLERY_SETTINGS_DEPTH:
+        raise ValueError("gallery settings are nested too deeply")
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("gallery settings must contain finite numbers")
+        return value
+    if isinstance(value, list):
+        if len(value) > MAX_GALLERY_SETTINGS_ITEMS:
+            raise ValueError("gallery settings contain too many list items")
+        return [normalize_gallery_settings_payload(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        if len(value) > MAX_GALLERY_SETTINGS_ITEMS:
+            raise ValueError("gallery settings contain too many fields")
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 128:
+                raise ValueError("gallery settings contain an invalid field name")
+            normalized[key] = normalize_gallery_settings_payload(item, depth + 1)
+        return normalized
+    raise ValueError("gallery settings contain an unsupported value")
+
+
+def validated_gallery_settings_payload(value):
+    if value is None:
+        return None
+    normalized = normalize_gallery_settings_payload(value)
+    if not isinstance(normalized, dict):
+        raise ValueError("gallery settings must be an object")
+    serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if len(serialized.encode("utf-8")) > MAX_GALLERY_SETTINGS_BYTES:
+        raise ValueError("gallery settings exceed the 128 KiB snapshot limit")
+    return json.loads(serialized)
+
+
+def gallery_access_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def has_gallery_access(job: dict, token: str | None) -> bool:
+    digest = job.get("gallery_access_token_digest")
+    return isinstance(token, str) and isinstance(digest, str) and hmac.compare_digest(digest, gallery_access_digest(token))
+
+
 class GenerateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1048,6 +1101,14 @@ class GenerateInput(BaseModel):
         default_factory=lambda: list(POSTPROCESS_STAGE_IDS), min_length=3, max_length=3
     )
     loras: list[LoraInput] = Field(default_factory=list, max_length=16)
+    # This client-only snapshot never affects inference. It is retained with the job so a completed
+    # task reopened after a browser refresh can still be saved to the gallery with exact settings.
+    gallery_settings: dict[str, object] | None = None
+
+    @field_validator("gallery_settings")
+    @classmethod
+    def validate_gallery_settings(cls, value):
+        return validated_gallery_settings_payload(value)
 
     @model_validator(mode="after")
     def validate_dimensions(self):
@@ -1793,7 +1854,7 @@ JOB_ACTIVE_STATUSES = frozenset({"queued", "running", "pausing", "paused", "canc
 JOB_FINISHED_STATUSES = frozenset({"complete", "error", "cancelled"})
 # Fields that name a place on this machine rather than something a client can fetch.
 JOB_PRIVATE_FIELDS = frozenset({
-    "output_path", "output_paths", "stage_preview_paths",
+    "output_path", "output_paths", "stage_preview_paths", "gallery_settings", "gallery_access_token_digest",
 })
 
 
@@ -1818,21 +1879,51 @@ def trim_job_history():
         cleanup_job_stage_previews(job["id"])
 
 
+def job_output_summary(output: dict | None) -> dict | None:
+    if not output:
+        return None
+    return {
+        "index": output.get("index"),
+        "output_name": output.get("output_name"),
+        "image_url": output.get("image_url"),
+        "seed": output.get("seed"),
+        "width": output.get("width"),
+        "height": output.get("height"),
+        "asset_id": output.get("asset_id"),
+        "transparent_background": output.get("transparent_background"),
+    }
+
+
+def job_stage_preview_summary(preview: dict | None) -> dict | None:
+    if not preview:
+        return None
+    return {
+        key: preview.get(key)
+        for key in ("index", "stage", "url", "label", "width", "height", "batch_index", "image_index")
+        if preview.get(key) is not None
+    }
+
+
 def job_queue_entry(job: dict, running_seen: bool) -> dict:
-    """One row of the queue list: what it is, where it got to, and what it produced.
+    """One bounded row of the queue list: what it is, where it got to, and one thumbnail.
 
     `queued` is reported as its own state rather than folded into `running`, because the two mean
     different things to someone deciding whether to submit another: one is being worked on, the
     rest are waiting behind it.
     """
     outputs = job.get("outputs") or []
+    stage_previews = job.get("stage_previews") or []
     return {
         "id": job["id"],
         "sequence": job.get("sequence"),
         "status": job["status"],
         "phase": job.get("phase") or "",
         "stage": job.get("stage") or "",
+        "stage_step": job.get("stage_step") or 0,
+        "stage_total": job.get("stage_total") or 0,
         "progress": job.get("progress") or 0,
+        "step": job.get("step") or 0,
+        "total_steps": job.get("total_steps") or 0,
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "completed_at": job.get("completed_at"),
@@ -1846,16 +1937,14 @@ def job_queue_entry(job: dict, running_seen: bool) -> dict:
         "seed": job.get("seed"),
         "total_images": job.get("total_images"),
         "completed_images": job.get("completed_images"),
-        # The image the row identifies itself by, so a completed row can be shown and reopened.
-        "outputs": [
-            {
-                "index": output.get("index"),
-                "output_name": output.get("output_name"),
-                "image_url": output.get("image_url"),
-                "seed": output.get("seed"),
-            }
-            for output in outputs
-        ],
+        "images_per_batch": job.get("images_per_batch"),
+        "batch_count": job.get("batch_count"),
+        "batch_index": job.get("batch_index"),
+        # The list is polled repeatedly. Keep it bounded to one thumbnail; reopening a row fetches
+        # the full result detail once instead of resending all prior previews and images every tick.
+        "stage_preview": job_stage_preview_summary(stage_previews[-1] if stage_previews else None),
+        "output": job_output_summary(outputs[0] if outputs else None),
+        "output_count": len(outputs),
         # A queued job's place in the line, counting only what is still ahead of it.
         "waiting": job["status"] == "queued",
         "active": job["status"] in JOB_ACTIVE_STATUSES,
@@ -8239,6 +8328,9 @@ def create_job(request: GenerateInput):
             require_background_removal_model(request.background_removal_model)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+    # This bearer is returned only to the submitting browser. The record holds its digest, so a
+    # second LAN client that can list job IDs cannot read another client's saved Prompt snapshot.
+    gallery_access_token = secrets.token_urlsafe(32) if request.gallery_settings is not None else None
     with jobs_lock:
         # Submitting while another job runs queues this one rather than refusing it. The request is
         # validated and captured now, above, so the job carries the parameters and the model the
@@ -8330,9 +8422,16 @@ def create_job(request: GenerateInput):
                 }.items()
                 if value is not None
             } if request.engine in NATIVE_ENGINES else {},
+            "gallery_settings": copy.deepcopy(request.gallery_settings),
+            "gallery_access_token_digest": gallery_access_digest(gallery_access_token) if gallery_access_token else None,
         }
+        # Snapshot before the worker can write progress fields, so response serialization never
+        # races with `update_job()` on the shared record.
+        response = public_job_view(jobs[job_id])
+        if gallery_access_token:
+            response["gallery_access_token"] = gallery_access_token
     executor.submit(run_generation, job_id, request)
-    return jobs[job_id]
+    return response
 
 
 @app.get("/api/inference/jobs/active")
@@ -8373,16 +8472,25 @@ def list_jobs():
 
 
 @app.get("/api/inference/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str, x_xirai_gallery_access: str | None = Header(default=None)):
     with jobs_lock:
         job = jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Generation job not found")
         payload = public_job_view(job)
         control = job_controls.get(job_id)
+        completed_gallery_settings = (
+            copy.deepcopy(job.get("gallery_settings"))
+            if job["status"] in JOB_FINISHED_STATUSES
+            and job.get("gallery_settings") is not None
+            and has_gallery_access(job, x_xirai_gallery_access)
+            else None
+        )
     if control and job.get("started_at"):
         payload["elapsed_seconds"] = round(control.active_elapsed(job["started_at"]), 1)
         payload["paused_seconds"] = round(control.total_paused(), 1)
+    if completed_gallery_settings is not None:
+        payload["gallery_settings"] = completed_gallery_settings
     return payload
 
 

@@ -196,7 +196,7 @@ test("Gallery Hires migration defaults legacy cards to inherit and preserves fix
   assert.deepEqual({ seedMode: inheritedFromWorkspace.seedMode, seed: inheritedFromWorkspace.seed }, { seedMode: "fixed", seed: COMFY_HIRES_SEED });
 });
 
-test("workspace and Gallery Hires seed controls stay locked and frozen through generation and reconnect", async () => {
+test("workspace and Gallery Hires seeds freeze per job while the next queued task stays editable", async () => {
   // Gallery.jsx keeps the add-to-gallery dialog; the curation page it used to hold is its own chunk.
   const [app, gallery, galleryPage] = await Promise.all([
     readSource("src/App.jsx"),
@@ -215,12 +215,12 @@ test("workspace and Gallery Hires seed controls stay locked and frozen through g
   // The payload carries the frozen resolution, and generated settings are deep-cloned at job start.
   assert.match(generate, /const generationHiresSeed = generationHiresSeedSettings\(hires\)/);
   assert.match(generate, /const generationHires = \{ \.\.\.hires, \.\.\.generationHiresSeed \}/);
-  assert.match(generate, /setGeneratedSettings\(JSON\.parse\(JSON\.stringify\(\{[\s\S]*?hires: generationHires,/);
+  assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?hires: generationHires,/);
   assert.match(generate, /\.\.\.hiresSeedPayload\(generationHiresSeed\)/);
   assert.doesNotMatch(generate, /seed: Number\(|parseInt\(hires\.seed/);
 
-  // Locking: hires seed controls follow hiresControlsLocked, which the reconnect path also sets.
-  assert.match(app, /const hiresControlsLocked = !hires\.enabled \|\| status === "running"/);
+  // A running task owns its frozen payload; only a model-switch transaction locks the next draft.
+  assert.match(app, /const hiresControlsLocked = modelSwitching;/);
   assert.match(app, /Hires Seed 模式<WorkspaceSelect[^>]*value=\{hires\.seedMode\} disabled=\{hiresControlsLocked\}/);
   assert.match(app, /hires-seed-field[\s\S]*?value=\{hires\.seed\} disabled=\{hiresControlsLocked\}/);
   assert.match(app, /hires-seed-field[\s\S]*?<button type="button" title="生成固定 Hires Seed" disabled=\{hiresControlsLocked\}/);

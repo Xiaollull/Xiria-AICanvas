@@ -220,7 +220,7 @@ test("the preset prompt reaches the request body and never the prompt box", asyn
   assert.ok(!/setPositive\([^)]*composeGenerationPrompt/.test(app), "nor does the preset composition rewrite it");
   // Checked per record rather than file-wide: the image-to-image request body legitimately composes
   // onto `settings.positive` on its way to the server, and only the stored record must stay clean.
-  const records = [...app.matchAll(/setGeneratedSettings\(JSON\.parse\(JSON\.stringify\(\{[\s\S]*?\}\)\)\);/g)].map((match) => match[0]);
+  const records = [...app.matchAll(/JSON\.parse\(JSON\.stringify\(\{[\s\S]*?\}\)\)/g)].map((match) => match[0]);
   assert.equal(records.length, 2, "text-to-image and image-to-image each freeze one record");
   for (const record of records) {
     assert.ok(!/positive: composeGroupPrompt/.test(record), "generated settings keep the user's own text");
@@ -342,9 +342,9 @@ test("a gallery card records the combinations its image was generated with", asy
   // One composition feeds both the request and the record, so a card can never
   // disagree with what was submitted.
   assert.match(app, /prompt: generationPrompt,/);
-  // Exactly four sites, so a fifth cannot appear unnoticed: the groups' own block for each page's
-  // record, the image-to-image composition, and the workspace-built card's derived prefix.
-  assert.equal([...app.matchAll(/composeGroupPrompt\(/g)].length, 4);
+  // Exactly three sites: one actual prompt composition for each generation page, plus the
+  // workspace-built card's derived prefix. The image page reuses its frozen local result.
+  assert.equal([...app.matchAll(/composeGroupPrompt\(/g)].length, 3);
   assert.match(app, /loraGroupPrompt: composeGroupPrompt\(enabled, ""\)/);
   // The record is this run's facts; the group library still stays out.
   assert.match(app, /delete source\.loraGroupsByEngine;/);
@@ -422,8 +422,8 @@ test("every path that builds a card carries the group record", async () => {
   // fields only on the first left the other two blank.
   assert.match(app, /const galleryCardSettings = \(source, \{ record \} = \{\}\)/);
   assert.match(app, /currentSettings=\{galleryCardSettings\(workspaceSnapshot\.current\)\}/);
-  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : galleryCardSettings\(workspaceSnapshot\.current\)\}/,
-    "a generated card keeps its own frozen record instead of today's groups");
+  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/,
+    "a result without a frozen record cannot fall back to today's groups");
   // No card-producing path may reach for the raw helper again.
   assert.equal([...app.matchAll(/gallerySettingsWithoutPromptPresets\(/g)].length, 5,
     "declaration, the two generation records (text-to-image and image-to-image), the one call inside galleryCardSettings, and the image-reader apply source — which builds an apply overlay, not a card");
@@ -431,7 +431,8 @@ test("every path that builds a card carries the group record", async () => {
   const imageRun = app.slice(app.indexOf("const generateFromImage = async"), app.indexOf("const releaseLoadedModel"));
   assert.match(imageRun, /positive: runPrompt \}/,
     "an enabled group contributes its trigger words to an image-to-image run too");
-  assert.match(imageRun, /loraGroupPrompt: composeGroupPrompt\(runGroups, ""\)/);
+  assert.match(imageRun, /const runGroupPrompt = composeGroupPrompt\(runGroups, ""\)/);
+  assert.match(imageRun, /loraGroupPrompt: runGroupPrompt/);
 });
 
 test("applying a new mounted list switches off the combinations it replaced", async () => {
