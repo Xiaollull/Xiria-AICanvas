@@ -48,6 +48,7 @@ import {
   VIEWER_MAX_STROKE_POINTS,
 } from "./viewer-editor.js";
 import ViewerRasterLayer from "./ViewerRasterLayer.jsx";
+import { StagePreviewLive, StageStrip } from "./StagePreviews.jsx";
 import { pluginDiagnosticMessage, pluginRegistrySummary, pluginRemoveConfirmation, pluginStatePresentation, pluginToggleAvailable } from "./plugin-presentation.js";
 import { appendHardwareSample, EMPTY_HARDWARE_HISTORY, formatMib, HARDWARE_POLL_MS, sensorAgeLabel, sparklineSegments, vramWallPercent } from "./hardware-monitor.js";
 import { collapseConsoleEntries, progressFigures } from "./console-progress.js";
@@ -116,6 +117,7 @@ import {
   normalizePostprocessOrder,
   postprocessTargetSize,
 } from "./postprocessing";
+import { DEFAULT_PERFORMANCE, performanceDefaultsFor, performancePresetsFor } from "./performance-defaults.js";
 import { APP_VERSION } from "./app-version";
 import { BrandLogo, LoadingLogo } from "./BrandLogo";
 import { formatFileSize } from "./format-size";
@@ -390,19 +392,6 @@ function galleryJobSnapshotPayload(settings) {
     return null;
   }
 }
-const DEFAULT_PERFORMANCE = {
-  memory_mode: "auto",
-  attention_backend: "auto",
-  compute_dtype: "fp16",
-  vae_mode: "auto",
-  cuda_math: "balanced",
-  keep_model_cached: true,
-  allow_shared_memory: true,
-  calculate_model_hash: false,
-  staged_vae_decode: false,
-  compile_transformer: false,
-  vram_limit_gb: 0,
-};
 const makeGridSlots = (count, columns) => {
   const rows = Math.ceil(count / columns);
   return Array.from({ length: count }, (_, index) => ({
@@ -513,15 +502,6 @@ function drawEdgeLine(context, x, y, width, height, options, scale = 1, hiddenSi
   }
   context.restore();
 }
-const performancePresets = [
-  { id: "auto", label: "自适应推荐", range: "全部显卡", detail: "按模型、画布与实时空闲显存自动安排", settings: { ...DEFAULT_PERFORMANCE } },
-  { id: "speed", label: "高速直通", range: "12 GB 以上", detail: "优先让模型完整驻留 GPU，适合连续生成", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "high_vram", vae_mode: "full" } },
-  { id: "large-model", label: "大型模型调度", range: "8 GB 以上", detail: "大型模型采样后转入内存，再单独执行 VAE 解码", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "sdxl_balanced", staged_vae_decode: true } },
-  { id: "balanced", label: "显存平衡", range: "4 GB 以上", detail: "按组件迁移，采样后释放显存并切片解码", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "normal_vram", vae_mode: "sliced", staged_vae_decode: true } },
-  { id: "low-memory", label: "低占用保护", range: "不足 4 GB", detail: "逐层卸载、分块解码，并在任务结束后释放模型", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "low_vram", attention_backend: "sliced", vae_mode: "tiled", keep_model_cached: false, staged_vae_decode: true } },
-  { id: "ultra-low", label: "极限省存 · Illustrious", range: "4 GB 显存 + 16 GB 内存", detail: "串行计算正负条件并关闭附加链路，目标是让 1024 画布尽量跑通", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "ultra_low_vram", attention_backend: "sliced", compute_dtype: "fp16", vae_mode: "tiled", cuda_math: "strict", keep_model_cached: false, allow_shared_memory: false, staged_vae_decode: true } },
-  { id: "large-canvas", label: "高分辨率稳态", range: "大画布", detail: "预留更多显存并使用空间分块，减少峰值波动", settings: { ...DEFAULT_PERFORMANCE, vae_mode: "tiled", allow_shared_memory: false, staged_vae_decode: true } },
-];
 const performanceChoices = {
   memory_mode: [
     ["auto", "动态预算", "按模型、画布与空闲显存实时选择"],
@@ -872,6 +852,9 @@ function loadWorkspaceState(saved) {
     const engineSettingsMap = normalizeEngineSettingsMap(saved.engineSettingsByEngine, {
       fieldMissing: !Object.prototype.hasOwnProperty.call(saved, "engineSettingsByEngine"),
       legacy: saved,
+      // Before schema 2 the image page held one shared set for every engine. It seeds all of them,
+      // so upgrading does not silently reset the parameters someone was working with.
+      legacyImageToImage: saved.imageToImage,
     });
     return {
       engineSettingsByEngine: engineSettingsMap.container,
@@ -1691,6 +1674,9 @@ function App() {
     steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     sampler, scheduler, guidance, pag, size,
     hires, adetailer, rtx, postprocessOrder, backgroundRemovalModel,
+    // The image page's parameters belong to the engine as much as the generate page's do, so they
+    // are put down and picked up by the same swap rather than surviving the switch unchanged.
+    imageToImage,
   });
 
   // The reverse: an engine's stored record becomes the working copy. Every field is written, with
@@ -1724,6 +1710,7 @@ function App() {
     setRtx(settings.rtx);
     setPostprocessOrder(settings.postprocessOrder);
     setBackgroundRemovalModel(settings.backgroundRemovalModel);
+    setImageToImage(settings.imageToImage);
   };
 
   /** Stores the selected engine's live values without disturbing any other engine's record. */
@@ -1747,6 +1734,7 @@ function App() {
       steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
       sampler, scheduler, guidance, pag, size,
       hires, adetailer, rtx, postprocessOrder, backgroundRemovalModel,
+      imageToImage,
     }),
     mountedLorasByEngine: shouldPersistMountedLoras ? mountedLorasByEngine : mountedLorasRaw,
     loraGroupsByEngine,
@@ -1899,7 +1887,6 @@ function App() {
           setLoraSearch(workspace.loraSearch);
           setSamplingExpanded(workspace.samplingExpanded);
           setRunInfoVisible(workspace.runInfoVisible);
-          setImageToImage(workspace.imageToImage);
         }
         setTheme(loadThemeState(saved?.theme));
         try {
@@ -6284,6 +6271,9 @@ function App() {
     ? ((vramLimitValue - vramLimitMinGb) / (vramLimitMaxGb - vramLimitMinGb)) * 100
     : 100;
   const recommendedPerformancePreset = vramGb >= 11.5 ? "speed" : vramGb >= 7.5 ? "large-model" : vramGb >= 5.5 ? "balanced" : ramGb >= 15 ? "ultra-low" : "low-memory";
+  // Built from the measured card rather than held as a constant: the adaptive preset is the
+  // shipped baseline, and on a small card that baseline includes the staged decode.
+  const performancePresets = performancePresetsFor(vramGb);
   const activePerformancePreset = performancePresets.find((preset) => Object.entries(preset.settings)
     .filter(([key]) => !["allow_shared_memory", "calculate_model_hash", "vram_limit_gb"].includes(key))
     .every(([key, value]) => performanceConfig[key] === value))?.id;
@@ -6756,12 +6746,7 @@ function App() {
             <div className="preview-grid" />
             {status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>等待生成</strong><p>也可以直接打开 outputs 图片<br />进入预览与拼图工作区</p><button type="button" onClick={openImageViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
             {status === "running" && <div className={`generating-preview ${generationStage}`}>
-              <div className="step-preview-empty">{latestStagePreview ? null : <><ImageIcon size={28} /><span>正在生成，完成后显示结果</span></>}</div>
-              {/* Once a stage has finished, its picture is what the panel shows for the whole of the
-                  stage that follows: the base sample through Hires, the Hires result through
-                  ADetailer. */}
-              {latestStagePreview
-                && <button type="button" className="stage-preview-image" title={`${latestStagePreview.label} · 点击放大`} onClick={() => setEnlargedStage(latestStagePreview)}><img src={latestStagePreview.url} alt={`${latestStagePreview.label} 阶段结果`} /><span className="stage-preview-tag">{latestStagePreview.label} 已完成 · 正在进行{stageLabel}</span></button>}
+              <StagePreviewLive stage={latestStagePreview} stageLabel={stageLabel} onEnlarge={setEnlargedStage} />
               {generationStage === "adetailer_inpaint" && <div className="preview-stage-badge detail"><span>局部放大</span><b>{activeDetail?.class_name || "区域"} · {(activeDetail?.confidence * 100 || 0).toFixed(0)}%</b></div>}
             </div>}
             {status === "complete" && <button className={`completed-preview ${selectedOutput?.transparent_background ? "transparent-preview" : ""}`} onClick={openImageViewer} title="点击放大预览"><img className="generated-image" src={generatedImage} alt={`第 ${selectedOutputIndex + 1} 张 AI 生成结果`} />{selectedOutput?.transparent_background && <div className="transparent-output-badge">RGBA · {selectedOutput.background_removal?.method === "birefnet-lite-fp16" ? "BIREFNET LITE" : selectedOutput.background_removal?.method === "bria-rmbg-2-fp16" ? "RMBG 2.0" : selectedOutput.background_removal?.method === "u2netp-onnx" ? "U-2-NETP" : selectedOutput.background_removal?.method?.startsWith("local:") ? "LOCAL ONNX" : "ALGORITHM"}</div>}<div className="image-caption"><span>{selectedOutput?.width || size.width} × {selectedOutput?.height || size.height} · 批 {selectedOutput?.batch_index || 1} / 图 {selectedOutput?.image_index || 1}</span><span>Seed {selectedOutput?.seed ?? seed} · {generationElapsed.toFixed(1)} 秒</span></div></button>}
@@ -6778,10 +6763,7 @@ function App() {
             <div className="generation-progress-line"><i style={{ width: `${displayedGenerationProgress}%` }} /></div>
             <div className="generation-progress-detail"><span>{generationStageTotal > 0 ? `${generationStageStep} / ${generationStageTotal}` : generationStage === "adetailer_detect" ? "ANALYZING" : "WAIT"}</span><span>{generationStage === "adetailer_inpaint" ? `REGION ${generationDetail?.region_index || 1} / ${generationDetail?.region_total || 1}` : generationStage === "rtx_upscale" ? "NVIDIA VFX" : generationStep > 0 ? `STEP ${generationStep} / ${generationTotal || steps}` : "MODEL LOADING"} · BATCH {generationBatchIndex || 1}/{generationBatchCount} · {generationCompletedImages}/{generationTotalImages} IMAGES</span></div>
           </div>}
-          {stagePreviews.length > 0 && <div className="stage-strip" aria-label="各阶段结果">
-            <div className="stage-strip-head"><span>阶段结果</span><b>{stagePreviews.length} 个阶段</b></div>
-            <div className="stage-strip-items">{stagePreviews.map((stage) => <button type="button" key={`${stage.index}-${stage.stage}`} className="stage-strip-item" title={`${stage.label} · ${stage.width} × ${stage.height} · 点击放大`} onClick={() => setEnlargedStage(stage)}><img src={stage.url} alt={`${stage.label} 阶段结果`} /><span>{stage.label}</span></button>)}</div>
-          </div>}
+          <StageStrip stages={stagePreviews} onEnlarge={setEnlargedStage} />
           {status === "complete" && generatedOutputs.length > 1 && <div className="output-selector" aria-label="生成结果选择器">
             <div className="output-selector-head"><span>结果浏览</span><b>第 {selectedOutputIndex + 1} / {generatedOutputs.length} 张</b></div>
             {outputBatches.length > 1 && <div className="output-batch-tabs">{outputBatches.map((batch) => <button type="button" key={batch} className={selectedOutput?.batch_index === batch ? "active" : ""} onClick={() => selectGeneratedOutput(generatedOutputs.findIndex((output) => output.batch_index === batch))}>批次 {batch}</button>)}</div>}
@@ -6846,6 +6828,8 @@ function App() {
           onSelectAsset: selectSplitModelAsset,
           onRefresh: refreshCheckpoints,
         }}
+        stagePreviews={stagePreviews}
+        onEnlargeStage={setEnlargedStage}
         job={{
           status,
           progress: displayedGenerationProgress,
@@ -7145,7 +7129,7 @@ function App() {
                   <button type="button" role="switch" aria-checked={performanceConfig.calculate_model_hash} className={`settings-switch ${performanceConfig.calculate_model_hash ? "active" : ""}`} onClick={() => setPerformanceConfig((current) => ({ ...current, calculate_model_hash: !current.calculate_model_hash }))}><i /></button>
                 </div>
                 <div className="performance-toggle-row">
-                  <div><strong>采样后卸载再解码</strong><p>开启后先将采样模型转入系统内存并释放显存，再仅加载 VAE 完成解码。可明显降低采样与解码叠加的显存峰值，但下次生成需要重新恢复模型。</p></div>
+                  <div><strong>采样后卸载再解码</strong><p>开启后先将采样模型转入系统内存并释放显存，再仅加载 VAE 完成解码。可明显降低采样与解码叠加的显存峰值，但下次生成需要重新恢复模型。16 GB 及以下显卡默认开启，可随时关闭。</p></div>
                   <button type="button" role="switch" aria-checked={performanceConfig.staged_vae_decode} className={`settings-switch ${performanceConfig.staged_vae_decode ? "active" : ""}`} onClick={() => setPerformanceConfig((current) => ({ ...current, staged_vae_decode: !current.staged_vae_decode }))}><i /></button>
                 </div>
                 <div className="performance-toggle-row">
@@ -7156,7 +7140,7 @@ function App() {
                   <div><span>BLACKWELL PATH</span><strong>NVFP4 实验能力</strong><p>{performanceCapabilities.nvfp4?.hardware_supported ? performanceCapabilities.nvfp4?.runtime_ready ? "已检测到 50 系硬件和量化运行库；为保护单文件 SDXL、LoRA 与 CPU offload 兼容性，本版本仅检测不启用。" : "显卡支持 NVFP4，但项目缺少经过验证的 TorchAO / ModelOpt 量化运行链。" : "当前显卡不提供 NVFP4 Tensor Core 路径；不影响 FP16 / BF16 与 SDPA 优化。"}</p></div>
                   <b>{performanceCapabilities.nvfp4?.runtime_ready ? "RUNTIME DETECTED" : performanceCapabilities.nvfp4?.hardware_supported ? "RUNTIME REQUIRED" : "NOT APPLICABLE"}</b>
                 </div>
-                <div className="performance-actions"><button type="button" onClick={() => setPerformanceConfig((current) => ({ ...DEFAULT_PERFORMANCE, vram_limit_gb: current.vram_limit_gb }))} disabled={performanceSaving}><RefreshCw size={14} />恢复建议值</button><button type="button" className="performance-apply" onClick={savePerformanceSettings} disabled={performanceLoading || performanceSaving || status === "running"}>{performanceSaving ? <RefreshCw className="spin" size={14} /> : <Check size={14} />}{performanceSaving ? "正在应用" : "应用性能方案"}</button></div>
+                <div className="performance-actions"><button type="button" onClick={() => setPerformanceConfig((current) => ({ ...performanceDefaultsFor(vramGb), vram_limit_gb: current.vram_limit_gb }))} disabled={performanceSaving}><RefreshCw size={14} />恢复建议值</button><button type="button" className="performance-apply" onClick={savePerformanceSettings} disabled={performanceLoading || performanceSaving || status === "running"}>{performanceSaving ? <RefreshCw className="spin" size={14} /> : <Check size={14} />}{performanceSaving ? "正在应用" : "应用性能方案"}</button></div>
                 {status === "running" && <p className="settings-notice">生成任务运行期间不能修改性能方案。</p>}
                 {performanceError && <p className="settings-error">{performanceError}</p>}
               </section>}

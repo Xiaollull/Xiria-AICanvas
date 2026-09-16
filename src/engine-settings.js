@@ -9,6 +9,13 @@
 // A change made under one engine cannot reach another, so a Krea 2 canvas size, a Flux step count
 // and an SD Hires chain coexist and stay put.
 //
+// Schema 2 gave each engine its own image-to-image block as well. The image page used to hold one
+// shared set, so switching engines left behind a denoise, a sampler and a Hires chain chosen for a
+// different engine -- normalized against the new engine's vocabulary only at submit time, which is
+// too late to be visible. The prompt stays out of it there too, for the same reason it stays out
+// here, and `mode` stays shared because it names which job the page is set up to run, not a
+// parameter of the engine.
+//
 // What is deliberately NOT in here: the prompt and its negative, the preset library, the LoRA
 // library (which has its own per-engine store in `lora-model-scope.js`), the search and category
 // filters, and the panel open/closed states. Prompts are content rather than parameters -- trying
@@ -16,10 +23,11 @@
 // window, not the run.
 
 import { normalizeADetailerStage } from "./adetailer-units.js";
+import { IMAGE_TO_IMAGE_DEFAULTS, normalizeImageToImageSettings } from "./image-to-image.js";
 import { normalizeUint64Seed } from "./hires-settings.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
 
-export const ENGINE_SETTINGS_SCHEMA_VERSION = 1;
+export const ENGINE_SETTINGS_SCHEMA_VERSION = 2;
 export const SETTINGS_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"];
 // Engines that mount separate component files instead of one checkpoint.
 const SPLIT_ENGINES = new Set(["Anima", "Flux", "Flux2", "Krea2"]);
@@ -80,6 +88,28 @@ function inRange(value, fallback, minimum, maximum) {
  * The split engines default to euler/simple because that is what their native runtimes ship; SD and
  * iL keep the dpmpp_2m/karras pair the ComfyUI samplers default to.
  */
+// The split engines default to euler/simple because that is what their native runtimes ship; SD and
+// iL keep the dpmpp_2m/karras pair the ComfyUI samplers default to. Both pages start an engine on
+// the same pair, so this is the one place that decides it.
+function engineDefaultSampler(engine) { return isSplitEngine(engine) ? "euler" : "dpmpp_2m"; }
+function engineDefaultScheduler(engine) { return isSplitEngine(engine) ? "simple" : "karras"; }
+
+/**
+ * An engine's own image-to-image parameters. Every engine offers the same sampler and scheduler
+ * names, so what differs is which pair a fresh record starts on and how a saved one is normalized.
+ */
+export function imageToImageDefaultsFor(engine, overrides = null) {
+  return normalizeImageToImageSettings(
+    { ...IMAGE_TO_IMAGE_DEFAULTS, ...(isPlainObject(overrides) ? overrides : {}) },
+    {
+      samplers: SAMPLER_NAMES,
+      schedulers: SCHEDULER_NAMES,
+      defaultSampler: engineDefaultSampler(engine),
+      defaultScheduler: engineDefaultScheduler(engine),
+    },
+  );
+}
+
 export function engineSettingsDefaults(engine) {
   const split = isSplitEngine(engine);
   return {
@@ -95,8 +125,8 @@ export function engineSettingsDefaults(engine) {
     batchCount: 1,
     seed: "847291",
     seedMode: "random",
-    sampler: split ? "euler" : "dpmpp_2m",
-    scheduler: split ? "simple" : "karras",
+    sampler: engineDefaultSampler(engine),
+    scheduler: engineDefaultScheduler(engine),
     guidance: "none",
     pag: { ...PAG_DEFAULTS },
     size: { width: 1024, height: 1024 },
@@ -105,6 +135,7 @@ export function engineSettingsDefaults(engine) {
     rtx: { ...RTX_DEFAULTS },
     postprocessOrder: [...POSTPROCESS_STAGES],
     backgroundRemovalModel: "",
+    imageToImage: imageToImageDefaultsFor(engine),
   };
 }
 
@@ -189,6 +220,9 @@ export function normalizeEngineSettings(engine, value, fallback = null) {
     },
     postprocessOrder: normalizePostprocessOrder(source.postprocessOrder ?? defaults.postprocessOrder),
     backgroundRemovalModel: text(source.backgroundRemovalModel) || defaults.backgroundRemovalModel,
+    // A record saved under schema 1 has no image-to-image block; it starts from this engine's
+    // defaults rather than from whatever the other engines happen to hold.
+    imageToImage: imageToImageDefaultsFor(engine, isPlainObject(source.imageToImage) ? source.imageToImage : defaults.imageToImage),
   };
 }
 
@@ -208,7 +242,7 @@ export function emptyEngineSettingsMap() {
  * other engine would open on defaults. Each copy is coerced to what that engine accepts, so an SD
  * sampler landing in Flux's record becomes Flux's default rather than an invalid request.
  */
-export function normalizeEngineSettingsMap(value, { fieldMissing = false, legacy = null } = {}) {
+export function normalizeEngineSettingsMap(value, { fieldMissing = false, legacy = null, legacyImageToImage = null } = {}) {
   const container = emptyEngineSettingsMap();
   let rejected = 0;
 
@@ -221,24 +255,30 @@ export function normalizeEngineSettingsMap(value, { fieldMissing = false, legacy
       const owner = SETTINGS_ENGINES.includes(legacy.model) ? legacy.model : null;
       const withoutModelFiles = { ...legacy, checkpoint: "", diffusionModel: "", textEncoder: "", textEncoder2: "", vae: "" };
       for (const engine of SETTINGS_ENGINES) {
-        container.byEngine[engine] = normalizeEngineSettings(engine, engine === owner ? legacy : withoutModelFiles);
+        const record = engine === owner ? legacy : withoutModelFiles;
+        container.byEngine[engine] = normalizeEngineSettings(engine, { ...record, imageToImage: legacyImageToImage ?? record.imageToImage });
       }
     }
     return { container, rejected: 0, migrated: isPlainObject(legacy), warning: "" };
   }
 
   const saved = isPlainObject(value.byEngine) ? value.byEngine : {};
+  // A map written under schema 1 has no per-engine image block. The page held one shared set then,
+  // so that set seeds every engine -- folded the same way the original single-set workspace was --
+  // and each engine normalizes it against its own vocabulary.
+  const foldImageBlock = Number(value.schemaVersion) < 2 && isPlainObject(legacyImageToImage);
   for (const engine of SETTINGS_ENGINES) {
     const record = saved[engine];
     if (record !== undefined && !isPlainObject(record)) rejected += 1;
     // A missing engine is an empty scope rather than a corrupt file: a map written before an engine
     // shipped cannot carry its record, and treating that as corruption would strand the rest.
-    container.byEngine[engine] = normalizeEngineSettings(engine, isPlainObject(record) ? record : null);
+    const base = isPlainObject(record) ? record : null;
+    container.byEngine[engine] = normalizeEngineSettings(engine, foldImageBlock ? { ...base, imageToImage: legacyImageToImage } : base);
   }
   return {
     container,
     rejected,
-    migrated: false,
+    migrated: foldImageBlock,
     warning: rejected ? `已重置 ${rejected} 个无效的引擎参数记录。` : "",
   };
 }

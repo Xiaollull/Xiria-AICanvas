@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { StagePreviewLive, StageStrip } from "./StagePreviews.jsx";
 import {
   ArrowDown,
   ArrowLeft,
@@ -37,6 +38,7 @@ import {
   sourceImageSummary,
   validateSourceFile,
 } from "./image-to-image";
+import { i2iCompareHeight } from "./i2i-compare-fit.js";
 import SizeGrid from "./SizeGrid";
 import { normalizePostprocessOrder, postprocessTargetSize } from "./postprocessing";
 import WorkspaceSelect from "./WorkspaceSelect";
@@ -358,6 +360,10 @@ export default function ImageToImagePage({
   negativePromptPresets = null,
   queueBusy = false,
   queuePendingCount = 0,
+  // The same generation publishes the same stage pictures whichever page started it, so this page
+  // shows them the same way rather than sitting on a placeholder until the final image lands.
+  stagePreviews = [],
+  onEnlargeStage,
 }) {
   const config = normalizeImageToImageSettings(settings, { samplers: engine.samplers, schedulers: engine.schedulers });
   const postprocessOnly = config.mode === "postprocess";
@@ -367,6 +373,9 @@ export default function ImageToImagePage({
   const selectedUpscaler = postprocess.upscalers?.find((item) => item.id === config.hires.model);
   const hiresSteps = hiresEffectiveSteps(config.hires, engine.name);
   const loraSummaryHover = useLoraHoverPreview();
+  // The newest finished stage is what the panel shows while the next one runs, the same rule the
+  // generate page follows.
+  const latestStagePreview = stagePreviews.length ? stagePreviews[stagePreviews.length - 1] : null;
   // Mirrors the generate page: a guidance-distilled engine encodes no negative prompt, so the box
   // is disabled and the request drops the text while the text itself survives an engine switch.
   const pageAllowsNegativePrompt = !DISTILLED_GUIDANCE_ENGINES.includes(engine.name);
@@ -384,6 +393,8 @@ export default function ImageToImagePage({
   const [loadingSource, setLoadingSource] = useState(false);
   const fileInputRef = useRef(null);
   const sourceTokenRef = useRef(0);
+  const stagePanelRef = useRef(null);
+  const runBarRef = useRef(null);
   const running = job.status === "running";
   // The job being watched is immutable on the server. Keep this page editable so its
   // controls describe the next queued request, not the one already rendering.
@@ -440,6 +451,31 @@ export default function ImageToImagePage({
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
   });
+  // The pictures are sized to what is left of the stage once the sticky bar has taken its share,
+  // so that the last scroll position shows the pair whole. Both measurements move on their own --
+  // the scrollport with the window, the bar whenever the progress dock or the diagnostics appear --
+  // so both are observed rather than read once. See `i2i-compare-fit.js`.
+  useEffect(() => {
+    const stage = stagePanelRef.current;
+    const bar = runBarRef.current;
+    if (!stage || !bar || typeof ResizeObserver === "undefined") return undefined;
+    let applied = null;
+    const measure = () => {
+      const height = i2iCompareHeight({
+        stageHeight: stage.clientHeight,
+        barHeight: bar.offsetHeight,
+        bottomPadding: Number.parseFloat(window.getComputedStyle(stage).paddingBottom) || 0,
+      });
+      if (height === applied) return;
+      applied = height;
+      stage.style.setProperty("--i2i-compare-height", `${height}px`);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(stage);
+    observer.observe(bar);
+    measure();
+    return () => observer.disconnect();
+  }, []);
   const blocker = imageToImageBlockers({
     source,
     settings: config,
@@ -475,10 +511,10 @@ export default function ImageToImagePage({
 
       {/* The two pictures are the page: everything else is a control for turning the left one into
           the right one, so they share one stage at equal size and every parameter moves to a rail. */}
-      <section className="i2i-stage-panel panel">
+      <section className="i2i-stage-panel panel" ref={stagePanelRef}>
         {/* Pinned above the pictures. What the run is about to do, and the button that does it,
             are the one thing on this page that must never move when something below it grows. */}
-        <div className="i2i-run-bar">
+        <div className="i2i-run-bar" ref={runBarRef}>
           {/* A mode, not a parameter: it changes what the button below it does, so it sits with the
               button rather than in the numbered parameter stack on the rail. */}
           <div className="i2i-mode-switch" role="group" aria-label="处理模式">
@@ -602,7 +638,9 @@ export default function ImageToImagePage({
             <div className={`i2i-compare-figure preview-stage ${job.status}`}>
               <div className="preview-grid" />
               {job.status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>{source ? "已就绪" : "等待来源图片"}</strong><p>{source ? (postprocessOnly ? "选择增强阶段与顺序后开始" : "调整重绘强度后开始生成") : "先放入一张来源图片"}</p><button type="button" onClick={onOpenViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
-              {job.status === "running" && <div className="generating-preview"><div className="step-preview-empty"><ImageIcon size={28} /><span>正在生成</span></div></div>}
+              {job.status === "running" && <div className="generating-preview">
+                <StagePreviewLive stage={latestStagePreview} stageLabel={job.phase} onEnlarge={onEnlargeStage} placeholder="正在生成" />
+              </div>}
               {job.status === "complete" && selectedOutput && <button className="completed-preview" onClick={onOpenViewer} title="点击放大预览"><img className="generated-image" src={selectedOutput.url} alt={`第 ${job.selectedIndex + 1} 张图生图结果`} /></button>}
               {job.status === "cancelled" && <div className="generation-cancelled"><Square size={30} /><strong>生成已终止</strong><p>已安全停止任务</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>}
               {job.status === "error" && <div className="generation-error"><X size={32} /><strong>生成失败</strong><p>{job.error}</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>}
@@ -615,6 +653,8 @@ export default function ImageToImagePage({
             </footer>
           </article>
         </div>
+
+        <StageStrip stages={stagePreviews} onEnlarge={onEnlargeStage} />
 
         {job.status === "complete" && job.outputs.length > 1 && <div className="output-selector" aria-label="生成结果选择器">
           <div className="output-selector-head"><span>结果浏览</span><b>第 {job.selectedIndex + 1} / {job.outputs.length} 张</b></div>

@@ -14,15 +14,20 @@ from backend import inference_server, memory_policy
 from backend.memory_policy import MIB, default_reserved_vram_bytes, vram_limit_bounds
 from backend.performance_settings import (
     DEFAULT_PERFORMANCE_SETTINGS,
+    STAGED_DECODE_VRAM_CEILING_GB,
+    default_performance_settings,
     file_sha256,
     memory_mode_for_family,
     enable_sequential_batch_forward,
+    staged_decode_default,
     vae_decode_tile_count,
     normalize_performance_settings,
     nvfp4_capabilities,
     read_performance_settings,
     write_performance_settings,
 )
+
+GIB = 1024**3
 
 
 class FakeCuda:
@@ -157,6 +162,35 @@ class PerformanceSettingsTests(unittest.TestCase):
     def test_missing_file_uses_current_safe_defaults(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertEqual(read_performance_settings(Path(temporary) / "missing.json"), DEFAULT_PERFORMANCE_SETTINGS)
+
+    def test_small_cards_ship_with_the_staged_decode_on(self):
+        # The sizes actually sold, as the driver reports them: a marketed size reads back a little
+        # short, which is what the ceiling's half a gigabyte of tolerance is for.
+        for gigabytes in (4, 6, 7.99, 8, 11.99, 12, 15.92, 16):
+            self.assertTrue(staged_decode_default(gigabytes * GIB), f"{gigabytes} GB")
+            self.assertTrue(default_performance_settings(gigabytes * GIB)["staged_vae_decode"])
+        # The next size up is 20 GB, so nothing larger can drift in under the ceiling.
+        for gigabytes in (19.5, 20, 23.6, 24, 48):
+            self.assertFalse(staged_decode_default(gigabytes * GIB), f"{gigabytes} GB")
+            self.assertEqual(default_performance_settings(gigabytes * GIB), DEFAULT_PERFORMANCE_SETTINGS)
+        self.assertEqual(STAGED_DECODE_VRAM_CEILING_GB, 16.5)
+        # Nothing to measure -- no CUDA device -- keeps the plain table rather than guessing small.
+        for unknown in (0, -1, None, float("nan")):
+            self.assertFalse(staged_decode_default(unknown))
+        self.assertEqual(default_performance_settings(), DEFAULT_PERFORMANCE_SETTINGS)
+
+    def test_the_staged_decode_default_is_not_a_lock(self):
+        # An explicit choice wins on any card, including switching it off on a small one, and that
+        # is the whole difference between a default and a forced setting.
+        self.assertFalse(normalize_performance_settings({"staged_vae_decode": False}, 8 * GIB)["staged_vae_decode"])
+        self.assertTrue(normalize_performance_settings({"staged_vae_decode": True}, 24 * GIB)["staged_vae_decode"])
+        # A file that predates the setting has no opinion, so the card decides.
+        self.assertTrue(normalize_performance_settings({"vae_mode": "tiled"}, 8 * GIB)["staged_vae_decode"])
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "performance.json"
+            path.write_text(json.dumps({"staged_vae_decode": False}), encoding="utf-8")
+            self.assertFalse(read_performance_settings(path, 8 * GIB)["staged_vae_decode"])
+            self.assertTrue(read_performance_settings(Path(temporary) / "missing.json", 8 * GIB)["staged_vae_decode"])
 
     def test_model_hash_reads_file_content(self):
         with tempfile.TemporaryDirectory() as temporary:

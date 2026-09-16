@@ -119,13 +119,13 @@ async function withUpdateMiddleware({ environment, fetcher, ...pluginOptions }, 
     updateApiPlugin({ environment, fetcher, ...pluginOptions }).configureServer({
       middlewares: { use: (handler) => { middleware = handler; } },
     });
-    const invoke = async (pathname, method = "GET") => {
-      const request = Readable.from([]);
+    const invoke = async (pathname, method = "GET", { address = "127.0.0.1", headers = {}, chunks = [], encrypted = false } = {}) => {
+      const request = Readable.from(chunks);
       Object.assign(request, {
         url: pathname,
         method,
-        headers: { host: "127.0.0.1:7709" },
-        socket: { remoteAddress: "127.0.0.1" },
+        headers: { host: "127.0.0.1:7709", ...headers },
+        socket: { remoteAddress: address, encrypted },
       });
       let body = "";
       const apiResponse = { statusCode: 200, setHeader() {}, end(value = "") { body += value; } };
@@ -147,6 +147,159 @@ test("the update state reports the running version before any release has been t
     assert.equal(body.current_version, JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version);
     assert.equal(body.online_release, null);
     assert.equal(body.online_checked_at, null);
+  });
+});
+
+// `openssl rand -hex 32`: the only shape the instance accepts, so the tests use one too.
+const INSTANCE_TOKEN = "9f2c41d7b8e05a63cf1e4a2d90b7356e8c4f1a0d63be27591cd8047af3e62b15";
+const REMOTE_ADDRESS = "203.0.113.29";
+const archiveHeaders = { "content-length": "0", "x-archive-name": "update.zip" };
+const withToken = (token) => ({ ...archiveHeaders, "x-xirai-remote-update-token": token });
+
+test("a remote browser may check a checksum-pinned release but cannot upload an arbitrary archive without its instance token", async () => {
+  // Over TLS, which is what the instance requires of a non-loopback caller.
+  const remote = { address: REMOTE_ADDRESS, encrypted: true };
+  const archive = { ...remote, headers: archiveHeaders };
+  await withUpdateMiddleware({
+    environment: { XIRAI_REMOTE_UPDATE_TOKEN: INSTANCE_TOKEN, XIRAI_UPDATE_FEED: "https://updates.example/latest.json" },
+    fetcher: feedFetcher({ getPayload: () => releasePayload("2.0.0") }),
+  }, async (invoke) => {
+    // The checksum-pinned online path is open to a remote browser: it can only ever install what
+    // the official release feed signs for.
+    const checked = await invoke("/api/system/update/check", "POST", remote);
+    assert.equal(checked.statusCode, 200);
+    assert.equal(checked.body.online_release.update_available, true);
+
+    const absent = await invoke("/api/system/update/archive", "POST", archive);
+    assert.equal(absent.statusCode, 403);
+    assert.match(absent.body.error, /密钥无效/);
+
+    const incorrect = await invoke("/api/system/update/archive", "POST", { ...archive, headers: withToken("not-the-instance-token") });
+    assert.equal(incorrect.statusCode, 403);
+    assert.match(incorrect.body.error, /密钥无效/);
+
+    const admitted = await invoke("/api/system/update/archive", "POST", { ...archive, headers: withToken(INSTANCE_TOKEN) });
+    assert.equal(admitted.statusCode, 400, "the request reached normal archive validation after authorization");
+    assert.match(admitted.body.error, /更新包为空/);
+
+    const state = await invoke("/api/system/update", "GET", remote);
+    assert.equal(state.statusCode, 200);
+    assert.equal(state.body.remote_offline_update_enabled, true);
+    assert.equal(state.body.remote_offline_update_insecure_allowed, false);
+    assert.doesNotMatch(JSON.stringify(state.body), new RegExp(INSTANCE_TOKEN), "the token is never echoed back by the API");
+  });
+});
+
+test("a configured token is required from localhost too, so a local port forward cannot launder a remote caller", async () => {
+  await withUpdateMiddleware({
+    environment: { XIRAI_REMOTE_UPDATE_TOKEN: INSTANCE_TOKEN },
+    fetcher: async () => assert.fail("network must not be used"),
+  }, async (invoke) => {
+    const local = { address: "127.0.0.1", headers: archiveHeaders };
+    const withoutToken = await invoke("/api/system/update/archive", "POST", local);
+    assert.equal(withoutToken.statusCode, 403);
+    assert.match(withoutToken.body.error, /密钥无效/);
+
+    const authorized = await invoke("/api/system/update/archive", "POST", { ...local, headers: withToken(INSTANCE_TOKEN) });
+    assert.equal(authorized.statusCode, 400, "a correct token lets the local request through to archive validation");
+  });
+});
+
+test("a loopback socket carrying a public Host header is treated as the remote caller it is", async () => {
+  await withUpdateMiddleware({
+    environment: { XIRAI_REMOTE_UPDATE_TOKEN: INSTANCE_TOKEN },
+    fetcher: async () => assert.fail("network must not be used"),
+  }, async (invoke) => {
+    // A reverse proxy on the box makes every request look like 127.0.0.1; the Host it forwards is
+    // what betrays the real origin, so plaintext is refused before the token is even read.
+    const proxied = await invoke("/api/system/update/archive", "POST", {
+      address: "127.0.0.1",
+      headers: { ...withToken(INSTANCE_TOKEN), host: "updates.example.net" },
+    });
+    assert.equal(proxied.statusCode, 403);
+    assert.match(proxied.body.error, /HTTPS|隧道/);
+  });
+});
+
+test("a plaintext remote request is refused before its token is considered", async () => {
+  await withUpdateMiddleware({
+    environment: { XIRAI_REMOTE_UPDATE_TOKEN: INSTANCE_TOKEN },
+    fetcher: async () => assert.fail("network must not be used"),
+  }, async (invoke) => {
+    const plaintext = await invoke("/api/system/update/archive", "POST", {
+      address: REMOTE_ADDRESS,
+      headers: withToken(INSTANCE_TOKEN),
+    });
+    assert.equal(plaintext.statusCode, 403);
+    assert.match(plaintext.body.error, /HTTPS|隧道/);
+  });
+});
+
+test("a trusted private network can opt into plaintext, and the state says so", async () => {
+  await withUpdateMiddleware({
+    environment: { XIRAI_REMOTE_UPDATE_TOKEN: INSTANCE_TOKEN, XIRAI_REMOTE_UPDATE_ALLOW_INSECURE: "1" },
+    fetcher: async () => assert.fail("network must not be used"),
+  }, async (invoke) => {
+    const plaintext = await invoke("/api/system/update/archive", "POST", {
+      address: REMOTE_ADDRESS,
+      headers: withToken(INSTANCE_TOKEN),
+    });
+    assert.equal(plaintext.statusCode, 400, "the opt-in carries the request through to archive validation");
+    const state = await invoke("/api/system/update", "GET", { address: REMOTE_ADDRESS });
+    assert.equal(state.body.remote_offline_update_insecure_allowed, true);
+  });
+});
+
+test("a token that is not 64 hex characters configures nothing at all", async () => {
+  // Anything shorter, longer or non-hex is not the documented `openssl rand -hex 32` output, so it
+  // is refused outright rather than accepted as a weaker secret.
+  for (const shape of ["remote-update-token-".repeat(3), INSTANCE_TOKEN.slice(0, 63), `${INSTANCE_TOKEN}a`, INSTANCE_TOKEN.replace("9f", "zz"), "   "]) {
+    await withUpdateMiddleware({
+      environment: { XIRAI_REMOTE_UPDATE_TOKEN: shape },
+      fetcher: async () => assert.fail("network must not be used"),
+    }, async (invoke) => {
+      const rejected = await invoke("/api/system/update/archive", "POST", {
+        address: REMOTE_ADDRESS,
+        encrypted: true,
+        headers: withToken(shape),
+      });
+      assert.equal(rejected.statusCode, 403);
+      assert.match(rejected.body.error, /远程离线更新未启用/, `token shape ${JSON.stringify(shape.slice(0, 12))} must not enable remote updates`);
+      const state = await invoke("/api/system/update", "GET");
+      assert.equal(state.body.remote_offline_update_enabled, false);
+    });
+  }
+});
+
+test("repeated wrong keys from one address are blocked for a while rather than retried forever", async () => {
+  await withUpdateMiddleware({
+    environment: { XIRAI_REMOTE_UPDATE_TOKEN: INSTANCE_TOKEN },
+    fetcher: async () => assert.fail("network must not be used"),
+  }, async (invoke) => {
+    const guess = (token) => invoke("/api/system/update/archive", "POST", {
+      address: REMOTE_ADDRESS,
+      encrypted: true,
+      headers: withToken(token),
+    });
+    const wrongKey = (attempt) => `${"0".repeat(63)}${attempt}`;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const wrong = await guess(wrongKey(attempt));
+      assert.equal(wrong.statusCode, 403, `attempt ${attempt} is still an ordinary refusal`);
+    }
+    const fifth = await guess(wrongKey(5));
+    assert.equal(fifth.statusCode, 403);
+    // The fifth failure arms the block; the next attempt is refused without comparing anything.
+    const blocked = await guess(INSTANCE_TOKEN);
+    assert.equal(blocked.statusCode, 429);
+    assert.match(blocked.body.error, /次数过多/);
+
+    // Another address is unaffected: the block is per caller, not a global lockout.
+    const elsewhere = await invoke("/api/system/update/archive", "POST", {
+      address: "198.51.100.7",
+      encrypted: true,
+      headers: withToken(INSTANCE_TOKEN),
+    });
+    assert.equal(elsewhere.statusCode, 400);
   });
 });
 

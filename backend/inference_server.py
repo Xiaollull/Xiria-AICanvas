@@ -409,7 +409,21 @@ YOLO_CATALOG_PATH = PROJECT_ROOT / "models" / "yolo-models.json"
 # a lot of detail; it is still bounded, because a 3072x2304 Hires result would otherwise be copied
 # in full for every stage of every job in the queue history.
 STAGE_PREVIEW_MAX_EDGE = configured_int("STAGE_PREVIEW_MAX_EDGE", 1536, 384, 4096)
-performance_settings = read_performance_settings(PERFORMANCE_SETTINGS_FILE)
+
+
+def installed_vram_bytes():
+    """Physical VRAM on the first device, or 0 when there is no CUDA device to ask."""
+    try:
+        if torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(0).total_memory)
+    except Exception:
+        return 0
+    return 0
+
+
+# The card decides one of the shipped defaults -- see `default_performance_settings` -- so the
+# settings are read with it in hand rather than being corrected afterwards.
+performance_settings = read_performance_settings(PERFORMANCE_SETTINGS_FILE, installed_vram_bytes())
 try:
     performance_settings["memory_mode"] = normalize_memory_mode(
         os.environ.get("XIRAI_MEMORY_MODE", performance_settings["memory_mode"])

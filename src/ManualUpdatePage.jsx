@@ -46,6 +46,7 @@ export default function ManualUpdatePage() {
   const [error, setError] = useState("");
   const [updateActionBusy, setUpdateActionBusy] = useState(false);
   const [restarting, setRestarting] = useState(() => updateRestartPending(window.sessionStorage));
+  const [remoteUpdateToken, setRemoteUpdateToken] = useState("");
   const restartReturnStarted = useRef(false);
 
   useEffect(() => {
@@ -101,6 +102,11 @@ export default function ManualUpdatePage() {
     };
   }, [restarting]);
 
+  const remoteUpdateHeaders = () => {
+    const token = remoteUpdateToken.trim();
+    return token ? { "X-XirAI-Remote-Update-Token": token } : {};
+  };
+
   const uploadArchive = (file) => {
     if (!file || uploading) return;
     if (!updateArchivePattern.test(file.name)) {
@@ -118,6 +124,8 @@ export default function ManualUpdatePage() {
     request.open("POST", "/api/system/update/archive");
     request.setRequestHeader("Content-Type", "application/octet-stream");
     request.setRequestHeader("X-Archive-Name", encodeURIComponent(file.name));
+    const token = remoteUpdateToken.trim();
+    if (token) request.setRequestHeader("X-XirAI-Remote-Update-Token", token);
     request.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable) setUploadProgress(Math.round(event.loaded / event.total * 100));
     });
@@ -144,7 +152,7 @@ export default function ManualUpdatePage() {
     setError("");
     setUpdateActionBusy(true);
     try {
-      const response = await fetch("/api/system/update/apply", { method: "POST" });
+      const response = await fetch("/api/system/update/apply", { method: "POST", headers: remoteUpdateHeaders() });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "无法开始更新");
       setUpdateState((current) => ({ ...current, ...payload }));
@@ -160,7 +168,7 @@ export default function ManualUpdatePage() {
     setError("");
     setUpdateActionBusy(true);
     try {
-      const response = await fetch("/api/system/update/repair", { method: "POST" });
+      const response = await fetch("/api/system/update/repair", { method: "POST", headers: remoteUpdateHeaders() });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "无法开始环境修复");
       setUpdateState((current) => ({ ...current, ...payload }));
@@ -173,7 +181,7 @@ export default function ManualUpdatePage() {
 
   const returnHome = async () => {
     if (uploading || updateBusy(updateState.status) || updateState.restart_required) return;
-    try { await fetch("/api/system/update", { method: "DELETE" }); } catch {}
+    try { await fetch("/api/system/update", { method: "DELETE", headers: remoteUpdateHeaders() }); } catch {}
     window.location.replace("/");
   };
 
@@ -186,7 +194,7 @@ export default function ManualUpdatePage() {
       const timer = window.setTimeout(() => controller.abort(), 5000);
       let response;
       try {
-        response = await fetch("/api/system/update/restart", { method: "POST", signal: controller.signal });
+        response = await fetch("/api/system/update/restart", { method: "POST", headers: remoteUpdateHeaders(), signal: controller.signal });
       } catch {}
       window.clearTimeout(timer);
       if (!response) {
@@ -210,6 +218,7 @@ export default function ManualUpdatePage() {
   // The two origins share every step after the archive reaches disk, so the server marks which one
   // started it and the wording follows that rather than the phase alone.
   const online = updateState.source === "online";
+  const remoteOfflineUpdateEnabled = updateState.remote_offline_update_enabled === true;
   const visualProgress = restarting ? 100
     : uploading ? uploadProgress * .2
       : updateState.status === "uploading" || updateState.status === "downloading" ? updateState.progress * .2
@@ -240,6 +249,10 @@ export default function ManualUpdatePage() {
       </div>
       <div className="update-workspace">
         <header><span>UPDATE WORKSPACE</span><strong>{updateState.status === "complete" ? "更新已完成" : updateState.status === "ready" ? "等待确认" : updateState.status === "downloading" ? "正在下载更新包" : busy ? "正在处理" : "选择本地更新包"}</strong></header>
+        {!online && <div className="update-remote-token">
+          <label><span>REMOTE OFFLINE UPDATE KEY</span><strong>远程离线更新密钥</strong><input type="password" value={remoteUpdateToken} autoComplete="off" spellCheck="false" onChange={(event) => setRemoteUpdateToken(event.target.value)} placeholder="仅从远端浏览器更新时填写" /></label>
+          <p>{remoteOfflineUpdateEnabled ? "该实例已配置离线更新密钥：包括本机在内的所有离线归档更新都需要填写，以免本机反向代理或端口转发把远端调用伪装成本机调用。密钥只保留在当前页面内存，刷新后需要重新输入。" : "此实例尚未配置离线更新密钥。本机离线更新无需填写；远端离线更新会被安全拒绝。"}</p>
+        </div>}
         {!UPDATE_OCCUPIED_STATUSES.includes(updateState.status) && !updateState.restart_required && !updateState.repair_available && !restarting && <button
           type="button"
           className={`update-dropzone ${dragging ? "dragging" : ""}`}

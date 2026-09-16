@@ -460,7 +460,7 @@ test("the mode sits with the button it changes, and hides the controls it makes 
   const page = await readSource("src/ImageToImagePage.jsx");
   // It decides whether the run samples at all, so it belongs to the run bar rather than to the
   // numbered parameter stack on the rail — where it would also have renumbered every section.
-  assert.match(page, /<div className="i2i-run-bar">[\s\S]{0,600}?className="i2i-mode-switch"/);
+  assert.match(page, /<div className="i2i-run-bar"[\s\S]{0,600}?className="i2i-mode-switch"/);
   assert.match(page, /const postprocessOnly = config\.mode === "postprocess";/);
   // Strength drives a base pass that post-processing does not run, and the canvas is the picture's
   // own. Both are left out rather than shown as controls with no effect.
@@ -534,4 +534,32 @@ test("the source envelope is reported the same way the run would report it", () 
   assert.match(postprocessSourceIssue(source(63, 512)), /至少 64 像素/);
   // Nothing to judge yet is not a problem to report.
   assert.equal(postprocessSourceIssue(null), "");
+});
+
+test("the image-to-image page shows the stage pictures the generation already publishes", async () => {
+  const [app, page, shared] = await Promise.all([
+    readFile(new URL("../src/App.jsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/ImageToImagePage.jsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/StagePreviews.jsx", import.meta.url), "utf8"),
+  ]);
+  // Both pages watch the same generation, so the stages reach the image page from the same state
+  // the generate page reads rather than from a second source of truth.
+  assert.match(app, /stagePreviews=\{stagePreviews\}\s*onEnlargeStage=\{setEnlargedStage\}/);
+  assert.match(page, /stagePreviews = \[\],\s*onEnlargeStage,/);
+  assert.match(page, /const latestStagePreview = stagePreviews\.length \? stagePreviews\[stagePreviews\.length - 1\] : null;/);
+  // While running it shows the newest finished stage; when finished, the whole strip.
+  assert.match(page, /job\.status === "running"[\s\S]{0,200}<StagePreviewLive stage=\{latestStagePreview\}/);
+  assert.match(page, /<StageStrip stages=\{stagePreviews\} onEnlarge=\{onEnlargeStage\} \/>/);
+
+  // One copy of the markup, used by both pages, so they cannot drift apart.
+  for (const source of [app, page]) {
+    assert.match(source, /import \{ StagePreviewLive, StageStrip \} from "\.\/StagePreviews\.jsx";/);
+    assert.doesNotMatch(source, /className="stage-strip-item"/, "the strip markup lives in the shared component only");
+  }
+  // The class names the stylesheet and the queue tests already know are preserved.
+  for (const className of ["step-preview-empty", "stage-preview-image", "stage-preview-tag", "stage-strip", "stage-strip-head", "stage-strip-items", "stage-strip-item"]) {
+    assert.match(shared, new RegExp(`"${className}`), `${className} must survive the extraction`);
+  }
+  // Enlarging is the App-level dialog both pages share; the component only reports the click.
+  assert.match(shared, /onEnlarge\?\.\(stage\)/);
 });

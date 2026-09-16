@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeDiagnosticLog } from "./diagnostics.mjs";
 import { recoverInterruptedUpdate } from "./archive-update.mjs";
-import { getVenvPythonPath, isolatedPythonEnv, loadLocalEnv } from "./python.mjs";
+import { getVenvPythonPath, isolatedPythonEnv, loadLocalEnv, withoutUpdateSecrets } from "./python.mjs";
 import { readSetupMarker } from "./setup-state.mjs";
 import { createHttpFetch, viteInvocation } from "./node-tools.mjs";
 import { acquireOfflineUpdateLock } from "./offline-update-lock.mjs";
@@ -203,7 +203,9 @@ async function runConfigurator() {
   console.log("\n正在切换到环境配置器，当前创作状态已保存在浏览器中...");
   const child = spawn(process.execPath, [path.join(projectRoot, "scripts", "setup-gui.mjs"), "--no-open", "--return-to-app", "--supervised"], {
     cwd: projectRoot,
-    env: process.env,
+    // The configurator installs an environment; it never authorizes an update, so it is handed one
+    // without the update secrets. The main service below keeps them: it is what checks them.
+    env: withoutUpdateSecrets(process.env),
     stdio: "inherit",
     windowsHide: true,
   });

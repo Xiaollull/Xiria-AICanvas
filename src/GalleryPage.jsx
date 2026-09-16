@@ -31,6 +31,7 @@ import {
 import { SAMPLER_NAMES as SAMPLERS, SCHEDULER_NAMES as SCHEDULERS } from "./sampling-options";
 import { normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
 import { DEFAULT_SETTINGS, GUIDANCE, boundedGalleryImageIndex, clone, displayTitle, distributeGalleryCards, galleryImageSeed, galleryRequest, normalizedSettings, useDialogLifecycle } from "./gallery-core";
+import { galleryAutoScrollStep, galleryDropAnchor, galleryOrderChanged, galleryPointerIsCoarse, galleryPressIntent, gallerySlotShifts, resolveDropIndex, spliceGalleryOrder, GALLERY_CLICK_SWALLOW_MS, GALLERY_DRAG_HOLD_MS } from "./gallery-drag.js";
 import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
 import { copyText } from "./clipboard";
@@ -249,96 +250,130 @@ function PromptLibrary({ entries, loading, error, onRefresh, onAdd, onEdit, onDe
   </section>;
 }
 
-function GalleryCardTile({ card, tileIndex = 0, onOpen, onMenu, dragState, reorderBusy, onReorderStart, onReorderOver, onReorderEnd }) {
+function GalleryCardTile({ card, tileIndex = 0, onOpen, onMenu, dragState, reorderBusy, onReorderStart, slotShift = 0 }) {
   const settings = normalizedSettings(card.settings);
   const first = card.images?.[0];
+  // This component only decides whether a press is a click, a scroll or the start of a sort. Once
+  // it is a sort the page owns the gesture on `window`, because the list re-flows on release and a
+  // card that changes column is unmounted and remounted -- taking its pointer capture, and any
+  // listener bound to it, out of the document mid-drag.
   const gesture = useRef(null);
-  const suppressClick = useRef(false);
+  const swallowClick = useRef(false);
+  const swallowTimer = useRef(0);
+  const cardRef = useRef(null);
   const [holding, setHolding] = useState(false);
   const isDragging = dragState?.cardId === card.id;
-  const isDropTarget = dragState?.targetId === card.id && !isDragging;
+
+  const swallowNextClick = () => {
+    swallowClick.current = true;
+    window.clearTimeout(swallowTimer.current);
+    swallowTimer.current = window.setTimeout(() => { swallowClick.current = false; }, GALLERY_CLICK_SWALLOW_MS);
+  };
+
+  const endPress = (releaseCapture = true) => {
+    const current = gesture.current;
+    gesture.current = null;
+    setHolding(false);
+    if (!current) return;
+    if (current.timer) window.clearTimeout(current.timer);
+    if (releaseCapture && current.node.hasPointerCapture?.(current.pointerId)) current.node.releasePointerCapture(current.pointerId);
+  };
+
   useEffect(() => () => {
     if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
+    window.clearTimeout(swallowTimer.current);
   }, []);
-  const clearGesture = (event, finishDrag = false) => {
-    const current = gesture.current;
-    if (!current || event.pointerId !== current.pointerId) return;
-    if (current.timer) window.clearTimeout(current.timer);
-    setHolding(false);
-    if (current.node.hasPointerCapture(current.pointerId)) current.node.releasePointerCapture(current.pointerId);
-    gesture.current = null;
-    if (current.active && finishDrag) {
-      event.preventDefault();
-      suppressClick.current = true;
-      onReorderEnd(card);
+
+  // `touch-action` is read when the gesture begins, long before the hold has decided this press is
+  // a sort, so the page is held still here instead -- and only while a drag is actually running.
+  useEffect(() => {
+    const node = cardRef.current;
+    if (!node) return undefined;
+    const block = (event) => { if (dragState?.cardId === card.id) event.preventDefault(); };
+    node.addEventListener("touchmove", block, { passive: false });
+    return () => node.removeEventListener("touchmove", block);
+  }, [dragState?.cardId, card.id]);
+
+  const handOver = (current) => {
+    if (gesture.current !== current || current.declined) return;
+    swallowNextClick();
+    // The page takes the pointer from here; this node may be re-rendered and must not be the thing
+    // the gesture depends on.
+    endPress();
+    // A collection with one card refuses the sort and says so once, rather than once per move.
+    if (onReorderStart(card, { x: current.x, y: current.y, pointerId: current.pointerId, pointerType: current.pointerType }) === false) {
+      current.declined = true;
     }
-    window.setTimeout(() => { suppressClick.current = false; }, 120);
   };
+
   const pointerDown = (event) => {
     if (event.button !== 0 || !event.isPrimary || reorderBusy) return;
     const node = event.currentTarget;
     const pointerId = event.pointerId;
     node.setPointerCapture(pointerId);
-    setHolding(true);
-    const next = { node, pointerId, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, active: false, timer: 0 };
-    next.timer = window.setTimeout(() => {
-      if (gesture.current !== next) return;
-      suppressClick.current = true;
-      next.active = onReorderStart(card, { x: next.x, y: next.y }) !== false;
-      setHolding(false);
-    }, 360);
+    const coarse = galleryPointerIsCoarse(event.pointerType);
+    setHolding(coarse);
+    const next = {
+      node, pointerId, pointerType: event.pointerType,
+      startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY,
+      startedAt: Date.now(), declined: false, timer: 0,
+    };
+    // A hold can complete with the finger perfectly still, which produces no further events.
+    if (coarse) next.timer = window.setTimeout(() => handOver(next), GALLERY_DRAG_HOLD_MS);
     gesture.current = next;
   };
+
   const pointerMove = (event) => {
     const current = gesture.current;
     if (!current || event.pointerId !== current.pointerId) return;
     current.x = event.clientX;
     current.y = event.clientY;
-    if (!current.active) {
-      if (Math.hypot(event.clientX - current.startX, event.clientY - current.startY) > 8) {
-        window.clearTimeout(current.timer);
-        current.timer = 0;
-        suppressClick.current = true;
-        setHolding(false);
-      }
-      return;
-    }
-    event.preventDefault();
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-gallery-card-id]");
-    if (target?.dataset.galleryCollectionId === card.collection_id) {
-      onReorderOver(card, target.dataset.galleryCardId, { x: event.clientX, y: event.clientY });
-    } else {
-      onReorderOver(card, null, { x: event.clientX, y: event.clientY });
-    }
-    const scroll = current.node.closest(".gallery-room") || current.node.closest(".gallery-scroll");
-    if (scroll) {
-      const bounds = scroll.getBoundingClientRect();
-      if (event.clientY < bounds.top + 56) scroll.scrollBy({ top: -14 });
-      else if (event.clientY > bounds.bottom - 56) scroll.scrollBy({ top: 14 });
+    const intent = galleryPressIntent({
+      pointerType: current.pointerType,
+      distance: Math.hypot(event.clientX - current.startX, event.clientY - current.startY),
+      elapsed: Date.now() - current.startedAt,
+    });
+    if (intent === "drag") handOver(current);
+    else if (intent === "release") {
+      // A finger that wandered during the hold is scrolling. Give the gesture back to the page, and
+      // make sure the press does not also open the card on the way out.
+      swallowNextClick();
+      endPress();
     }
   };
+
   const contextMenu = (event) => {
     if (event.button !== 2) return;
     event.preventDefault();
-    if (gesture.current?.timer) window.clearTimeout(gesture.current.timer);
-    gesture.current = null;
-    setHolding(false);
+    endPress();
     if (!reorderBusy && !dragState) onMenu(card, event);
   };
+
   return <button
+    ref={cardRef}
     type="button"
-    className={`gallery-card ${holding ? "holding" : ""} ${isDragging ? "dragging" : ""} ${isDropTarget ? "drop-target" : ""} ${reorderBusy ? "reorder-busy" : ""}`}
+    className={`gallery-card ${holding ? "holding" : ""} ${isDragging ? "dragging" : ""} ${slotShift ? "yielding" : ""} ${reorderBusy ? "reorder-busy" : ""}`}
     data-gallery-card-id={card.id}
     data-gallery-collection-id={card.collection_id}
-    style={{ "--gallery-card-index": Math.min(tileIndex, 12) }}
+    style={{ "--gallery-card-index": Math.min(tileIndex, 12), "--gallery-slot-shift": `${slotShift}px` }}
     aria-grabbed={isDragging}
-    title="单击查看；按住左键拖拽排序；右键删除"
+    title="单击查看；拖动排序（触摸屏先按住再拖）；右键删除"
     onPointerDown={pointerDown}
     onPointerMove={pointerMove}
-    onPointerUp={(event) => clearGesture(event, true)}
-    onPointerCancel={(event) => clearGesture(event, true)}
+    onPointerUp={() => endPress()}
+    onPointerCancel={() => endPress()}
     onContextMenu={contextMenu}
-    onClick={(event) => { if (suppressClick.current || isDragging) { event.preventDefault(); return; } onOpen(card); }}
+    onClick={(event) => {
+      // The click that ends a drag is consumed here rather than waiting out a timer, so a touch
+      // click arriving late cannot slip through and open the card the user was moving.
+      if (swallowClick.current || isDragging) {
+        swallowClick.current = false;
+        window.clearTimeout(swallowTimer.current);
+        event.preventDefault();
+        return;
+      }
+      onOpen(card);
+    }}
   >
     <span className="gallery-card-visual">
       {first ? <img src={thumbUrl(first)} alt="" loading="lazy" decoding="async" /> : <span className="gallery-card-empty"><ImageIcon size={25} /><b>{displayTitle(card)}</b></span>}
@@ -365,14 +400,14 @@ function useGalleryColumnCount() {
   return columnCount;
 }
 
-function GalleryCardColumns({ cards, dragState, reorderBusy, onOpen, onMenu, onReorderStart, onReorderOver, onReorderEnd }) {
+function GalleryCardColumns({ cards, dragState, reorderBusy, onOpen, onMenu, onReorderStart, slotShifts }) {
   const columnCount = useGalleryColumnCount();
   const columns = distributeGalleryCards(cards, columnCount);
   const cardIndexes = new Map(cards.map((card, index) => [card.id, index]));
   return <div className={`gallery-card-grid gallery-columns-${columnCount}${dragState ? " reordering" : ""}`}>
     {columns.map((column, columnIndex) => <div className="gallery-card-column" key={columnIndex}>{column.map((card) => {
       const index = cardIndexes.get(card.id) ?? 0;
-      return <GalleryCardTile card={card} tileIndex={index} key={card.id} onOpen={onOpen} onMenu={onMenu} dragState={dragState} reorderBusy={reorderBusy} onReorderStart={onReorderStart} onReorderOver={onReorderOver} onReorderEnd={onReorderEnd} />;
+      return <GalleryCardTile card={card} tileIndex={index} key={card.id} onOpen={onOpen} onMenu={onMenu} dragState={dragState} reorderBusy={reorderBusy} onReorderStart={onReorderStart} slotShift={slotShifts?.get(card.id) || 0} />;
     })}</div>)}
   </div>;
 }
@@ -992,6 +1027,17 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
   const [collectionDialog, setCollectionDialog] = useState(null);
   const [editor, setEditor] = useState(null);
   const [dragState, setDragState] = useState(null);
+  const dragGhostRef = useRef(null);
+  const galleryRoomRef = useRef(null);
+  const libraryRef = useRef(null);
+  const searchBoxRef = useRef(null);
+  // The collections nav is pinned, so scrolling slides the search box up behind it. The arrow
+  // appears at the moment the search box has gone entirely under the nav's bottom edge -- the point
+  // where the tools are no longer reachable without scrolling back.
+  const [backToTop, setBackToTop] = useState(false);
+  const galleryColumnCount = useGalleryColumnCount();
+  const galleryColumnCountRef = useRef(galleryColumnCount);
+  galleryColumnCountRef.current = galleryColumnCount;
   const [reorderBusy, setReorderBusy] = useState("");
   const [cardMenu, setCardMenu] = useState(null);
   const [promptEntries, setPromptEntries] = useState([]);
@@ -1091,49 +1137,138 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
     setCardMenu(null);
     void deleteCard(card);
   };
+  // The whole drag lives here, on `window`, rather than on the card. The list re-flows only on
+  // release, but even so the gesture must not depend on a node: a card that changes column is
+  // unmounted and remounted, and its pointer capture goes with it. Bound to the window, the drag
+  // survives anything React does to the grid.
   const startCardReorder = (card, point) => {
-    if (reorderBusy) return false;
+    if (reorderBusy || dragSession.current) return false;
     const order = data.cards.filter((item) => item.collection_id === card.collection_id).map((item) => item.id);
     if (order.length < 2) {
       onNotice("当前收藏夹只有一张卡片，无需排序");
       return false;
     }
-    dragSession.current = { collectionId: card.collection_id, original: [...order], order: [...order], changed: false };
-    setDragState({ cardId: card.id, collectionId: card.collection_id, targetId: card.id, ...point });
+    const measure = () => [...document.querySelectorAll(`[data-gallery-card-id][data-gallery-collection-id="${CSS.escape(card.collection_id)}"]`)]
+      .map((node) => ({ id: node.dataset.galleryCardId, rect: node.getBoundingClientRect() }));
+    const session = {
+      cardId: card.id,
+      collectionId: card.collection_id,
+      pointerId: point.pointerId,
+      order: [...order],
+      laid: measure(),
+      measure,
+      x: point.x,
+      y: point.y,
+      anchor: null,
+      raf: 0,
+      scrollRaf: 0,
+    };
+    dragSession.current = session;
+    setDragState({ cardId: card.id, collectionId: card.collection_id, anchor: null, shifts: new Map() });
+    runDragFrame();
+    runDragAutoScroll();
     return true;
   };
-  const moveCardDuringReorder = (card, targetId, point) => {
+
+  // The ghost follows the pointer by writing a transform straight onto the node once per frame.
+  // Re-rendering the page for every pointer sample is what made the drag feel heavy.
+  const runDragFrame = () => {
     const session = dragSession.current;
-    if (!session || session.collectionId !== card.collection_id) return;
-    setDragState((current) => current ? { ...current, targetId: targetId || current.targetId, ...point } : current);
-    if (!targetId || card.id === targetId) return;
-    const fromIndex = session.order.indexOf(card.id);
-    const targetIndex = session.order.indexOf(targetId);
-    if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return;
-    const next = [...session.order];
-    const [moved] = next.splice(fromIndex, 1);
-    next.splice(targetIndex, 0, moved);
-    session.order = next;
-    session.changed = true;
-    setData((current) => ({ ...current, cards: applyCollectionCardOrder(current.cards, session.collectionId, next) }));
-    setDragState({ cardId: card.id, collectionId: card.collection_id, targetId, ...point });
+    if (!session) return;
+    const ghost = dragGhostRef.current;
+    if (ghost) ghost.style.transform = `translate3d(${session.x}px, ${session.y}px, 0)`;
+    session.raf = window.requestAnimationFrame(runDragFrame);
   };
-  const finishCardReorder = async () => {
+
+  const runDragAutoScroll = () => {
+    const session = dragSession.current;
+    if (!session) return;
+    const scroll = document.querySelector(".gallery-room") || document.querySelector(".gallery-scroll");
+    const step = scroll ? galleryAutoScrollStep(session.y, scroll.getBoundingClientRect()) : 0;
+    if (step) {
+      scroll.scrollBy({ top: step });
+      // Scrolling moved every card, so the drop point has to be recomputed against fresh geometry.
+      session.laid = session.measure();
+      updateDropAnchor(session);
+    }
+    session.scrollRaf = window.requestAnimationFrame(runDragAutoScroll);
+  };
+
+  // Only the anchor and the yielded slot change while the pointer moves. The order is not touched
+  // until release, so passing over a card can never carry it away mid-drag.
+  const updateDropAnchor = (session) => {
+    const anchor = galleryDropAnchor(session.laid, { x: session.x, y: session.y });
+    const sameCard = anchor.type === session.anchor?.type && anchor.cardId === session.anchor?.cardId;
+    if (sameCard) return;
+    session.anchor = anchor;
+    const shifts = gallerySlotShifts(session.laid, anchor, session.cardId, galleryColumnCountRef.current);
+    setDragState((current) => current ? { ...current, anchor, shifts } : current);
+  };
+
+  const stopDragSession = () => {
     const session = dragSession.current;
     dragSession.current = null;
+    if (session?.raf) window.cancelAnimationFrame(session.raf);
+    if (session?.scrollRaf) window.cancelAnimationFrame(session.scrollRaf);
     setDragState(null);
-    if (!session?.changed) return;
+    return session;
+  };
+
+  const cancelCardReorder = () => {
+    // Nothing was reordered on the way here, so abandoning is just putting the visuals back.
+    stopDragSession();
+  };
+
+  useEffect(() => {
+    if (!dragState) return undefined;
+    const owns = (event) => dragSession.current && (event.pointerId === undefined || event.pointerId === dragSession.current.pointerId);
+    const move = (event) => {
+      const session = dragSession.current;
+      if (!owns(event)) return;
+      event.preventDefault();
+      session.x = event.clientX;
+      session.y = event.clientY;
+      updateDropAnchor(session);
+    };
+    const up = (event) => { if (owns(event)) void finishCardReorder(); };
+    const cancel = (event) => { if (owns(event)) cancelCardReorder(); };
+    const key = (event) => { if (event.key === "Escape") { event.preventDefault(); cancelCardReorder(); } };
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("blur", cancelCardReorder);
+    window.addEventListener("keydown", key);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("blur", cancelCardReorder);
+      window.removeEventListener("keydown", key);
+    };
+  }, [dragState?.cardId]);
+
+  const finishCardReorder = async () => {
+    const session = stopDragSession();
+    if (!session) return;
+    // One splice, here, on release. The anchor names a card the user can see, so a filtered view
+    // inserts where it looks like it will rather than sweeping hidden cards to one end.
+    const index = resolveDropIndex(session.order, session.anchor, session.cardId);
+    const next = spliceGalleryOrder(session.order, session.cardId, index);
+    // Released where it started: nothing moved, so nothing is sent.
+    if (!galleryOrderChanged(session.order, next)) return;
+    const original = session.order;
+    setData((current) => ({ ...current, cards: applyCollectionCardOrder(current.cards, session.collectionId, next) }));
     setReorderBusy(session.collectionId);
     try {
       const payload = await galleryRequest(`/collections/${encodeURIComponent(session.collectionId)}/card-order`, {
         method: "PUT",
-        body: JSON.stringify({ card_ids: session.order }),
+        body: JSON.stringify({ card_ids: next }),
       });
       const saved = new Map((payload.cards || []).map((card) => [card.id, card]));
       setData((current) => ({ ...current, cards: current.cards.map((card) => saved.get(card.id) || card) }));
       onNotice("卡片顺序已保存");
     } catch (requestError) {
-      setData((current) => ({ ...current, cards: applyCollectionCardOrder(current.cards, session.collectionId, session.original) }));
+      setData((current) => ({ ...current, cards: applyCollectionCardOrder(current.cards, session.collectionId, original) }));
       onNotice(requestError.message, true);
     } finally {
       setReorderBusy("");
@@ -1182,7 +1317,34 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
       onNotice(applyError.message, true);
     }
   };
-  return <section className="gallery-page gallery-room">
+  useEffect(() => {
+    const room = galleryRoomRef.current;
+    if (!room) return undefined;
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      const nav = libraryRef.current;
+      const search = searchBoxRef.current;
+      // At the top there is nothing to go back to, whatever the geometry says.
+      if (!nav || !search || room.scrollTop <= 0) return setBackToTop(false);
+      setBackToTop(search.getBoundingClientRect().bottom < nav.getBoundingClientRect().bottom);
+    };
+    const schedule = () => { if (!frame) frame = window.requestAnimationFrame(measure); };
+    measure();
+    room.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      room.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+    };
+  }, [activeSection, selectedCollection]);
+
+  const scrollGalleryToTop = () => {
+    galleryRoomRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  return <section className="gallery-page gallery-room" ref={galleryRoomRef}>
     <div className="gallery-room-grain" aria-hidden="true" />
     <div className="gallery-room-wash" aria-hidden="true" />
     <header className="gallery-room-header">
@@ -1193,10 +1355,16 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
     <main className="gallery-main gallery-room-main">
       {activeSection === "prompts" ? <div className="gallery-room-prompts"><PromptLibrary entries={promptEntries} loading={promptLoading} error={promptError} onRefresh={() => void refreshPrompts()} onAdd={() => setPromptDialog({})} onEdit={(entry) => setPromptDialog({ entry })} onDelete={(entry) => void deletePromptEntry(entry)} onApply={(entry, target) => void applyPromptEntry(entry, target)} onNotice={onNotice} /></div> : <>
         <section className="gallery-room-archive">
-          <nav className="gallery-room-library" aria-label="画廊收藏夹"><button type="button" className={selectedCollection === null ? "active" : ""} onClick={() => { setSelectedCollection(null); setSelectedCard(null); }}><i />全部作品 <b>{data.cards.length}</b></button>{data.collections.map((collection) => <button type="button" className={selectedCollection === collection.id ? "active" : ""} key={collection.id} onClick={() => { setSelectedCollection(collection.id); setSelectedCard(null); }}><i />{collection.id} <b>{collection.card_count}</b></button>)}</nav>
+          <nav className="gallery-room-library" aria-label="画廊收藏夹" ref={libraryRef}><button type="button" className={selectedCollection === null ? "active" : ""} onClick={() => { setSelectedCollection(null); setSelectedCard(null); }}><i />全部作品 <b>{data.cards.length}</b></button>{data.collections.map((collection) => <button type="button" className={selectedCollection === collection.id ? "active" : ""} key={collection.id} onClick={() => { setSelectedCollection(collection.id); setSelectedCard(null); }}><i />{collection.id} <b>{collection.card_count}</b></button>)}{backToTop && <button
+            type="button"
+            className="gallery-room-top"
+            title="回到顶部"
+            aria-label="回到顶部"
+            onClick={scrollGalleryToTop}
+          ><ArrowUp size={20} strokeWidth={2.4} /></button>}</nav>
           <div className="gallery-room-navigator"><button type="button" aria-label="上一个收藏夹" disabled={collectionScopes.length < 2} onClick={() => navigateCollection(-1)}><ArrowLeft size={17} /></button><div><span>{selectedCollection === null ? "ALL COLLECTIONS" : "CURRENT COLLECTION"}</span><strong>{selectedCollection === null ? "全部作品" : selectedCollection}</strong><small>{selectedCollectionRecord?.description || (selectedCollection === null ? "跨收藏夹浏览全部本地精选卡片" : "这个收藏夹还没有简介")}</small></div><button type="button" aria-label="下一个收藏夹" disabled={collectionScopes.length < 2} onClick={() => navigateCollection(1)}><ArrowRight size={17} /></button></div>
           <div className="gallery-room-tools">
-            <label><Search size={15} /><input type="search" value={gallerySearch} onChange={(event) => setGallerySearch(event.target.value)} placeholder="搜索标题、Prompt、模型或 LoRA" />{gallerySearch && <button type="button" aria-label="清空搜索" onClick={() => setGallerySearch("")}><X size={13} /></button>}</label>
+            <label ref={searchBoxRef}><Search size={15} /><input type="search" value={gallerySearch} onChange={(event) => setGallerySearch(event.target.value)} placeholder="搜索标题、Prompt、模型或 LoRA" />{gallerySearch && <button type="button" aria-label="清空搜索" onClick={() => setGallerySearch("")}><X size={13} /></button>}</label>
             <div className="gallery-room-filters">{[["all", "全部"], ["single", "单图"], ["multi", "多图"], ["text", "无图卡片"]].map(([id, label]) => <button type="button" className={galleryFilter === id ? "active" : ""} key={id} onClick={() => setGalleryFilter(id)}>{label}</button>)}</div>
             <div className="gallery-room-actions"><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={14} />新建收藏夹</button>{selectedCollectionRecord && <AddCardTile collectionId={selectedCollectionRecord.id} onAdd={(id, initialImages) => setEditor({ mode: "create", collectionId: id, initialImages })} onDropError={(message) => onNotice(message, true)} />}{selectedCollectionRecord && <button type="button" onClick={() => setCollectionDialog({ mode: "edit", collection: selectedCollectionRecord })}><Pencil size={14} />管理</button>}<button type="button" onClick={() => void refresh()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={14} />刷新</button></div>
           </div>
@@ -1206,14 +1374,14 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
             {!error && loading && <div className="gallery-loading"><RefreshCw className="spin" size={25} /><span>正在读取精选集</span></div>}
             {!error && !loading && data.collections.length === 0 && <div className="gallery-first-empty"><span><Sparkles size={33} /></span><strong>创建第一个精选收藏夹</strong><p>自定义收藏夹 ID 与简介，然后添加生成结果或手动卡片。</p><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={15} />创建收藏夹</button></div>}
             {!error && !loading && data.collections.length > 0 && filteredCards.length === 0 && <div className="gallery-first-empty"><span><FolderOpen size={33} /></span><strong>{gallerySearch || galleryFilter !== "all" ? "没有匹配的作品" : "这个收藏夹还是空的"}</strong><p>{gallerySearch || galleryFilter !== "all" ? "尝试清空搜索或切换筛选条件。" : "从生图结果加入画廊，或手动添加一张精选卡片。"}</p>{selectedCollectionRecord && <button type="button" onClick={() => setEditor({ mode: "create", collectionId: selectedCollectionRecord.id, initialImages: [] })}><ImagePlus size={15} />添加作品</button>}</div>}
-            {!error && !loading && filteredCards.length > 0 && <GalleryCardColumns cards={filteredCards} dragState={dragState} reorderBusy={Boolean(reorderBusy)} onOpen={setSelectedCard} onMenu={openCardMenu} onReorderStart={startCardReorder} onReorderOver={moveCardDuringReorder} onReorderEnd={finishCardReorder} />}
+            {!error && !loading && filteredCards.length > 0 && <GalleryCardColumns cards={filteredCards} dragState={dragState} reorderBusy={Boolean(reorderBusy)} onOpen={setSelectedCard} onMenu={openCardMenu} onReorderStart={startCardReorder} slotShifts={dragState?.shifts} />}
           </div>
         </section>
       </>}
       <footer className="gallery-room-footer"><span>XIRIA CANVAS AI / LOCAL GALLERY</span><span>SQLITE INDEX · INDEPENDENT COPIES</span><span>2026 / PERSONAL ARCHIVE</span></footer>
     </main>
     {selectedCard && createPortal(<GalleryDetail card={selectedCard} cards={viewerCards} onBack={() => setSelectedCard(null)} onNavigate={setSelectedCard} onEdit={(card) => { setSelectedCard(null); setEditor({ mode: "edit", card }); }} onDelete={deleteCard} onApply={onApplySettings} onNotice={onNotice} />, document.body)}
-    {dragState && <div className="gallery-drag-ghost" style={{ left: dragState.x, top: dragState.y }}><Images size={14} /><span><strong>正在排序</strong><small>{displayTitle(data.cards.find((card) => card.id === dragState.cardId), 42)}</small></span></div>}
+    {dragState && createPortal(<div ref={dragGhostRef} className="gallery-drag-ghost"><Images size={14} /><span><strong>正在排序</strong><small>{displayTitle(data.cards.find((card) => card.id === dragState.cardId), 42)}</small></span></div>, document.body)}
     {cardMenu && <GalleryCardMenu menu={cardMenu} onClose={() => setCardMenu(null)} onEdit={editFromCardMenu} onDelete={deleteFromCardMenu} />}
     {collectionDialog && <CollectionDialog collection={collectionDialog.collection} onClose={() => setCollectionDialog(null)} onSaved={saveCollection} onDeleted={collectionDeleted} />}
     {editor && <GalleryCardEditor card={editor.card} collectionId={editor.collectionId} collections={data.collections} initialSettings={currentSettings} initialImages={editor.initialImages} onClose={() => setEditor(null)} onSaved={saveCard} />}

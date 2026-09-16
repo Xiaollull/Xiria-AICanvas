@@ -152,7 +152,8 @@ test("ADetailer request controls stay editable for the next queued task", async 
 test("performance settings expose a hardware-derived VRAM wall slider", async () => {
   const app = await readSource("src/App.jsx");
   const performance = sourceBetween(app, "{settingsTab === \"performance\" && <section", "{settingsTab === \"theme\"");
-  assert.match(app, /vram_limit_gb: 0/);
+  // The baseline lives in its own module now, because one of its entries follows the installed card.
+  assert.match(await readSource("src/performance-defaults.js"), /vram_limit_gb: 0/);
   assert.match(app, /vramLimitInfo = performanceCapabilities\.vram_limit/);
   assert.match(performance, /VRAM HARD WALL/);
   assert.match(performance, /type=\"range\"/);

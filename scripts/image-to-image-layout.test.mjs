@@ -35,7 +35,7 @@ test("each column scrolls on its own, and neither carries the other", async () =
   assert.match(css, /@media \(max-width: 959px\)[\s\S]*?\.i2i-run-bar \{ position: static/);
 });
 
-test("the prompt and the pictures share one left-aligned measure and the previews are square", async () => {
+test("the prompt and the pictures share one left-aligned measure", async () => {
   const css = await read("src/styles.css");
   // Capping the two blocks separately left a band of dead stage to the right of the images that the
   // prompt above them filled — visible as a misalignment rather than as a deliberate margin.
@@ -49,11 +49,48 @@ test("the prompt and the pictures share one left-aligned measure and the preview
   assert.match(css, /\.i2i-prompt-deck, \.i2i-compare[^{]*\{[^}]*margin-inline: 0/);
   assert.match(css, /\.i2i-run-bar > \* \{[^}]*min-width: 0;[^}]*max-width: var\(--stage-measure\);[^}]*margin-inline: 0/,
     "the bar's contents line up with the left-anchored blocks below while the bar stays full-bleed for its sticky background");
-  assert.match(css, /\.i2i-compare-pane \.i2i-compare-figure \{[^}]*aspect-ratio: 1 \/ 1/);
-  // `.preview-stage` carries a 340px floor that would beat the aspect ratio on a narrow pane.
-  assert.match(css, /\.i2i-compare-pane \.i2i-compare-figure \{[^}]*min-height: 0/);
   assert.match(css, /\.i2i-prompt-column \.prompt-field textarea[^{]*\{[^}]*resize: vertical/,
     "the stage scrolls, so the user can make the primary block taller themselves");
+});
+
+test("the pictures are fitted to what the sticky bar leaves, not to a square", async () => {
+  const [css, page, fit] = await Promise.all([
+    read("src/styles.css"),
+    read("src/ImageToImagePage.jsx"),
+    import("../src/i2i-compare-fit.js"),
+  ]);
+  // A square took its height from the width of the column, and on a wide stage that was taller than
+  // the window: scrolled to the bottom the frame still ran past the edge, so no scroll position
+  // showed a whole picture and its caption at once.
+  // The base rule, not the stacked one below the breakpoint: `^` with `m` skips the indented copy
+  // inside the media query, which does still carry a ratio because there is no stage to fit into.
+  const figure = css.match(/^\.i2i-compare-pane \.i2i-compare-figure \{[^}]*\}/m)[0];
+  assert.doesNotMatch(figure, /aspect-ratio/, "the frame is sized by the stage, not by its own width");
+  assert.match(css, /\.i2i-compare \{[^}]*height: var\(--i2i-compare-height, auto\)/);
+  assert.match(css, /\.i2i-compare-pane \.i2i-compare-figure \{[^}]*flex: 1 1 0;[^}]*min-height: 180px/,
+    "equal basis so both panes match, and a floor that also clears `.preview-stage`'s 340px one");
+
+  // The remainder is the scrollport minus the bar covering its top minus the stage's own padding:
+  // land on that and the headings sit against the bar's lower edge while the captions finish at the
+  // bottom of the scrollport.
+  const { i2iCompareHeight, I2I_COMPARE_MIN_HEIGHT } = fit;
+  assert.equal(i2iCompareHeight({ stageHeight: 900, barHeight: 210, bottomPadding: 22 }), 668);
+  // A taller bar -- the progress dock and the run diagnostics both open inside it -- takes its room
+  // from the pictures rather than pushing them off the bottom.
+  assert.equal(i2iCompareHeight({ stageHeight: 900, barHeight: 320, bottomPadding: 22 }), 558);
+  // Past the floor the fit gives up instead of shrinking a picture to nothing; the stage scrolls.
+  assert.equal(i2iCompareHeight({ stageHeight: 300, barHeight: 210, bottomPadding: 22 }), I2I_COMPARE_MIN_HEIGHT);
+  // Nothing measured yet reads as "leave the stylesheet's own height alone".
+  assert.equal(i2iCompareHeight({ stageHeight: 0, barHeight: 0 }), 0);
+
+  // Both measurements move on their own -- the scrollport with the window, the bar whenever the
+  // progress dock appears -- so a single reading at mount would be wrong by the first generation.
+  assert.match(page, /const observer = new ResizeObserver\(measure\);\s*observer\.observe\(stage\);\s*observer\.observe\(bar\);/);
+  assert.match(page, /<section className="i2i-stage-panel panel" ref=\{stagePanelRef\}>/);
+  assert.match(page, /<div className="i2i-run-bar" ref=\{runBarRef\}>/);
+  // Below the two-column breakpoint the bar is not sticky and the page scrolls as one, so there is
+  // no remainder to fit into.
+  assert.match(css, /@media \(max-width: 959px\)[\s\S]*?\.i2i-compare \{ height: auto; \}/);
 });
 
 test("the two pictures are one stage at equal size, and only collapse when neither would be useful", async () => {
@@ -65,7 +102,7 @@ test("the two pictures are one stage at equal size, and only collapse when neith
   assert.match(css, /\.i2i-compare-head \{[^}]*min-height: \d+px/);
   assert.match(css, /\.i2i-compare-foot \{[^}]*min-height: \d+px/);
   assert.match(css, /\.i2i-compare-pane \.i2i-compare-figure \{[^}]*width: 100%/,
-    "the pane is capped at the square's width, so head, frame and caption align to one edge");
+    "the frame fills the pane, so head, frame and caption align to one edge");
   // Side by side below 640px would be two thumbnails, so the comparison turns vertical instead.
   assert.match(css, /@media \(max-width: 639px\)[\s\S]*?\.i2i-compare[^{]*\{ grid-template-columns: minmax\(0, 1fr\)/);
 });
@@ -73,7 +110,7 @@ test("the two pictures are one stage at equal size, and only collapse when neith
 test("the run bar holds the top of the stage and the prompt lives under the pictures", async () => {
   const css = await read("src/styles.css");
   const page = await read("src/ImageToImagePage.jsx");
-  const stage = page.slice(page.indexOf('<section className="i2i-stage-panel panel">'), page.indexOf('<aside className="i2i-controls-panel panel">'));
+  const stage = page.slice(page.indexOf('<section className="i2i-stage-panel panel"'), page.indexOf('<aside className="i2i-controls-panel panel">'));
   // Order inside the stage is the contract: the run bar first so nothing below can displace it,
   // then the prompt as the primary block, then the pictures it produces.
   const order = ["i2i-run-bar", "i2i-prompt-deck", "i2i-compare"].map((name) => stage.indexOf(name));

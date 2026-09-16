@@ -103,11 +103,24 @@ export function verifyProjectVenv(projectRoot) {
   }
 }
 
+// Secrets that belong to the update API and nothing else.
+export const UPDATE_SECRET_VARIABLES = Object.freeze(["XIRAI_REMOTE_UPDATE_TOKEN", "XIRAI_UPDATE_TOKEN"]);
+
+export function withoutUpdateSecrets(environment = process.env) {
+  const clean = { ...environment };
+  for (const name of UPDATE_SECRET_VARIABLES) delete clean[name];
+  return clean;
+}
+
 export function isolatedPythonEnv(environment = process.env) {
   const clean = { ...environment, PYTHONDONTWRITEBYTECODE: "1", PYTHONNOUSERSITE: "1" };
   for (const name of ["PYTHONHOME", "PYTHONPATH", "PIP_CONFIG_FILE", "PIP_TARGET", "PIP_PREFIX", "PIP_USER", "VIRTUAL_ENV", "CONDA_PREFIX", "__PYVENV_LAUNCHER__"]) {
     delete clean[name];
   }
+  // Only the web server authorizes updates, so no Python child has any use for the update key.
+  // Inherited, it would reach the inference process, its own children, and every crash report or
+  // environment dump any of them writes.
+  for (const name of UPDATE_SECRET_VARIABLES) delete clean[name];
   return clean;
 }
 

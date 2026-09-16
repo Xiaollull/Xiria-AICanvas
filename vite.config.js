@@ -1,6 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -1845,6 +1845,78 @@ function requireLocalRequest(request, message = "This operation is available onl
     throw Object.assign(new Error(message), { statusCode: 403 });
   }
   requireSameOrigin(request);
+}
+
+const REMOTE_UPDATE_TOKEN_HEADER = "x-xirai-remote-update-token";
+const REMOTE_UPDATE_TOKEN_PATTERN = /^[a-f0-9]{64}$/i;
+const REMOTE_UPDATE_FAILURE_LIMIT = 5;
+const REMOTE_UPDATE_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const REMOTE_UPDATE_BLOCK_MS = 15 * 60 * 1000;
+
+function isLoopbackAddress(value) {
+  return new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]).has(value || "");
+}
+
+function hasLoopbackHost(request) {
+  const host = String(request.headers.host || "").toLowerCase();
+  return /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(host);
+}
+
+function remoteUpdateTokenFromEnvironment(environment) {
+  const token = typeof environment?.XIRAI_REMOTE_UPDATE_TOKEN === "string"
+    ? environment.XIRAI_REMOTE_UPDATE_TOKEN.trim()
+    : "";
+  // This is exactly the output shape of `openssl rand -hex 32`, not a user-chosen password.
+  return REMOTE_UPDATE_TOKEN_PATTERN.test(token) ? token.toLowerCase() : "";
+}
+
+function createManualUpdateAuthorizer({ configuredToken, allowInsecure }) {
+  const failures = new Map();
+  const reject = (address, message, statusCode = 403) => {
+    const now = Date.now();
+    for (const [key, attempt] of failures) {
+      if (now - attempt.updatedAt > REMOTE_UPDATE_FAILURE_WINDOW_MS && now >= (attempt.blockedUntil || 0)) failures.delete(key);
+    }
+    throw Object.assign(new Error(message), { statusCode });
+  };
+  return (request) => {
+    const address = request.socket.remoteAddress || "";
+    const directLocal = isLoopbackAddress(address) && hasLoopbackHost(request);
+    if (!configuredToken) {
+      if (directLocal) {
+        requireSameOrigin(request);
+        return;
+      }
+      reject(address, "远程离线更新未启用。请在实例端配置 64 位十六进制 XIRAI_REMOTE_UPDATE_TOKEN");
+    }
+    // A configured token is always required, including a localhost request. That prevents a local
+    // reverse proxy or port forward from silently turning a remote caller into a trusted peer.
+    if (!directLocal && !request.socket.encrypted && !allowInsecure) {
+      reject(address, "远程离线更新只允许 HTTPS 或安全本机隧道。受信任私网可显式设置 XIRAI_REMOTE_UPDATE_ALLOW_INSECURE=1");
+    }
+    requireSameOrigin(request);
+    const now = Date.now();
+    const attempt = failures.get(address);
+    if (attempt?.blockedUntil > now) {
+      reject(address, "远程离线更新密钥尝试次数过多，请稍后再试", 429);
+    }
+    const supplied = request.headers[REMOTE_UPDATE_TOKEN_HEADER];
+    const candidate = typeof supplied === "string" ? supplied.trim().toLowerCase() : "";
+    const expectedBytes = Buffer.from(configuredToken, "utf8");
+    const candidateBytes = Buffer.from(candidate, "utf8");
+    if (candidateBytes.length !== expectedBytes.length || !timingSafeEqual(candidateBytes, expectedBytes)) {
+      const firstAt = attempt && now - attempt.firstAt <= REMOTE_UPDATE_FAILURE_WINDOW_MS ? attempt.firstAt : now;
+      const count = attempt && now - attempt.firstAt <= REMOTE_UPDATE_FAILURE_WINDOW_MS ? attempt.count + 1 : 1;
+      failures.set(address, {
+        firstAt,
+        count,
+        updatedAt: now,
+        blockedUntil: count >= REMOTE_UPDATE_FAILURE_LIMIT ? now + REMOTE_UPDATE_BLOCK_MS : 0,
+      });
+      reject(address, "远程离线更新密钥无效");
+    }
+    failures.delete(address);
+  };
 }
 
 function validLogFilename(value) {
@@ -4808,6 +4880,9 @@ export function updateApiPlugin({
   // update settings once for this server instance instead of re-reading a mutable process.env after
   // a release has already crossed the check boundary.
   const releaseEnvironment = Object.freeze({ ...updateEnvironment });
+  const remoteUpdateToken = remoteUpdateTokenFromEnvironment(releaseEnvironment);
+  const remoteUpdateAllowInsecure = releaseEnvironment.XIRAI_REMOTE_UPDATE_ALLOW_INSECURE === "1";
+  const authorizeManualUpdate = createManualUpdateAuthorizer({ configuredToken: remoteUpdateToken, allowInsecure: remoteUpdateAllowInsecure });
   let preparedUpdate;
   let activeTask;
   let uploadDirectory;
@@ -4962,6 +5037,8 @@ export function updateApiPlugin({
     current_version: appVersion,
     online_checked_at: onlineCheckedAt,
     online_release: publicOnlineRelease(),
+    remote_offline_update_enabled: Boolean(remoteUpdateToken),
+    remote_offline_update_insecure_allowed: remoteUpdateAllowInsecure,
   });
   const setState = (updates, immediate = false) => {
     updateState = { ...updateState, ...updates, updated_at: new Date().toISOString() };
@@ -5241,13 +5318,17 @@ export function updateApiPlugin({
       let acquiredTaskLock = false;
       try {
         await updateStateReady;
-        requireLocalRequest(request, "手动更新只能在运行程序的本机执行");
+        // Reading state and the checksum-pinned online path can be used from a remote browser. The
+        // arbitrary archive path stays local unless the instance owner configured its explicit token.
+        requireSameOrigin(request);
+        const requireManualUpdateControl = () => authorizeManualUpdate(request);
         if (url.pathname === "/api/system/update" && request.method === "GET") {
           response.statusCode = 200;
           response.end(JSON.stringify(publicState()));
           return;
         }
         if (url.pathname === "/api/system/update" && request.method === "DELETE") {
+          if (updateState.source !== "online") requireManualUpdateControl();
           if (activeTask || operationLock || updateBusy(updateState.status)) throw Object.assign(new Error("更新任务正在运行，暂时不能离开"), { statusCode: 409 });
           await cleanupPrepared();
           setState({ status: "idle", phase: "idle", source: undefined, progress: 0, message: "请选择更新归档", filename: undefined, bytes: undefined, restart_required: false, environment_ready: false, repair_available: false });
@@ -5346,6 +5427,7 @@ export function updateApiPlugin({
           return;
         }
         if (url.pathname === "/api/system/update/archive" && request.method === "POST") {
+          requireManualUpdateControl();
           if (activeTask || operationLock || !["idle", "error"].includes(updateState.status)) throw Object.assign(new Error("已有更新包正在处理"), { statusCode: 409 });
           const encodedName = String(request.headers["x-archive-name"] || "");
           let filename;
@@ -5420,6 +5502,7 @@ export function updateApiPlugin({
           return;
         }
         if (url.pathname === "/api/system/update/apply" && request.method === "POST") {
+          if (updateState.source !== "online") requireManualUpdateControl();
           if (activeTask || operationLock || updateState.status !== "ready" || !preparedUpdate) throw Object.assign(new Error("更新包尚未准备完成"), { statusCode: 409 });
           await acquireTaskLock("archive-apply");
           acquiredTaskLock = true;
@@ -5513,6 +5596,7 @@ export function updateApiPlugin({
           return;
         }
         if (url.pathname === "/api/system/update/repair" && request.method === "POST") {
+          if (updateState.source !== "online") requireManualUpdateControl();
           if (activeTask || operationLock || !updateState.repair_available || updateState.environment_ready) throw Object.assign(new Error("当前不需要环境修复"), { statusCode: 409 });
           await acquireTaskLock("environment-repair");
           acquiredTaskLock = true;
@@ -5550,6 +5634,7 @@ export function updateApiPlugin({
           return;
         }
         if (url.pathname === "/api/system/update/restart" && request.method === "POST") {
+          if (updateState.source !== "online") requireManualUpdateControl();
           if (activeTask || operationLock || !updateState.restart_required || !updateState.environment_ready || !readSetupMarker(projectRoot)) {
             throw Object.assign(new Error("环境尚未验证通过，暂时不能重启返回主页面"), { statusCode: 409 });
           }

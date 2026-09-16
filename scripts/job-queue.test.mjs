@@ -85,15 +85,18 @@ test("model and render controls remain editable while an earlier request runs", 
 });
 
 test("a finished stage is what the panel shows while the next stage runs", async () => {
-  const app = await readSource("src/App.jsx");
+  const [app, shared] = await Promise.all([readSource("src/App.jsx"), readSource("src/StagePreviews.jsx")]);
   assert.match(app, /const latestStagePreview = stagePreviews\.length \? stagePreviews\[stagePreviews\.length - 1\] : null;/);
-  // The stage picture shows while the next stage runs. It is no longer a ternary: it used to fall
-  // back to the latent stream, and that stream has been withdrawn.
-  assert.match(app, /latestStagePreview\s*\n?\s*&& <button type="button" className="stage-preview-image"/);
+  // The markup is shared with the image-to-image page now, but the rule is unchanged: the stage
+  // picture shows while the next stage runs, and it is not a ternary -- it used to fall back to the
+  // latent stream, and that stream has been withdrawn.
+  assert.match(app, /<StagePreviewLive stage=\{latestStagePreview\} stageLabel=\{stageLabel\} onEnlarge=\{setEnlargedStage\} \/>/);
+  assert.match(shared, /\{stage && <button\s*\n\s*type="button"\s*\n\s*className="stage-preview-image"/);
   assert.doesNotMatch(app, /livePreview/);
-  // Every stage stays reachable and can be opened larger.
-  assert.match(app, /className="stage-strip-item"/);
-  assert.match(app, /setEnlargedStage\(stage\)/);
+  assert.doesNotMatch(shared, /livePreview/);
+  // Every stage stays reachable and can be opened larger; the dialog itself stays in App.
+  assert.match(shared, /className="stage-strip-item"/);
+  assert.match(app, /<StageStrip stages=\{stagePreviews\} onEnlarge=\{setEnlargedStage\} \/>/);
   assert.match(app, /className="stage-enlarge"/);
 });
 

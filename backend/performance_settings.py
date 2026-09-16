@@ -17,6 +17,8 @@ DEFAULT_PERFORMANCE_SETTINGS = {
     "keep_model_cached": True,
     "allow_shared_memory": True,
     "calculate_model_hash": False,
+    # Off in the table, but not unconditionally off in practice: `default_performance_settings`
+    # turns it on for cards at or below `STAGED_DECODE_VRAM_CEILING_GB`. See that function.
     "staged_vae_decode": False,
     # Inductor compilation of the native Anima transformer blocks. Off by default:
     # it needs Triton, costs a one-off compile per latent shape, and changes the
@@ -43,9 +45,41 @@ SETTING_CHOICES = {
 }
 
 
-def normalize_performance_settings(value):
+# A card at or below this size cannot hold the sampler and the decoder at the same time on a large
+# canvas, so the staged decode is what it is shipped with. The ceiling carries the same half-a-
+# gigabyte tolerance the recommended presets use: a card sold as "16 GB" reports a little under
+# 16 GiB, and the next size up is 20 GB, so nothing larger can drift in under it.
+STAGED_DECODE_VRAM_CEILING_GB = 16.5
+
+
+def staged_decode_default(vram_bytes):
+    """Whether a machine with this much VRAM should start with the staged decode on."""
+    try:
+        total = float(vram_bytes)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(total) or total <= 0:
+        return False
+    return total / 1024**3 <= STAGED_DECODE_VRAM_CEILING_GB
+
+
+def default_performance_settings(vram_bytes=None):
+    """The settings a machine with this much VRAM starts with.
+
+    A default, not a lock. Only `staged_vae_decode` depends on the card, and only until the user
+    has an opinion: an explicit value in the settings file always wins, including an explicit
+    `false` on a small card. Passing no VRAM (or a machine with no CUDA device) yields the plain
+    table, which is what the tests and the file readers want when there is nothing to measure.
+    """
+    defaults = DEFAULT_PERFORMANCE_SETTINGS.copy()
+    if staged_decode_default(vram_bytes):
+        defaults["staged_vae_decode"] = True
+    return defaults
+
+
+def normalize_performance_settings(value, vram_bytes=None):
     source = value if isinstance(value, dict) else {}
-    normalized = DEFAULT_PERFORMANCE_SETTINGS.copy()
+    normalized = default_performance_settings(vram_bytes)
     for key, choices in SETTING_CHOICES.items():
         candidate = source.get(key)
         if isinstance(candidate, str) and candidate in choices:
@@ -82,15 +116,15 @@ def normalize_performance_settings(value):
     return normalized
 
 
-def read_performance_settings(path: Path):
+def read_performance_settings(path: Path, vram_bytes=None):
     try:
-        return normalize_performance_settings(json.loads(path.read_text(encoding="utf-8")))
+        return normalize_performance_settings(json.loads(path.read_text(encoding="utf-8")), vram_bytes)
     except (OSError, json.JSONDecodeError):
-        return DEFAULT_PERFORMANCE_SETTINGS.copy()
+        return default_performance_settings(vram_bytes)
 
 
-def write_performance_settings(path: Path, settings):
-    normalized = normalize_performance_settings(settings)
+def write_performance_settings(path: Path, settings, vram_bytes=None):
+    normalized = normalize_performance_settings(settings, vram_bytes)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
     try:

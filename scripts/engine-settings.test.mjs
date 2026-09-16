@@ -205,3 +205,62 @@ test("a pre-split workspace's model files seed only the engine they were chosen 
   assert.equal(engineSettingsFor(fromIllustrious, "iL").checkpoint, "wai.safetensors");
   assert.equal(engineSettingsFor(fromIllustrious, "SD").checkpoint, "");
 });
+
+test("each engine owns its image-to-image parameters, and a change under one cannot reach another", () => {
+  assert.equal(ENGINE_SETTINGS_SCHEMA_VERSION, 2, "the per-engine image block is schema 2");
+  const map = emptyEngineSettingsMap();
+  for (const engine of SETTINGS_ENGINES) {
+    const record = map.byEngine[engine];
+    assert.ok(record.imageToImage, `${engine} starts with its own image-to-image block`);
+    // A fresh image record starts on the same sampler pair the engine's generate record does,
+    // which is the one thing that differs between a split engine and a single-file one.
+    assert.equal(record.imageToImage.sampler, record.sampler, `${engine} image sampler matches its own default`);
+    assert.equal(record.imageToImage.scheduler, record.scheduler);
+  }
+  const afterSd = withEngineSettings(map, "SD", { ...engineSettingsFor(map, "SD"), imageToImage: { ...engineSettingsFor(map, "SD").imageToImage, denoise: 0.25 } });
+  assert.equal(engineSettingsFor(afterSd, "SD").imageToImage.denoise, 0.25);
+  assert.equal(engineSettingsFor(afterSd, "Krea2").imageToImage.denoise, 0.6, "Krea 2 keeps its own denoise");
+});
+
+test("a workspace saved before the split keeps the image parameters it was using", () => {
+  // Schema 1 held one shared image block for every engine. Upgrading folds it into all of them
+  // rather than resetting to defaults, so nobody loses the settings they were working with.
+  const shared = { denoise: 0.42, steps: 17, cfg: 3.5, sampler: "euler_ancestral", scheduler: "normal" };
+  const migrated = normalizeEngineSettingsMap(
+    { schemaVersion: 1, byEngine: { SD: { steps: 30 }, Krea2: { steps: 8 } } },
+    { legacyImageToImage: shared },
+  );
+  assert.equal(migrated.migrated, true);
+  for (const engine of SETTINGS_ENGINES) {
+    const image = migrated.container.byEngine[engine].imageToImage;
+    assert.equal(image.denoise, 0.42, `${engine} inherits the shared denoise`);
+    assert.equal(image.steps, 17);
+    assert.equal(image.sampler, "euler_ancestral", `${engine} keeps a sampler every engine offers`);
+  }
+  // The generate parameters each engine already had are untouched by the fold.
+  assert.equal(migrated.container.byEngine.SD.steps, 30);
+  assert.equal(migrated.container.byEngine.Krea2.steps, 8);
+
+  // A map already at schema 2 is left alone: its per-engine blocks are the truth.
+  const kept = normalizeEngineSettingsMap(
+    { schemaVersion: 2, byEngine: { SD: { imageToImage: { denoise: 0.9 } }, Krea2: { imageToImage: { denoise: 0.2 } } } },
+    { legacyImageToImage: shared },
+  );
+  assert.equal(kept.migrated, false);
+  assert.equal(kept.container.byEngine.SD.imageToImage.denoise, 0.9);
+  assert.equal(kept.container.byEngine.Krea2.imageToImage.denoise, 0.2);
+});
+
+test("switching engines swaps the image parameters with everything else", async () => {
+  const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
+  // Put down what the engine being left was holding, pick up what the engine being opened holds --
+  // the image block travels with the rest of the record, in both directions.
+  assert.match(app, /const captureEngineSettings = \(\) => \(\{[\s\S]{0,700}\n    imageToImage,\n  \}\);/);
+  assert.match(app, /setBackgroundRemovalModel\(settings\.backgroundRemovalModel\);\s*\n\s*setImageToImage\(settings\.imageToImage\);/);
+  // A reload mid-session comes back to what is on screen, not to the last engine switch.
+  assert.match(app, /engineSettingsByEngine: withEngineSettings\(engineSettingsByEngine, model, \{[\s\S]{0,400}\n      imageToImage,\n    \}\)/);
+  // The pre-schema-2 shared block is what a migration reads from.
+  assert.match(app, /legacyImageToImage: saved\.imageToImage,/);
+  // And the restore no longer writes the flat field back over the engine's own record.
+  assert.doesNotMatch(app, /setImageToImage\(workspace\.imageToImage\)/);
+});
