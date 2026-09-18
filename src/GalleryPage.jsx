@@ -36,6 +36,18 @@ import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
 import { copyText } from "./clipboard";
 import { engineGuidance, isSplitEngine } from "./engine-settings.js";
+import {
+  RESAMPLE_UNIT_LIMIT,
+  RESIZE_ALGORITHMS,
+  addResampleUnit,
+  chainSizeLine,
+  moveChainStage,
+  removeChainStage,
+  resampleUnitSummary,
+  resampleUnitTitle,
+  resampleUnits,
+  updateChainStage,
+} from "./resample-chain.js";
 
 const MAX_MANUAL_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_MANUAL_TOTAL_BYTES = 100 * 1024 * 1024;
@@ -50,16 +62,16 @@ const APPLY_GROUPS = [
   ["loras", "LoRA 组合", "挂载顺序、权重与启用状态"],
   ["sampling", "采样参数", "引导增强、步数、CFG、降噪、Seed、采样器与批次"],
   ["canvas", "画布大小", "基础宽度与高度"],
-  ["hires", "Hires.fix", "开关、模型、倍率与精修参数"],
-  ["adetailer", "ADetailer", "开关、检测模型、蒙版与重绘参数"],
-  ["rtx", "RTX VSR", "开关、倍率、质量与后处理顺序"],
+  ["chain", "后处理链", "重采样单元、ADetailer、RTX VSR 与执行顺序"],
   ["auxiliary", "其他选项", "透明背景模型"],
 ];
 
+/** The resample seed one saved image of a card ran with, falling back to the unit's own mode. */
 function selectedImageHiresSeed(settings, imageIndex) {
   const mode = settings.imageHiresSeedModes?.[imageIndex];
   const seed = settings.imageHiresSeeds?.[imageIndex];
-  return normalizeHiresSeed(mode ?? settings.hires.seedMode, seed ?? settings.hires.seed);
+  const firstUnit = resampleUnits(settings.postprocessChain).find((unit) => unit.enabled && unit.denoise > 0) || null;
+  return normalizeHiresSeed(mode ?? firstUnit?.seedMode, seed ?? firstUnit?.seed);
 }
 
 function applyCollectionCardOrder(cards, collectionId, cardIds) {
@@ -602,11 +614,11 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
   const [selectedCollection, setSelectedCollection] = useState(card?.collection_id || collectionId || collections[0]?.id || "");
   const [title, setTitle] = useState(card?.title || "");
   const [settings, setSettings] = useState(() => card
-    ? normalizedSettings(card.settings, DEFAULT_SETTINGS, { hiresSourceKind: "persisted_card" })
-    : normalizedSettings(undefined, initialSettings, { hiresSourceKind: "workspace_inheritance" }));
+    ? normalizedSettings(card.settings, DEFAULT_SETTINGS)
+    : normalizedSettings(undefined, initialSettings));
   const [images, setImages] = useState(() => card
     ? (card.images || []).map((image, index) => {
-      const cardSettings = normalizedSettings(card.settings, DEFAULT_SETTINGS, { hiresSourceKind: "persisted_card" });
+      const cardSettings = normalizedSettings(card.settings, DEFAULT_SETTINGS);
       const imageHires = selectedImageHiresSeed(cardSettings, index);
       const hasImageHires = Array.isArray(card.settings?.imageHiresSeedModes) && index < card.settings.imageHiresSeedModes.length;
       return { kind: "existing", id: image.id, name: image.name, url: image.url, seed: card.settings?.imageSeeds?.[index] ?? "", hiresSeedMode: hasImageHires ? imageHires.seedMode : undefined, hiresSeed: hasImageHires ? imageHires.seed : undefined };
@@ -690,14 +702,10 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
     [next[index], next[target]] = [next[target], next[index]];
     return next;
   });
-  const moveStage = (stage, direction) => setSettings((current) => {
+  const setStage = (id, updates) => setSettings((current) => (busy ? current : { ...current, postprocessChain: updateChainStage(current.postprocessChain, id, updates) }));
+  const moveStage = (id, direction) => setSettings((current) => {
     if (busy) return current;
-    const order = [...current.postprocessOrder];
-    const index = order.indexOf(stage);
-    const target = index + direction;
-    if (index < 0 || target < 0 || target >= order.length) return current;
-    [order[index], order[target]] = [order[target], order[index]];
-    return { ...current, postprocessOrder: order };
+    return { ...current, postprocessChain: moveChainStage(current.postprocessChain, id, direction) };
   });
   const save = async (event) => {
     event.preventDefault();
@@ -725,8 +733,15 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
     }
     setBusy(true);
     setError("");
-    const normalizedHiresSeed = normalizeHiresSeed(settings.hires.seedMode, settings.hires.seed);
-    const safeSettings = { ...settings, seed: normalizeUint64Seed(settings.seed, "0"), hires: { ...settings.hires, ...normalizedHiresSeed } };
+    // The first unit that redraws is the one an output's recorded seed belongs to.
+    const firstRedrawUnit = resampleUnits(settings.postprocessChain).find((unit) => unit.enabled && unit.denoise > 0) || null;
+    const safeSettings = {
+      ...settings,
+      seed: normalizeUint64Seed(settings.seed, "0"),
+      postprocessChain: settings.postprocessChain.map((stage) => (stage.type === "resample"
+        ? { ...stage, ...normalizeHiresSeed(stage.seedMode, stage.seed) }
+        : stage)),
+    };
     const savedSettings = isSplit ? {
       ...safeSettings,
       checkpoint: "",
@@ -747,8 +762,8 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
       settings: {
         ...savedSettings,
         imageSeeds: images.map((image) => normalizeUint64Seed(image.seed, "")),
-        imageHiresSeedModes: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? savedSettings.hires.seedMode, image.hiresSeed ?? savedSettings.hires.seed).seedMode),
-        imageHiresSeeds: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? savedSettings.hires.seedMode, image.hiresSeed ?? savedSettings.hires.seed).seed),
+        imageHiresSeedModes: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? firstRedrawUnit?.seedMode, image.hiresSeed ?? firstRedrawUnit?.seed).seedMode),
+        imageHiresSeeds: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? firstRedrawUnit?.seedMode, image.hiresSeed ?? firstRedrawUnit?.seed).seed),
       },
       images: images.map((image) => image.kind === "existing" ? { gallery_image_id: image.id } : { data_url: image.dataUrl, name: image.name }),
     };
@@ -804,25 +819,38 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
         </details>
 
         <details>
-          <summary><WandSparkles size={14} />Hires.fix</summary>
-          <div className="gallery-hires-seed-editor">
-            <div className="gallery-editor-grid two">
-              <label className="gallery-field"><span>Hires Seed 模式</span><select value={settings.hires.seedMode} onChange={(event) => { const mode = event.target.value; const next = normalizeHiresSeed(mode, mode === "fixed" ? normalizeUint64Seed(settings.hires.seed, settings.seed) : null); setSettings((current) => ({ ...current, hires: { ...current.hires, ...next } })); }}><option value="inherit">继承首轮</option><option value="fixed">固定</option><option value="random">每张随机</option></select></label>
-              {settings.hires.seedMode === "fixed" && <label className="gallery-field gallery-hires-seed-field"><span>固定 Hires Seed</span><i><input inputMode="numeric" maxLength="20" value={settings.hires.seed} onChange={(event) => setNested("hires", "seed", event.target.value.replace(/\D/g, ""))} onBlur={() => setNested("hires", "seed", normalizeUint64Seed(settings.hires.seed, "0"))} /><button type="button" title="生成固定 Hires Seed" onClick={() => setNested("hires", "seed", secureRandomUint64Seed())}><RefreshCw size={12} /></button></i></label>}
+          <summary><Zap size={14} />后处理链</summary>
+          <div className="gallery-details-content">
+            <p className="gallery-field-detail">按执行顺序排列。重采样单元可增删与调序；ADetailer 与 RTX VSR 各只有一个，只能调序与开关。</p>
+            <div className="gallery-chain-list">
+              {settings.postprocessChain.map((stage, index) => <div key={stage.id} className={stage.enabled ? "enabled" : "disabled"}>
+                <header>
+                  <span>{index + 1}</span>
+                  <strong>{stage.type === "resample" ? resampleUnitTitle(settings.postprocessChain, stage) : stageLabels[stage.type]}</strong>
+                  <ToggleField label="启用" detail="" checked={stage.enabled} onChange={(value) => setStage(stage.id, { enabled: value })} />
+                  <button type="button" aria-label="上移" disabled={index === 0} onClick={() => moveStage(stage.id, -1)}><ArrowUp size={12} /></button>
+                  <button type="button" aria-label="下移" disabled={index === settings.postprocessChain.length - 1} onClick={() => moveStage(stage.id, 1)}><ArrowDown size={12} /></button>
+                  {stage.type === "resample" && <button type="button" aria-label="删除该单元" onClick={() => setSettings((current) => ({ ...current, postprocessChain: removeChainStage(current.postprocessChain, stage.id) }))}><X size={12} /></button>}
+                </header>
+                {stage.type === "resample" && <div className="gallery-editor-grid four">
+                  <label className="gallery-field"><span>超分模型</span><input value={stage.upscaler} placeholder="留空 = 仅算法缩放" onChange={(event) => setStage(stage.id, { upscaler: event.target.value })} /></label>
+                  <label className="gallery-field"><span>缩放算法</span><select value={stage.resizeAlgorithm} onChange={(event) => setStage(stage.id, { resizeAlgorithm: event.target.value })}>{RESIZE_ALGORITHMS.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}</select></label>
+                  <NumericField label="倍率" value={stage.scale} min={1} max={4} step={0.1} onChange={(value) => setStage(stage.id, { scale: value })} />
+                  <NumericField label="重绘强度" value={stage.denoise} min={0} max={1} step={0.01} onChange={(value) => setStage(stage.id, { denoise: value })} />
+                  <NumericField label="步数（0 = 跟随首轮）" value={stage.steps ?? 0} min={0} max={100} onChange={(value) => setStage(stage.id, { steps: value > 0 ? Math.round(value) : null })} />
+                  <NumericField label="CFG（-1 = 跟随首轮）" value={stage.cfg ?? -1} min={-1} max={30} step={0.1} onChange={(value) => setStage(stage.id, { cfg: value >= 0 ? value : null })} />
+                  <NumericField label="像素放大分块" value={stage.tileSize} min={32} max={2048} onChange={(value) => setStage(stage.id, { tileSize: Math.round(value) })} />
+                  <NumericField label="像素放大分块重叠" value={stage.tileOverlap} min={0} max={512} onChange={(value) => setStage(stage.id, { tileOverlap: Math.round(value) })} />
+                  {tilesHires && <label className="gallery-field"><span>重绘方式</span><select value={stage.executionMode} onChange={(event) => setStage(stage.id, { executionMode: event.target.value })}><option value="usdu_tiled">USDU 分块重绘（推荐）</option><option value="full_frame">整图重绘（兼容）</option></select></label>}
+                  <label className="gallery-field"><span>采样器</span><select value={stage.sampler || ""} onChange={(event) => setStage(stage.id, { sampler: event.target.value || null })}><option value="">跟随首轮</option>{SAMPLERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
+                  <label className="gallery-field"><span>调度器</span><select value={stage.scheduler || ""} onChange={(event) => setStage(stage.id, { scheduler: event.target.value || null })}><option value="">跟随首轮</option>{SCHEDULERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
+                </div>}
+                {stage.type === "adetailer" && <div className="gallery-editor-grid two"><label className="gallery-field wide"><span>检测模型</span><input value={stage.units?.[0]?.detector || ""} onChange={(event) => setStage(stage.id, { units: (stage.units || []).map((unit, position) => (position === 0 ? { ...unit, detector: event.target.value } : unit)) })} /></label><NumericField label="单元数" value={(stage.units || []).length} min={1} max={6} onChange={() => {}} /></div>}
+                {stage.type === "rtx" && <div className="gallery-editor-grid two"><NumericField label="RTX 倍率" value={stage.scale} min={1} max={4} step={0.01} onChange={(value) => setStage(stage.id, { scale: value })} /><label className="gallery-field"><span>RTX 质量</span><select value={stage.quality} onChange={(event) => setStage(stage.id, { quality: event.target.value })}><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option><option value="ultra">ULTRA</option></select></label></div>}
+              </div>)}
             </div>
-            {images.length > 0 && <div className="gallery-image-hires-seeds"><strong>逐图 Hires Seed</strong>{images.map((image, index) => { const imageHires = normalizeHiresSeed(image.hiresSeedMode ?? settings.hires.seedMode, image.hiresSeed ?? settings.hires.seed); return <div key={image.id || `${image.name}-${index}`}><span>{index + 1}</span><select value={imageHires.seedMode} onChange={(event) => { const mode = event.target.value; const next = normalizeHiresSeed(mode, mode === "fixed" ? normalizeUint64Seed(imageHires.seed, settings.seed) : null); setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeedMode: next.seedMode, hiresSeed: next.seed } : item)); }}><option value="inherit">继承</option><option value="fixed">固定</option><option value="random">随机</option></select>{imageHires.seedMode === "fixed" ? <><input inputMode="numeric" maxLength="20" value={imageHires.seed} onChange={(event) => setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeedMode: "fixed", hiresSeed: event.target.value.replace(/\D/g, "") } : item))} onBlur={() => setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeed: normalizeUint64Seed(item.hiresSeed, "0") } : item))} /><button type="button" title={`生成图片 ${index + 1} 的固定 Hires Seed`} onClick={() => setImages((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, hiresSeedMode: "fixed", hiresSeed: secureRandomUint64Seed() } : item))}><RefreshCw size={12} /></button></> : <small>{imageHires.seedMode === "inherit" ? "依赖该图首轮 Seed" : "下次生成时重新随机"}</small>}</div>; })}</div>}
+            <button type="button" className="gallery-chain-add" disabled={resampleUnits(settings.postprocessChain).length >= RESAMPLE_UNIT_LIMIT} onClick={() => setSettings((current) => ({ ...current, postprocessChain: addResampleUnit(current.postprocessChain) }))}><Plus size={12} />添加重采样单元</button>
           </div>
-          <div className="gallery-details-content"><ToggleField label="启用 Hires.fix" detail="应用时由生图区域验证引擎能力与超分模型" checked={settings.hires.enabled} onChange={(value) => setNested("hires", "enabled", value)} /><div className="gallery-editor-grid four"><label className="gallery-field"><span>超分模型</span><input value={settings.hires.model} onChange={(event) => setNested("hires", "model", event.target.value)} /></label><NumericField label="倍率" value={settings.hires.scale} min={1} max={4} step={0.1} onChange={(value) => setNested("hires", "scale", value)} /><NumericField label="重绘强度" value={settings.hires.denoise} min={0.05} max={1} step={0.01} onChange={(value) => setNested("hires", "denoise", value)} /><NumericField label="Hires 步数" value={settings.hires.steps} min={1} max={100} onChange={(value) => setNested("hires", "steps", Math.round(value))} /><NumericField label="Hires CFG" value={settings.hires.cfg} min={0} max={30} step={0.1} onChange={(value) => setNested("hires", "cfg", value)} /><NumericField label="像素放大分块" value={settings.hires.tileSize} min={32} max={2048} onChange={(value) => setNested("hires", "tileSize", Math.round(value))} /><NumericField label="像素放大分块重叠" value={settings.hires.tileOverlap} min={0} max={512} onChange={(value) => setNested("hires", "tileOverlap", Math.round(value))} /></div>{tilesHires && <div className="gallery-editor-grid two"><label className="gallery-field"><span>重绘方式</span><select value={settings.hires.executionMode} onChange={(event) => setNested("hires", "executionMode", event.target.value)}><option value="usdu_tiled">USDU 分块重绘（推荐）</option><option value="full_frame">整图重绘（兼容）</option></select></label><label className="gallery-field"><span>Hires 采样器</span><select value={settings.hires.sampler || ""} onChange={(event) => setNested("hires", "sampler", event.target.value || null)}><option value="">跟随首轮</option>{SAMPLERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label><label className="gallery-field"><span>Hires 调度器</span><select value={settings.hires.scheduler || ""} onChange={(event) => setNested("hires", "scheduler", event.target.value || null)}><option value="">跟随首轮</option>{SCHEDULERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label></div>} {tilesHires && settings.hires.executionMode === "usdu_tiled" && <p className="gallery-field-detail">扩散重绘分块：Auto 使用首轮图片宽高；padding 32；每 tile 按 Hires 步数执行；seam fix 目前为 None。</p>}</div>
-        </details>
-
-        <details>
-          <summary><Sparkles size={14} />ADetailer</summary>
-          <div className="gallery-details-content"><ToggleField label="启用 ADetailer" detail="应用时由生图区域验证引擎能力与检测模型" checked={settings.adetailer.enabled} onChange={(value) => setNested("adetailer", "enabled", value)} /><div className="gallery-editor-grid four"><label className="gallery-field wide"><span>检测模型</span><input value={settings.adetailer.detector} onChange={(event) => setNested("adetailer", "detector", event.target.value)} /></label><NumericField label="置信度" value={settings.adetailer.confidence} min={0.05} max={1} step={0.01} onChange={(value) => setNested("adetailer", "confidence", value)} /><NumericField label="区域数" value={settings.adetailer.maxDetections} min={1} max={8} onChange={(value) => setNested("adetailer", "maxDetections", Math.round(value))} /><NumericField label="最小比例" value={settings.adetailer.maskMinRatio} min={0} max={0.5} step={0.01} onChange={(value) => setNested("adetailer", "maskMinRatio", value)} /><NumericField label="最大比例" value={settings.adetailer.maskMaxRatio} min={0.05} max={1} step={0.01} onChange={(value) => setNested("adetailer", "maskMaxRatio", value)} /><NumericField label="膨胀/腐蚀" value={settings.adetailer.dilateErode} min={-128} max={128} onChange={(value) => setNested("adetailer", "dilateErode", Math.round(value))} /><NumericField label="蒙版模糊" value={settings.adetailer.maskBlur} min={0} max={64} onChange={(value) => setNested("adetailer", "maskBlur", Math.round(value))} /><NumericField label="边距" value={settings.adetailer.padding} min={0} max={256} onChange={(value) => setNested("adetailer", "padding", Math.round(value))} /><NumericField label="重绘强度" value={settings.adetailer.denoise} min={0.05} max={1} step={0.01} onChange={(value) => setNested("adetailer", "denoise", value)} /></div><div className="gallery-editor-grid two"><label className="gallery-field"><span>ADetailer 正向 Prompt</span><textarea value={settings.adetailer.prompt} onChange={(event) => setNested("adetailer", "prompt", event.target.value)} /></label><label className="gallery-field"><span>ADetailer 负向 Prompt</span><textarea value={settings.adetailer.negativePrompt} onChange={(event) => setNested("adetailer", "negativePrompt", event.target.value)} /></label></div></div>
-        </details>
-
-        <details>
-          <summary><Zap size={14} />RTX VSR 与后处理</summary>
-          <div className="gallery-details-content"><ToggleField label="启用 RTX VSR" detail="应用时由生图区域验证引擎能力与 RTX 运行时" checked={settings.rtx.enabled} onChange={(value) => setNested("rtx", "enabled", value)} /><div className="gallery-editor-grid two"><NumericField label="RTX 倍率" value={settings.rtx.scale} min={1} max={4} step={0.01} onChange={(value) => setNested("rtx", "scale", value)} /><label className="gallery-field"><span>RTX 质量</span><select value={settings.rtx.quality} onChange={(event) => setNested("rtx", "quality", event.target.value)}><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option><option value="ultra">ULTRA</option></select></label></div><div className="gallery-stage-order">{settings.postprocessOrder.map((stage, index) => <div key={stage}><span>{index + 1}</span><strong>{{ hires: "Hires.fix", adetailer: "ADetailer", rtx: "RTX VSR" }[stage]}</strong><button type="button" disabled={index === 0} onClick={() => moveStage(stage, -1)}><ArrowUp size={12} /></button><button type="button" disabled={index === settings.postprocessOrder.length - 1} onClick={() => moveStage(stage, 1)}><ArrowDown size={12} /></button></div>)}</div></div>
         </details>
         {error && <p className="gallery-form-error">{error}</p>}
       </fieldset>
@@ -872,7 +900,7 @@ function ApplySettingsDialog({ card, onClose, onApply }) {
 
 function GalleryInspector({ card, settings, isSplit, onEdit, onDelete, onNotice, onApplyOpenChange }) {
   const tilesHires = supportsUsduTiled(settings.model);
-  const stageLabels = { hires: "Hires.fix", adetailer: "ADetailer", rtx: "RTX VSR" };
+  const stageLabels = { resample: "重采样", adetailer: "ADetailer", rtx: "RTX VSR" };
   return <section className="gallery-inspector" aria-label="生成参数">
     <header><div><span>CURATED DETAIL</span><h1 title={card.title || settings.positive}>{displayTitle(card)}</h1><p>{card.collection_id} · 更新于 {formatDate(card.updated_at)}</p></div><div><button type="button" onClick={() => onEdit(card)}><Pencil size={14} />编辑</button><button type="button" className="danger" aria-label="删除精选卡片" onClick={() => onDelete(card)}><Trash2 size={14} /></button></div></header>
     <div className="gallery-inspector-scroll">
@@ -913,8 +941,13 @@ function GalleryInspector({ card, settings, isSplit, onEdit, onDelete, onNotice,
       )}
       <section className="gallery-detail-section"><header><span>MODEL</span><strong>模型组件与 LoRA</strong></header><dl><div><dt>引擎</dt><dd>{settings.model}</dd></div>{isSplit ? <><div><dt>扩散模型</dt><dd title={settings.diffusionModel}>{compactName(settings.diffusionModel)}</dd></div><div><dt>文本编码器</dt><dd title={settings.textEncoder}>{compactName(settings.textEncoder)}</dd></div><div><dt>VAE</dt><dd title={settings.vae}>{compactName(settings.vae)}</dd></div></> : <div><dt>底模</dt><dd title={settings.checkpoint}>{compactName(settings.checkpoint)}</dd></div>}</dl><div className="gallery-detail-loras">{settings.loras.length ? settings.loras.map((item, index) => { const owner = settings.loraGroups.find((group) => group.id === item.groupId); return <div className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><strong>{item.name || compactName(item.value)}</strong>{owner && <em className="gallery-lora-group-tag" title={`来自组合 ${owner.name}`}>{owner.name}</em>}<b>{formatWeight(item.weight ?? 1)}</b><small>{item.enabled === false ? "关闭" : "启用"}</small></div>; }) : <p>未使用 LoRA</p>}</div></section>
       <section className="gallery-detail-section"><header><span>SAMPLING</span><strong>采样与画布</strong></header><div className="gallery-stat-grid"><div><span>STEP</span><b>{settings.steps}</b></div><div><span>CFG</span><b>{settings.cfg}</b></div><div><span>DENOISE</span><b>{settings.denoise}</b></div><div><span>SEED</span><b title={settings.seed}>{settings.seed}</b></div><div><span>SIZE</span><b>{settings.size.width} × {settings.size.height}</b></div><div><span>BATCH</span><b>{settings.imagesPerBatch} × {settings.batchCount}</b></div></div><p className="gallery-detail-line">{GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "无（None）"}{settings.guidance === "pag" ? ` ${settings.pag.scale} / ${settings.pag.appliedLayers === "mid" ? "Mid" : "全部层"}` : ""} · {settings.sampler} · {settings.scheduler}</p></section>
-      <section className="gallery-detail-section"><header><span>POST PROCESS</span><strong>后处理开关与顺序</strong></header><div className="gallery-process-list">{settings.postprocessOrder.map((stage, index) => { const stageSettings = settings[stage]; return <div className={stageSettings?.enabled ? "enabled" : "disabled"} key={stage}><span>{index + 1}</span><strong>{stageLabels[stage]}</strong><b>{stageSettings?.enabled ? "ON" : "OFF"}</b><small>{stage === "hires" ? `${stageSettings.scale}x · ${compactName(stageSettings.model)}${tilesHires ? ` · ${stageSettings.executionMode === "usdu_tiled" ? "USDU 分块重绘" : "整图重绘"}` : ""}` : stage === "adetailer" ? `${compactName(stageSettings.detector)} · ${stageSettings.confidence}` : `${stageSettings.scale}x · ${String(stageSettings.quality).toUpperCase()}`}</small></div>; })}</div><p className="gallery-detail-line">Hires Seed · {settings.hires.seedMode === "inherit" ? "继承当前图片首轮 Seed" : settings.hires.seedMode === "random" ? "每张安全随机" : settings.hires.seed}</p></section>
-      <section className="gallery-detail-section"><header><span>ADETAILER DETAIL</span><strong>局部重绘参数</strong></header><dl><div><dt>Prompt</dt><dd>{settings.adetailer.prompt || "继承主 Prompt"}</dd></div><div><dt>负向</dt><dd>{settings.adetailer.negativePrompt || "继承主负向"}</dd></div><div><dt>蒙版</dt><dd>{settings.adetailer.maskMinRatio}–{settings.adetailer.maskMaxRatio} · blur {settings.adetailer.maskBlur}</dd></div><div><dt>重绘</dt><dd>{settings.adetailer.denoise} · {settings.adetailer.useSteps ? `${settings.adetailer.steps} steps` : "继承步数"}</dd></div></dl></section>
+      <section className="gallery-detail-section"><header><span>POST PROCESS</span><strong>后处理链</strong></header><div className="gallery-process-list">{settings.postprocessChain.map((stage, index) => <div className={stage.enabled ? "enabled" : "disabled"} key={stage.id}><span>{index + 1}</span><strong>{stage.type === "resample" ? resampleUnitTitle(settings.postprocessChain, stage) : stageLabels[stage.type]}</strong><b>{stage.enabled ? "ON" : "OFF"}</b><small>{stage.type === "resample" ? `${resampleUnitSummary(stage)}${stage.upscaler ? ` · ${compactName(stage.upscaler)}` : ""}${tilesHires && stage.denoise > 0 ? ` · ${stage.executionMode === "usdu_tiled" ? "USDU 分块重绘" : "整图重绘"}` : ""}` : stage.type === "adetailer" ? `${compactName(stage.units?.[0]?.detector)} · ${(stage.units || []).length} 个单元` : `${stage.scale}x · ${String(stage.quality).toUpperCase()}`}</small></div>)}</div><p className="gallery-detail-line">尺寸链 · {chainSizeLine(settings.size, settings.postprocessChain, settings.model)}</p></section>
+      {(() => {
+        const detail = settings.postprocessChain.find((stage) => stage.type === "adetailer");
+        const unit = detail?.units?.[0];
+        if (!unit) return null;
+        return <section className="gallery-detail-section"><header><span>ADETAILER DETAIL</span><strong>局部重绘参数</strong></header><dl><div><dt>Prompt</dt><dd>{unit.prompt || "继承主 Prompt"}</dd></div><div><dt>负向</dt><dd>{unit.negativePrompt || "继承主负向"}</dd></div><div><dt>蒙版</dt><dd>{unit.maskMinRatio}–{unit.maskMaxRatio} · blur {unit.maskBlur}</dd></div><div><dt>重绘</dt><dd>{unit.denoise} · {unit.useSteps ? `${unit.steps} steps` : "继承步数"}</dd></div></dl></section>;
+      })()}
     </div>
     <footer><button type="button" onClick={() => onApplyOpenChange(true)}><SlidersHorizontal size={15} /><span><strong>应用参数</strong><small>选择性回填到生图区域</small></span><ChevronRight size={15} /></button></footer>
   </section>;
@@ -972,7 +1005,12 @@ function GalleryDetail({ card, cards, onBack, onNavigate, onEdit, onDelete, onAp
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [applyOpen, cardIndex, viewerCardKey]);
   const baseSettings = normalizedSettings({ ...card.settings, seed: galleryImageSeed(card.settings, safeImageIndex) });
-  const settings = { ...baseSettings, hires: { ...baseSettings.hires, ...selectedImageHiresSeed(baseSettings, safeImageIndex) } };
+  // Viewing one image of a grouped card pins the first redrawing unit to that image's own seed.
+  const imageUnitSeed = selectedImageHiresSeed(baseSettings, safeImageIndex);
+  const pinnedUnitId = resampleUnits(baseSettings.postprocessChain).find((unit) => unit.enabled && unit.denoise > 0)?.id;
+  const settings = pinnedUnitId
+    ? { ...baseSettings, postprocessChain: updateChainStage(baseSettings.postprocessChain, pinnedUnitId, imageUnitSeed) }
+    : baseSettings;
   const image = card.images?.[safeImageIndex];
   const isSplit = isSplitEngine(settings.model);
   const zoomAtPointer = (event) => {

@@ -90,7 +90,7 @@ test("a finished stage is what the panel shows while the next stage runs", async
   // The markup is shared with the image-to-image page now, but the rule is unchanged: the stage
   // picture shows while the next stage runs, and it is not a ternary -- it used to fall back to the
   // latent stream, and that stream has been withdrawn.
-  assert.match(app, /<StagePreviewLive stage=\{latestStagePreview\} stageLabel=\{stageLabel\} onEnlarge=\{setEnlargedStage\} \/>/);
+  assert.match(app, /<StagePreviewLive stage=\{latestStagePreview\} stageLabel=\{stageLabel\} onEnlarge=\{setEnlargedStage\} held=\{heldPreview\} \/>/);
   assert.match(shared, /\{stage && <button\s*\n\s*type="button"\s*\n\s*className="stage-preview-image"/);
   assert.doesNotMatch(app, /livePreview/);
   assert.doesNotMatch(shared, /livePreview/);

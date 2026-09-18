@@ -216,7 +216,12 @@ test("the back-to-top arrow appears only once the search box has gone behind the
   ]);
   // The nav is pinned, which is what lets the search box slide up behind it -- without that the two
   // scroll together and their edges never cross.
-  assert.match(css, /\.gallery-room-library \{ position: sticky; top: 0;[^}]*background: var\(--gallery-background\);/);
+  assert.match(css, /\.gallery-room-library \{ position: sticky; top: 0;/);
+  // The bar's background is full-bleed rather than the width of the centred archive column: at the
+  // column's measure the cards scrolling underneath showed either side of it, level with the bar,
+  // which is the one band nothing may show through. The pseudo carries the bottom border out to the
+  // edges with it.
+  assert.match(css, /\.gallery-room-library::before \{ content: ""; position: absolute; z-index: -1; inset: 0 calc\(50% - 50vw\); border-bottom: 1px solid var\(--gallery-line\); background: var\(--gallery-background\); \}/);
   // The trigger is exactly that crossing, and the top of the list is never a place to go back from.
   assert.match(page, /if \(!nav \|\| !search \|\| room\.scrollTop <= 0\) return setBackToTop\(false\);/);
   assert.match(page, /setBackToTop\(search\.getBoundingClientRect\(\)\.bottom < nav\.getBoundingClientRect\(\)\.bottom\);/);
@@ -231,7 +236,12 @@ test("the back-to-top arrow appears only once the search box has gone behind the
   assert.match(page, /className="gallery-room-top"[\s\S]{0,160}onClick=\{scrollGalleryToTop\}/);
   assert.match(page, /aria-label="回到顶部"/);
   assert.match(page, /galleryRoomRef\.current\?\.scrollTo\(\{ top: 0, behavior: "smooth" \}\)/);
-  assert.match(css, /\.gallery-room-top \{ position: absolute; right: 0; bottom: 0;[^}]*translate: 0 50%;/);
+  // Inside the bar at its right end, not straddling the bottom border: half a circle hanging over
+  // the first row of pictures read as a misalignment. `right: 0` is the bar's padding box, which
+  // the full-bleed pseudo does not move, so it still lines up with the cards below.
+  assert.match(css, /\.gallery-room-top \{ position: absolute; right: 0; top: 50%;[^}]*translate: 0 -50%;/);
+  // Reserved room at the end of the bar, or the collection chips run under the button.
+  assert.match(css, /\.gallery-room-library \{ position: sticky;[^}]*padding: 19px 56px 19px 0;/);
   assert.match(css, /animation: gallery-top-enter [\d.]+s/);
   assert.match(css, /@keyframes gallery-top-enter \{ from \{ opacity: 0;/);
 
@@ -241,7 +251,9 @@ test("the back-to-top arrow appears only once the search box has gone behind the
   assert.ok(css.indexOf(".gallery-room-top { animation: none; }") > base, "the reduced-motion override must come after the base rule");
   assert.ok(css.indexOf(".gallery-room-top { position: fixed") > base, "the narrow-screen override must come after the base rule");
   // A horizontally scrolling nav clips its own children, so on narrow screens the arrow leaves it.
-  assert.match(css, /\.gallery-room-top \{ position: fixed; right: 16px; bottom: calc\(16px \+ env\(safe-area-inset-bottom, 0px\)\)/);
+  // `top: auto` is load-bearing: the base rule now rests on `top: 50%`, and leaving it set would
+  // pin the fixed button halfway down the viewport instead of above the safe-area inset.
+  assert.match(css, /\.gallery-room-top \{ position: fixed; right: 16px; top: auto; bottom: calc\(16px \+ env\(safe-area-inset-bottom, 0px\)\)/);
   // The narrow rule must not restate the animation: it sits after the reduced-motion override, so
   // naming an animation there would switch the entry movement back on for exactly the people who
   // asked for less of it.

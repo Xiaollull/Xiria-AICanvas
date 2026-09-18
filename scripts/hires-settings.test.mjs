@@ -4,16 +4,16 @@ import test from "node:test";
 import {
   MAX_UINT64_SEED,
   galleryOutputSeedSettings,
-  generationHiresSeedSettings,
-  hiresEffectiveSteps,
-  hiresSeedPayload,
-  normalizeGalleryHires,
   normalizeHiresSeed,
   normalizeUint64Seed,
   resolvedGalleryOutputHiresSeed,
   secureRandomUint64Seed,
   supportsUsduTiled,
 } from "../src/hires-settings.js";
+import {
+  normalizeResampleUnit,
+  resampleUnitEffectiveSteps,
+} from "../src/resample-chain.js";
 
 const readSource = (file) => readFile(new URL(`../${file}`, import.meta.url), "utf8");
 
@@ -30,32 +30,6 @@ const MAX_SEED_TEXT = "18446744073709551615";
 const cryptoSourceFor = (high, low) => ({ getRandomValues: (target) => { target[0] = high; target[1] = low; return target; } });
 
 const defaults = { executionMode: "full_frame", tileWidth: "auto", tileHeight: "auto", padding: 32, maskBlur: 8, seamMode: "none", uniformTiles: true, tiledDecode: true, samplers: ["euler", "euler_ancestral"], schedulers: ["normal", "simple"] };
-
-test("Gallery Hires migration reads executionMode only from persisted card source", () => {
-  const fallbackWithNewDefault = { executionMode: "full_frame", sampler: "euler", scheduler: "simple" };
-  assert.equal(normalizeGalleryHires("Anima", { steps: 27 }, fallbackWithNewDefault, defaults).executionMode, "usdu_tiled");
-  assert.equal(normalizeGalleryHires("SD", { steps: 27 }, fallbackWithNewDefault, defaults).executionMode, "full_frame");
-  assert.equal(normalizeGalleryHires("iL", { executionMode: "usdu_tiled" }, fallbackWithNewDefault, defaults).executionMode, "full_frame");
-  assert.equal(normalizeGalleryHires("Anima", { executionMode: "full_frame" }, fallbackWithNewDefault, defaults).executionMode, "full_frame");
-  assert.equal(normalizeGalleryHires("Anima", { executionMode: "usdu_tiled" }, fallbackWithNewDefault, defaults).executionMode, "usdu_tiled");
-});
-
-test("new Gallery Anima cards inherit an explicit workspace Hires mode", () => {
-  assert.equal(normalizeGalleryHires("Anima", {}, { executionMode: "full_frame" }, defaults, { sourceKind: "workspace_inheritance" }).executionMode, "full_frame");
-  assert.equal(normalizeGalleryHires("Anima", {}, { executionMode: "usdu_tiled" }, defaults, { sourceKind: "workspace_inheritance" }).executionMode, "usdu_tiled");
-});
-
-test("Gallery Hires preserves independent inherit or override settings and fixed tiled defaults", () => {
-  const inherited = normalizeGalleryHires("Anima", {}, {}, defaults);
-  assert.equal(inherited.sampler, null);
-  assert.equal(inherited.scheduler, null);
-  assert.deepEqual({ tileWidth: inherited.tileWidth, tileHeight: inherited.tileHeight, padding: inherited.padding, maskBlur: inherited.maskBlur, seamMode: inherited.seamMode, uniformTiles: inherited.uniformTiles, tiledDecode: inherited.tiledDecode }, { tileWidth: "auto", tileHeight: "auto", padding: 32, maskBlur: 8, seamMode: "none", uniformTiles: true, tiledDecode: true });
-  const overridden = normalizeGalleryHires("Anima", { sampler: "euler_ancestral", scheduler: "normal" }, {}, defaults);
-  assert.equal(overridden.sampler, "euler_ancestral");
-  assert.equal(overridden.scheduler, "normal");
-  const explicit = normalizeGalleryHires("Anima", { executionMode: "full_frame", sampler: "euler_ancestral", scheduler: "normal", padding: 48, maskBlur: 12, uniformTiles: false, tiledDecode: false }, {}, defaults);
-  assert.deepEqual({ executionMode: explicit.executionMode, sampler: explicit.sampler, scheduler: explicit.scheduler, padding: explicit.padding, maskBlur: explicit.maskBlur, uniformTiles: explicit.uniformTiles, tiledDecode: explicit.tiledDecode }, { executionMode: "full_frame", sampler: "euler_ancestral", scheduler: "normal", padding: 48, maskBlur: 12, uniformTiles: false, tiledDecode: false });
-});
 
 test("normalizeUint64Seed keeps the whole unsigned 64-bit range without Number precision loss", () => {
   assert.equal(MAX_UINT64_SEED, 18446744073709551615n);
@@ -112,25 +86,6 @@ test("normalizeHiresSeed keeps fixed seeds exact and clears stale text for inher
   assert.deepEqual(normalizeHiresSeed("bogus", COMFY_HIRES_SEED), { seedMode: "inherit", seed: "" });
 });
 
-test("generation Hires seed payload sends mode always and a lossless fixed seed only in fixed mode", () => {
-  assert.deepEqual(generationHiresSeedSettings({ seedMode: "fixed", seed: COMFY_HIRES_SEED }), { seedMode: "fixed", seed: COMFY_HIRES_SEED });
-  assert.deepEqual(generationHiresSeedSettings({ seedMode: "fixed", seed: MAX_SEED_TEXT }), { seedMode: "fixed", seed: MAX_SEED_TEXT });
-  assert.deepEqual(generationHiresSeedSettings({ seedMode: "fixed", seed: "" }), { seedMode: "fixed", seed: "0" });
-  assert.deepEqual(generationHiresSeedSettings({ seedMode: "inherit", seed: COMFY_HIRES_SEED }), { seedMode: "inherit", seed: "" });
-  assert.deepEqual(generationHiresSeedSettings({ seedMode: "random", seed: COMFY_HIRES_SEED }), { seedMode: "random", seed: "" });
-
-  assert.deepEqual(hiresSeedPayload({ seedMode: "fixed", seed: COMFY_HIRES_SEED }), { mode: "fixed", seed: COMFY_HIRES_SEED });
-  assert.deepEqual(hiresSeedPayload({ seedMode: "fixed", seed: MAX_SEED_TEXT }), { mode: "fixed", seed: MAX_SEED_TEXT });
-  assert.deepEqual(hiresSeedPayload({ seedMode: "inherit", seed: COMFY_HIRES_SEED }), { mode: "inherit" });
-  assert.deepEqual(hiresSeedPayload({ seedMode: "random", seed: COMFY_HIRES_SEED }), { mode: "random" });
-  assert.deepEqual(hiresSeedPayload({ seedMode: "fixed", seed: "18446744073709551616" }), { mode: "inherit" });
-  assert.deepEqual(hiresSeedPayload(undefined), { mode: "inherit" });
-  for (const mode of ["inherit", "random"]) {
-    assert.equal("seed" in hiresSeedPayload({ seedMode: mode, seed: COMFY_HIRES_SEED }), false);
-  }
-  assert.equal(JSON.stringify(hiresSeedPayload(generationHiresSeedSettings({ seedMode: "fixed", seed: MAX_SEED_TEXT }))), `{"mode":"fixed","seed":"${MAX_SEED_TEXT}"}`);
-});
-
 test("resolved Gallery output Hires seed converts random outputs to their fixed resolved seed", () => {
   const fallback = { seedMode: "fixed", seed: "42" };
   assert.deepEqual(resolvedGalleryOutputHiresSeed({ hires_seed_mode: "random", hires_seed: COMFY_HIRES_SEED }, fallback), { seedMode: "fixed", seed: COMFY_HIRES_SEED });
@@ -146,109 +101,88 @@ test("resolved Gallery output Hires seed converts random outputs to their fixed 
 });
 
 test("galleryOutputSeedSettings freezes per-image base and Hires seeds without leaking across outputs", () => {
-  const normalized = { seed: "7", seedMode: "random", imagesPerBatch: 4, batchCount: 3, hires: { enabled: true, seedMode: "inherit", seed: "" } };
+  const firstUnit = { enabled: true, seedMode: "inherit", seed: "" };
+  const normalized = { seed: "7", seedMode: "random", imagesPerBatch: 4, batchCount: 3 };
   const first = { base_seed: "1015878324182247", seed: "1015878324182247", hires_seed_mode: "random", hires_seed: COMFY_HIRES_SEED };
   const second = { base_seed: "2", seed: "2", hires_seed_mode: "fixed", hires_seed: MAX_SEED_TEXT };
   const third = { base_seed: "3", seed: "3", hires_seed_mode: "inherit", hires_seed: "3" };
   const items = [first, second, third];
 
-  const applied = galleryOutputSeedSettings(normalized, first, items);
+  const applied = galleryOutputSeedSettings(normalized, first, items, false, firstUnit);
   assert.equal(applied.seed, "1015878324182247");
   assert.equal(applied.seedMode, "fixed");
-  assert.deepEqual({ seedMode: applied.hires.seedMode, seed: applied.hires.seed }, { seedMode: "fixed", seed: COMFY_HIRES_SEED });
-  assert.equal(applied.hires.enabled, true);
+  assert.deepEqual({ seedMode: applied.resampleSeed.seedMode, seed: applied.resampleSeed.seed }, { seedMode: "fixed", seed: COMFY_HIRES_SEED });
   assert.deepEqual(applied.imageSeeds, ["1015878324182247", "2", "3"]);
   assert.deepEqual(applied.imageHiresSeedModes, ["fixed", "fixed", "inherit"]);
   assert.deepEqual(applied.imageHiresSeeds, [COMFY_HIRES_SEED, MAX_SEED_TEXT, ""]);
   assert.equal(applied.imagesPerBatch, 1);
   assert.equal(applied.batchCount, 1);
-  assert.equal(galleryOutputSeedSettings(normalized, first, items, true).imagesPerBatch, 3);
+  assert.equal(galleryOutputSeedSettings(normalized, first, items, true, firstUnit).imagesPerBatch, 3);
 
   // Selecting a different output must not inherit the previous output's Hires seed.
-  const secondApplied = galleryOutputSeedSettings(normalized, second, items);
-  assert.deepEqual({ seedMode: secondApplied.hires.seedMode, seed: secondApplied.hires.seed }, { seedMode: "fixed", seed: MAX_SEED_TEXT });
-  const thirdApplied = galleryOutputSeedSettings(normalized, third, items);
-  assert.deepEqual({ seedMode: thirdApplied.hires.seedMode, seed: thirdApplied.hires.seed }, { seedMode: "inherit", seed: "" });
+  const secondApplied = galleryOutputSeedSettings(normalized, second, items, false, firstUnit);
+  assert.deepEqual({ seedMode: secondApplied.resampleSeed.seedMode, seed: secondApplied.resampleSeed.seed }, { seedMode: "fixed", seed: MAX_SEED_TEXT });
+  const thirdApplied = galleryOutputSeedSettings(normalized, third, items, false, firstUnit);
+  assert.deepEqual({ seedMode: thirdApplied.resampleSeed.seedMode, seed: thirdApplied.resampleSeed.seed }, { seedMode: "inherit", seed: "" });
   assert.notEqual(applied.imageHiresSeeds, secondApplied.imageHiresSeeds);
-  assert.equal(normalized.hires.seedMode, "inherit");
+  assert.equal(firstUnit.seedMode, "inherit");
   assert.equal(normalized.seed, "7");
 
-  assert.deepEqual(galleryOutputSeedSettings(normalized, first, undefined).imageHiresSeeds, []);
-  assert.equal(galleryOutputSeedSettings(normalized, { base_seed: null, seed: null }, []).seed, "7");
+  assert.deepEqual(galleryOutputSeedSettings(normalized, first, undefined, false, firstUnit).imageHiresSeeds, []);
+  assert.equal(galleryOutputSeedSettings(normalized, { base_seed: null, seed: null }, [], false, firstUnit).seed, "7");
 });
 
-test("Gallery Hires migration defaults legacy cards to inherit and preserves fixed Hires seeds", () => {
-  const legacy = normalizeGalleryHires("Anima", { steps: 12 }, {}, defaults);
-  assert.deepEqual({ seedMode: legacy.seedMode, seed: legacy.seed }, { seedMode: "inherit", seed: "" });
-
-  const fixed = normalizeGalleryHires("Anima", { seedMode: "fixed", seed: COMFY_HIRES_SEED }, {}, defaults);
-  assert.deepEqual({ seedMode: fixed.seedMode, seed: fixed.seed }, { seedMode: "fixed", seed: COMFY_HIRES_SEED });
-  const maxFixed = normalizeGalleryHires("SD", { seedMode: "fixed", seed: MAX_SEED_TEXT }, {}, defaults);
-  assert.deepEqual({ seedMode: maxFixed.seedMode, seed: maxFixed.seed }, { seedMode: "fixed", seed: MAX_SEED_TEXT });
-
-  const corrupted = normalizeGalleryHires("Anima", { seedMode: "fixed", seed: "18446744073709551616" }, {}, defaults);
-  assert.deepEqual({ seedMode: corrupted.seedMode, seed: corrupted.seed }, { seedMode: "inherit", seed: "" });
-
-  const random = normalizeGalleryHires("Anima", { seedMode: "random", seed: COMFY_HIRES_SEED }, {}, defaults);
-  assert.deepEqual({ seedMode: random.seedMode, seed: random.seed }, { seedMode: "random", seed: "" });
-
-  const inheritedFromWorkspace = normalizeGalleryHires("Anima", {}, { seedMode: "fixed", seed: COMFY_HIRES_SEED }, defaults, { sourceKind: "workspace_inheritance" });
-  assert.deepEqual({ seedMode: inheritedFromWorkspace.seedMode, seed: inheritedFromWorkspace.seed }, { seedMode: "fixed", seed: COMFY_HIRES_SEED });
-});
-
-test("workspace and Gallery Hires seeds freeze per job while the next queued task stays editable", async () => {
+test("workspace and Gallery resample seeds freeze per job while the next queued task stays editable", async () => {
   // Gallery.jsx keeps the add-to-gallery dialog; the curation page it used to hold is its own chunk.
-  const [app, gallery, galleryPage] = await Promise.all([
+  const [app, gallery, galleryPage, chain] = await Promise.all([
     readSource("src/App.jsx"),
     readSource("src/Gallery.jsx"),
     readSource("src/GalleryPage.jsx"),
+    readSource("src/resample-chain.js"),
   ]);
   const generate = sourceBetween(app, "  const generate = async () => {", "  const releaseLoadedModel = async () => {");
   const restore = sourceBetween(app, "function loadWorkspaceState(saved)", "function reconcileModels");
-  const engineSettingsSource = await readFile(new URL("../src/engine-settings.js", import.meta.url), "utf8");
 
-  assert.match(app, /import \{[^}]*\bgenerationHiresSeedSettings\b[^}]*\bhiresSeedPayload\b[^}]*\} from "\.\/hires-settings"/);
-  // HIRES_DEFAULTS now lives beside the per-engine store that has to reason about it.
-  assert.match(engineSettingsSource, /seedMode: "inherit"/);
+  // A saved workspace's Hires seed is still read through the lossless helper on the way in.
   assert.match(restore, /const savedHiresSeed = normalizeHiresSeed\(savedHires\.seedMode, savedHires\.seed\)/);
+  assert.match(restore, /postprocessChain: migrateResampleChain\(/);
 
-  // The payload carries the frozen resolution, and generated settings are deep-cloned at job start.
-  assert.match(generate, /const generationHiresSeed = generationHiresSeedSettings\(hires\)/);
-  assert.match(generate, /const generationHires = \{ \.\.\.hires, \.\.\.generationHiresSeed \}/);
-  assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?hires: generationHires,/);
-  assert.match(generate, /\.\.\.hiresSeedPayload\(generationHiresSeed\)/);
-  assert.doesNotMatch(generate, /seed: Number\(|parseInt\(hires\.seed/);
+  // The payload carries each unit's own resolution, and generated settings are deep-cloned at job
+  // start so a queued edit cannot reach a job already running.
+  assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?postprocessChain,/);
+  assert.match(generate, /postprocess_chain: resampleChainPayload\(postprocessChain, \{ engine: model \}\)/);
+  assert.doesNotMatch(generate, /seed: Number\(|parseInt\(/);
+  // A fixed seed with nothing typed in it never reaches the service as an invalid number.
+  assert.match(chain, /const fixed = seedMode === "fixed" && normalizeUint64Seed\(seed\) !== null;/);
 
   // A running task owns its frozen payload; only a model-switch transaction locks the next draft.
   assert.match(app, /const hiresControlsLocked = modelSwitching;/);
-  assert.match(app, /Hires Seed 模式<WorkspaceSelect[^>]*value=\{hires\.seedMode\} disabled=\{hiresControlsLocked\}/);
-  assert.match(app, /hires-seed-field[\s\S]*?value=\{hires\.seed\} disabled=\{hiresControlsLocked\}/);
-  assert.match(app, /hires-seed-field[\s\S]*?<button type="button" title="生成固定 Hires Seed" disabled=\{hiresControlsLocked\}/);
+  assert.match(app, /locked=\{hiresControlsLocked\}/);
   assert.match(app, /无法恢复生成任务[\s\S]*?generationLocked\.current = true;[\s\S]*?setStatus\("running"\)/);
-  assert.match(app, /const hiresSeedReady = hires\.seedMode !== "fixed" \|\| normalizeUint64Seed\(hires\.seed\) !== null/);
 
-  // Gallery routes every persisted and per-image Hires seed through the lossless helpers.
+  // Gallery routes every persisted and per-image resample seed through the lossless helpers.
   assert.match(gallery, /import \{[^}]*\bgalleryOutputSeedSettings\b[^}]*\} from "\.\/hires-settings"/);
-  assert.match(gallery, /return galleryOutputSeedSettings\(normalized, output, selectedItems, combined\)/);
+  assert.match(gallery, /return galleryOutputSeedSettings\(normalized, output, selectedItems, combined, firstUnit\)/);
   assert.match(galleryPage, /imageHiresSeedModes: images\.map\(\(image\) => normalizeHiresSeed\(/);
   assert.match(galleryPage, /imageHiresSeeds: images\.map\(\(image\) => normalizeHiresSeed\(/);
   for (const source of [gallery, galleryPage]) assert.doesNotMatch(source, /Number\(image\.hiresSeed\)|parseInt\(image\.hiresSeed/);
 });
 
-test("the Hires pass is counted the way the family actually runs it", () => {
-  // Diffusers image-to-image runs int(steps × denoise) updates.
-  assert.equal(hiresEffectiveSteps({ steps: 20, denoise: 0.35 }, "SD"), 7);
-  assert.equal(hiresEffectiveSteps({ steps: 10, denoise: 0.05 }, "iL"), 0);
-  // Native Anima follows Comfy — a longer schedule with the last `steps + 1` sigmas kept — so it
-  // runs every requested step whatever the denoise. Multiplying refused a configuration the run
-  // would have executed, and understated the steps the progress bar was counting against.
-  assert.equal(hiresEffectiveSteps({ steps: 10, denoise: 0.05 }, "Anima"), 10);
-  assert.equal(hiresEffectiveSteps({ steps: 20, denoise: 1 }, "Anima"), 20);
-  // Nothing configured yet is zero, not NaN: the caller compares it against 1 to block a run.
-  assert.equal(hiresEffectiveSteps(undefined, "SD"), 0);
-  assert.equal(hiresEffectiveSteps({ steps: 20 }, "SD"), 0);
+test("a unit's redraw is counted the way the family actually runs it", () => {
+  const native = ["Anima", "Flux", "Flux2", "Krea2"];
+  const unit = (overrides) => normalizeResampleUnit({ enabled: true, ...overrides });
+  // Diffusers image-to-image runs int(steps x denoise) updates.
+  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 20, denoise: 0.35 }), 28, "SD", native), 7);
+  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 10, denoise: 0.05 }), 28, "iL", native), 0);
+  // Native engines follow Comfy -- a longer schedule with the last `steps + 1` sigmas kept -- so
+  // they run every requested step whatever the denoise.
+  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 10, denoise: 0.05 }), 28, "Anima", native), 10);
+  // A unit that leaves its steps to inherit is counted against the request's own.
+  assert.equal(resampleUnitEffectiveSteps(unit({ denoise: 0.5 }), 28, "SD", native), 14);
+  assert.equal(resampleUnitEffectiveSteps(unit({ denoise: 0.5 }), 28, "Anima", native), 28);
+  // A unit that does not redraw spends no steps at all.
+  assert.equal(resampleUnitEffectiveSteps(unit({ scale: 2, denoise: 0 }), 28, "SD", native), 0);
 });
-
 test("tiled Hires is offered by engine capability, not by naming one engine", () => {
   // Both engines prepare their conditioning and sigma schedule once and hand the same pair to
   // every tile. The Flux engines are guidance distilled and expose no such surface.
@@ -259,32 +193,21 @@ test("tiled Hires is offered by engine capability, not by naming one engine", ()
   }
 });
 
-test("a Krea2 card keeps its tiled execution mode, and a Flux card cannot acquire one", () => {
-  const tiled = { executionMode: "usdu_tiled" };
-  assert.equal(normalizeGalleryHires("Krea2", tiled, {}, {}).executionMode, "usdu_tiled");
-  assert.equal(normalizeGalleryHires("Anima", tiled, {}, {}).executionMode, "usdu_tiled");
-  assert.equal(normalizeGalleryHires("Flux2", tiled, {}, {}).executionMode, "full_frame");
-  assert.equal(normalizeGalleryHires("SD", tiled, {}, {}).executionMode, "full_frame");
-  // An explicit full-frame choice is still honoured on an engine that could tile.
-  assert.equal(
-    normalizeGalleryHires("Krea2", { executionMode: "full_frame" }, {}, {}).executionMode,
-    "full_frame",
-  );
-});
-
 test("the workspace, the gallery and image-to-image all ask the same predicate", async () => {
-  const [app, gallery, i2iPage, i2i] = await Promise.all([
+  const [app, gallery, i2iPage, chain, panel] = await Promise.all([
     readSource("src/App.jsx"),
     readSource("src/GalleryPage.jsx"),
     readSource("src/ImageToImagePage.jsx"),
-    readSource("src/image-to-image.js"),
+    readSource("src/resample-chain.js"),
+    readSource("src/ResampleChainPanel.jsx"),
   ]);
-  for (const [name, source] of [["App", app], ["GalleryPage", gallery], ["ImageToImagePage", i2iPage], ["image-to-image", i2i]]) {
-    assert.match(source, /supportsUsduTiled/, `${name} must derive tiled Hires from the shared predicate`);
+  // The chain module and the editor both ask the predicate; the pages read the answer off them.
+  for (const [name, source] of [["GalleryPage", gallery], ["ImageToImagePage", i2iPage], ["resample-chain", chain], ["ResampleChainPanel", panel]]) {
+    assert.match(source, /supportsUsduTiled/, `${name} must derive tiled refinement from the shared predicate`);
   }
   // The capability must never be re-derived from an engine name beside a usdu_tiled decision.
   assert.doesNotMatch(app, /=== "Anima"[^\n]*usdu_tiled/);
   assert.doesNotMatch(gallery, /isAnima[^\n]{0,40}usdu_tiled/);
   assert.doesNotMatch(i2iPage, /=== "Anima"[^\n]*usdu_tiled/);
-  assert.doesNotMatch(i2i, /\banima\b[^\n]{0,20}executionMode === "usdu_tiled"/);
+  assert.doesNotMatch(chain, /\banima\b[^\n]{0,20}executionMode === "usdu_tiled"/);
 });

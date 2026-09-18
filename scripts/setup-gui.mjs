@@ -95,7 +95,7 @@ let setupStateWrite = Promise.resolve();
 
 // Migration source only: the default the withdrawn 2026-08-15 visual pass shipped. See src/theme.js.
 const withdrawnDefaultTheme = { overall: "#D96846", accent: "#D96846", ink: "#111112", disc: "#FFF9F2", guide: "#E3C7BD" };
-const defaultTheme = { overall: "#8B7CFF", accent: "#8B7CFF", ink: "#111112", disc: "#FFFFFF", guide: "#C9C5E8", light: false };
+const defaultTheme = { overall: "#8B7CFF", accent: "#8B7CFF", ink: "#111112", disc: "#FFFFFF", guide: "#C9C5E8" };
 
 function normalizedThemeHex(value, fallback) {
   const match = typeof value === "string" ? value.trim().match(/^#?([0-9a-f]{6})$/i) : null;
@@ -113,14 +113,13 @@ async function readPersistedTheme() {
       && normalizedThemeHex(saved.ink, defaultTheme.ink) === withdrawnDefaultTheme.ink
       && normalizedThemeHex(saved.disc, defaultTheme.disc) === withdrawnDefaultTheme.disc
       && normalizedThemeHex(saved.guide, defaultTheme.guide) === withdrawnDefaultTheme.guide;
-    if (legacyDefault || withdrawnDefault) return { ...defaultTheme, light: saved.light === true || saved.monochrome === true };
+    if (legacyDefault || withdrawnDefault) return { ...defaultTheme };
     return {
       overall: normalizedThemeHex(saved.overall, defaultTheme.overall),
       accent: normalizedThemeHex(saved.accent, defaultTheme.accent),
       ink: normalizedThemeHex(saved.ink, defaultTheme.ink),
       disc: normalizedThemeHex(saved.disc, defaultTheme.disc),
       guide: normalizedThemeHex(saved.guide, defaultTheme.guide),
-      light: saved.light === true || saved.monochrome === true,
     };
   } catch {
     return defaultTheme;

@@ -29,7 +29,7 @@ from math import ceil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Literal
+from typing import Annotated, Literal, Union
 try:
     from .benchmark_lease import HIRES_ARTIFACT_PURPOSE, validate_lease
     from .hires_artifacts import NULL_CAPTURE, StageArtifactCapture, canonical_parameter_digest, capture_gate, prompt_facts
@@ -199,14 +199,14 @@ try:
     )
     from .anima_pipeline import ANIMA_PIXEL_ALIGNMENT, load_anima_runtime
     from .anima_sampling import ANIMA_SAMPLERS, ANIMA_SCHEDULERS, anima_sampling_diagnostics
-    from .flux_pipeline import FLUX_MAX_EDGE, flux_component_bytes, load_flux_runtime
+    from .flux_pipeline import FLUX_MAX_EDGE, FLUX_PIXEL_ALIGNMENT, flux_component_bytes, load_flux_runtime
     from .flux_sampling import (
         FLUX_SAMPLERS,
         FLUX_SCHEDULERS,
         flux_resolution_shift,
         flux_sampling_diagnostics,
     )
-    from .flux2_pipeline import FLUX2_MAX_EDGE, flux2_component_bytes, load_flux2_runtime
+    from .flux2_pipeline import FLUX2_MAX_EDGE, FLUX2_PIXEL_ALIGNMENT, flux2_component_bytes, load_flux2_runtime
     from .flux2_sampling import (
         FLUX2_SAMPLERS,
         FLUX2_SCHEDULERS,
@@ -231,6 +231,7 @@ try:
         error_looks_like_oom,
         estimate_inference_bytes,
         estimate_largest_component_bytes,
+        estimate_vae_decode_bytes,
         normalize_memory_mode,
         reserved_vram_bytes,
         effective_vram_limit_bytes,
@@ -265,6 +266,7 @@ try:
     from . import rtx_vsr
     from .performance_settings import (
         file_sha256,
+        disable_sequential_batch_forward,
         enable_sequential_batch_forward,
         memory_mode_for_family,
         nvfp4_capabilities,
@@ -273,7 +275,16 @@ try:
         write_performance_settings,
     )
     from .pipeline_configs import PIPELINE_CONFIG_REPOSITORIES, find_pipeline_config, require_pipeline_config
-    from .upscaler import resolve_model as resolve_upscaler_model, status as upscaler_status, target_size as hires_target_size, upscale_image
+    from .console_noise import mark_long_prompts_handled, quiet_lora_loading, quiet_pipeline_loading
+    from .residency import (
+        RESIDENCY_TIER_MEMORY_MODES,
+        RESIDENCY_TIER_OFFLOAD_MODES,
+        ResidencyController,
+        remove_group_offload,
+        tier_for_memory_mode,
+    )
+    from .resize import DEFAULT_RESIZE_METHOD, RESIZE_METHODS, align_size, resize_image, scaled_size
+    from .upscaler import resolve_model as resolve_upscaler_model, status as upscaler_status, upscale_image
     from .usdu_tiles import TileCompositor, plan_tiles, prepare_tile
 except ImportError:
     from adetailer import (
@@ -286,14 +297,14 @@ except ImportError:
     )
     from anima_pipeline import ANIMA_PIXEL_ALIGNMENT, load_anima_runtime
     from anima_sampling import ANIMA_SAMPLERS, ANIMA_SCHEDULERS, anima_sampling_diagnostics
-    from flux_pipeline import FLUX_MAX_EDGE, flux_component_bytes, load_flux_runtime
+    from flux_pipeline import FLUX_MAX_EDGE, FLUX_PIXEL_ALIGNMENT, flux_component_bytes, load_flux_runtime
     from flux_sampling import (
         FLUX_SAMPLERS,
         FLUX_SCHEDULERS,
         flux_resolution_shift,
         flux_sampling_diagnostics,
     )
-    from flux2_pipeline import FLUX2_MAX_EDGE, flux2_component_bytes, load_flux2_runtime
+    from flux2_pipeline import FLUX2_MAX_EDGE, FLUX2_PIXEL_ALIGNMENT, flux2_component_bytes, load_flux2_runtime
     from flux2_sampling import (
         FLUX2_SAMPLERS,
         FLUX2_SCHEDULERS,
@@ -318,6 +329,7 @@ except ImportError:
         error_looks_like_oom,
         estimate_inference_bytes,
         estimate_largest_component_bytes,
+        estimate_vae_decode_bytes,
         normalize_memory_mode,
         reserved_vram_bytes,
         effective_vram_limit_bytes,
@@ -352,6 +364,7 @@ except ImportError:
     import rtx_vsr
     from performance_settings import (
         file_sha256,
+        disable_sequential_batch_forward,
         enable_sequential_batch_forward,
         memory_mode_for_family,
         nvfp4_capabilities,
@@ -360,7 +373,16 @@ except ImportError:
         write_performance_settings,
     )
     from pipeline_configs import PIPELINE_CONFIG_REPOSITORIES, find_pipeline_config, require_pipeline_config
-    from upscaler import resolve_model as resolve_upscaler_model, status as upscaler_status, target_size as hires_target_size, upscale_image
+    from console_noise import mark_long_prompts_handled, quiet_lora_loading, quiet_pipeline_loading
+    from residency import (
+        RESIDENCY_TIER_MEMORY_MODES,
+        RESIDENCY_TIER_OFFLOAD_MODES,
+        ResidencyController,
+        remove_group_offload,
+        tier_for_memory_mode,
+    )
+    from resize import DEFAULT_RESIZE_METHOD, RESIZE_METHODS, align_size, resize_image, scaled_size
+    from upscaler import resolve_model as resolve_upscaler_model, status as upscaler_status, upscale_image
     from usdu_tiles import TileCompositor, plan_tiles, prepare_tile
 
 
@@ -526,6 +548,28 @@ USDU_TILED_FAMILIES = frozenset({"anima", "krea2"})
 # multiple of 8 lands off Anima's 32 for most paddings, and off Krea 2's 16 for many of them.
 USDU_PIXEL_ALIGNMENT = {"anima": ANIMA_PIXEL_ALIGNMENT, "krea2": KREA2_PIXEL_ALIGNMENT}
 
+# What each engine's latent grid accepts as a redraw canvas. A resample unit's target is exact --
+# `round(edge x scale)` and nothing else -- but the canvas handed to a diffusion redraw is not free:
+# every runtime here rejects a size its VAE and patch embedding cannot divide. So the target is the
+# number the chain reports and this is the number the redraw runs at, and a unit records both
+# whenever they differ rather than quietly presenting one as the other.
+ENGINE_PIXEL_ALIGNMENT = {
+    "sd": 8,
+    "anima": ANIMA_PIXEL_ALIGNMENT,
+    "flux": FLUX_PIXEL_ALIGNMENT,
+    "flux2": FLUX2_PIXEL_ALIGNMENT,
+    "krea2": KREA2_PIXEL_ALIGNMENT,
+}
+# The edge each engine refuses a refinement past, by family rather than by engine name so the walk
+# that validates a chain and the stage that executes it consult one table.
+ENGINE_MAX_REFINEMENT_EDGE = {
+    "sd": rtx_vsr.MAX_OUTPUT_EDGE,
+    "anima": NATIVE_MAX_REFINEMENT_EDGE,
+    "flux": FLUX_MAX_EDGE,
+    "flux2": FLUX2_MAX_EDGE,
+    "krea2": KREA2_MAX_EDGE,
+}
+
 
 def supports_usdu_tiled(family):
     return family in USDU_TILED_FAMILIES
@@ -533,6 +577,24 @@ def supports_usdu_tiled(family):
 
 def usdu_pixel_alignment(family):
     return USDU_PIXEL_ALIGNMENT[family]
+
+
+def engine_pixel_alignment(family):
+    return ENGINE_PIXEL_ALIGNMENT.get(family, ENGINE_PIXEL_ALIGNMENT["sd"])
+
+
+def engine_max_refinement_edge(family):
+    return ENGINE_MAX_REFINEMENT_EDGE.get(family, ENGINE_MAX_REFINEMENT_EDGE["sd"])
+
+
+def redraw_canvas_size(size, family):
+    """The canvas an engine will actually sample, for a unit target of `size`."""
+    return align_size(size, engine_pixel_alignment(family))
+
+
+def request_family(engine: str):
+    """The runtime family an engine name maps to. SD and iL share the Diffusers path."""
+    return NATIVE_FAMILY_BY_ENGINE.get(engine, "sd")
 
 
 # One worker, so submitting several jobs queues them rather than running them together: a second
@@ -559,6 +621,11 @@ loaded_engine = None
 loaded_model_assets = {}
 loaded_model_revisions = {}
 active_memory_strategy = None
+# Owns where the diffusion model lives for the loaded Diffusers pipeline, and the only thing allowed
+# to install an offload mechanism on it. None for the native engines, which schedule their own.
+active_residency = None
+# The job the controller's moves are announced on. The controller outlives jobs; this does not.
+residency_job_id = None
 active_attention_backend = "none"
 active_compute_dtype = "none"
 active_vae_mode = "none"
@@ -641,7 +708,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="XiriaCanvas AI Inference", docs_url=None, redoc_url=None, lifespan=lifespan)
-INFERENCE_PROTOCOL = 35
+INFERENCE_PROTOCOL = 36
 WORKSPACE_ID = os.environ.get("INFERENCE_WORKSPACE_ID")
 
 
@@ -802,6 +869,7 @@ class ADetailerInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["adetailer"] = "adetailer"
     enabled: bool = False
     units: list[ADetailerUnitInput] = Field(default_factory=list, max_length=ADETAILER_UNIT_LIMIT)
 
@@ -826,22 +894,48 @@ class ADetailerInput(BaseModel):
         return list(self.units) if self.enabled else []
 
 
-class HiresInput(BaseModel):
+RESAMPLE_UNIT_LIMIT = 8
+
+
+class ResampleUnitInput(BaseModel):
+    """One pass of the resample chain: upscale, resize, redraw — each part optional.
+
+    This is what the single Hires.fix block became. The fields it carried all survive with their
+    meanings intact; what changed is that none of the three parts is mandatory any more, so one
+    model describes the whole behaviour matrix:
+
+    - an upscaler with a scale above 1 and a denoise above 0 is the second pass as it always was;
+    - `upscaler = None` drops the model and resizes algorithmically, which is an image resize;
+    - `denoise = 0` drops the redraw, which is a pure enlargement;
+    - `scale = 1` keeps the size and redraws, which is a detail pass.
+
+    `steps`, `cfg`, `sampler` and `scheduler` are `None` by default and inherit the request's own,
+    so a unit added without being configured runs the settings the picture was sampled with rather
+    than a second set of defaults nobody chose.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["resample"] = "resample"
     enabled: bool = False
-    model: str = Field(default="", max_length=500)
-    mode: Literal["inherit", "fixed", "random"] = "inherit"
-    seed: str | None = None
+    name: str = Field(default="", max_length=80)
+    # `None` is "no model, resize only" and is the default: a unit is useful without one, and an
+    # empty string would be indistinguishable from a model that has not been chosen yet.
+    upscaler: str | None = Field(default=None, max_length=500)
     scale: float = Field(default=1.0, ge=1, le=4)
-    denoise: float = Field(default=0.35, gt=0, le=1)
-    steps: int = Field(default=20, ge=1, le=100)
-    cfg: float = Field(default=7, ge=0, le=30)
+    resize_algorithm: Literal["nearest-exact", "bilinear", "area", "bicubic", "lanczos"] = "lanczos"
+    # Zero is a real value here, not a disabled unit: it is what asks for the enlargement without
+    # the redraw. The old field refused it because a Hires pass that did not redraw was a no-op.
+    denoise: float = Field(default=0.35, ge=0, le=1)
+    steps: int | None = Field(default=None, ge=1, le=100)
+    cfg: float | None = Field(default=None, ge=0, le=30)
+    sampler: str | None = None
+    scheduler: str | None = None
+    seed_mode: Literal["inherit", "fixed", "random"] = "inherit"
+    seed: str | None = None
     tile_size: int = Field(default=192, ge=32, le=2048)
     tile_overlap: int = Field(default=16, ge=0, le=512)
     execution_mode: Literal["full_frame", "usdu_tiled"] = "full_frame"
-    sampler: str | None = None
-    scheduler: str | None = None
     tile_width: Literal["auto"] = "auto"
     tile_height: Literal["auto"] = "auto"
     padding: int = Field(default=32, ge=0, le=256)
@@ -849,6 +943,10 @@ class HiresInput(BaseModel):
     seam_mode: Literal["none"] = "none"
     uniform_tiles: bool = True
     tiled_decode: bool = True
+    # The engine rounds the redraw canvas to its own grid, so a unit can finish a few pixels off the
+    # size it asked for. Off by default, which is ComfyUI's behaviour — its VAE encode truncates to
+    # the same kind of grid and nothing resizes the result back.
+    exact_output: bool = False
 
     @field_validator("seed", mode="before")
     @classmethod
@@ -856,10 +954,10 @@ class HiresInput(BaseModel):
         if value is None:
             return None
         if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
-            raise ValueError("Hires.fix seed must be an unsigned 64-bit decimal string")
+            raise ValueError("Resample seed must be an unsigned 64-bit decimal string")
         parsed = int(value, 10)
         if parsed > 0xFFFFFFFFFFFFFFFF:
-            raise ValueError("Hires.fix seed must not exceed 18446744073709551615")
+            raise ValueError("Resample seed must not exceed 18446744073709551615")
         return str(parsed)
 
     @field_validator("scale")
@@ -870,21 +968,33 @@ class HiresInput(BaseModel):
     @model_validator(mode="after")
     def validate_configuration(self):
         if not math.isfinite(self.scale):
-            raise ValueError("Hires.fix scale must be finite")
-        if self.enabled and not self.model:
-            raise ValueError("Hires.fix upscaler model is required when enabled")
+            raise ValueError("Resample scale must be finite")
         if self.enabled and self.tile_overlap > self.tile_size // 2:
-            raise ValueError("Hires.fix tile overlap cannot exceed half the tile size")
+            raise ValueError("Resample tile overlap cannot exceed half the tile size")
         if self.execution_mode == "usdu_tiled" and (not self.uniform_tiles or not self.tiled_decode):
-            raise ValueError("USDU tiled Hires requires uniform_tiles and tiled_decode")
-        if self.mode == "fixed" and self.seed is None:
-            raise ValueError("Hires.fix fixed seed mode requires seed")
-        if self.mode != "fixed" and self.seed is not None:
-            raise ValueError("Hires.fix seed is only valid in fixed seed mode")
+            raise ValueError("USDU tiled resampling requires uniform_tiles and tiled_decode")
+        if self.seed_mode == "fixed" and self.seed is None:
+            raise ValueError("Resample fixed seed mode requires seed")
+        if self.seed_mode != "fixed" and self.seed is not None:
+            raise ValueError("Resample seed is only valid in fixed seed mode")
+        # A unit that neither enlarges nor redraws would consume a chain slot, a progress band and a
+        # preview to hand back the picture it was given.
+        if self.enabled and self.scale == 1.0 and self.denoise == 0:
+            raise ValueError("A resample unit at scale 1.0 with denoise 0 would do nothing")
         return self
 
+    @property
+    def redraws(self) -> bool:
+        return self.enabled and self.denoise > 0
 
-DIFFUSERS_HIRES_SAMPLERS = frozenset({
+    def resolved_steps(self, request_steps: int) -> int:
+        return request_steps if self.steps is None else self.steps
+
+    def resolved_cfg(self, request_cfg: float) -> float:
+        return request_cfg if self.cfg is None else self.cfg
+
+
+DIFFUSERS_RESAMPLE_SAMPLERS = frozenset({
     "euler", "euler_cfg_pp", "euler_ancestral", "euler_ancestral_cfg_pp", "heun", "heunpp2",
     "exp_heun_2_x0", "exp_heun_2_x0_sde", "dpm_2", "dpm_2_ancestral", "lms", "dpm_fast",
     "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_2s_ancestral_cfg_pp", "dpmpp_sde", "dpmpp_sde_gpu",
@@ -894,25 +1004,34 @@ DIFFUSERS_HIRES_SAMPLERS = frozenset({
     "res_multistep_ancestral_cfg_pp", "gradient_estimation", "gradient_estimation_cfg_pp", "er_sde",
     "seeds_2", "seeds_3", "sa_solver", "sa_solver_pece", "ddim", "uni_pc", "uni_pc_bh2",
 })
-DIFFUSERS_HIRES_SCHEDULERS = frozenset({
+DIFFUSERS_RESAMPLE_SCHEDULERS = frozenset({
     "simple", "sgm_uniform", "karras", "exponential", "ddim_uniform", "beta", "normal",
     "linear_quadratic", "kl_optimal",
 })
 
 
-def validate_hires_sampling_override(sampler: str | None, scheduler: str | None, family: str):
-    """Validate explicit Hires overrides without constructing a derived pipeline."""
-    samplers, schedulers = (
+def resample_sampling_catalog(family: str):
+    return (
         (ANIMA_SAMPLERS, ANIMA_SCHEDULERS) if family == "anima"
         else (FLUX_SAMPLERS, FLUX_SCHEDULERS) if family == "flux"
         else (FLUX2_SAMPLERS, FLUX2_SCHEDULERS) if family == "flux2"
         else (KREA2_SAMPLERS, KREA2_SCHEDULERS) if family == "krea2"
-        else (DIFFUSERS_HIRES_SAMPLERS, DIFFUSERS_HIRES_SCHEDULERS)
+        else (DIFFUSERS_RESAMPLE_SAMPLERS, DIFFUSERS_RESAMPLE_SCHEDULERS)
     )
+
+
+def validate_resample_sampling_override(sampler: str | None, scheduler: str | None, family: str, unit_index: int | None = None):
+    """Validate one unit's explicit overrides without constructing a derived pipeline.
+
+    `unit_index` is 1-based and names the card in the chain: with several units, "unsupported
+    sampler" alone leaves the user to find which one they set it on.
+    """
+    samplers, schedulers = resample_sampling_catalog(family)
+    where = f" in resample unit {unit_index}" if unit_index else ""
     if sampler is not None and sampler not in samplers:
-        raise ValueError(f"Unsupported Hires sampler: {sampler}")
+        raise ValueError(f"Unsupported resample sampler{where}: {sampler}")
     if scheduler is not None and scheduler not in schedulers:
-        raise ValueError(f"Unsupported Hires scheduler: {scheduler}")
+        raise ValueError(f"Unsupported resample scheduler{where}: {scheduler}")
 
 
 def serializable_runtime_metrics(value):
@@ -947,6 +1066,7 @@ class SourceImageInput(BaseModel):
 class RtxInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["rtx"] = "rtx"
     enabled: bool = False
     scale: float = Field(default=2.0, ge=1, le=4)
     quality: Literal["low", "medium", "high", "ultra"] = "ultra"
@@ -959,8 +1079,21 @@ class RtxInput(BaseModel):
         return round(value, 2)
 
 
-PostprocessStage = Literal["hires", "adetailer", "rtx"]
-POSTPROCESS_STAGE_IDS = ("hires", "adetailer", "rtx")
+# One entry of the chain. The type is the discriminator and the payload is inline rather than
+# nested under a `settings` key: the three stage shapes have no field in common to confuse, and a
+# flat entry is what both the workspace record and the PNG parameter block store.
+StageInstance = Annotated[
+    Union[ResampleUnitInput, ADetailerInput, RtxInput],
+    Field(discriminator="type"),
+]
+POSTPROCESS_STAGE_TYPES = ("resample", "adetailer", "rtx")
+# Eight resample units, plus at most one ADetailer stage and one RTX stage.
+POSTPROCESS_CHAIN_LIMIT = RESAMPLE_UNIT_LIMIT + 2
+# What a chain without that stage reads as. Both stages are single-instance, so a request that omits
+# one is asking for it switched off, and the code that reads their settings should not have to ask
+# whether the entry exists before asking whether it is enabled.
+ABSENT_ADETAILER_STAGE = ADetailerInput()
+ABSENT_RTX_STAGE = RtxInput()
 # The sampler's canvas: a latent grid, so 64-aligned, and capped where the memory policy was
 # measured. Post-processing has no latent grid of its own — every stage works on pixels it is
 # handed — so a post-processing run is bounded by the RTX safety envelope instead and keeps the
@@ -1108,21 +1241,59 @@ class GenerateInput(BaseModel):
     # read — model, LoRAs, prompt, sampler, seed — is still the mounted configuration, which is why
     # this is a flag on the ordinary request rather than an endpoint of its own.
     postprocess_only: bool = False
-    hires: HiresInput = Field(default_factory=HiresInput)
-    adetailer: ADetailerInput = Field(default_factory=ADetailerInput)
-    rtx: RtxInput = Field(default_factory=RtxInput)
-    postprocess_order: list[PostprocessStage] = Field(
-        default_factory=lambda: list(POSTPROCESS_STAGE_IDS), min_length=3, max_length=3
-    )
+    # The post-processing chain: stage instances in execution order. It replaces the three fixed
+    # blocks and the separate order list, because with a variable number of resample units the two
+    # could no longer describe the same thing — an order of stage *names* cannot say which of four
+    # resample units runs third.
+    postprocess_chain: list[StageInstance] = Field(default_factory=list, max_length=POSTPROCESS_CHAIN_LIMIT)
     loras: list[LoraInput] = Field(default_factory=list, max_length=16)
     # This client-only snapshot never affects inference. It is retained with the job so a completed
     # task reopened after a browser refresh can still be saved to the gallery with exact settings.
     gallery_settings: dict[str, object] | None = None
 
+    # ADetailer and RTX stay single-instance, so naming one is unambiguous and the code that reads
+    # their settings is unchanged by the chain. A resample unit has no such accessor on purpose:
+    # there are up to eight of them and the question "which one" always has to be answered.
+    @property
+    def adetailer(self) -> ADetailerInput:
+        return next((stage for stage in self.postprocess_chain if stage.type == "adetailer"), ABSENT_ADETAILER_STAGE)
+
+    @property
+    def rtx(self) -> RtxInput:
+        return next((stage for stage in self.postprocess_chain if stage.type == "rtx"), ABSENT_RTX_STAGE)
+
+    @property
+    def resample_units(self) -> list[ResampleUnitInput]:
+        return [stage for stage in self.postprocess_chain if stage.type == "resample"]
+
+    @property
+    def active_resample_units(self) -> list[ResampleUnitInput]:
+        return [unit for unit in self.resample_units if unit.enabled]
+
+    def resample_unit_number(self, unit: ResampleUnitInput) -> int:
+        """Which resample card this is, 1-based — the number the user sees, not the chain index."""
+        for number, candidate in enumerate(self.resample_units, start=1):
+            if candidate is unit:
+                return number
+        return 0
+
     @field_validator("gallery_settings")
     @classmethod
     def validate_gallery_settings(cls, value):
         return validated_gallery_settings_payload(value)
+
+    @model_validator(mode="after")
+    def validate_chain_shape(self):
+        counts = {name: 0 for name in POSTPROCESS_STAGE_TYPES}
+        for stage in self.postprocess_chain:
+            counts[stage.type] += 1
+        if counts["resample"] > RESAMPLE_UNIT_LIMIT:
+            raise ValueError(f"The resample chain accepts at most {RESAMPLE_UNIT_LIMIT} units")
+        if counts["adetailer"] > 1:
+            raise ValueError("The chain accepts at most one ADetailer stage")
+        if counts["rtx"] > 1:
+            raise ValueError("The chain accepts at most one RTX VSR stage")
+        return self
 
     @model_validator(mode="after")
     def validate_dimensions(self):
@@ -1147,7 +1318,7 @@ class GenerateInput(BaseModel):
         if not self.source_image.enabled:
             raise ValueError("Post-processing mode requires a source image")
         if not postprocessing_stages(self):
-            raise ValueError("Post-processing mode requires at least one of Hires.fix, ADetailer, or RTX VSR")
+            raise ValueError("Post-processing mode requires at least one enabled resample, ADetailer, or RTX VSR stage")
         return self
 
     @model_validator(mode="after")
@@ -1155,8 +1326,6 @@ class GenerateInput(BaseModel):
         cleaned_prompt, directives = parse_prompt_directives(self.prompt)
         if directives["transparent_background"] and not cleaned_prompt:
             raise ValueError("透明背景特殊标签之外还需要填写主体提示词")
-        if tuple(sorted(self.postprocess_order)) != tuple(sorted(POSTPROCESS_STAGE_IDS)):
-            raise ValueError("Post-processing order must contain Hires.fix, ADetailer, and RTX VSR exactly once")
         # `denoise` is the image-to-image strength. Text-to-image has always ignored it, so it is
         # only now that zero becomes a contradiction rather than a no-op: it would ask the sampler
         # to change nothing at all.
@@ -1170,10 +1339,6 @@ class GenerateInput(BaseModel):
                 raise ValueError("SD / iL forbids diffusion_model, text_encoder, text_encoder_2, and vae")
             if self.guidance == "cfg_zero_star":
                 raise ValueError("CFG-Zero* 仅适用于 Flow Matching 模型；当前 SD / iL 不兼容")
-            if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is supported only by Anima and Krea2")
-            if self.hires.sampler is not None or self.hires.scheduler is not None:
-                validate_hires_sampling_override(self.hires.sampler, self.hires.scheduler, "sd")
         elif self.engine == "Anima":
             if self.checkpoint is not None:
                 raise ValueError("Anima forbids checkpoint; use diffusion_model, text_encoder, and vae")
@@ -1185,10 +1350,6 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Anima sampler: {self.sampler}")
             if self.scheduler not in ANIMA_SCHEDULERS:
                 raise ValueError(f"Unsupported Anima scheduler: {self.scheduler}")
-            if self.hires.sampler is not None and self.hires.sampler not in ANIMA_SAMPLERS:
-                raise ValueError(f"Unsupported Anima Hires sampler: {self.hires.sampler}")
-            if self.hires.scheduler is not None and self.hires.scheduler not in ANIMA_SCHEDULERS:
-                raise ValueError(f"Unsupported Anima Hires scheduler: {self.hires.scheduler}")
         elif self.engine == "Flux":
             if self.checkpoint is not None:
                 raise ValueError("Flux forbids checkpoint; use diffusion_model, text_encoder, text_encoder_2, and vae")
@@ -1200,12 +1361,6 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Flux sampler: {self.sampler}")
             if self.scheduler not in FLUX_SCHEDULERS:
                 raise ValueError(f"Unsupported Flux scheduler: {self.scheduler}")
-            if self.hires.sampler is not None and self.hires.sampler not in FLUX_SAMPLERS:
-                raise ValueError(f"Unsupported Flux Hires sampler: {self.hires.sampler}")
-            if self.hires.scheduler is not None and self.hires.scheduler not in FLUX_SCHEDULERS:
-                raise ValueError(f"Unsupported Flux Hires scheduler: {self.hires.scheduler}")
-            if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is supported only by Anima and Krea2")
             # FLUX.1 is guidance distilled: one forward per step, steered by a scalar baked into the
             # timestep embedding. There is no unconditional branch, so a negative prompt would be
             # silently discarded and PAG / CFG-Zero* have nothing to perturb.
@@ -1230,12 +1385,6 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Flux2 sampler: {self.sampler}")
             if self.scheduler not in FLUX2_SCHEDULERS:
                 raise ValueError(f"Unsupported Flux2 scheduler: {self.scheduler}")
-            if self.hires.sampler is not None and self.hires.sampler not in FLUX2_SAMPLERS:
-                raise ValueError(f"Unsupported Flux2 Hires sampler: {self.hires.sampler}")
-            if self.hires.scheduler is not None and self.hires.scheduler not in FLUX2_SCHEDULERS:
-                raise ValueError(f"Unsupported Flux2 Hires scheduler: {self.hires.scheduler}")
-            if self.hires.execution_mode == "usdu_tiled":
-                raise ValueError("USDU tiled Hires is supported only by Anima and Krea2")
             # FLUX.2 is guidance distilled for the same reason FLUX.1 is, and refuses the same
             # three settings rather than encoding them and throwing the result away.
             if self.guidance != "none":
@@ -1256,34 +1405,41 @@ class GenerateInput(BaseModel):
                 raise ValueError(f"Unsupported Krea2 sampler: {self.sampler}")
             if self.scheduler not in KREA2_SCHEDULERS:
                 raise ValueError(f"Unsupported Krea2 scheduler: {self.scheduler}")
-            if self.hires.sampler is not None and self.hires.sampler not in KREA2_SAMPLERS:
-                raise ValueError(f"Unsupported Krea2 Hires sampler: {self.hires.sampler}")
-            if self.hires.scheduler is not None and self.hires.scheduler not in KREA2_SCHEDULERS:
-                raise ValueError(f"Unsupported Krea2 Hires scheduler: {self.hires.scheduler}")
             # Unlike the Flux engines, Krea 2 has a real unconditional branch, so the negative
             # prompt and CFG-Zero* both work. PAG does not: it needs an identity-self-attention
             # override of the transformer's own blocks, which this runtime does not install.
             if self.guidance == "pag":
                 raise ValueError("Krea2 does not support PAG; select None or CFG-Zero*")
-        current_size = (self.width, self.height)
-        for stage in self.postprocess_order:
-            enabled = getattr(self, stage).enabled
-            if not enabled:
+        family = request_family(self.engine)
+        distilled = self.engine in DISTILLED_GUIDANCE_ENGINES
+        for number, unit in enumerate(self.resample_units, start=1):
+            if not unit.enabled:
                 continue
-            if stage == "hires":
-                current_size = tuple(max(64, math.ceil(value * self.hires.scale / 64) * 64) for value in current_size)
-            elif stage == "rtx":
-                current_size = rtx_vsr.target_size(current_size, self.rtx.scale)
-            if self.engine == "Anima" and stage == "hires" and max(current_size) > 4096:
-                raise ValueError("Anima native refinement dimensions cannot exceed 4096")
-            if self.engine == "Flux" and stage == "hires" and max(current_size) > FLUX_MAX_EDGE:
-                raise ValueError(f"Flux native refinement dimensions cannot exceed {FLUX_MAX_EDGE}")
-            if self.engine == "Flux2" and stage == "hires" and max(current_size) > FLUX2_MAX_EDGE:
-                raise ValueError(f"Flux2 native refinement dimensions cannot exceed {FLUX2_MAX_EDGE}")
-            if self.engine == "Krea2" and stage == "hires" and max(current_size) > KREA2_MAX_EDGE:
-                raise ValueError(f"Krea2 native refinement dimensions cannot exceed {KREA2_MAX_EDGE}")
-            if self.rtx.enabled and (max(current_size) > rtx_vsr.MAX_OUTPUT_EDGE or current_size[0] * current_size[1] > rtx_vsr.MAX_OUTPUT_PIXELS):
-                raise ValueError("Post-processing output exceeds the safe 8192-edge / 32-megapixel limit")
+            validate_resample_sampling_override(unit.sampler, unit.scheduler, family, number)
+            if unit.execution_mode == "usdu_tiled" and not supports_usdu_tiled(family):
+                raise ValueError(f"USDU tiled resampling in resample unit {number} is supported only by Anima and Krea2")
+            # A model-less unit is a plain resize and never reaches a sampler, so the settings that
+            # only a redraw can honour are refused rather than silently ignored.
+            if not unit.redraws and (unit.sampler is not None or unit.scheduler is not None):
+                raise ValueError(f"Resample unit {number} sets a sampler but does not redraw (denoise is 0)")
+            if not unit.redraws and unit.execution_mode == "usdu_tiled":
+                raise ValueError(f"Resample unit {number} asks for USDU tiling but does not redraw (denoise is 0)")
+            if distilled and unit.redraws and self.negative_prompt:
+                raise ValueError(f"{self.engine} has no unconditional branch; resample unit {number} cannot carry a negative prompt")
+        # Walk the chain the way the run will, accumulating sizes. `plan` is the same computation the
+        # stage itself performs, so a chain accepted here is one the engines can actually execute.
+        for entry in resample_chain_plan(self):
+            if entry["type"] == "resample":
+                number = entry["unit_number"]
+                if max(entry["redraw_size"]) > engine_max_refinement_edge(family) and entry["redraws"]:
+                    raise ValueError(
+                        f"Resample unit {number} reaches {entry['redraw_size'][0]}x{entry['redraw_size'][1]}, "
+                        f"past the {self.engine} refinement limit of {engine_max_refinement_edge(family)}"
+                    )
+            size = entry["output_size"]
+            if max(size) > MAX_POSTPROCESS_SOURCE_EDGE or size[0] * size[1] > MAX_POSTPROCESS_SOURCE_PIXELS:
+                where = f"Resample unit {entry['unit_number']}" if entry["type"] == "resample" else f"The {entry['type']} stage"
+                raise ValueError(f"{where} exceeds the safe 8192-edge / 32-megapixel limit")
         return self
 
 
@@ -2057,7 +2213,7 @@ def history_file_record(path: Path):
         "hires_seed": str(parameters["hires_seed"]) if parameters.get("hires_seed") is not None else None,
         "transparent_background": isinstance(parameters.get("transparent_background"), dict),
         "background_removal": parameters.get("transparent_background") if isinstance(parameters.get("transparent_background"), dict) else None,
-        "postprocess_order": parameters.get("postprocess_order") if isinstance(parameters.get("postprocess_order"), list) else None,
+        "postprocess_chain": parameters.get("postprocess_chain") if isinstance(parameters.get("postprocess_chain"), list) else None,
         "rtx": parameters.get("rtx") if isinstance(parameters.get("rtx"), dict) else None,
         "manual_layout": parameters.get("manual_layout") if isinstance(parameters.get("manual_layout"), dict) else None,
         "mime_type": "image/gif" if path.suffix.lower() == ".gif" else "image/png",
@@ -3111,6 +3267,7 @@ def clear_pipeline():
     global loaded_pipeline, pipeline_cpu_parked, loaded_checkpoint, loaded_checkpoint_hash, loaded_family, loaded_engine
     global loaded_model_assets, loaded_model_revisions
     global active_memory_strategy, active_attention_backend, active_compute_dtype, active_vae_mode
+    global active_residency
     released = loaded_pipeline is not None
     if loaded_pipeline is not None:
         if is_native_family(loaded_family):
@@ -3123,11 +3280,16 @@ def clear_pipeline():
         except Exception:
             pass
         try:
+            remove_group_offload(getattr(loaded_pipeline, "unet", None))
+        except Exception:
+            pass
+        try:
             loaded_pipeline.remove_all_hooks()
         except Exception:
             pass
         del loaded_pipeline
     loaded_pipeline = None
+    active_residency = None
     pipeline_cpu_parked = False
     loaded_checkpoint = None
     loaded_checkpoint_hash = None
@@ -3219,6 +3381,43 @@ def configure_cuda_memory_limit():
         return None
 
 
+MEMORY_MODE_LABELS = {
+    "high_vram": "HIGH_VRAM 高速常驻",
+    "normal_vram": "NORMAL_VRAM 智能调度",
+    "low_vram": "LOW_VRAM 低显存",
+    "ultra_low_vram": "ULTRA_LOW 极限省存",
+}
+MEMORY_OFFLOAD_MODES = {
+    "high_vram": "none",
+    "normal_vram": "model",
+    "low_vram": "sequential",
+    "ultra_low_vram": "sequential_cfg_split",
+}
+# The next-heavier rung, for a Diffusers pass that runs out of memory after admission let it start.
+SD_OFFLOAD_ESCALATION = {"high_vram": "normal_vram", "normal_vram": "low_vram", "low_vram": "ultra_low_vram"}
+# The Diffusers families whose UNet admission is resident-first and whose CFG branches may be run
+# one after another. The native engines reach `select_memory_policy` through their own loaders and
+# keep the workspace-upfront rule, which is what their staged runtimes are written against.
+SD_COMPONENT_FAMILIES = frozenset({"sd", "sdxl"})
+# ComfyUI batches a CFG step only when the batched activation peak clears free memory by half again
+# (`comfy/samplers.py::_calc_cond_batch`), and otherwise runs the branches one at a time. The margin
+# is the same here; what differs is that this is settled once for the job rather than at every step,
+# so a fixed seed keeps producing the same picture.
+CFG_BATCH_FREE_MEMORY_MARGIN = 1.5
+
+
+def serial_cfg_eligible(family: str, guidance: str) -> bool:
+    """Whether this job's CFG branches may be split into one forward each.
+
+    Splitting is only ever a re-ordering of the same arithmetic, but it is the *batch* that PAG
+    reads: `PAGCFGIdentitySelfAttnProcessor2_0` chunks `hidden_states` into three along dim 0 inside
+    the UNet, so a batch of one reaches it as a batch it cannot divide. Plain CFG carries no such
+    structure — Diffusers concatenates `[negative, positive]` and chunks the *result* outside the
+    UNet — so that is the one guidance mode this applies to.
+    """
+    return family in SD_COMPONENT_FAMILIES and guidance == "none"
+
+
 def choose_memory_strategy(
     checkpoint: Path,
     family: str,
@@ -3231,6 +3430,8 @@ def choose_memory_strategy(
     include_loaded_model=False,
     base_weight_bytes=None,
     base_largest_component_bytes=None,
+    resident_first=False,
+    cfg_serial_eligible=False,
 ):
     free_bytes, physical_total_bytes, limit_bytes = effective_cuda_free_memory()
     fixed_vram_wall = performance_settings.get("vram_limit_gb", 0.0) > 0
@@ -3255,9 +3456,27 @@ def choose_memory_strategy(
         reserved_bytes = 0
     # This is a physical peak: callers with sequential logical guidance may
     # explicitly budget one physical forward without changing SD/iL behavior.
-    physical_forward_copies = max(1, int(guidance_copies if guidance_copies is not None else 2 if guidance_scale > 1 else 1))
-    inference_bytes = estimate_inference_bytes(
-        family, width, height, guidance_scale, images_per_batch, guidance_copies
+    logical_guidance_copies = max(1, int(guidance_copies if guidance_copies is not None else 2 if guidance_scale > 1 else 1))
+    physical_forward_copies = logical_guidance_copies
+    batched_inference_bytes = estimate_inference_bytes(
+        family, width, height, guidance_scale, images_per_batch, logical_guidance_copies
+    )
+    # ComfyUI's rule, measured against the memory a resident component leaves behind rather than
+    # against the bare card: `_calc_cond_batch` asks its question after the model is loaded, so the
+    # comparable headroom here is what survives the largest component and the platform reserve.
+    cfg_batch_headroom_bytes = max(0, free_bytes - largest_component_bytes - reserved_bytes)
+    cfg_serial_applies = bool(
+        cfg_serial_eligible
+        and logical_guidance_copies > 1
+        and batched_inference_bytes * CFG_BATCH_FREE_MEMORY_MARGIN >= cfg_batch_headroom_bytes
+    )
+    if cfg_serial_applies:
+        physical_forward_copies = 1
+    cfg_mode = "serial" if cfg_serial_applies else "batched"
+    inference_bytes = (
+        estimate_inference_bytes(family, width, height, guidance_scale, images_per_batch, physical_forward_copies)
+        if cfg_serial_applies
+        else batched_inference_bytes
     )
     requested_memory_mode = memory_mode_for_family(performance_settings["memory_mode"], family)
     policy = select_memory_policy(
@@ -3268,12 +3487,20 @@ def choose_memory_strategy(
         inference_bytes=inference_bytes,
         largest_component_bytes=largest_component_bytes,
         reserved_bytes=reserved_bytes,
+        resident_first=resident_first,
     )
     mode = policy["mode"]
     if policy["requested_mode"] != "auto" and mode != policy["requested_mode"]:
+        # Quote what the mode that was actually asked for needs. Quoting HIGH's requirement for a
+        # NORMAL request is what made an 8 GB card report "needs about 11.2 GB" for a job whose
+        # component path wanted 7.8.
+        shortfall_bytes = (
+            policy["high_required_bytes"] if policy["requested_mode"] == "high_vram"
+            else policy["normal_required_bytes"]
+        )
         reason = (
             f"配置请求 {policy['requested_mode'].upper()}，但当前模型与画布需要约 "
-            f"{policy['high_required_bytes'] / GIB:.1f} GB，已安全降级"
+            f"{shortfall_bytes / GIB:.1f} GB，已安全降级"
         )
     elif mode == "high_vram":
         reason = f"自动预算通过：{free_bytes / GIB:.1f} GB 可用，底模完整常驻 GPU"
@@ -3283,14 +3510,13 @@ def choose_memory_strategy(
         reason = "极限省存：逐层卸载、串行 CFG、VAE 分块，并在任务后释放全部模型"
     else:
         reason = f"自动预算：推理至少需要约 {policy['normal_required_bytes'] / GIB:.1f} GB，启用逐层低显存保护"
+    if cfg_serial_applies and mode != "ultra_low_vram":
+        # Say it where the mode is said. Serial CFG is the other half of why this job fits, and a
+        # health report that named only the rung would leave the halved activation peak unexplained.
+        reason += "；CFG 正负分支串行推理，激活峰值减半"
     return {
         **policy,
-        "label": {
-            "high_vram": "HIGH_VRAM 高速常驻",
-            "normal_vram": "NORMAL_VRAM 智能调度",
-            "low_vram": "LOW_VRAM 低显存",
-            "ultra_low_vram": "ULTRA_LOW 极限省存",
-        }[mode],
+        "label": MEMORY_MODE_LABELS[mode],
         "reason": reason,
         "total_gb": round(budget_total_bytes / GIB, 1),
         "physical_total_gb": round(physical_total_bytes / GIB, 1),
@@ -3303,17 +3529,35 @@ def choose_memory_strategy(
         "base_largest_component_bytes": base_largest_component_bytes,
         "free_bytes": free_bytes,
         "inference_bytes": inference_bytes,
+        "logical_guidance_copies": logical_guidance_copies,
         "physical_forward_copies": physical_forward_copies,
+        "cfg_mode": cfg_mode,
+        "cfg_batch": cfg_mode == "batched" and logical_guidance_copies > 1,
+        "cfg_serial_eligible": bool(cfg_serial_eligible),
         "reserved_bytes": reserved_bytes,
         "physical_total_bytes": physical_total_bytes,
         "vram_limit_bytes": limit_bytes,
-        "offload_mode": {
-            "high_vram": "none",
-            "normal_vram": "model",
-            "low_vram": "sequential",
-            "ultra_low_vram": "sequential_cfg_split",
-        }[mode],
+        "offload_mode": MEMORY_OFFLOAD_MODES[mode],
         "model_resident": mode == "high_vram",
+        "admission": {
+            "normal_admission_rule": policy["normal_admission_rule"],
+            "allocator_free_bytes": int(free_bytes),
+            "budget_total_bytes": int(budget_total_bytes),
+            "largest_component_bytes": int(largest_component_bytes),
+            "normal_required_bytes": int(policy["normal_required_bytes"]),
+            "normal_residency_bytes": int(policy["normal_residency_bytes"]),
+            "high_required_bytes": int(policy["high_required_bytes"]),
+            "cfg_mode": cfg_mode,
+            "cfg_batch_headroom_bytes": int(cfg_batch_headroom_bytes),
+            "cfg_batch_margin": CFG_BATCH_FREE_MEMORY_MARGIN,
+            "cfg_batch_inference_bytes": int(batched_inference_bytes),
+            "serial_cfg_inference_bytes": int(inference_bytes) if cfg_serial_applies else None,
+            "logical_guidance_copies": logical_guidance_copies,
+            "physical_forward_copies": physical_forward_copies,
+            "requested_offload_mode": MEMORY_OFFLOAD_MODES[mode],
+            "actual_offload_mode": MEMORY_OFFLOAD_MODES[mode],
+            "fallback": None,
+        },
     }
 
 
@@ -3370,6 +3614,10 @@ def memory_job_fields(strategy, model_cached=True):
         # model actually took once it was resident.
         "model_weight_bytes": strategy.get("base_weight_bytes"),
         "cfg_batch": strategy.get("cfg_batch", False),
+        # Whether the guidance branches share one forward or take one each. The native engines have
+        # always run them one at a time and say so through `physical_forward_copies`; naming it here
+        # is what lets an SD/iL job be checked against the mode it was admitted for.
+        "cfg_mode": strategy.get("cfg_mode", "batched"),
         "memory_admission": strategy.get("admission"),
         "acceleration": strategy.get("acceleration"),
     }
@@ -3380,7 +3628,18 @@ def configure_cuda_math():
     torch.set_float32_matmul_precision("high" if balanced else "highest")
     torch.backends.cuda.matmul.allow_tf32 = balanced
     torch.backends.cudnn.allow_tf32 = balanced
-    torch.backends.cudnn.benchmark = balanced
+    # Balanced keeps TF32 and gives up cuDNN benchmarking, as Anima already does below. The
+    # benchmark picks each convolution's algorithm by timing it in *this* process, so a fixed seed
+    # drew a different picture after every restart — within a process the reruns agreed, which is
+    # all anyone had checked. Measured on the reference card, two fresh processes each, fused
+    # adapters, 8 steps at 768x1280 plus a whole-image decode:
+    #
+    #     benchmark on    latents differ between processes    sample 8.6 s   decode 11-13 s
+    #     benchmark off   latents identical                   sample 6.1 s   decode 1.3 s
+    #
+    # So the benchmark was not buying speed either: it was the cold-process tax on every first job,
+    # paid again for every new canvas shape.
+    torch.backends.cudnn.benchmark = False
 
 
 def configure_anima_cuda_math():
@@ -3547,12 +3806,15 @@ def configure_vae_mode(pipeline, strategy):
             "low_vram": "tiled",
             "ultra_low_vram": "tiled",
         }[strategy["mode"]]
-    pipeline.disable_vae_slicing()
-    pipeline.disable_vae_tiling()
+    # On the autoencoder itself: the pipeline-level wrappers are deprecated in Diffusers 0.38 and
+    # printed a FutureWarning on every reconfigure, which the console showed as an error.
+    vae = pipeline.vae
+    vae.disable_slicing()
+    vae.disable_tiling()
     if mode in {"sliced", "tiled"}:
-        pipeline.enable_vae_slicing()
+        vae.enable_slicing()
     if mode == "tiled":
-        pipeline.enable_vae_tiling()
+        vae.enable_tiling()
     active_vae_mode = mode
 
 
@@ -3564,6 +3826,21 @@ def resolve_compute_dtype():
 
 def apply_memory_strategy(pipeline, strategy):
     mode = strategy["mode"]
+    # Take the previous guidance wrapper off before the new offload mechanism goes on. Accelerate
+    # captures whatever `forward` it finds as `_old_forward`, so a wrapper left in place would be
+    # captured under the new hook, where nothing can reach it again — and the job that asked for
+    # batched CFG would go on splitting every batch while reporting that it does not.
+    unet = getattr(pipeline, "unet", None)
+    if unet is not None:
+        disable_sequential_batch_forward(unet)
+    # Once a controller owns this pipeline it owns the mechanism too, and the rung it is on is not
+    # always recoverable from `mode` — T3 and T4 both report `low_vram`. Asking it to reinstall is
+    # what stops a restore from silently dropping a streaming job onto the per-submodule path.
+    if active_residency is not None and active_residency.pipeline is pipeline and active_residency.tier:
+        active_residency.reinstall()
+        apply_cfg_execution_mode(pipeline, strategy)
+        configure_vae_mode(pipeline, strategy)
+        return
     if mode == "high_vram":
         pipeline.to("cuda")
     elif mode == "normal_vram":
@@ -3572,12 +3849,105 @@ def apply_memory_strategy(pipeline, strategy):
         if active_attention_backend == "sliced attention":
             pipeline.enable_attention_slicing("max")
         pipeline.enable_sequential_cpu_offload(device="cuda")
-        if mode == "ultra_low_vram":
-            enable_sequential_batch_forward(pipeline.unet)
+    apply_cfg_execution_mode(pipeline, strategy)
     configure_vae_mode(pipeline, strategy)
 
 
+def apply_cfg_execution_mode(pipeline, strategy):
+    """Put the UNet into the guidance execution order this job was admitted for.
+
+    The wrapper goes on *after* the offload hooks, so each split forward still passes through
+    whatever hook the chosen rung installed. Ultra-low keeps running serial unconditionally — it is
+    a survival mode and the halved activation peak is the whole point — but it no longer does so for
+    PAG, whose attention processor divides the batch itself and cannot be handed one sample at a
+    time. Removing the wrapper is as necessary as installing it: a resident pass carries no
+    accelerate hooks, so nothing else would ever take it off again.
+    """
+    unet = getattr(pipeline, "unet", None)
+    if unet is None:
+        return
+    serial = strategy.get("cfg_mode") == "serial" or (
+        strategy["mode"] == "ultra_low_vram" and strategy.get("cfg_serial_eligible", True)
+    )
+    if serial:
+        enable_sequential_batch_forward(unet)
+    else:
+        disable_sequential_batch_forward(unet)
+
+
+def residency_job_fields():
+    """What the controller has done so far, for the job record and for health."""
+    if active_residency is None:
+        return {"residency": None, "residency_trace": []}
+    return {"residency": active_residency.snapshot(), "residency_trace": list(active_residency.trace)}
+
+
+def publish_residency(job_id=None):
+    """Make the reported mode the rung the run is actually on.
+
+    `memory_mode` and `offload_mode` are what every existing report reads, so a tier change has to
+    land in them or the job would describe an offload path it stopped using two stages ago.
+    """
+    global active_memory_strategy
+    if active_residency is None or active_memory_strategy is None:
+        return
+    tier = active_residency.tier
+    if tier is None:
+        return
+    mode = RESIDENCY_TIER_MEMORY_MODES.get(tier, active_memory_strategy["mode"])
+    active_memory_strategy = {
+        **active_memory_strategy,
+        "mode": mode,
+        "label": MEMORY_MODE_LABELS[mode],
+        "offload_mode": RESIDENCY_TIER_OFFLOAD_MODES.get(tier, active_memory_strategy["offload_mode"]),
+        "model_resident": tier == "T0",
+        "residency_tier": tier,
+    }
+    if job_id is not None:
+        update_job(job_id, **memory_job_fields(active_memory_strategy), **residency_job_fields())
+
+
+def plan_residency_for_stage(stage, family, canvas, guidance_scale, images_per_batch, job_id=None):
+    """Re-ask where the diffusion model should live, for the stage about to run.
+
+    This is the difference Phase 1 exists to make. Admission sizes the whole chain against its most
+    demanding stage, so a 768x1280 base pass used to be placed by what a 1152x1920 redraw needed;
+    here each sampling stage is placed by what *it* needs against the memory free at that moment.
+    Only the Diffusers families have a controller — the native engines schedule their own.
+    """
+    if active_residency is None or family not in SD_COMPONENT_FAMILIES or loaded_pipeline is None:
+        return None
+    copies = int((active_memory_strategy or {}).get("physical_forward_copies", 1))
+    inference_bytes = estimate_inference_bytes(
+        family, canvas[0], canvas[1], guidance_scale, images_per_batch, copies
+    )
+    previous = active_residency.tier
+    try:
+        tier = active_residency.plan_for_stage(stage, inference_bytes, canvas=canvas)
+    except Exception:
+        # A rung that will not install is not a reason to lose the job: the pipeline keeps whatever
+        # it had, and the run continues on it.
+        traceback.print_exc()
+        try:
+            active_residency.set_tier(previous, reason="plan_failed_restore", stage=stage)
+        except Exception:
+            traceback.print_exc()
+        return None
+    if tier != previous:
+        # Deliberately *not* reconfiguring the VAE here. A tiled decode and a whole-image decode do
+        # not produce the same pixels, so letting the rung redecide it would make the picture depend
+        # on where the weights were living; `whole_image_decode_fits` decides it per decode, with
+        # the free memory of that moment, which is both safer and more informed.
+        apply_cfg_execution_mode(loaded_pipeline, active_memory_strategy or {})
+    publish_residency(job_id)
+    return tier
+
+
 def reconfigure_memory_strategy(pipeline, strategy):
+    # Diffusers' group-offload hooks live under `_diffusers_hook` and `remove_all_hooks` removes
+    # none of them, while `enable_model_cpu_offload` refuses to install over them. Taking them off
+    # first is what keeps the two mechanisms from ever overlapping (plan P1-3).
+    remove_group_offload(getattr(pipeline, "unet", None))
     pipeline.remove_all_hooks()
     pipeline.to("cpu", silence_dtype_warnings=True)
     pipeline.disable_attention_slicing()
@@ -3589,6 +3959,7 @@ def reconfigure_memory_strategy(pipeline, strategy):
 def park_pipeline_for_vae(pipeline):
     global pipeline_cpu_parked
     try:
+        remove_group_offload(getattr(pipeline, "unet", None))
         pipeline.remove_all_hooks()
         for name, component in pipeline.components.items():
             if name != "vae" and isinstance(component, torch.nn.Module):
@@ -3602,6 +3973,8 @@ def park_pipeline_for_vae(pipeline):
     gc.collect()
     torch.cuda.empty_cache()
     pipeline_cpu_parked = True
+    if active_residency is not None and active_residency.pipeline is pipeline:
+        active_residency.note_parked()
 
 
 def park_pipeline_for_external_stage(pipeline, family: str):
@@ -3636,13 +4009,53 @@ def prepare_vae_latents(pipeline, latents, family):
     return latents, needs_upcasting
 
 
+def whole_image_decode_fits(latents, vae):
+    """Whether this decode can run on the card in one piece, now that the sampler has been parked.
+
+    ComfyUI asks the same question at the same moment (`comfy/sd.py::VAE.decode`: size the decode,
+    evict the diffusion model, then decide) but can afford to ask it by trying: a decode that does
+    not fit raises, and it retries tiled. That does not transfer to Windows, where the driver serves
+    an oversized allocation out of host memory instead of failing — the picture comes back correct
+    and a hundred times slower. So the size is compared before the decode rather than after it.
+
+    Asked here rather than at load, because this is the first moment the free memory is the memory
+    the decoder will actually have, and because a job's stages do not share a canvas: the reference
+    run's base pass fits whole and its hires redraw does not.
+    """
+    if not torch.cuda.is_available():
+        # Without a device there is no free memory to measure and nothing to spill into; whatever
+        # the caller configured stands.
+        return True
+    free_bytes, physical_total_bytes, _limit_bytes = effective_cuda_free_memory()
+    reserved_bytes = int(RESERVED_VRAM_GB * GIB) if RESERVED_VRAM_GB is not None else reserved_vram_bytes(
+        physical_total_bytes,
+        allow_shared_memory=performance_settings["allow_shared_memory"],
+    )
+    # How Diffusers derives the same number from the autoencoder it was handed, fallback included.
+    scale = 2 ** (len(getattr(vae.config, "block_out_channels", (0,) * 4)) - 1)
+    required_bytes = estimate_vae_decode_bytes(
+        latents.shape[-1] * scale,
+        latents.shape[-2] * scale,
+        images_per_batch=latents.shape[0],
+        sliced=bool(getattr(vae, "use_slicing", False)),
+    )
+    # The estimate is `max_memory_allocated`, which does not count what the allocator holds reserved
+    # around it, so the comparison carries the margin rather than the measurement.
+    return required_bytes * 1.10 <= max(0, free_bytes - reserved_bytes)
+
+
 def decode_staged_latents(pipeline, latents, family, job_id, control, use_tiling, start_progress=94, final_progress=98):
+    global active_vae_mode
     latents = latents.to("cpu")
     control.checkpoint(job_id, "Unloading sampler")
     update_job(job_id, phase="Moving sampler to system memory", stage="sampler_offload", stage_step=0, stage_total=0, progress=start_progress)
     park_pipeline_for_vae(pipeline)
     control.checkpoint(job_id, "Preparing VAE")
     vae = pipeline.vae
+    if not use_tiling and not whole_image_decode_fits(latents, vae):
+        use_tiling = True
+    # The configured mode is a preference; what the report has to name is the decode that ran.
+    active_vae_mode = "tiled" if use_tiling else active_vae_mode
     original_dtype = vae.dtype
     needs_upcasting = False
     decoded = None
@@ -3806,6 +4219,7 @@ def pipeline_status_fields():
         }
     return {
         **memory_job_fields(active_memory_strategy),
+        **residency_job_fields(),
         "attention_backend": current_attention_backend(),
         "compute_dtype": active_compute_dtype,
         "vae_mode": active_vae_mode,
@@ -3852,12 +4266,55 @@ def loaded_model_asset_references():
     return references
 
 
-def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height: int, guidance_scale: float, lora_bytes: int, job_id: str, images_per_batch=1, guidance="none"):
+def announce_residency_transition(entry):
+    """Put a move on the job record and the console as it happens (plan P1-7)."""
+    if residency_job_id is not None:
+        update_job(residency_job_id, residency_event=entry)
+
+
+def build_residency_controller(pipeline, strategy):
+    """Hand the loaded pipeline to the controller, told what is already installed on it.
+
+    Admission (Phase 0) still chooses where a job starts; the controller is what re-asks the question
+    at each stage boundary, against the free memory of that moment rather than the whole chain's
+    worst case.
+    """
+    fixed_wall = performance_settings.get("vram_limit_gb", 0.0) > 0
+    return ResidencyController(
+        pipeline,
+        reserved_bytes=int(strategy.get("reserved_bytes", 0)),
+        free_memory=lambda: effective_cuda_free_memory()[0],
+        tier=tier_for_memory_mode(strategy["mode"]),
+        # A configured VRAM wall is the ceiling the allocator cap may never exceed; without one the
+        # ceiling is the device, and the cap is what keeps the allocator inside what is free.
+        allocator_ceiling_bytes=int(strategy.get("vram_limit_bytes", 0)) if fixed_wall else None,
+        on_transition=announce_residency_transition,
+    )
+
+
+def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height: int, guidance_scale: float, lora_bytes: int, job_id: str, images_per_batch=1, guidance="none", loras=()):
     global loaded_pipeline, loaded_checkpoint, loaded_checkpoint_hash, loaded_family, loaded_engine
     global pipeline_cpu_parked, active_memory_strategy, active_attention_backend, active_compute_dtype
+    global active_residency, residency_job_id
+    residency_job_id = job_id
     with pipeline_lock:
         guidance_copies = guidance_prediction_copies(guidance, guidance_scale)
-        if loaded_pipeline is not None and loaded_checkpoint == str(checkpoint) and loaded_family == family and loaded_engine == engine:
+        # SD/iL is the family that mounts one large UNet beside two small towers, so it is the one
+        # whose NORMAL admission should ask whether the component fits rather than whether the whole
+        # workspace does, and the one whose CFG branches may be taken one at a time.
+        resident_first = family in SD_COMPONENT_FAMILIES
+        cfg_serial_eligible = serial_cfg_eligible(family, guidance)
+        if active_residency is not None:
+            # One job, one trace. The controller outlives a job because the pipeline does, but the
+            # record published on a job has to describe that job rather than every job since load.
+            active_residency.begin_job()
+        # A fused adapter set cannot be taken off again by `unload_lora_weights`, so a job that
+        # wants different adapters cannot reuse this pipeline — it has to be built from the
+        # checkpoint again. Same set, and both the load and the fuse are skipped entirely.
+        fused = getattr(loaded_pipeline, "_xiriai_fused_loras", None)
+        adapters_compatible = fused is None or fused == tuple(loras or ())
+        if (loaded_pipeline is not None and loaded_checkpoint == str(checkpoint)
+                and loaded_family == family and loaded_engine == engine and adapters_compatible):
             strategy = choose_memory_strategy(
                 checkpoint,
                 family,
@@ -3870,8 +4327,16 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
                 include_loaded_model=True,
                 base_weight_bytes=active_memory_strategy["base_weight_bytes"],
                 base_largest_component_bytes=active_memory_strategy["base_largest_component_bytes"],
+                resident_first=resident_first,
+                cfg_serial_eligible=cfg_serial_eligible,
             )
-            if pipeline_cpu_parked or strategy["mode"] != active_memory_strategy["mode"]:
+            # The guidance execution order is part of what is installed on the UNet, so a job that
+            # is admitted for a different one has to reinstall it even when the rung has not moved.
+            if (
+                pipeline_cpu_parked
+                or strategy["mode"] != active_memory_strategy["mode"]
+                or strategy.get("cfg_mode") != active_memory_strategy.get("cfg_mode")
+            ):
                 update_job(job_id, phase=f"Adjusting VRAM policy · {strategy['label']}", progress=8)
                 previous_strategy = active_memory_strategy
                 try:
@@ -3884,7 +4349,19 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
                     except Exception:
                         clear_pipeline()
                     raise
+            # Idempotent, and the one thing a reused pipeline cannot inherit from the last job: a
+            # PAG run behind a plain-CFG one has the same rung and the same `cfg_mode`, and would
+            # otherwise reach its attention processor with a batch of one it cannot divide by three.
+            apply_cfg_execution_mode(loaded_pipeline, strategy)
             active_memory_strategy = strategy
+            if active_residency is None:
+                active_residency = build_residency_controller(loaded_pipeline, strategy)
+            else:
+                # The rung a restore reinstalls is the controller's, not the admission's — the last
+                # job may have left it streaming — so the strategy is told what is actually on the
+                # pipeline. The base stage plan re-checks it against this job's canvas before any
+                # step runs, which is why starting where the last job left off is safe and cheap.
+                publish_residency()
             update_job(
                 job_id,
                 phase="Reusing loaded model",
@@ -3903,7 +4380,9 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
         clear_pipeline()
         update_job(job_id, phase="Loading checkpoint", progress=4)
         strategy = choose_memory_strategy(
-            checkpoint, family, width, height, guidance_scale, lora_bytes, images_per_batch, guidance_copies
+            checkpoint, family, width, height, guidance_scale, lora_bytes, images_per_batch, guidance_copies,
+            resident_first=resident_first,
+            cfg_serial_eligible=cfg_serial_eligible,
         )
         update_job(
             job_id,
@@ -3923,8 +4402,13 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
         if family == "sd":
             kwargs.update({"safety_checker": None, "requires_safety_checker": False})
 
-        pipeline = pipeline_class.from_single_file(str(checkpoint), **kwargs)
+        # The console's own "Model ready" line reports this load; Diffusers' bar only duplicated it.
+        with quiet_pipeline_loading():
+            pipeline = pipeline_class.from_single_file(str(checkpoint), **kwargs)
         pipeline.set_progress_bar_config(disable=True)
+        # Long prompts are chunked into 77-token CLIP blocks (`prompt_encoding`), so the tokenizers'
+        # "will result in indexing errors" warning is false for this pipeline.
+        mark_long_prompts_handled(getattr(pipeline, "tokenizer", None), getattr(pipeline, "tokenizer_2", None))
         if performance_settings["calculate_model_hash"]:
             checkpoint_stat = checkpoint.stat()
             update_job(job_id, phase="Calculating model identity", progress=15)
@@ -3943,10 +4427,13 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
             guidance_copies,
             base_weight_bytes=actual_weight_bytes or strategy["base_weight_bytes"],
             base_largest_component_bytes=actual_largest_component or strategy["base_largest_component_bytes"],
+            resident_first=resident_first,
+            cfg_serial_eligible=cfg_serial_eligible,
         )
         configure_cuda_math()
         configure_attention_backend(pipeline)
         apply_memory_strategy(pipeline, strategy)
+        active_residency = build_residency_controller(pipeline, strategy)
         loaded_pipeline = pipeline
         loaded_checkpoint = str(checkpoint)
         loaded_family = family
@@ -3974,6 +4461,13 @@ def anima_weight_estimates(assets):
         stat = path.stat()
         estimates.append(estimate_checkpoint_weight_bytes(str(path), stat.st_size, stat.st_mtime_ns))
     return sum(estimates), max(estimates)
+
+
+# What a text-encoding pass allocates beyond the weights themselves, when the DiT is being held on
+# the card across jobs. Anima conditions a few hundred tokens through a 0.6B Qwen3 tower, so this is
+# headroom rather than a measurement of a large tensor — and it is deliberately not the component
+# engines' `RESIDENT_HOLD_ENCODE_HEADROOM_BYTES`, which sizes the same pass through a 4B decoder.
+ANIMA_RESIDENT_HOLD_ENCODE_HEADROOM_BYTES = 256 * 1024**2
 
 
 def choose_anima_memory_strategy(
@@ -4105,13 +4599,36 @@ def choose_anima_memory_strategy(
         estimate_inference_bytes("anima", width, height, guidance_scale, strategy.get("sampling_batch_size", images_per_batch), guidance_copies=2)
         if (cfg_batch and group_offload) else strategy.get("inference_bytes", 0)
     )
-    # ComfyUI default auto behavior keeps models resident only for the current
-    # job and returns them to RAM before the next stage; cross-job GPU residency
-    # is a high-VRAM choice. Normal mode therefore stages per job.
+    # Holding the DiT between jobs is admitted on its own terms rather than by requiring HIGH_VRAM,
+    # which is what `choose_flux_memory_strategy` already does for the component engines. HIGH is a
+    # strictly stronger condition — it budgets the sampling tensors alongside every weight — and on
+    # a card where the DiT is half the device it is unreachable at any canvas, so Anima parked a
+    # transformer that fits perfectly well and bought a PCIe round trip per job for nothing.
+    #
+    # What the hold has to survive is whatever shares the card with the held DiT: this job's decode
+    # (DiT + VAE + the decode's own tiles) and the next job's text encoding (DiT + encoder + its
+    # activations), never both at once. Only `total_weight_bytes` and the largest component are
+    # known here, so the bound counts the encoder and the VAE together — over-counting one of them
+    # is what pays for the activations neither figure includes. The component engines' 1 GiB
+    # headroom is not reused: it sizes conditioning through a 4B decoder, where Anima encodes
+    # through a 0.6B tower, and on an 8 GB card that difference decides the whole question.
+    #
+    # A decode that cannot share the card with a held DiT is not a failed job — the runtime parks
+    # it, sets `_co_residency_failed`, retries, and never offers co-residency again for that
+    # runtime — so being wrong here costs one retry, once.
+    resident_hold_bytes = (
+        int(total_weight_bytes * 1.02)
+        + int(strategy.get("reserved_bytes", 0))
+        + ANIMA_RESIDENT_HOLD_ENCODE_HEADROOM_BYTES
+    )
+    resident_hold_admitted = strategy.get("free_bytes", 0) >= resident_hold_bytes
     keep_transformer_resident = bool(
         performance_settings["keep_model_cached"]
         and not group_offload
-        and strategy.get("mode") == "high_vram"
+        and (
+            strategy.get("mode") == "high_vram"
+            or (strategy.get("mode") == "normal_vram" and resident_hold_admitted)
+        )
     )
     strategy.update(
         offload_mode=(
@@ -5121,8 +5638,48 @@ def report_mounted_loras(job_id: str, entries):
         update_job(job_id, mounted_loras=mounted)
 
 
+def lora_signature(loras, lora_root: Path):
+    """What identifies a mounted adapter set: the resolved files and the weights applied to them."""
+    signature = []
+    for lora in loras or ():
+        try:
+            path = resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA")
+        except Exception:
+            path = Path(lora.path)
+        signature.append((str(path), round(float(lora.weight), 6)))
+    return tuple(signature)
+
+
 def configure_loras(pipeline, loras: list[LoraInput], lora_root: Path, job_id: str):
+    """Mount the adapters and fold them into the weights.
+
+    ComfyUI applies LoRA by patching the model's weights; Diffusers mounts PEFT adapters, so every
+    linear in the UNet computes `base(x) + sum_i s_i * B_i(A_i(x))` at every step. With six adapters
+    that is twelve extra matmuls per linear, twenty-eight steps, two forwards a step — and on the
+    reference job it is the single largest remaining cost. Measured on the reference card, same
+    seed, 8 steps with the warm-up excluded:
+
+        768x1280    mounted 1.917 s/it   fused 1.169 s/it   (streaming: 1.781 -> 0.718)
+        1152x1920   mounted 4.975 s/it   fused 2.352 s/it   (streaming: 4.606 -> 2.050)
+
+    This is the plan's P1-6, and the order it prescribes: load and fuse first, then let the
+    controller measure and place what is left. Fusing changes the arithmetic — the adapter deltas
+    are added into fp16 weights once instead of being applied per forward — so a fixed seed draws a
+    slightly different picture than the mounted path did. It is the same operation ComfyUI performs,
+    and it is not a quality reduction, but it is a visible change and it is recorded on the job.
+
+    The fused set is remembered on the pipeline, because a fuse cannot be undone by
+    `unload_lora_weights`: a later job whose adapters differ has to rebuild the pipeline rather than
+    stack a second set on top of the first. A later job with the *same* set skips both the load and
+    the fuse, which is most of what a cached model is worth.
+    """
+    requested = lora_signature(loras, lora_root)
+    if getattr(pipeline, "_xiriai_fused_loras", None) == requested:
+        update_job(job_id, lora_fusion={"fused": bool(requested), "reused": True, "count": len(requested)})
+        report_mounted_loras(job_id, [(Path(path), weight) for path, weight in requested])
+        return
     pipeline.unload_lora_weights()
+    pipeline._xiriai_fused_loras = None
     if not loras:
         return
 
@@ -5133,11 +5690,30 @@ def configure_loras(pipeline, loras: list[LoraInput], lora_root: Path, job_id: s
     for index, lora in enumerate(loras):
         path = resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA")
         adapter_name = f"lora_{index}"
-        pipeline.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter_name)
+        with quiet_lora_loading(path):
+            pipeline.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter_name)
         adapter_names.append(adapter_name)
         adapter_weights.append(lora.weight)
         mounted.append((path, lora.weight))
     pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
+    fused = False
+    started = time.time()
+    try:
+        update_job(job_id, phase="Folding LoRA into weights", progress=22)
+        pipeline.fuse_lora(adapter_names=adapter_names)
+        pipeline.unload_lora_weights()
+        pipeline._xiriai_fused_loras = requested
+        fused = True
+    except Exception:
+        # A set that will not fuse still runs: the adapters stay mounted and the job pays the
+        # per-step cost rather than failing. `set_adapters` has already been applied, so the only
+        # thing lost is the speed.
+        traceback.print_exc()
+        pipeline._xiriai_fused_loras = None
+    update_job(job_id, lora_fusion={
+        "fused": fused, "reused": False, "count": len(adapter_names),
+        "elapsed_seconds": round(time.time() - started, 2),
+    })
     report_mounted_loras(job_id, mounted)
 
 
@@ -5184,13 +5760,106 @@ def derived_sampling_pipeline(pipeline, factory, guidance: str, pag: PagInput | 
     return active_pipeline, guidance_kwargs
 
 
+def run_with_offload_escalation(pipeline, pipeline_kwargs, call):
+    """Answer a mid-sampling OOM by offloading harder and re-running, rather than ending the job.
+
+    Every native engine already has this answer: park the transformer, stream it a block at a time,
+    restore the generator state and sample again, so the picture is unchanged and only the clock
+    suffers (`anima_pipeline.py` sampling and refinement both do it). The Diffusers path had none —
+    an OOM ended the run with "GPU memory exhausted" — and that is why its admission has to budget
+    the whole chain's worst stage before the first step runs. On a card where the UNet is already
+    4.9 GB that lands jobs on `enable_sequential_cpu_offload`, which moves every submodule per
+    forward, when component offload would have held them.
+
+    Restoring the generator state is what makes the retry honest. Diffusers cannot resume a
+    half-finished call, so the second attempt starts over; without the restore it would start over
+    from noise the first attempt had already drawn, and the retry would not be the same picture.
+    """
+    global active_memory_strategy
+    requested = pipeline_kwargs.get("generator")
+    generators = requested if isinstance(requested, list) else [requested] if requested is not None else []
+    states = [generator.get_state() for generator in generators]
+    try:
+        return call()
+    except BaseException as error:
+        if not is_oom_error(error):
+            raise
+        # With a controller the next rung is the next one down *its* ladder. The mode ladder cannot
+        # express that — T3 and T4 both report `low_vram` — and asking `reconfigure_memory_strategy`
+        # for it would have the controller reinstall the rung that has just run out of memory.
+        controlled = active_residency is not None and active_residency.pipeline is pipeline
+        lower_tier = active_residency.next_lower_tier() if controlled else None
+        heavier = (
+            RESIDENCY_TIER_MEMORY_MODES[lower_tier] if lower_tier is not None
+            else SD_OFFLOAD_ESCALATION.get((active_memory_strategy or {}).get("mode"))
+        )
+        if heavier is None:
+            raise
+        offload_to = (
+            RESIDENCY_TIER_OFFLOAD_MODES[lower_tier] if lower_tier is not None
+            else MEMORY_OFFLOAD_MODES[heavier]
+        )
+        torch.cuda.empty_cache()
+        # An OOM is also the moment to stop batching the guidance branches, when this job is allowed
+        # to split them: it halves the activation peak without touching the arithmetic, which is a
+        # cheaper answer than the next offload rung and arrives with it rather than after it.
+        serial_now = active_memory_strategy.get("cfg_serial_eligible", False)
+        escalated = {
+            **active_memory_strategy,
+            "mode": heavier,
+            "label": MEMORY_MODE_LABELS[heavier],
+            "offload_mode": offload_to,
+            "model_resident": False,
+            "residency_tier": lower_tier or active_memory_strategy.get("residency_tier"),
+            "cfg_mode": "serial" if serial_now else active_memory_strategy.get("cfg_mode", "batched"),
+            "reason": active_memory_strategy.get("reason", "") + "；采样期间显存不足，已自动改用更重的卸载策略",
+        }
+        admission = escalated.get("admission")
+        if isinstance(admission, dict):
+            escalated["admission"] = {
+                **admission,
+                "actual_offload_mode": offload_to,
+                "cfg_mode": escalated["cfg_mode"],
+                "fallback": {
+                    "stage": "sampling",
+                    "reason": "cuda_oom",
+                    "from": active_memory_strategy.get("offload_mode"),
+                    "to": offload_to,
+                    "cfg_mode_from": active_memory_strategy.get("cfg_mode", "batched"),
+                    "cfg_mode_to": escalated["cfg_mode"],
+                    "attempts": 1,
+                    "generator_states_restored": True,
+                },
+            }
+        if lower_tier is not None:
+            active_residency.set_tier(lower_tier, reason="oom_escalation", stage=active_residency.stage or "sampling")
+            apply_cfg_execution_mode(pipeline, escalated)
+        else:
+            # The bottom of the controller's ladder, or no controller at all: the existing rung
+            # stays and ultra-low adds what it adds — serial CFG and a tiled autoencoder.
+            reconfigure_memory_strategy(pipeline, escalated)
+            if controlled:
+                active_residency._record(
+                    active_residency.stage or "sampling", active_residency.tier, active_residency.tier,
+                    active_residency.observe(), "oom_escalation_ultra_low",
+                )
+        active_memory_strategy = escalated
+        for generator, state in zip(generators, states):
+            generator.set_state(state)
+        return call()
+
+
 def run_guided_pipeline(pipeline, active_pipeline, pipeline_kwargs, guidance_kwargs=None):
     original_attn_processors = (
         dict(pipeline.unet.attn_processors)
         if guidance_kwargs and hasattr(pipeline, "unet") else None
     )
     try:
-        return active_pipeline(**{**pipeline_kwargs, **(guidance_kwargs or {})})
+        return run_with_offload_escalation(
+            pipeline,
+            pipeline_kwargs,
+            lambda: active_pipeline(**{**pipeline_kwargs, **(guidance_kwargs or {})}),
+        )
     finally:
         if original_attn_processors is not None:
             pipeline.unet.set_attn_processor(original_attn_processors)
@@ -5348,7 +6017,69 @@ def run_guided_pipeline_batch(pipeline, guidance: str, pipeline_kwargs, pag: Pag
 
 
 def postprocessing_stages(request: GenerateInput):
-    return [stage for stage in request.postprocess_order if getattr(request, stage).enabled]
+    """The chain entries that will actually run, in order."""
+    return [stage for stage in request.postprocess_chain if stage.enabled]
+
+
+def postprocess_stage_types(request: GenerateInput):
+    """The same list as stage type names, for the record blocks that describe a run."""
+    return [stage.type for stage in postprocessing_stages(request)]
+
+
+def resample_unit_sizes(size, unit: ResampleUnitInput, family: str):
+    """The three sizes one unit deals in.
+
+    `target` is what the user asked for: `round(edge x scale)` and nothing else. `redraw` is what the
+    engine will accept, which is `target` rounded to its latent grid — the same number for most
+    scales and a few pixels away for the rest. `output` is what leaves the unit, which is the redraw
+    canvas unless the unit asked for its exact target back.
+    """
+    target = scaled_size(size, unit.scale)
+    if unit.denoise <= 0:
+        # No redraw, so no grid to satisfy: the resize lands on the exact target.
+        return {"target": target, "redraw": target, "output": target}
+    redraw = redraw_canvas_size(target, family)
+    return {"target": target, "redraw": redraw, "output": target if unit.exact_output else redraw}
+
+
+def resample_chain_plan(request: GenerateInput, base_size=None):
+    """Walk the enabled chain, accumulating sizes, without running anything.
+
+    One walk serves three readers — request validation, memory admission and the stage headers the
+    job reports — so a chain can never be admitted against one set of sizes and executed at another.
+    """
+    family = request_family(request.engine)
+    size = tuple(base_size) if base_size is not None else (request.width, request.height)
+    plan = []
+    for stage in request.postprocess_chain:
+        if not stage.enabled:
+            continue
+        entry = {"type": stage.type, "stage": stage, "input_size": size, "unit_number": 0}
+        if stage.type == "resample":
+            sizes = resample_unit_sizes(size, stage, family)
+            entry.update({
+                "unit_number": request.resample_unit_number(stage),
+                "target_size": sizes["target"],
+                "redraw_size": sizes["redraw"],
+                "output_size": sizes["output"],
+                "redraws": stage.denoise > 0,
+                "upscales": bool(stage.upscaler),
+            })
+        elif stage.type == "rtx":
+            entry["output_size"] = rtx_vsr.target_size(size, stage.scale)
+        else:
+            # ADetailer inpaints in place; the canvas it is handed is the canvas it returns.
+            entry["output_size"] = size
+        plan.append(entry)
+        size = entry["output_size"]
+    return plan
+
+
+def chain_output_size(request: GenerateInput, base_size=None):
+    plan = resample_chain_plan(request, base_size)
+    if plan:
+        return plan[-1]["output_size"]
+    return tuple(base_size) if base_size is not None else (request.width, request.height)
 
 
 def merge_runtime_metrics(job_id: str, metrics, namespace=None, previous=None):
@@ -5404,12 +6135,23 @@ def aggregate_usdu_sampling_metrics(tile_metrics):
 
 
 def generation_memory_workload_diagnostics(request: GenerateInput, family: str):
-    guidance_copies = (
-        1 if is_native_family(family)
-        else guidance_prediction_copies(request.guidance, request.cfg)
-    )
+    # What ranks the stages is the *physical* forward count, because that is what the sampler will
+    # allocate for. The native engines have always run their branches one after another; SD/iL now
+    # does the same whenever serial CFG is eligible, so every stage of a diffusers job is compared
+    # on one forward too. Where batched CFG is later admitted instead, it was admitted by clearing
+    # the batched peak by half again, and that margin covers the difference in ranking.
+    cfg_serial_eligible = serial_cfg_eligible(family, request.guidance)
+
+    def physical_copies(cfg_value):
+        if is_native_family(family) or cfg_serial_eligible:
+            return 1
+        return guidance_prediction_copies(request.guidance, cfg_value)
+
+    guidance_copies = physical_copies(request.cfg)
     base = (request.width, request.height)
     diagnostics = {
+        "guidance_copies": guidance_copies,
+        "cfg_serial_eligible": cfg_serial_eligible,
         "base_dimensions": base,
         "target_dimensions": None,
         "core_dimensions": None,
@@ -5424,55 +6166,57 @@ def generation_memory_workload_diagnostics(request: GenerateInput, family: str):
     # whose only stage is RTX (or ADetailer on a family that plans no admission entry for it) would
     # then have nothing to size the loaded pipeline against, so the base entry stands in.
     workloads = [] if request.postprocess_only else [base_workload]
-    current_size = (request.width, request.height)
-    for stage in postprocessing_stages(request):
-        if stage == "rtx":
-            current_size = rtx_vsr.target_size(current_size, request.rtx.scale)
-        elif stage == "hires":
-            hires_source_size = current_size
-            current_size = tuple(math.ceil(value * request.hires.scale / 64) * 64 for value in current_size)
-            hires_copies = (
-                1 if is_native_family(family)
-                else guidance_prediction_copies(request.guidance, request.hires.cfg)
-            )
-            admission_size = current_size
+    # Units run one after another, so the chain's demand is its most demanding single unit rather
+    # than the sum: only one canvas is resident at a time.
+    for entry in resample_chain_plan(request):
+        stage = entry["stage"]
+        if stage.type == "rtx":
+            continue
+        if stage.type == "resample":
+            if not entry["redraws"]:
+                # A resize with no redraw never touches the sampler, so it adds no inference bytes.
+                continue
+            resample_source_size = entry["input_size"]
+            redraw_size = entry["redraw_size"]
+            unit_cfg = stage.resolved_cfg(request.cfg)
+            unit_copies = physical_copies(unit_cfg)
+            admission_size = redraw_size
             reason = "full_frame_target"
-            if supports_usdu_tiled(family) and request.hires.execution_mode == "usdu_tiled":
-                # Match apply_hires_fix: Auto core is the canvas entering Hires,
-                # which may already have been changed by an earlier RTX stage.
-                core = hires_source_size
+            if supports_usdu_tiled(family) and stage.execution_mode == "usdu_tiled":
+                # Match apply_resample_unit: Auto core is the canvas entering the unit, which an
+                # earlier stage may already have changed.
+                core = resample_source_size
                 plan = plan_tiles(
-                    current_size, core, padding=request.hires.padding,
-                    seam_mode=request.hires.seam_mode, alignment=usdu_pixel_alignment(family),
+                    redraw_size, core, padding=stage.padding,
+                    seam_mode=stage.seam_mode, alignment=usdu_pixel_alignment(family),
                 )
-                admission_size = tuple(max(base, processed) for base, processed in zip(hires_source_size, plan.processing_size))
+                admission_size = tuple(max(base, processed) for base, processed in zip(resample_source_size, plan.processing_size))
                 reason = "usdu_tile_processing_target_excluded"
                 diagnostics.update({
-                    "target_dimensions": current_size,
+                    "target_dimensions": redraw_size,
                     "core_dimensions": core,
                     "processing_dimensions": plan.processing_size,
                     "admission_dimensions": admission_size,
-                    "stage": "hires",
+                    "stage": "resample",
+                    "unit_number": entry["unit_number"],
                     "reason": reason,
                     "target_excluded": True,
                 })
-            elif stage == "hires":
+            else:
                 diagnostics.update({
-                    "target_dimensions": current_size,
+                    "target_dimensions": redraw_size,
                     "admission_dimensions": admission_size,
-                    "stage": "hires",
+                    "stage": "resample",
+                    "unit_number": entry["unit_number"],
                     "reason": reason,
                 })
-            workloads.append((*admission_size, request.hires.cfg, 1, hires_copies, reason))
-        elif stage == "adetailer" and is_native_family(family):
+            workloads.append((*admission_size, unit_cfg, 1, unit_copies, reason))
+        elif stage.type == "adetailer" and is_native_family(family):
             # Units run one after another, never together, so admission is the
             # most demanding single unit rather than their sum.
-            for unit in request.adetailer.active_units:
+            for unit in stage.active_units:
                 detail_cfg = unit.cfg if unit.use_cfg else request.cfg
-                detail_copies = (
-                    1 if is_native_family(family)
-                    else guidance_prediction_copies(request.guidance, detail_cfg)
-                )
+                detail_copies = physical_copies(detail_cfg)
                 workloads.append((1024, 1024, detail_cfg, 1, detail_copies, "adetailer"))
     selected = max(workloads or [base_workload], key=lambda item: estimate_inference_bytes(family, *item[:5]))
     diagnostics["admission"] = selected[:4]
@@ -5539,30 +6283,109 @@ def apply_rtx_vsr(
     return result, diagnostics
 
 
-def apply_hires_fix(
+def resample_unit_label(settings: ResampleUnitInput, unit_number: int):
+    """What the job's phase text calls this unit. The user's name wins when they gave one."""
+    name = (settings.name or "").strip()
+    return f"Resample {unit_number} · {name}" if name else f"Resample {unit_number}"
+
+
+def resample_stage_facts(
+    settings: ResampleUnitInput,
+    unit_number: int,
+    base_seed: int,
+    unit_seed,
+    *,
+    source_size,
+    target_size,
+    executed_size,
+    steps,
+    cfg,
+    sampler_resolved,
+    scheduler_resolved,
+    execution_mode: str,
+    effective_steps=None,
+):
+    """The facts every unit reports, whichever of the three paths produced the picture.
+
+    `target_size` and `executed_size` are both recorded even when they agree. A reader that only
+    saw one of them could not tell a chain that landed where it was asked from one an engine grid
+    moved, and that difference is the whole reason `exact_output` exists.
+    """
+    facts = {
+        "unit": unit_number,
+        "name": settings.name or None,
+        "upscaler": settings.upscaler,
+        "scale": settings.scale,
+        "resize_algorithm": settings.resize_algorithm,
+        "exact_output": settings.exact_output,
+        "execution_mode": execution_mode,
+        "denoise": settings.denoise,
+        "steps": steps,
+        "effective_steps": effective_steps if effective_steps is not None else steps,
+        "cfg": cfg,
+        "sampler_requested": settings.sampler,
+        "scheduler_requested": settings.scheduler,
+        "sampler_resolved": sampler_resolved,
+        "scheduler_resolved": scheduler_resolved,
+        "source_size": list(source_size),
+        "target_size": list(target_size),
+        "executed_size": list(executed_size),
+        "size_matches_target": tuple(target_size) == tuple(executed_size),
+        "base_seed": str(base_seed),
+        "seed_mode": settings.seed_mode,
+        "seed": str(unit_seed) if unit_seed is not None else None,
+        # The two names the single Hires block used. Kept so a reader written against the old
+        # record — the gallery's seed restore, the artifact capture — still finds its fields.
+        "hires_seed_mode": settings.seed_mode,
+        "hires_seed": str(unit_seed) if unit_seed is not None else None,
+    }
+    return facts
+
+
+def exact_resample_output(image: Image.Image, settings: ResampleUnitInput, target_size, diagnostics, control, job_id, label):
+    """Put the picture back on the unit's exact target when it asked for that, and say so either way."""
+    executed = tuple(image.size)
+    target = tuple(target_size)
+    diagnostics["executed_size"] = list(executed)
+    diagnostics["size_matches_target"] = executed == target
+    if not settings.exact_output or executed == target:
+        return image
+    control.checkpoint(job_id, f"{label} exact resize")
+    corrected = resize_image(image, target[0], target[1], settings.resize_algorithm)
+    diagnostics.update({
+        "exact_output_applied": True,
+        "pre_exact_size": list(executed),
+        "executed_size": list(target),
+        "size_matches_target": True,
+    })
+    return corrected
+
+
+def apply_resample_unit(
     image: Image.Image,
     pipeline,
     family: str,
     request: GenerateInput,
+    settings: ResampleUnitInput,
     job_id: str,
     control: JobControl,
     started_at: float,
+    unit_number=1,
     image_seed=None,
-    effective_hires_seed=None,
+    effective_seed=None,
     progress_start=80,
     progress_end=96,
 ):
-    """Public Hires entry point; benchmark stage capture stays a no-op unless its isolated gate passes."""
-    settings = request.hires
+    """Public resample entry point; benchmark stage capture stays a no-op unless its isolated gate passes."""
     if not settings.enabled:
         return image, None
-    if effective_hires_seed is None:
-        raise ValueError("Effective Hires.fix seed must be resolved before the Hires stage")
+    if settings.redraws and effective_seed is None:
+        raise ValueError("A resample unit's effective seed must be resolved before the unit runs")
     base_seed = request.seed if image_seed is None else image_seed
     capture, capture_gate_facts = open_hires_artifact_capture(job_id, base_seed)
-    stages = lambda: _apply_hires_fix_stages(
-        image, pipeline, family, request, job_id, control, started_at,
-        image_seed=image_seed, effective_hires_seed=effective_hires_seed,
+    stages = lambda: _apply_resample_unit_stages(
+        image, pipeline, family, request, settings, job_id, control, started_at,
+        unit_number=unit_number, image_seed=image_seed, effective_seed=effective_seed,
         progress_start=progress_start, progress_end=progress_end, capture=capture,
     )
     if not capture.enabled:
@@ -5576,8 +6399,8 @@ def apply_hires_fix(
             engine=request.engine,
             execution_mode=diagnostics.get("execution_mode"),
             base_seed=str(base_seed),
-            hires_seed_mode=settings.mode,
-            effective_hires_seed=str(effective_hires_seed),
+            hires_seed_mode=settings.seed_mode,
+            effective_hires_seed=str(effective_seed) if effective_seed is not None else None,
             base_dimensions=list(image.size),
             post_sr_dimensions=list(result.size),
             tile_plan={
@@ -5591,9 +6414,11 @@ def apply_hires_fix(
                 "engine": request.engine, "width": request.width, "height": request.height,
                 "steps": request.steps, "cfg": request.cfg, "denoise": request.denoise,
                 "sampler": request.sampler, "scheduler": request.scheduler,
-                "hires": {
-                    "scale": settings.scale, "steps": settings.steps, "cfg": settings.cfg,
+                "resample": {
+                    "unit": unit_number,
+                    "scale": settings.scale, "steps": diagnostics.get("steps"), "cfg": diagnostics.get("cfg"),
                     "denoise": settings.denoise, "execution_mode": settings.execution_mode,
+                    "resize_algorithm": settings.resize_algorithm, "exact_output": settings.exact_output,
                     "sampler": diagnostics.get("sampler_resolved"), "scheduler": diagnostics.get("scheduler_resolved"),
                     "padding": settings.padding, "mask_blur": settings.mask_blur,
                     "uniform_tiles": settings.uniform_tiles, "tiled_decode": settings.tiled_decode,
@@ -5610,144 +6435,194 @@ def apply_hires_fix(
         raise
 
 
-def _apply_hires_fix_stages(
+def _apply_resample_unit_stages(
     image: Image.Image,
     pipeline,
     family: str,
     request: GenerateInput,
+    settings: ResampleUnitInput,
     job_id: str,
     control: JobControl,
     started_at: float,
+    unit_number=1,
     image_seed=None,
-    effective_hires_seed=None,
+    effective_seed=None,
     progress_start=80,
     progress_end=96,
     capture=NULL_CAPTURE,
 ):
-    settings = request.hires
     if not settings.enabled:
         return image, None
-    if effective_hires_seed is None:
-        raise ValueError("Effective Hires.fix seed must be resolved before the Hires stage")
+    if settings.redraws and effective_seed is None:
+        raise ValueError("A resample unit's effective seed must be resolved before the unit runs")
     base_seed = request.seed if image_seed is None else image_seed
+    label = resample_unit_label(settings, unit_number)
     # USDU Auto follows the pre-SR image, even though planning happens after
     # pixel SR has produced the diffusion canvas.
-    hires_source_size = image.size
+    resample_source_size = image.size
+    unit_steps = settings.resolved_steps(request.steps)
+    unit_cfg = settings.resolved_cfg(request.cfg)
     # SD/iL retain Diffusers' effective callback count. The native engines follow Comfy's
     # expanded-schedule suffix and always execute every requested step.
-    effective_steps = settings.steps if is_native_family(family) else max(1, int(settings.steps * settings.denoise))
-    destination = hires_target_size(image, settings.scale)
-    if is_native_family(family) and max(destination) > NATIVE_MAX_REFINEMENT_EDGE:
-        raise ValueError(f"Native refinement dimensions cannot exceed {NATIVE_MAX_REFINEMENT_EDGE}")
+    effective_steps = unit_steps if is_native_family(family) else max(1, int(unit_steps * settings.denoise))
+    sizes = resample_unit_sizes(image.size, settings, family)
+    # `target` is the exact size the chain asked for; `destination` is where the pixels actually
+    # land, which is the engine's grid when a redraw follows and the target itself when none does.
+    target_size = sizes["target"]
+    destination = sizes["redraw"]
+    if settings.redraws and max(destination) > engine_max_refinement_edge(family):
+        raise ValueError(f"Refinement dimensions cannot exceed {engine_max_refinement_edge(family)}")
     staged_decode = performance_settings["staged_vae_decode"] and not is_native_family(family)
-    upscale_end = progress_start + round((progress_end - progress_start) * 0.2) if settings.scale > 1 else progress_start
+    resizes = destination != image.size
+    upscale_end = progress_start + round((progress_end - progress_start) * 0.2) if resizes else progress_start
     sampling_end = progress_end - round((progress_end - progress_start) * 0.15) if staged_decode else progress_end
-    control.checkpoint(job_id, "Hires.fix upscaling")
+    control.checkpoint(job_id, f"{label} upscaling")
     reported_upscale_tiles = [0]
 
     def on_upscale_tile(completed, total):
         reported_upscale_tiles[0] = max(reported_upscale_tiles[0], completed)
         update_job(
             job_id,
-            phase=f"Hires.fix · Upscaling {destination[0]} x {destination[1]}",
-            stage="hires_upscale",
+            phase=f"{label} · Upscaling {destination[0]} x {destination[1]}",
+            stage="resample_upscale",
             stage_step=reported_upscale_tiles[0],
             stage_total=total,
             progress=progress_start + round((upscale_end - progress_start) * reported_upscale_tiles[0] / max(1, total)),
             elapsed_seconds=round(control.active_elapsed(started_at), 1),
         )
-        control.checkpoint(job_id, "Hires.fix upscaling")
+        control.checkpoint(job_id, f"{label} upscaling")
 
-    update_job(job_id, phase="Hires.fix · Loading upscaler", stage="hires_upscale", stage_step=0, stage_total=0, progress=progress_start)
-    use_cuda_upscaler = settings.scale > 1 and torch.cuda.is_available()
+    use_cuda_upscaler = bool(settings.upscaler) and any(edge > source for edge, source in zip(destination, image.size)) and torch.cuda.is_available()
     upscale_warning = None
-    def run_upscaler(device: str, label: str):
+    def run_upscaler(device: str, running_label: str):
         return upscale_image(
             image,
             UPSCALER_MODEL_DIRECTORY,
-            settings.model,
+            settings.upscaler,
             settings.scale,
             settings.tile_size,
             settings.tile_overlap,
             on_upscale_tile,
             device=device,
-            checkpoint=lambda: control.checkpoint(job_id, label),
+            checkpoint=lambda: control.checkpoint(job_id, running_label),
+            method=settings.resize_algorithm,
+            destination=destination,
         )
 
-    try:
+    if settings.upscaler:
+        update_job(job_id, phase=f"{label} · Loading upscaler", stage="resample_upscale", stage_step=0, stage_total=0, progress=progress_start)
         try:
-            # The upscaler used to be given the card unconditionally, which meant parking the
-            # diffusion model before it and fetching it back for the refinement that follows —
-            # 10.1s out and 2.4s back on a 24 GB card, around an upscale that takes 2.0s. It never
-            # needed the room: the pass is tiled, so its footprint is bounded by one tile rather
-            # than by the picture, and an ESRGAN at a 192-pixel tile peaks far below what sampling
-            # just used with the model resident. So the parking is demand-driven now. Running out
-            # of memory is the signal, and it is answered the way it always was, one step later.
-            upscaled, diagnostics = run_upscaler(
-                "cuda" if use_cuda_upscaler else "cpu", "Hires.fix upscaling")
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
-            if not use_cuda_upscaler or not is_oom_error(error):
-                raise
-            torch.cuda.empty_cache()
-            if not pipeline_cpu_parked:
-                # The room the tiled pass turned out to need is exactly what parking frees, and
-                # the GPU pass is worth another attempt before falling back to the CPU one.
-                update_job(job_id, phase="Hires.fix · Parking diffusion model", stage="sampler_offload", progress=progress_start)
-                park_pipeline_for_external_stage(pipeline, family)
-                try:
-                    upscaled, diagnostics = run_upscaler("cuda", "Hires.fix upscaling")
-                except (torch.cuda.OutOfMemoryError, RuntimeError) as retry_error:
-                    if not is_oom_error(retry_error):
-                        raise
-                    torch.cuda.empty_cache()
-                    upscale_warning = "Hires.fix upscaler exceeded GPU memory and used CPU fallback"
-                    update_job(job_id, phase="Hires.fix · CPU fallback", stage="hires_upscale", warning=append_warning(None, upscale_warning))
-                    upscaled, diagnostics = run_upscaler("cpu", "Hires.fix CPU upscaling")
-            else:
-                upscale_warning = "Hires.fix upscaler exceeded GPU memory and used CPU fallback"
-                update_job(job_id, phase="Hires.fix · CPU fallback", stage="hires_upscale", warning=append_warning(None, upscale_warning))
-                upscaled, diagnostics = run_upscaler("cpu", "Hires.fix CPU upscaling")
-    finally:
-        if not is_native_family(family) and pipeline_cpu_parked and not control.cancelled:
-            update_job(job_id, phase="Hires.fix · Restoring diffusion model", stage="model_restore")
-            restore_parked_pipeline()
-    if is_native_family(family) and max(upscaled.size) > NATIVE_MAX_REFINEMENT_EDGE:
+            try:
+                # The upscaler used to be given the card unconditionally, which meant parking the
+                # diffusion model before it and fetching it back for the refinement that follows —
+                # 10.1s out and 2.4s back on a 24 GB card, around an upscale that takes 2.0s. It never
+                # needed the room: the pass is tiled, so its footprint is bounded by one tile rather
+                # than by the picture, and an ESRGAN at a 192-pixel tile peaks far below what sampling
+                # just used with the model resident. So the parking is demand-driven now. Running out
+                # of memory is the signal, and it is answered the way it always was, one step later.
+                upscaled, diagnostics = run_upscaler(
+                    "cuda" if use_cuda_upscaler else "cpu", f"{label} upscaling")
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+                if not use_cuda_upscaler or not is_oom_error(error):
+                    raise
+                torch.cuda.empty_cache()
+                if not pipeline_cpu_parked:
+                    # The room the tiled pass turned out to need is exactly what parking frees, and
+                    # the GPU pass is worth another attempt before falling back to the CPU one.
+                    update_job(job_id, phase=f"{label} · Parking diffusion model", stage="sampler_offload", progress=progress_start)
+                    park_pipeline_for_external_stage(pipeline, family)
+                    try:
+                        upscaled, diagnostics = run_upscaler("cuda", f"{label} upscaling")
+                    except (torch.cuda.OutOfMemoryError, RuntimeError) as retry_error:
+                        if not is_oom_error(retry_error):
+                            raise
+                        torch.cuda.empty_cache()
+                        upscale_warning = f"{label} upscaler exceeded GPU memory and used CPU fallback"
+                        update_job(job_id, phase=f"{label} · CPU fallback", stage="resample_upscale", warning=append_warning(None, upscale_warning))
+                        upscaled, diagnostics = run_upscaler("cpu", f"{label} CPU upscaling")
+                else:
+                    upscale_warning = f"{label} upscaler exceeded GPU memory and used CPU fallback"
+                    update_job(job_id, phase=f"{label} · CPU fallback", stage="resample_upscale", warning=append_warning(None, upscale_warning))
+                    upscaled, diagnostics = run_upscaler("cpu", f"{label} CPU upscaling")
+        finally:
+            if not is_native_family(family) and pipeline_cpu_parked and not control.cancelled:
+                update_job(job_id, phase=f"{label} · Restoring diffusion model", stage="model_restore")
+                restore_parked_pipeline()
+    else:
+        # No model means no model pass: the unit resizes and that is the whole pixel stage. It is
+        # the same call the model path finishes with, so a unit whose model would have had nothing
+        # to add lands on the same pixels either way.
+        update_job(
+            job_id,
+            phase=f"{label} · Resizing {destination[0]} x {destination[1]}",
+            stage="resample_resize", stage_step=0, stage_total=1, progress=progress_start,
+        )
+        control.checkpoint(job_id, f"{label} resizing")
+        upscaled = resize_image(image, destination[0], destination[1], settings.resize_algorithm)
+        diagnostics = {
+            "model": None,
+            "scale": settings.scale,
+            "source_size": list(image.size),
+            "target_size": list(destination),
+            "resize_algorithm": settings.resize_algorithm,
+            "upscaler_applied": False,
+            "device": "cpu",
+        }
+        update_job(
+            job_id,
+            phase=f"{label} · Resizing {destination[0]} x {destination[1]}",
+            stage="resample_resize", stage_step=1, stage_total=1, progress=upscale_end,
+        )
+
+    if settings.redraws and is_native_family(family) and max(upscaled.size) > NATIVE_MAX_REFINEMENT_EDGE:
         raise ValueError(f"Native refinement dimensions cannot exceed {NATIVE_MAX_REFINEMENT_EDGE}")
     capture.stage("base", image)
     capture.stage("post_sr", upscaled)
-    control.checkpoint(job_id, "Hires.fix diffusion refinement")
-    phase = f"Hires.fix · Diffusion {destination[0]} x {destination[1]}"
+    # Denoise 0 asks for the enlargement without the redraw, so the unit is finished here: there is
+    # no sampler to configure, no seed to spend and no schedule to build.
+    if not settings.redraws:
+        diagnostics.update(resample_stage_facts(
+            settings, unit_number, base_seed, None,
+            source_size=resample_source_size, target_size=target_size,
+            executed_size=upscaled.size, steps=None, cfg=None,
+            sampler_resolved=None, scheduler_resolved=None, execution_mode="resize_only",
+        ))
+        if upscale_warning:
+            diagnostics["warning"] = upscale_warning
+        return upscaled.convert("RGB"), diagnostics
+    control.checkpoint(job_id, f"{label} diffusion refinement")
+    phase = f"{label} · Diffusion {destination[0]} x {destination[1]}"
     resolved_sampler = settings.sampler or request.sampler
     resolved_scheduler = settings.scheduler or request.scheduler
     if not is_native_family(family):
-        validate_hires_sampling_override(resolved_sampler, resolved_scheduler, family)
-    hires_seed = effective_hires_seed
+        validate_resample_sampling_override(resolved_sampler, resolved_scheduler, family, unit_number)
+    hires_seed = effective_seed
     if is_native_family(family):
         if supports_usdu_tiled(family) and settings.execution_mode == "usdu_tiled":
             core_tile = (
-                hires_source_size[0] if settings.tile_width == "auto" else settings.tile_width,
-                hires_source_size[1] if settings.tile_height == "auto" else settings.tile_height,
+                resample_source_size[0] if settings.tile_width == "auto" else settings.tile_width,
+                resample_source_size[1] if settings.tile_height == "auto" else settings.tile_height,
             )
             plan = plan_tiles(
                 upscaled.size, core_tile, padding=settings.padding,
                 seam_mode=settings.seam_mode, alignment=usdu_pixel_alignment(family),
             )
             tile_count = len(plan.regions)
-            stage_total = tile_count * settings.steps
+            stage_total = tile_count * unit_steps
             update_job(
                 job_id,
-                phase=f"Hires.fix · Tile 1/{tile_count}",
-                stage="hires_sampling", stage_step=0, stage_total=stage_total,
+                phase=f"{label} · Tile 1/{tile_count}",
+                stage="resample_sampling", stage_step=0, stage_total=stage_total,
                 stage_unit_index=1, stage_unit_total=tile_count,
-                stage_unit_step=0, stage_unit_steps=settings.steps,
+                stage_unit_step=0, stage_unit_steps=unit_steps,
                 progress=upscale_end, step=0, total_steps=stage_total,
             )
             previous_metrics = dict(getattr(pipeline, "last_generation_metrics", {}) or {})
             preparation_started = time.monotonic()
             prepared_conditioning = pipeline.prepare_refinement_conditioning(
-                request.prompt, request.negative_prompt, settings.cfg, request.guidance
+                request.prompt, request.negative_prompt, unit_cfg, request.guidance
             )
-            prepared_sigmas = pipeline.prepare_refinement_sigmas(settings.steps, settings.denoise, resolved_scheduler)
+            prepared_sigmas = pipeline.prepare_refinement_sigmas(unit_steps, settings.denoise, resolved_scheduler)
             preparation_metrics = serializable_runtime_metrics(
                 (getattr(pipeline, "last_generation_metrics", {}) or {}).get("refinement.prompt_encode")
             )
@@ -5755,16 +6630,16 @@ def _apply_hires_fix_stages(
             compositor = TileCompositor(upscaled.convert("RGB"), plan, mask_blur=settings.mask_blur)
             tile_metrics = []
             for tile_index, region in enumerate(plan.regions):
-                control.checkpoint(job_id, f"Hires.fix tile {tile_index + 1}/{tile_count}")
+                control.checkpoint(job_id, f"{label} tile {tile_index + 1}/{tile_count}")
                 tile = prepare_tile(upscaled, region)
                 generator = torch.Generator(device="cpu").manual_seed(hires_seed)
                 tile_started = time.monotonic()
 
                 def on_anima_tile_step(step, total, _latents, index=tile_index):
-                    stage_step = index * settings.steps + step
+                    stage_step = index * unit_steps + step
                     progress = upscale_end + round((progress_end - upscale_end) * stage_step / max(1, stage_total))
                     update_job(
-                        job_id, phase=f"Hires.fix · Tile {index + 1}/{tile_count}", stage="hires_sampling",
+                        job_id, phase=f"{label} · Tile {index + 1}/{tile_count}", stage="resample_sampling",
                         stage_step=stage_step,
                         # The tile is the unit a reader waits on, so it is reported as one rather
                         # than left to be recovered from the phase text: the console gives each
@@ -5776,11 +6651,11 @@ def _apply_hires_fix_stages(
                         paused_seconds=round(control.total_paused(), 1),
                     )
                 def on_anima_tile_checkpoint(_step, _total, _latents, index=tile_index):
-                    control.checkpoint(job_id, f"Hires.fix tile {index + 1}/{tile_count}")
+                    control.checkpoint(job_id, f"{label} tile {index + 1}/{tile_count}")
 
                 refined = pipeline.refine_batch(
                     images=[tile], prompt=request.prompt, negative_prompt=request.negative_prompt,
-                    steps=settings.steps, denoise=settings.denoise, cfg=settings.cfg,
+                    steps=unit_steps, denoise=settings.denoise, cfg=unit_cfg,
                     sampler=resolved_sampler, scheduler=resolved_scheduler, generators=[generator],
                     guidance=request.guidance, pag_scale=request.pag.scale, pag_applied_layers=request.pag.applied_layers,
                     masks=None, on_step=on_anima_tile_step, prepared_conditioning=prepared_conditioning,
@@ -5788,7 +6663,7 @@ def _apply_hires_fix_stages(
                     on_step_checkpoint=on_anima_tile_checkpoint,
                 )
                 if len(refined) != 1:
-                    raise RuntimeError(f"USDU Hires tile returned {len(refined)} images instead of 1")
+                    raise RuntimeError(f"USDU resample tile returned {len(refined)} images instead of 1")
                 metrics = serializable_runtime_metrics(getattr(pipeline, "last_generation_metrics", {}) or {})
                 sampling_metrics = metrics.get("refinement.sampling")
                 decode_metrics = metrics.get("refinement.vae_decode")
@@ -5797,12 +6672,12 @@ def _apply_hires_fix_stages(
                 # Snapshotting the canvas costs a full RGBA->RGB copy, so never build it when capture is off.
                 if capture.enabled:
                     capture.composite(tile_index, compositor.finish())
-                control.checkpoint(job_id, f"Hires.fix tile {tile_index + 1}/{tile_count} composite")
+                control.checkpoint(job_id, f"{label} tile {tile_index + 1}/{tile_count} composite")
                 row, col = divmod(tile_index, plan.cols)
                 tile_metrics.append({
                     "index": tile_index, "row": row, "col": col, "hires_seed": str(hires_seed),
                     "elapsed_seconds": round(time.monotonic() - tile_started, 4),
-                    "schedule_requested": {"sampler": resolved_sampler, "scheduler": resolved_scheduler, "steps": settings.steps},
+                    "schedule_requested": {"sampler": resolved_sampler, "scheduler": resolved_scheduler, "steps": unit_steps},
                     "schedule_executed": {key: sampling_metrics.get(key) if isinstance(sampling_metrics, dict) else None
                                           for key in ("schedule_steps", "schedule_mode", "start_sigma")},
                     "conditioning_reused": sampling_metrics.get("conditioning_reused") if isinstance(sampling_metrics, dict) else None,
@@ -5819,17 +6694,19 @@ def _apply_hires_fix_stages(
             merge_runtime_metrics(job_id, getattr(pipeline, "last_generation_metrics", None), "hires", previous_metrics)
             refinement_sampling = (getattr(pipeline, "last_generation_metrics", {}) or {}).get("refinement.sampling", {})
             refinement_decode = (getattr(pipeline, "last_generation_metrics", {}) or {}).get("refinement.vae_decode", {})
+            diagnostics.update(resample_stage_facts(
+                settings, unit_number, base_seed, hires_seed,
+                source_size=resample_source_size, target_size=target_size, executed_size=destination,
+                steps=unit_steps, cfg=unit_cfg, sampler_resolved=resolved_sampler,
+                scheduler_resolved=resolved_scheduler, execution_mode="usdu_tiled",
+            ))
             diagnostics.update({
-                "execution_mode": "usdu_tiled", "sampler_requested": settings.sampler,
-                "scheduler_requested": settings.scheduler, "sampler_resolved": resolved_sampler,
-                "scheduler_resolved": resolved_scheduler, "source_size": hires_source_size, "target_size": destination,
-                "base_seed": str(base_seed), "hires_seed_mode": settings.mode, "hires_seed": str(hires_seed),
                 "core_tile": core_tile, "model_size": plan.processing_size, "rows": plan.rows,
                 "cols": plan.cols, "tile_count": tile_count, "padding": settings.padding,
                 "mask_blur": settings.mask_blur, "seam_mode": settings.seam_mode,
                 "uniform_tiles": settings.uniform_tiles, "tiled_decode_requested": {"tile": 512, "overlap": 64},
                 "tiled_decode_resolved": refinement_decode.get("resolved_tiled_decode", {"mode": "unknown"}),
-                "steps_per_tile": settings.steps, "total_steps": stage_total,
+                "steps_per_tile": unit_steps, "total_steps": stage_total,
                 "conditioning_reused": True, "sigmas_reused": True, "tile_metrics": tile_metrics,
                 "preparation_metrics": {"prompt_encode": preparation_metrics, "elapsed_seconds": preparation_elapsed},
                 "aggregate": {
@@ -5847,13 +6724,13 @@ def _apply_hires_fix_stages(
                     diagnostics[key] = refinement_sampling[key]
             if upscale_warning:
                 diagnostics["warning"] = upscale_warning
-            return compositor.finish(), diagnostics
+            return exact_resample_output(compositor.finish(), settings, target_size, diagnostics, control, job_id, label), diagnostics
 
         generator = torch.Generator(device="cpu").manual_seed(hires_seed)
         update_job(
             job_id,
             phase=phase,
-            stage="hires_sampling",
+            stage="resample_sampling",
             stage_step=0,
             stage_total=effective_steps,
             progress=upscale_end,
@@ -5866,7 +6743,7 @@ def _apply_hires_fix_stages(
             update_job(
                 job_id,
                 phase=phase,
-                stage="hires_sampling",
+                stage="resample_sampling",
                 stage_step=min(step, total),
                 stage_total=total,
                 progress=min(progress, progress_end),
@@ -5883,9 +6760,9 @@ def _apply_hires_fix_stages(
             images=[upscaled.convert("RGB")],
             prompt=request.prompt,
             negative_prompt=request.negative_prompt,
-            steps=settings.steps,
+            steps=unit_steps,
             denoise=settings.denoise,
-            cfg=settings.cfg,
+            cfg=unit_cfg,
             sampler=resolved_sampler,
             scheduler=resolved_scheduler,
             generators=[generator],
@@ -5897,33 +6774,30 @@ def _apply_hires_fix_stages(
             on_step_checkpoint=on_anima_hires_checkpoint,
         )
         if len(refined) != 1:
-            raise RuntimeError(f"Anima Hires.fix returned {len(refined)} images instead of 1")
+            raise RuntimeError(f"Native resample refinement returned {len(refined)} images instead of 1")
         merge_runtime_metrics(
             job_id, getattr(pipeline, "last_generation_metrics", None), "hires", previous_metrics
         )
-        diagnostics.update({
-            "execution_mode": "full_frame",
-            "sampler_requested": settings.sampler,
-            "scheduler_requested": settings.scheduler,
-            "sampler_resolved": resolved_sampler,
-            "scheduler_resolved": resolved_scheduler,
-            "base_seed": str(base_seed),
-            "hires_seed_mode": settings.mode,
-            "hires_seed": str(hires_seed),
-            "denoise": settings.denoise,
-            "steps": settings.steps,
-            "effective_steps": effective_steps,
-            "cfg": settings.cfg,
-            "postprocess_order": list(request.postprocess_order),
-        })
+        diagnostics.update(resample_stage_facts(
+            settings, unit_number, base_seed, hires_seed,
+            source_size=resample_source_size, target_size=target_size, executed_size=refined[0].size,
+            steps=unit_steps, cfg=unit_cfg, sampler_resolved=resolved_sampler,
+            scheduler_resolved=resolved_scheduler, execution_mode="full_frame",
+            effective_steps=effective_steps,
+        ))
         refinement_sampling = (getattr(pipeline, "last_generation_metrics", {}) or {}).get("refinement.sampling", {})
         for key in ("schedule_steps", "schedule_mode", "start_sigma"):
             if key in refinement_sampling:
                 diagnostics[key] = refinement_sampling[key]
         if upscale_warning:
             diagnostics["warning"] = upscale_warning
-        return refined[0].convert("RGB"), diagnostics
+        return exact_resample_output(refined[0].convert("RGB"), settings, target_size, diagnostics, control, job_id, label), diagnostics
 
+    # The redraw is its own stage on its own canvas. By now the base decode has given its memory
+    # back and the upscaler has been parked, so where the diffusion model should live is a different
+    # question from the one the base pass answered — and on a 1152x1920 redraw it is the question
+    # that used to be answered once, for the whole chain, by whichever stage needed the most.
+    plan_residency_for_stage("hires_sampling", family, tuple(target_size), unit_cfg, 1, job_id)
     image_pipeline, guidance_kwargs = derived_sampling_pipeline(
         pipeline, AutoPipelineForImage2Image, request.guidance, request.pag
     )
@@ -5939,7 +6813,7 @@ def _apply_hires_fix_stages(
         update_job(
             job_id,
             phase=phase,
-            stage="hires_sampling",
+            stage="resample_sampling",
             stage_step=step,
             stage_total=effective_steps,
             progress=min(progress, progress_end),
@@ -5951,7 +6825,7 @@ def _apply_hires_fix_stages(
         control.checkpoint(job_id, phase)
         return callback_kwargs
 
-    update_job(job_id, phase=phase, stage="hires_sampling", stage_step=0, stage_total=effective_steps, progress=upscale_end, step=0, total_steps=effective_steps)
+    update_job(job_id, phase=phase, stage="resample_sampling", stage_step=0, stage_total=effective_steps, progress=upscale_end, step=0, total_steps=effective_steps)
     try:
         pipeline_output = run_guided_pipeline(
             pipeline,
@@ -5959,8 +6833,8 @@ def _apply_hires_fix_stages(
             {
                 "image": upscaled,
                 "strength": settings.denoise,
-                "num_inference_steps": settings.steps,
-                "guidance_scale": settings.cfg,
+                "num_inference_steps": unit_steps,
+                "guidance_scale": unit_cfg,
                 "generator": torch.Generator(device="cpu").manual_seed(hires_seed),
                 "callback_on_step_end": on_hires_step,
                 "callback_on_step_end_tensor_inputs": ["latents"],
@@ -5985,24 +6859,16 @@ def _apply_hires_fix_stages(
             del decoded, pipeline_output
         else:
             result = pipeline_output[0].convert("RGB")
-        diagnostics.update({
-            "execution_mode": "full_frame",
-            "sampler_requested": settings.sampler,
-            "scheduler_requested": settings.scheduler,
-            "sampler_resolved": resolved_sampler,
-            "scheduler_resolved": resolved_scheduler,
-            "base_seed": str(base_seed),
-            "hires_seed_mode": settings.mode,
-            "hires_seed": str(hires_seed),
-            "denoise": settings.denoise,
-            "steps": settings.steps,
-            "effective_steps": effective_steps,
-            "cfg": settings.cfg,
-            "postprocess_order": list(request.postprocess_order),
-        })
+        diagnostics.update(resample_stage_facts(
+            settings, unit_number, base_seed, hires_seed,
+            source_size=resample_source_size, target_size=target_size, executed_size=result.size,
+            steps=unit_steps, cfg=unit_cfg, sampler_resolved=resolved_sampler,
+            scheduler_resolved=resolved_scheduler, execution_mode="full_frame",
+            effective_steps=effective_steps,
+        ))
         if upscale_warning:
             diagnostics["warning"] = upscale_warning
-        return result, diagnostics
+        return exact_resample_output(result, settings, target_size, diagnostics, control, job_id, label), diagnostics
     finally:
         try:
             image_pipeline.maybe_free_model_hooks()
@@ -6457,7 +7323,7 @@ def remove_preview(path):
 
 STAGE_PREVIEW_LABELS = {
     "base": "基础采样",
-    "hires": "Hires.fix",
+    "resample": "重采样",
     "adetailer": "ADetailer",
     "rtx": "RTX VSR",
     "background_removal": "透明背景",
@@ -6516,28 +7382,64 @@ def secure_random_uint64():
     return secrets.randbits(64)
 
 
-def resolve_effective_hires_seed(settings: HiresInput, base_seed: int, random_uint64=None):
-    """Resolve exactly one output's Hires seed after its base seed is known."""
-    if not settings.enabled:
+def resolve_resample_unit_seed(settings: ResampleUnitInput, base_seed: int, random_uint64=None):
+    """Resolve one unit's seed for one output, after that output's base seed is known.
+
+    A unit that does not redraw spends no seed, and says so with `None` rather than carrying one
+    that never reaches a generator.
+    """
+    if not settings.redraws:
         return None
     if isinstance(base_seed, bool) or not isinstance(base_seed, int) or not 0 <= base_seed <= 0xFFFFFFFFFFFFFFFF:
         raise ValueError("Base seed must be an unsigned 64-bit integer")
-    if settings.mode == "inherit":
+    if settings.seed_mode == "inherit":
         return base_seed
-    if settings.mode == "fixed":
+    if settings.seed_mode == "fixed":
         return int(settings.seed, 10)
     candidate = (random_uint64 or secure_random_uint64)()
     if isinstance(candidate, bool) or not isinstance(candidate, int) or not 0 <= candidate <= 0xFFFFFFFFFFFFFFFF:
-        raise ValueError("Random Hires seed source returned an invalid unsigned 64-bit integer")
+        raise ValueError("Random resample seed source returned an invalid unsigned 64-bit integer")
     return candidate
 
 
-def output_seed_facts(request: GenerateInput, base_seed: int, effective_hires_seed):
+def resolve_chain_seeds(request: GenerateInput, base_seed: int, random_uint64=None):
+    """Every enabled unit's seed for one output, keyed by its position in the chain.
+
+    Resolved once per picture, before the chain runs: `random` must draw a fresh value per output
+    rather than per unit invocation, and a unit that is reached twice in a retry must not move.
+    """
+    return {
+        index: resolve_resample_unit_seed(stage, base_seed, random_uint64)
+        for index, stage in enumerate(request.postprocess_chain)
+        if stage.type == "resample" and stage.enabled
+    }
+
+
+def output_seed_facts(request: GenerateInput, base_seed: int, chain_seeds=None):
+    """The seed block every output record carries.
+
+    `hires_seed` and `hires_seed_mode` describe the first redrawing unit. They are the names the
+    gallery restores a run from, and with one unit — which is what every chain migrated from the old
+    Hires block has — they mean exactly what they always did.
+    """
+    seeds = chain_seeds or {}
+    units = []
+    for index, stage in enumerate(request.postprocess_chain):
+        if stage.type != "resample" or not stage.enabled:
+            continue
+        seed_value = seeds.get(index)
+        units.append({
+            "unit": request.resample_unit_number(stage),
+            "seed_mode": stage.seed_mode,
+            "seed": str(seed_value) if seed_value is not None else None,
+        })
+    leading = next((unit for unit in units if unit["seed"] is not None), None)
     return {
         "seed": str(base_seed),
         "base_seed": str(base_seed),
-        "hires_seed_mode": request.hires.mode,
-        "hires_seed": str(effective_hires_seed) if effective_hires_seed is not None else None,
+        "hires_seed_mode": leading["seed_mode"] if leading else "inherit",
+        "hires_seed": leading["seed"] if leading else None,
+        "resample_seeds": units,
     }
 
 
@@ -6558,7 +7460,9 @@ def batch_pipeline_kwargs(request: GenerateInput, generators, on_step_end, condi
 
 
 def run_pipeline_batch(pipeline, pipeline_kwargs):
-    outputs = pipeline(**pipeline_kwargs).images
+    outputs = run_with_offload_escalation(
+        pipeline, pipeline_kwargs, lambda: pipeline(**pipeline_kwargs)
+    ).images
     expected = pipeline_kwargs["num_images_per_prompt"]
     if len(outputs) != expected:
         raise RuntimeError(f"Pipeline returned {len(outputs)} images for a requested batch of {expected}")
@@ -6573,20 +7477,21 @@ def save_image(
     wall_elapsed: float,
     paused_seconds: float,
     adetailer_result=None,
-    hires_result=None,
+    resample_results=None,
     rtx_result=None,
     background_removal_result=None,
     *,
     conditioning_prompt=None,
     seed=None,
-    effective_hires_seed=None,
+    chain_seeds=None,
     batch_index=1,
     image_index=1,
     before_commit=None,
 ):
     base_seed = request.seed if seed is None else seed
-    if request.hires.enabled and effective_hires_seed is None:
-        raise ValueError("Effective Hires.fix seed is required when saving a Hires output")
+    resample_results = list(resample_results or [])
+    if any(unit.redraws for unit in request.active_resample_units) and not chain_seeds:
+        raise ValueError("Resample seeds must be resolved before saving an output that redraws")
     output_path = create_output_path()
     temporary_path = output_path.with_name(f".{output_path.stem}-{uuid.uuid4().hex}.tmp")
     metadata = PngInfo()
@@ -6603,7 +7508,7 @@ def save_image(
         "steps": request.steps,
         "cfg": request.cfg,
         "denoise": request.denoise,
-        **output_seed_facts(request, base_seed, effective_hires_seed),
+        **output_seed_facts(request, base_seed, chain_seeds),
         "images_per_batch": request.images_per_batch,
         "batch_count": request.batch_count,
         "batch_index": batch_index,
@@ -6630,11 +7535,15 @@ def save_image(
             "denoise": request.denoise,
             "postprocess_only": request.postprocess_only,
         } if request.source_image.enabled else None,
-        "hires": hires_result if request.hires.enabled else None,
+        # The chain as it was configured, and what each stage actually did. The old single-block
+        # `hires` key is still written when exactly one unit ran, so a reader from before the chain
+        # — an older gallery card, someone's script — finds the record where it expects it.
+        "postprocess_chain": [stage.model_dump() for stage in request.postprocess_chain],
+        "resample": resample_results or None,
+        "hires": resample_results[0] if len(resample_results) == 1 else None,
         "adetailer": adetailer_result if request.adetailer.enabled else None,
         "rtx": rtx_result if request.rtx.enabled else None,
-        "postprocess_order": list(request.postprocess_order),
-        "postprocess_stages": postprocessing_stages(request),
+        "postprocess_stages": postprocess_stage_types(request),
         "postprocess_only": request.postprocess_only,
         "loras": [{"name": Path(item.path).name, "weight": item.weight} for item in request.loras],
         "elapsed_seconds": round(elapsed, 3),
@@ -6840,13 +7749,19 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                 "adetailer_enabled": request.adetailer.enabled,
                 "adetailer_units": len(request.adetailer.active_units),
                 "adetailer_detector": " · ".join(unit.detector for unit in request.adetailer.active_units) or None,
-                "hires_enabled": request.hires.enabled,
-                "hires_model": request.hires.model if request.hires.enabled else None,
-                "hires_scale": request.hires.scale if request.hires.enabled else None,
+                "resample_units": len(request.active_resample_units),
+                "resample_chain": [
+                    {
+                        "unit": request.resample_unit_number(unit), "upscaler": unit.upscaler,
+                        "scale": unit.scale, "denoise": unit.denoise,
+                        "resize_algorithm": unit.resize_algorithm, "execution_mode": unit.execution_mode,
+                    }
+                    for unit in request.active_resample_units
+                ],
                 "rtx_enabled": request.rtx.enabled,
                 "rtx_scale": request.rtx.scale if request.rtx.enabled else None,
                 "rtx_quality": request.rtx.quality if request.rtx.enabled else None,
-                "postprocess_order": list(request.postprocess_order),
+                "postprocess_chain": [stage.model_dump() for stage in request.postprocess_chain],
             },
             "runtime": {
                 "python": sys.version,
@@ -6949,7 +7864,7 @@ def run_generation(job_id: str, request: GenerateInput):
     ultra_low_memory = performance_settings["memory_mode"] == "ultra_low_vram"
     pipeline = None
     adetailer_result = None
-    hires_result = None
+    resample_results = []
     rtx_result = None
     background_removal_result = None
     release_cuda_cache = False
@@ -6963,13 +7878,14 @@ def run_generation(job_id: str, request: GenerateInput):
             except OSError:
                 pass
 
-    def publish_stage_preview(image: Image.Image, stage: str, image_index: int = 0):
+    def publish_stage_preview(image: Image.Image, stage: str, image_index: int = 0, label: str | None = None):
         """Record one finished stage's picture on the job.
 
         This is the settled result of a stage that has just finished, published while the next
         stage is already running. It stays until that next stage finishes, which is what puts the
-        base sample on screen for the whole of Hires, and the Hires result on screen for the whole
-        of ADetailer.
+        base sample on screen for the whole of the first unit, and that unit's result on screen for
+        the whole of whatever follows it. With several resample units, `label` is what tells two of
+        them apart on screen -- they share a stage type and differ only by their number.
         """
         try:
             with jobs_lock:
@@ -6990,7 +7906,7 @@ def run_generation(job_id: str, request: GenerateInput):
             entries.append({
                 "index": index,
                 "stage": stage,
-                "label": STAGE_PREVIEW_LABELS.get(stage, stage),
+                "label": label or STAGE_PREVIEW_LABELS.get(stage, stage),
                 "image_index": image_index,
                 "url": f"/api/inference/jobs/{job_id}/stages/{index}",
                 "width": image.width,
@@ -7194,6 +8110,7 @@ def run_generation(job_id: str, request: GenerateInput):
                 job_id,
                 memory_batch,
                 request.guidance,
+                loras=lora_signature(request.loras, lora_root),
             )
         # The native loaders fuse their adapters into the weights as the pipeline is built, so this
         # is the point at which they are mounted. The diffusers families report from
@@ -7350,6 +8267,11 @@ def run_generation(job_id: str, request: GenerateInput):
             negative_prompt_weighted_tokens = 0
         else:
             configure_loras(pipeline, request.loras, lora_root, job_id)
+            # Adapters change every figure the controller places the model by, and a block or leaf
+            # carries its adapter submodules with it — so the measurement belongs after the mount,
+            # which is the order the plan asks for (P1-6).
+            if active_residency is not None:
+                active_residency.measure()
             prompt_info = prompt_diagnostics(pipeline.tokenizer, request.prompt)
             negative_prompt_info = prompt_diagnostics(pipeline.tokenizer, request.negative_prompt)
             prompt_weighted_tokens = prompt_info["weighted_tokens"]
@@ -7397,10 +8319,14 @@ def run_generation(job_id: str, request: GenerateInput):
             batch_start = 25 + 73 * batch_index / request.batch_count
             batch_end = 25 + 73 * (batch_index + 1) / request.batch_count
             enabled_post_stages = postprocessing_stages(request)
+            # Where each of them sits in the whole chain. Two resample units can hold identical
+            # settings, and `list.index` compares pydantic models by value, so the position has to
+            # be carried rather than looked up again from the stage itself.
+            enabled_post_stage_indices = [index for index, stage in enumerate(request.postprocess_chain) if stage.enabled]
             postprocessing_enabled = bool(enabled_post_stages)
             # Post-processing mode samples and decodes nothing, so both of those slices collapse onto
             # the start of the batch and the stages get the whole budget.
-            sampling_end = batch_start if request.postprocess_only else batch_start + (batch_end - batch_start) * (0.68 if request.hires.enabled else 0.82 if postprocessing_enabled else 0.92)
+            sampling_end = batch_start if request.postprocess_only else batch_start + (batch_end - batch_start) * (0.68 if request.active_resample_units else 0.82 if postprocessing_enabled else 0.92)
             decode_end = batch_start if request.postprocess_only else batch_start + (batch_end - batch_start) * (0.74 if postprocessing_enabled else 1.0)
             phase = (
                 f"Batch {batch_index + 1}/{request.batch_count} · Post-processing {request.images_per_batch} images"
@@ -7634,6 +8560,10 @@ def run_generation(job_id: str, request: GenerateInput):
                     if source_image is not None
                     else batch_pipeline_kwargs(request, generators, on_step_end, conditioning)
                 )
+                plan_residency_for_stage(
+                    "base_sampling", family, (request.width, request.height),
+                    request.cfg, request.images_per_batch, job_id,
+                )
                 if performance_settings["staged_vae_decode"]:
                     pipeline_kwargs["output_type"] = "latent"
                     latents = run_guided_pipeline_batch(pipeline, request.guidance, pipeline_kwargs, request.pag, sampling_factory)
@@ -7659,13 +8589,13 @@ def run_generation(job_id: str, request: GenerateInput):
             for image_index, image in enumerate(images):
                 control.checkpoint(job_id, f"Processing image {image_index + 1}")
                 base_seed = seeds[image_index]
-                effective_hires_seed = resolve_effective_hires_seed(request.hires, base_seed)
-                seed_facts = output_seed_facts(request, base_seed, effective_hires_seed)
+                chain_seeds = resolve_chain_seeds(request, base_seed)
+                seed_facts = output_seed_facts(request, base_seed, chain_seeds)
                 update_job(job_id, **seed_facts)
                 detail_start = decode_end + (batch_end - decode_end) * image_index / request.images_per_batch
                 detail_end = decode_end + (batch_end - decode_end) * (image_index + 1) / request.images_per_batch
                 adetailer_result = None
-                hires_result = None
+                resample_results = []
                 rtx_result = None
                 post_stages = enabled_post_stages
                 # The base sample is a stage in its own right, and publishing it here is what puts a
@@ -7676,29 +8606,35 @@ def run_generation(job_id: str, request: GenerateInput):
                 for stage_index, post_stage in enumerate(post_stages):
                     stage_start = detail_start + (detail_end - detail_start) * stage_index / len(post_stages)
                     stage_end = detail_start + (detail_end - detail_start) * (stage_index + 1) / len(post_stages)
-                    if post_stage == "adetailer" and pipeline_cpu_parked:
+                    chain_index = enabled_post_stage_indices[stage_index]
+                    if post_stage.type == "adetailer" and pipeline_cpu_parked:
                         control.checkpoint(job_id, "Restoring sampler for ADetailer")
                         update_job(job_id, phase="Restoring model for ADetailer", stage="model_restore", progress=round(stage_start))
                         restore_parked_pipeline()
-                    if post_stage == "hires":
-                        image, hires_result = apply_hires_fix(
+                    if post_stage.type == "resample":
+                        unit_number = request.resample_unit_number(post_stage)
+                        image, resample_result = apply_resample_unit(
                             image,
                             pipeline,
                             family,
                             request,
+                            post_stage,
                             job_id,
                             control,
                             started_at,
+                            unit_number=unit_number,
                             image_seed=base_seed,
-                            effective_hires_seed=effective_hires_seed,
+                            effective_seed=chain_seeds.get(chain_index),
                             progress_start=round(stage_start),
                             progress_end=round(stage_end),
                         )
-                        hires_warning = hires_result.get("warning") if hires_result else None
-                        if hires_warning and hires_warning not in (warning or ""):
-                            warning = append_warning(warning, hires_warning)
+                        if resample_result:
+                            resample_results.append(resample_result)
+                        resample_warning = resample_result.get("warning") if resample_result else None
+                        if resample_warning and resample_warning not in (warning or ""):
+                            warning = append_warning(warning, resample_warning)
                             update_job(job_id, warning=warning)
-                    elif post_stage == "adetailer":
+                    elif post_stage.type == "adetailer":
                         image, adetailer_result, adetailer_warning = apply_adetailer(
                             image,
                             pipeline,
@@ -7714,7 +8650,7 @@ def run_generation(job_id: str, request: GenerateInput):
                         if adetailer_warning and adetailer_warning not in (warning or ""):
                             warning = append_warning(warning, adetailer_warning)
                             update_job(job_id, warning=warning)
-                    elif post_stage == "rtx":
+                    elif post_stage.type == "rtx":
                         image, rtx_result = apply_rtx_vsr(
                             image,
                             pipeline,
@@ -7726,11 +8662,14 @@ def run_generation(job_id: str, request: GenerateInput):
                             progress_end=round(stage_end),
                         )
                     else:
-                        raise RuntimeError(f"Unsupported post-processing stage: {post_stage}")
+                        raise RuntimeError(f"Unsupported post-processing stage: {post_stage.type}")
                     # `image` is now this stage's result, and stays on screen until the next stage
-                    # finishes — so Hires is watched against the base sample, and ADetailer against
-                    # the Hires result.
-                    publish_stage_preview(image, post_stage, image_index)
+                    # finishes — so the first unit is watched against the base sample, and whatever
+                    # follows against that unit's result.
+                    publish_stage_preview(
+                        image, post_stage.type, image_index,
+                        label=f"重采样 {request.resample_unit_number(post_stage)}" if post_stage.type == "resample" else None,
+                    )
                 background_removal_result = None
                 if transparent_background:
                     control.checkpoint(job_id, "Removing background")
@@ -7774,12 +8713,12 @@ def run_generation(job_id: str, request: GenerateInput):
                     wall_elapsed,
                     paused_seconds,
                     adetailer_result,
-                    hires_result,
+                    resample_results,
                     rtx_result,
                     background_removal_result,
                     conditioning_prompt=conditioning_prompt,
                     seed=base_seed,
-                    effective_hires_seed=effective_hires_seed,
+                    chain_seeds=chain_seeds,
                     batch_index=batch_index + 1,
                     image_index=image_index + 1,
                     before_commit=lambda: control.checkpoint(job_id, "Committing image"),
@@ -7799,7 +8738,7 @@ def run_generation(job_id: str, request: GenerateInput):
                     "transparent_background": transparent_background,
                     "background_removal": background_removal_result,
                     "postprocess_stages": post_stages,
-                    "hires": hires_result,
+                    "resample": resample_results,
                     "rtx": rtx_result,
                 })
                 update_job(job_id, completed_images=completed_images)
@@ -7998,6 +8937,14 @@ def health():
         "memory_inference_gb": active_memory_strategy["inference_gb"] if active_memory_strategy else None,
         "memory_reserved_gb": active_memory_strategy["reserved_gb"] if active_memory_strategy else None,
         "offload_mode": "cpu_parked" if pipeline_cpu_parked else active_memory_strategy["offload_mode"] if active_memory_strategy else None,
+        # Which order the guidance branches run in, and the arithmetic that chose the rung. Both are
+        # what a run has to be checked against: the rung alone cannot say whether the activation
+        # peak was halved, and the reason string rounds to one decimal place.
+        "cfg_mode": active_memory_strategy.get("cfg_mode") if active_memory_strategy else None,
+        "memory_admission": active_memory_strategy.get("admission") if active_memory_strategy else None,
+        # Where the diffusion model is living, and every move it has made this job.
+        "residency": active_residency.snapshot() if active_residency is not None else None,
+        "residency_trace": list(active_residency.trace) if active_residency is not None else [],
         "attention_backend": current_attention_backend(),
         "compute_dtype": active_compute_dtype,
         "vae_mode": active_vae_mode,
@@ -8316,9 +9263,11 @@ def create_job(request: GenerateInput):
             except ValueError as error:
                 label = f"ADetailer {index + 1}" if len(request.adetailer.units) > 1 else "ADetailer"
                 raise HTTPException(status_code=422, detail=f"{label}: {error}") from error
-    if request.hires.enabled:
+    for unit in request.active_resample_units:
+        if not unit.upscaler:
+            continue
         try:
-            resolve_upscaler_model(UPSCALER_MODEL_DIRECTORY, request.hires.model)
+            resolve_upscaler_model(UPSCALER_MODEL_DIRECTORY, unit.upscaler)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
     if request.source_image.enabled:
@@ -8377,7 +9326,7 @@ def create_job(request: GenerateInput):
             "stage_previews": [],
             "seed": str(request.seed),
             "base_seed": str(request.seed),
-            "hires_seed_mode": request.hires.mode,
+            "hires_seed_mode": request.resample_units[0].seed_mode if request.resample_units else "inherit",
             "hires_seed": None,
             "transparent_background": directives["transparent_background"],
             # The picture itself never reaches the job record: it is polled several times a second
@@ -8388,13 +9337,12 @@ def create_job(request: GenerateInput):
             "source_image_resize_mode": request.source_image.resize_mode if request.source_image.enabled else None,
             "background_removal_model": request.background_removal_model,
             "background_removal": None,
-            "hires_enabled": request.hires.enabled,
-            "hires_model": request.hires.model if request.hires.enabled else None,
+            "resample_units": len(request.active_resample_units),
             "rtx_enabled": request.rtx.enabled,
             "rtx_scale": request.rtx.scale if request.rtx.enabled else None,
             "rtx_quality": request.rtx.quality if request.rtx.enabled else None,
-            "postprocess_order": list(request.postprocess_order),
-            "postprocess_stages": postprocessing_stages(request),
+            "postprocess_chain": [stage.model_dump() for stage in request.postprocess_chain],
+            "postprocess_stages": postprocess_stage_types(request),
             "postprocess_only": request.postprocess_only,
             "created_at": time.time(),
             "error": None,

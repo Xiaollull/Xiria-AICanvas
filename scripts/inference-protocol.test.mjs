@@ -5,7 +5,7 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 
-test("frontend supervisor, startup, update validation, and Python backend use protocol 35", () => {
+test("frontend supervisor, startup, update validation, and Python backend use protocol 36", () => {
   const sources = [
     ["vite.config.js", /const inferenceProtocol = (\d+);/],
     ["scripts/start.mjs", /const inferenceProtocol = (\d+);/],
@@ -17,5 +17,5 @@ test("frontend supervisor, startup, update validation, and Python backend use pr
     assert.ok(match, `${relative} must declare the inference protocol`);
     return Number(match[1]);
   });
-  assert.deepEqual(protocols, [35, 35, 35, 35]);
+  assert.deepEqual(protocols, [36, 36, 36, 36]);
 });

@@ -142,12 +142,44 @@ test("the lightbox scales both portrait and panoramic originals fully inside the
     "the viewer must not jump back to desktop spacing between 681px and 720px");
 });
 
-test("ADetailer independent overrides use readable checkboxes in both workspaces", async () => {
+/** Every declaration a selector receives, from each rule whose selector list names it exactly. */
+function declarationsFor(css, selector) {
+  const found = {};
+  for (const rule of cssRules(css)) {
+    if (!rule.selectors.split(",").map((item) => item.trim()).includes(selector)) continue;
+    for (const declaration of cssDeclarations(rule.body)) {
+      const separator = declaration.indexOf(":");
+      if (separator !== -1) found[declaration.slice(0, separator).trim()] = declaration.slice(separator + 1).trim();
+    }
+  }
+  return found;
+}
+
+test("independent step and CFG overrides use readable checkboxes in every panel", async () => {
+  // Read by selector rather than by the rule's text: the resample chain shares ADetailer's rule for
+  // the same two controls, and a shared rule names both panels in one selector list.
   const css = await read("src/styles.css");
-  assert.match(css, /\.adetailer-overrides input\[type="checkbox"\] \{ width: 18px; height: 18px;/,
-    "text-to-image ADetailer checkboxes must not fall back to the tiny browser default");
-  assert.match(css, /\.i2i-override-grid input\[type="checkbox"\] \{ width: 18px; height: 18px;/,
-    "image-to-image ADetailer checkboxes must match the readable control size");
+  for (const [selector, where] of [
+    ['.adetailer-overrides input[type="checkbox"]', "text-to-image ADetailer"],
+    ['.i2i-override-grid input[type="checkbox"]', "image-to-image ADetailer"],
+    ['.resample-overrides input[type="checkbox"]', "resample unit"],
+  ]) {
+    const declared = declarationsFor(css, selector);
+    assert.equal(declared.width, "18px", `${where} checkboxes must not fall back to the tiny browser default`);
+    assert.equal(declared.height, "18px", `${where} checkboxes must match the readable control size`);
+  }
+});
+
+test("a resample unit's step and CFG fields are styled, not browser-default boxes", async () => {
+  // `.bounded-number` has no rule of its own; it is styled only inside a container that names it.
+  // The resample pair had none, so its two fields rendered as white default inputs in a dark panel.
+  const css = await read("src/styles.css");
+  const field = declarationsFor(css, ".resample-overrides .bounded-number");
+  assert.ok(field.border, "the field needs a border");
+  assert.ok(field.background, "the field needs the panel's surface, not the browser's white");
+  assert.ok(field.font, "the field needs the panel's type, not the browser's");
+  const row = declarationsFor(css, ".resample-overrides > label");
+  assert.ok(row.border && row.background, "each override sits on its own card, as ADetailer's do");
 });
 
 test("every gallery UI font is at least 9px unless it is an explicit icon-hide zero", async () => {

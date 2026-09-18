@@ -1,7 +1,7 @@
 {
   "name": "xiriacanvas-ai",
   "private": true,
-  "version": "1.0.9",
+  "version": "1.1.0",
   "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
@@ -11,7 +11,7 @@
     "setup": "node scripts/setup-gui.mjs",
     "setup:cli": "node scripts/setup.mjs",
     "test:setup": "node --test --test-timeout=60000 scripts/*.test.mjs",
-    "test:backend": "python -m unittest discover -s backend -p \"test_*.py\" -v",
+    "test:backend": "python -m unittest discover -s backend/tests -p \"test_*.py\" -v",
     "start": "node scripts/start.mjs",
     "dev": "node scripts/start.mjs",
     "dev:vite": "vite",

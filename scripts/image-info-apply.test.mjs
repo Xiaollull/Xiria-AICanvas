@@ -190,7 +190,6 @@ test("the panel keeps its marks on screen and the workspace writes go through on
   // The base model is read first, so it is sized and coloured to be found first.
   assert.match(styles, /\.info-identity-model > \.info-identity-model-name \{[^}]*font-size: 14px/);
   assert.match(styles, /\.info-identity-model > \.model-name-found\.info-identity-model-name \{ color: var\(--lime\)/);
-  assert.match(styles, /html\[data-theme-mode="light"\] \.image-info-apply-fields > li\.missing/);
 });
 
 test("a split engine's model lands in the diffusion model field, not the checkpoint", () => {

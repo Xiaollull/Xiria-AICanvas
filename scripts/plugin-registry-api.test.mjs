@@ -359,7 +359,10 @@ test("the registry plugin is wired into the control plane behind the setup gate"
   // The setup gate stays `enforce: "pre"`, and the registry only mounts once setup is complete, so
   // an unconfigured install answers `/config` instead of exposing the plugin port.
   assert.match(source, /name: "setup-gate",\n\s+enforce: "pre",/);
-  const registration = /plugins: \[setupGatePlugin\(\), themedLogoPlugin\(\), react\(\), \.\.\.\(setupComplete \? \[([^\]]+)\]/.exec(source);
+  // The connection guard precedes the gate: a socket is accepted before any middleware runs, so a
+  // plugin that installs its error listener later would be racing the request it is meant to
+  // survive. See `scripts/service-resilience.test.mjs`.
+  const registration = /plugins: \[connectionResiliencePlugin\(\), setupGatePlugin\(\), themedLogoPlugin\(\), react\(\), \.\.\.\(setupComplete \? \[([^\]]+)\]/.exec(source);
   assert.notEqual(registration, null, "the plugin array must keep its documented shape");
   assert.equal(registration[1].includes("pluginRegistryApiPlugin()"), true);
 
@@ -377,8 +380,8 @@ test("the registry plugin is wired into the control plane behind the setup gate"
   // Discovery stays in the Node control plane; the FastAPI data plane is not involved.
   const backend = await readFile(path.join(projectDirectory, "backend", "inference_server.py"), "utf8");
   assert.equal(backend.includes("/api/plugins"), false);
-  assert.match(source, /const inferenceProtocol = 35;/);
-  assert.match(backend, /^INFERENCE_PROTOCOL = 35$/m);
+  assert.match(source, /const inferenceProtocol = 36;/);
+  assert.match(backend, /^INFERENCE_PROTOCOL = 36$/m);
 });
 
 test("the build never transpiles, copies, or bundles plugin content", async (context) => {

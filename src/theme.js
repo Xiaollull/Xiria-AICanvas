@@ -18,7 +18,6 @@ export const DEFAULT_THEME = {
   ink: "#111112",
   disc: "#FFFFFF",
   guide: "#C9C5E8",
-  light: false,
 };
 
 export function normalizeHex(value, fallback = null) {
@@ -124,14 +123,13 @@ export function loadThemeState(saved) {
       && normalizeHex(saved.ink, DEFAULT_THEME.ink) === WITHDRAWN_DEFAULT_THEME.ink
       && normalizeHex(saved.disc, DEFAULT_THEME.disc) === WITHDRAWN_DEFAULT_THEME.disc
       && normalizeHex(saved.guide, DEFAULT_THEME.guide) === WITHDRAWN_DEFAULT_THEME.guide;
-    if (legacyDefault || withdrawnDefault) return { ...DEFAULT_THEME, light: saved.light === true || saved.monochrome === true };
+    if (legacyDefault || withdrawnDefault) return { ...DEFAULT_THEME };
     return {
       overall,
       accent: normalizeHex(saved.accent, deriveLogoTheme(overall).accent),
       ink: normalizeHex(saved.ink, deriveLogoTheme(overall).ink),
       disc: normalizeHex(saved.disc, deriveLogoTheme(overall).disc),
       guide: normalizeHex(saved.guide, deriveLogoTheme(overall).guide),
-      light: saved.light === true || saved.monochrome === true,
     };
   } catch {
     return { ...DEFAULT_THEME };
@@ -151,7 +149,6 @@ export function applyThemeToDocument(theme) {
   root.style.setProperty("--logo-disc", theme.disc);
   root.style.setProperty("--logo-guide", theme.guide);
   root.style.setProperty("--orange", "#FF7548");
-  root.dataset.themeMode = theme.light ? "light" : "dark";
-  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme.light ? "#F4F4F1" : "#0B0B0C");
+  // The tab colour is the dark page itself and never changes, so index.html states it once.
   document.querySelector('link[rel~="icon"]')?.setAttribute("href", `/xiriacanvas-favicon.svg?palette=${logoPalette}`);
 }

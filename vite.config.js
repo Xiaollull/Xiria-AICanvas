@@ -221,7 +221,7 @@ const loraPreviewRequests = new Map();
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 35;
+const inferenceProtocol = 36;
 export const inferenceWorkspaceId = workspaceId;
 const maximumUpdateArchiveBytes = 4 * 1024 ** 3;
 // The saved workspace carries the prompt, the negative prompt and every prompt preset, none of
@@ -311,6 +311,42 @@ function themedLogoPlugin() {
     name: "persisted-theme-logo",
     configureServer(server) { server.middlewares.use(themedLogoMiddleware); },
     configurePreviewServer(server) { server.middlewares.use(themedLogoMiddleware); },
+  };
+}
+
+/**
+ * A client that goes away must not be able to stop the service.
+ *
+ * Node routes a socket error onto the request or the response while one of them is attached, which
+ * is why most resets surface as a handled `aborted` and nothing more. A connection that resets with
+ * neither -- idle between keep-alive requests, or dropped before the first request line arrives --
+ * has nowhere to send it, so the socket emits `'error'` with no listener and Node throws out of the
+ * event loop. That is a real failure mode here rather than a theoretical one: a browser on another
+ * machine whose tunnel drops leaves exactly that socket behind, and it ended the whole server with
+ * `Error: read ECONNRESET at TCP.onStreamRead` while the generation it was watching ran happily on
+ * to completion. The instance was then unreachable with nobody in front of it to notice.
+ *
+ * So every accepted connection gets a listener whose only purpose is to exist. There is nothing to
+ * handle -- a client hanging up is ordinary traffic, not a fault of the service -- and swallowing it
+ * here hides nothing, because a reset that interrupts real work still reaches whichever request or
+ * response owns it.
+ */
+function connectionResiliencePlugin() {
+  const guard = (server) => {
+    const httpServer = server.httpServer;
+    if (!httpServer) return;
+    httpServer.on("connection", (socket) => { socket.on("error", () => {}); });
+    // A malformed request line or header block arrives here instead of on a request. Answering is
+    // optional and best-effort; not taking the process down with it is the point.
+    httpServer.on("clientError", (error, socket) => {
+      if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      else socket.destroy();
+    });
+  };
+  return {
+    name: "connection-resilience",
+    configureServer: guard,
+    configurePreviewServer: guard,
   };
 }
 
@@ -5738,7 +5774,7 @@ function systemApiPlugin() {
 }
 
 export default defineConfig({
-  plugins: [setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
+  plugins: [connectionResiliencePlugin(), setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
   cacheDir: path.join(cacheDirectory, "vite"),
   define: {
     // The browser may be on a different machine than the folders the user is

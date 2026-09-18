@@ -2,7 +2,8 @@
 // gallery page and the add-to-gallery dialog, which stays with the generate page.
 import { useEffect, useRef } from "react";
 import { SAMPLER_NAMES as SAMPLERS, SCHEDULER_NAMES as SCHEDULERS } from "./sampling-options.js";
-import { normalizeGalleryHires, normalizeUint64Seed } from "./hires-settings.js";
+import { normalizeUint64Seed } from "./hires-settings.js";
+import { migrateResampleChain } from "./resample-chain.js";
 import { normalizeADetailerStage } from "./adetailer-units.js";
 import { SETTINGS_ENGINES, engineGuidance, isSplitEngine } from "./engine-settings.js";
 
@@ -27,10 +28,7 @@ export const DEFAULT_SETTINGS = {
   pag: { scale: 0.3, appliedLayers: "mid" },
   size: { width: 1024, height: 1024 },
   backgroundRemovalModel: "",
-  hires: { enabled: false, expanded: false, model: "", seedMode: "inherit", seed: "", scale: 1, denoise: 0.35, steps: 20, cfg: 7, tileSize: 192, tileOverlap: 16, executionMode: "full_frame", sampler: null, scheduler: null, tileWidth: "auto", tileHeight: "auto", padding: 32, maskBlur: 8, seamMode: "none", uniformTiles: true, tiledDecode: true },
-  adetailer: normalizeADetailerStage({ enabled: false, expanded: false }),
-  rtx: { enabled: false, expanded: false, scale: 2, quality: "ultra" },
-  postprocessOrder: ["hires", "adetailer", "rtx"],
+  postprocessChain: [],
   loras: [],
   // Which LoRA combinations were switched on for this generation, and the prefix
   // they contributed. This is a *record of the run*, not the group library:
@@ -69,7 +67,7 @@ export function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-export function normalizedSettings(value, fallback = DEFAULT_SETTINGS, { hiresSourceKind = "persisted_card" } = {}) {
+export function normalizedSettings(value, fallback = DEFAULT_SETTINGS) {
   const source = value && typeof value === "object" ? value : {};
   const base = fallback && typeof fallback === "object" ? fallback : DEFAULT_SETTINGS;
   // Every engine the workspace can run. This list stopped at Anima, so a Flux, FLUX.2 or Krea 2 card
@@ -107,10 +105,13 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS, { hiresSo
         : ["mid", "all"].includes(base.pag?.appliedLayers) ? base.pag.appliedLayers : DEFAULT_SETTINGS.pag.appliedLayers,
     },
     size: { ...DEFAULT_SETTINGS.size, ...base.size, ...source.size },
-    hires: normalizeGalleryHires(model, source.hires, base.hires, { ...DEFAULT_SETTINGS.hires, samplers: SAMPLERS, schedulers: SCHEDULERS }, { sourceKind: hiresSourceKind }),
-    adetailer: normalizeADetailerStage({ ...base.adetailer, ...source.adetailer }),
-    rtx: { ...DEFAULT_SETTINGS.rtx, ...base.rtx, ...source.rtx },
-    postprocessOrder: Array.isArray(source.postprocessOrder) ? [...source.postprocessOrder] : Array.isArray(base.postprocessOrder) ? [...base.postprocessOrder] : [...DEFAULT_SETTINGS.postprocessOrder],
+    // A card written before the chain carries the three blocks and an order; one written after
+    // carries the chain. Either is read into a chain, and a card that carries neither falls back to
+    // whatever the workspace it is being applied against holds.
+    postprocessChain: migrateResampleChain(
+      Array.isArray(source.postprocessChain) || source.hires || source.adetailer || source.rtx ? source : base,
+      { engine: model, samplers: SAMPLERS, schedulers: SCHEDULERS },
+    ),
     loras: (Array.isArray(source.loras) ? clone(source.loras) : Array.isArray(base.loras) ? clone(base.loras) : []).slice(0, 16),
     loraGroups: normalizeCardLoraGroups(Array.isArray(source.loraGroups) ? source.loraGroups : base.loraGroups),
     loraGroupPrompt: typeof source.loraGroupPrompt === "string"

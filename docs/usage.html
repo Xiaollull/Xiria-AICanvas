@@ -39,6 +39,7 @@
       <li><a href="#lora-cards">LoRA cards</a></li>
       <li><a href="#samplers">Samplers and schedulers</a></li>
       <li><a href="#batches">Image batches</a></li>
+      <li><a href="#postprocess">Post-processing chain</a></li>
       <li><a href="#workspace">Image viewer workspace</a></li>
     </ul>
   </aside>
@@ -172,6 +173,48 @@
       active batch; zoom and download always use the selected image. Cancelling or failing a
       multi-batch job removes partial outputs, while completed PNG files include their batch, image,
       seed and total batch settings in metadata.</p>
+
+    <h2 id="postprocess">Post-processing chain</h2>
+    <p>The <strong>后处理增强</strong> panel is one ordered list of stages, run top to bottom after
+      sampling: up to eight <strong>resample units</strong> plus the ADetailer and RTX VSR stages,
+      interleaved in any order — resample, ADetailer, resample again, then RTX, for example. Adding a
+      unit inserts it; the arrows reorder it; each stage switches on and off on its own.</p>
+    <p>A resample unit is three optional steps: enlarge with an upscale model, resize to the target
+      size with an ordinary algorithm, then redraw with the current checkpoint, LoRAs and prompt.
+      Every combination is a real configuration:</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Upscale model</th><th>Scale</th><th>Denoise</th><th>What the unit does</th></tr></thead>
+        <tbody>
+          <tr><td>yes</td><td>&gt; 1</td><td>&gt; 0</td><td>The classic Hires.fix second pass.</td></tr>
+          <tr><td>yes</td><td>&gt; 1</td><td>0</td><td>Enlarges with the model and does not redraw.</td></tr>
+          <tr><td>no</td><td>&gt; 1</td><td>0</td><td>A plain image resize.</td></tr>
+          <tr><td>no</td><td>&gt; 1</td><td>&gt; 0</td><td>Resizes, then redraws.</td></tr>
+          <tr><td>no</td><td>1</td><td>&gt; 0</td><td>A detail pass at the same size.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><strong>Sizes are exact.</strong> Each unit's target is <code>round(edge × scale)</code> of
+      the image it receives, the figure ComfyUI's <code>ImageScaleBy</code> computes, with no rounding
+      up to 64. A redraw still has to land on the engine's latent grid — 8 pixels for SD and
+      Illustrious, 16 for FLUX.1, FLUX.2 and Krea 2, 32 for Anima — so the panel shows the size the
+      redraw will actually run at next to the target, and <strong>精确输出尺寸</strong> scales the
+      result back to the exact target at the cost of one more resize. A redraw edge may be up to
+      8192 pixels on SD and Illustrious and 4096 on the other engines; a unit that does not redraw is
+      held to neither limit.</p>
+    <p>The resize algorithms are ComfyUI's <code>ImageScale</code> set without the latent-only
+      <code>bislerp</code>: Lanczos (the default, sharpest for enlarging), Bicubic, Bilinear, Area
+      (best for shrinking) and Nearest.</p>
+    <p>A redraw inherits the main steps, CFG, sampler and scheduler unless the unit sets its own with
+      <strong>独立步数</strong> and <strong>独立 CFG</strong> and its own pickers. Its seed follows each
+      picture's first-pass seed by default, or can be one fixed seed for every picture, or a fresh
+      random seed per picture. Anima and Krea 2 can also redraw in USDU tiles instead of the whole
+      frame at once.</p>
+    <p>Settings saved before this chain existed — workspaces, per-engine settings, gallery cards and
+      PNG metadata — open with their Hires.fix pass as the first resample unit and the old stage order
+      kept, so an old workspace produces the run it always did.</p>
 
     <h2 id="workspace">Image viewer workspace</h2>
     <p>The local image workspace can be opened from the preview header or its empty state before any

@@ -15,10 +15,18 @@
 // turn a settings file into an image store and make each autosave proportional to the picture. The
 // picture lives for the session only, and the page says so rather than pretending otherwise.
 
-import { POSTPROCESS_STAGE_IDS, normalizePostprocessOrder, postprocessTargetSize } from "./postprocessing.js";
 import { formatFileSize } from "./format-size.js";
-import { DISTILLED_GUIDANCE_ENGINES, adetailerPayload, adetailerStageIssue, normalizeADetailerStage } from "./adetailer-units.js";
-import { generationHiresSeedSettings, hiresSeedPayload, normalizeUint64Seed, supportsUsduTiled } from "./hires-settings.js";
+import { DISTILLED_GUIDANCE_ENGINES, NATIVE_STEP_ENGINES, adetailerStageIssue } from "./adetailer-units.js";
+import {
+  chainStage,
+  enabledChainStages,
+  migrateResampleChain,
+  normalizeResampleChain,
+  resampleChainIssue,
+  resampleChainPayload,
+  resampleChainPlan,
+  resampleUnits,
+} from "./resample-chain.js";
 import { transparentBackgroundEnabled, transparentBackgroundSubject } from "./transparent-background.js";
 
 export const IMAGE_TO_IMAGE_SCHEMA_VERSION = 1;
@@ -38,19 +46,6 @@ export const IMAGE_TO_IMAGE_MODES = Object.freeze([
 export const POSTPROCESS_SOURCE_MIN_EDGE = 64;
 export const POSTPROCESS_SOURCE_MAX_EDGE = 8192;
 export const POSTPROCESS_SOURCE_MAX_PIXELS = 32 * 1024 * 1024;
-
-export const IMAGE_TO_IMAGE_POSTPROCESS_DEFAULTS = Object.freeze({
-  hires: Object.freeze({
-    enabled: false, expanded: false, model: "", seedMode: "inherit", seed: "", scale: 1,
-    denoise: 0.35, steps: 20, cfg: 7, tileSize: 192, tileOverlap: 16,
-    executionMode: "full_frame", sampler: null, scheduler: null, tileWidth: "auto", tileHeight: "auto",
-    padding: 32, maskBlur: 8, seamMode: "none", uniformTiles: true, tiledDecode: true,
-  }),
-  adetailer: Object.freeze(normalizeADetailerStage({ enabled: false, expanded: false })),
-  rtx: Object.freeze({ enabled: false, expanded: false, scale: 2, quality: "ultra" }),
-});
-
-const RTX_QUALITY_LEVELS = ["low", "medium", "high", "ultra"];
 
 // A source larger than this is refused before it is read, not after: `FileReader` would otherwise
 // hold the file, a base64 copy of it and the decoded bitmap at once.
@@ -102,10 +97,10 @@ export const IMAGE_TO_IMAGE_DEFAULTS = Object.freeze({
   width: 1024,
   height: 1024,
   resizeMode: "cover",
-  hires: IMAGE_TO_IMAGE_POSTPROCESS_DEFAULTS.hires,
-  adetailer: IMAGE_TO_IMAGE_POSTPROCESS_DEFAULTS.adetailer,
-  rtx: IMAGE_TO_IMAGE_POSTPROCESS_DEFAULTS.rtx,
-  postprocessOrder: POSTPROCESS_STAGE_IDS,
+  // One switched-off resample unit, the same as the workspace starts with, so the card is on the
+  // page to be switched on rather than something to discover an "add" button for. An empty array is
+  // a different thing and stays empty: it is what deleting every unit leaves behind.
+  postprocessChain: migrateResampleChain({}),
 });
 
 function numberInRange(value, fallback, minimum, maximum) {
@@ -118,64 +113,6 @@ function pickFromCatalog(value, catalog, fallback) {
   if (!Array.isArray(catalog) || catalog.length === 0) return typeof value === "string" ? value : fallback;
   if (typeof value === "string" && catalog.includes(value)) return value;
   return catalog.includes(fallback) ? fallback : catalog[0];
-}
-
-function normalizeHires(value, { samplers = [], schedulers = [] } = {}) {
-  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  const tileSize = Math.round(numberInRange(source.tileSize, 192, 32, 2048));
-  const tileOverlap = Math.min(
-    Math.round(numberInRange(source.tileOverlap, 16, 0, 512)),
-    Math.floor(tileSize / 2),
-  );
-  // `normalizeHiresSeed` collapses "fixed with no number" straight back to `inherit`. That is the
-  // right repair for a value read once from disk, but this normaliser runs on every render, so it
-  // would undo the mode the instant it was chosen — before a number could be typed — and again the
-  // moment the field was cleared to type a new one. The mode is kept as chosen and an empty number
-  // is a run blocker instead; `hiresSeedPayload` already falls back to `inherit`, so an unfinished
-  // edit can never reach the server as an invalid seed.
-  const seedMode = ["inherit", "fixed", "random"].includes(source.seedMode) ? source.seedMode : "inherit";
-  const seed = seedMode === "fixed" ? normalizeUint64Seed(source.seed) ?? "" : "";
-  return {
-    ...IMAGE_TO_IMAGE_POSTPROCESS_DEFAULTS.hires,
-    enabled: source.enabled === true,
-    expanded: source.expanded === true,
-    model: typeof source.model === "string" ? source.model : "",
-    seedMode,
-    seed,
-    scale: Math.round(numberInRange(source.scale, 1, 1, 4) * 10) / 10,
-    denoise: Math.round(numberInRange(source.denoise, 0.35, 0.05, 1) * 100) / 100,
-    steps: Math.round(numberInRange(source.steps, 20, 1, 100)),
-    cfg: Math.round(numberInRange(source.cfg, 7, 0, 30) * 10) / 10,
-    tileSize,
-    tileOverlap,
-    executionMode: source.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
-    sampler: samplers.includes(source.sampler) ? source.sampler : null,
-    scheduler: schedulers.includes(source.scheduler) ? source.scheduler : null,
-    tileWidth: source.tileWidth === "auto" ? "auto" : "auto",
-    tileHeight: source.tileHeight === "auto" ? "auto" : "auto",
-    padding: Math.round(numberInRange(source.padding, 32, 0, 256)),
-    maskBlur: Math.round(numberInRange(source.maskBlur, 8, 0, 64)),
-    seamMode: "none",
-    uniformTiles: source.uniformTiles !== false,
-    tiledDecode: source.tiledDecode !== false,
-  };
-}
-
-function normalizeADetailer(value) {
-  // The stage is a list of passes; `adetailer-units.js` owns the shape so this
-  // page and the text-to-image page cannot disagree about what a unit is.
-  return normalizeADetailerStage(value);
-}
-
-function normalizeRtx(value) {
-  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  return {
-    ...IMAGE_TO_IMAGE_POSTPROCESS_DEFAULTS.rtx,
-    enabled: source.enabled === true,
-    expanded: source.expanded === true,
-    scale: Math.round(numberInRange(source.scale, 2, 1, 4) * 100) / 100,
-    quality: RTX_QUALITY_LEVELS.includes(source.quality) ? source.quality : "ultra",
-  };
 }
 
 export function normalizeSourceSeed(value) {
@@ -207,10 +144,11 @@ export function normalizeImageToImageSettings(value, { samplers = [], schedulers
     width: snapEdge(source.width ?? IMAGE_TO_IMAGE_DEFAULTS.width),
     height: snapEdge(source.height ?? IMAGE_TO_IMAGE_DEFAULTS.height),
     resizeMode: RESIZE_MODES.some((mode) => mode.id === source.resizeMode) ? source.resizeMode : IMAGE_TO_IMAGE_DEFAULTS.resizeMode,
-    hires: normalizeHires(source.hires, { samplers, schedulers }),
-    adetailer: normalizeADetailer(source.adetailer),
-    rtx: normalizeRtx(source.rtx),
-    postprocessOrder: normalizePostprocessOrder(source.postprocessOrder ?? source.postprocess_order),
+    // Either shape, read once: a record saved before the chain carries the three blocks, one
+    // saved after carries the chain itself.
+    postprocessChain: Array.isArray(source.postprocessChain)
+      ? normalizeResampleChain(source.postprocessChain, { samplers, schedulers })
+      : migrateResampleChain(source, { samplers, schedulers }),
   };
 }
 
@@ -236,7 +174,7 @@ export function fitSourceSize(width, height) {
 export function outputSize(source, settings) {
   const config = normalizeImageToImageSettings(settings);
   // Post-processing never resamples, so the canvas is not a choice: it is whatever the file is. The
-  // stage chain then grows it from there, which is what `postprocessTargetSize` reports.
+  // stage chain then grows it from there, which is what `resampleChainPlan` reports.
   if (config.mode === "postprocess") {
     if (!source || !source.width || !source.height) return { width: config.width, height: config.height };
     return { width: source.width, height: source.height };
@@ -305,30 +243,37 @@ export function imageToImageBlockers({ source, settings, engine, engineReady = t
   if (postprocessOnly) {
     const sourceIssue = postprocessSourceIssue(source);
     if (sourceIssue) return sourceIssue;
-    if (!config.hires.enabled && !config.adetailer.enabled && !config.rtx.enabled) {
-      return "后处理模式需要至少启用 Hires.fix、ADetailer 或 RTX VSR";
+    if (!enabledChainStages(config.postprocessChain).length) {
+      return "后处理模式需要至少启用一个重采样单元、ADetailer 或 RTX VSR";
     }
   }
   // The server refuses every post-processing stage in ultra-low memory mode, so this is a 422 the
   // page can explain instead of submitting into.
-  if (postprocess.ultraLow && (config.hires.enabled || config.adetailer.enabled || config.rtx.enabled)) {
-    return "极限省存模式不支持 Hires.fix、ADetailer 与 RTX VSR";
+  if (postprocess.ultraLow && enabledChainStages(config.postprocessChain).length) {
+    return "极限省存模式不支持任何后处理阶段";
   }
-  if (config.hires.enabled && config.hires.seedMode === "fixed" && !config.hires.seed) {
-    return "固定 Hires Seed 必须是 0 ～ 18446744073709551615";
+  const chainIssue = resampleChainIssue(config.postprocessChain, {
+    baseSteps: config.steps,
+    engine,
+    nativeEngines: NATIVE_STEP_ENGINES,
+    upscalers: postprocess.upscalers ?? null,
+  });
+  if (chainIssue) return chainIssue;
+  const adetailerStage = chainStage(config.postprocessChain, "adetailer");
+  if (resampleUnits(config.postprocessChain).some((unit) => unit.enabled && unit.upscaler) && postprocess.hiresReady === false) {
+    return postprocess.hiresReason || "超分运行环境当前不可用";
   }
-  if (config.hires.enabled && postprocess.hiresReady === false) return postprocess.hiresReason || "Hires.fix 当前不可用";
-  if (config.adetailer.enabled && postprocess.adetailerReady === false) return postprocess.adetailerReason || "ADetailer 当前不可用";
+  if (adetailerStage?.enabled && postprocess.adetailerReady === false) return postprocess.adetailerReason || "ADetailer 当前不可用";
   // Which unit is at fault matters once there are several: "ADetailer is not
   // ready" does not say which card to open.
-  if (config.adetailer.enabled) {
+  if (adetailerStage?.enabled) {
     // The engine decides what a pass executes: native Anima runs every requested
     // step whatever the denoise, so the multiplied count would refuse a run the
     // server would have accepted.
-    const issue = adetailerStageIssue(config.adetailer, config.steps, undefined, engine);
+    const issue = adetailerStageIssue(adetailerStage, config.steps, undefined, engine);
     if (issue) return issue;
   }
-  if (config.rtx.enabled && postprocess.rtxReady === false) return postprocess.rtxReason || "RTX VSR 当前不可用";
+  if (chainStage(config.postprocessChain, "rtx")?.enabled && postprocess.rtxReady === false) return postprocess.rtxReason || "RTX VSR 当前不可用";
   if (postprocess.dimensions?.valid === false) return postprocess.dimensions.reason || "后处理目标尺寸不安全";
   return "";
 }
@@ -344,7 +289,9 @@ export function imageToImageRequestBody({
   settings,
   seed,
   loras = [],
-  hiresSeed,
+  // A run started from a gallery output pins that output's resample seeds; an ordinary run sends
+  // each unit's own mode.
+  seedOverrides = null,
   gallerySettings = null,
   backgroundRemovalModel = null,
   samplers = [],
@@ -392,30 +339,7 @@ export function imageToImageRequestBody({
       resize_mode: config.resizeMode,
       name: source?.name || "",
     },
-    hires: {
-      enabled: config.hires.enabled,
-      model: config.hires.model,
-      ...hiresSeedPayload(hiresSeed || generationHiresSeedSettings(config.hires)),
-      scale: config.hires.scale,
-      denoise: config.hires.denoise,
-      steps: config.hires.steps,
-      cfg: config.hires.cfg,
-      tile_size: config.hires.tileSize,
-      tile_overlap: config.hires.tileOverlap,
-      execution_mode: supportsUsduTiled(engine) && config.hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
-      ...(config.hires.sampler ? { sampler: config.hires.sampler } : {}),
-      ...(config.hires.scheduler ? { scheduler: config.hires.scheduler } : {}),
-      tile_width: "auto",
-      tile_height: "auto",
-      padding: config.hires.padding,
-      mask_blur: config.hires.maskBlur,
-      seam_mode: "none",
-      uniform_tiles: config.hires.uniformTiles !== false,
-      tiled_decode: config.hires.tiledDecode !== false,
-    },
-    adetailer: adetailerPayload(config.adetailer, engine),
-    rtx: { enabled: config.rtx.enabled, scale: config.rtx.scale, quality: config.rtx.quality },
-    postprocess_order: normalizePostprocessOrder(config.postprocessOrder),
+    postprocess_chain: resampleChainPayload(config.postprocessChain, { engine, seedOverrides }),
     loras: loras.filter((lora) => lora.enabled !== false).map((lora) => ({ path: lora.value, weight: lora.weight })),
     gallery_settings: gallerySettings,
   };

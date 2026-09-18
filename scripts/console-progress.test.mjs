@@ -66,7 +66,7 @@ test("ordinary log output is not mistaken for progress", () => {
     "",
     "Loading checkpoint anima_v5.safetensors",
     "INFO:     127.0.0.1:52413 - \"GET /api/inference/jobs/abc HTTP/1.1\" 200 OK",
-    "Complete                              2 images · 54 steps · 03:01 elapsed · 3.36s/it average",
+    "Complete                              2 images · 54 steps · 03:01 elapsed · 3.36s/it sampling",
     "Downloading local runtime config from huggingface: black-forest-labs/FLUX.1-dev",
   ]) {
     assert.equal(parseProgressLine(line), null, line);

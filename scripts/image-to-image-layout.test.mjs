@@ -202,7 +202,12 @@ test("image controls use an accessible unclipped dropdown and page-scoped scroll
     assert.ok(select.includes(anchor), `${anchor} is required for the custom dropdown`);
   }
   assert.match(app, /import WorkspaceSelect from "\.\/WorkspaceSelect"/);
-  for (const label of ['ariaLabel="采样器"', 'ariaLabel="Hires Seed 模式"', 'ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`}', 'ariaLabel="RTX VSR 处理质量"']) assert.ok(app.includes(`<WorkspaceSelect ${label}`), `${label} uses the shared dropdown on text-to-image`);
+  for (const label of ['ariaLabel="采样器"', 'ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`}', 'ariaLabel="RTX VSR 处理质量"']) assert.ok(app.includes(`<WorkspaceSelect ${label}`), `${label} uses the shared dropdown on text-to-image`);
+  // The resample unit's own dropdowns come from the shared chain panel, and use the same component.
+  const panel = await read("src/ResampleChainPanel.jsx");
+  for (const label of ["Seed 模式", "超分模型", "缩放算法", "采样器", "调度器"]) {
+    assert.match(panel, new RegExp(`<WorkspaceSelect\\n\\s+ariaLabel=\\{\`重采样 \\$\\{number\\} ${label}\`\\}|ariaLabel=\\{\`重采样 \\$\\{number\\} ${label}\`\\}`), `${label} uses the shared dropdown`);
+  }
   assert.match(page, /import WorkspaceSelect from "\.\/WorkspaceSelect"/);
   assert.match(css, /\.workspace-select-menu \{[^}]*position: fixed;[^}]*overflow-y: auto;[^}]*scrollbar-width: thin/,
     "the dropdown escapes both independent column scrollports and keeps long lists usable");
@@ -277,13 +282,14 @@ test("the run bar adapts to the fixed stage width and exposes the shared run dia
 test("image postprocess stages have independent collapse controls", async () => {
   const [page, css] = await Promise.all([read("src/ImageToImagePage.jsx"), read("src/styles.css")]);
   assert.match(page, /ChevronDown,/);
-  assert.match(page, /const \[expandedStages, setExpandedStages\] = useState\(\{ hires: false, adetailer: false, rtx: false \}\)/);
+  assert.match(page, /const \[expandedStages, setExpandedStages\] = useState\(\{ adetailer: false, rtx: false \}\)/);
   assert.match(page, /const toggleStageExpanded = \(stage\) => setExpandedStages\(\(current\) => \(\{ \.\.\.current, \[stage\]: !current\[stage\] \}\)\)/);
-  for (const stage of ["hires", "adetailer", "rtx"]) {
+  for (const stage of ["adetailer", "rtx"]) {
     assert.match(page, new RegExp(`expanded=\\{expandedStages\\.${stage}\\}[\\s\\S]*?onToggleExpanded=\\{\\(\\) => toggleStageExpanded\\("${stage}"\\)\\}`));
     assert.match(page, new RegExp(`expandedStages\\.${stage} &&`));
-    assert.doesNotMatch(page, new RegExp(`config\\.${stage}\\.enabled && expandedStages\\.${stage}`));
   }
+  // A resample unit keeps its own expanded flag, because there can be several of them.
+  assert.match(page, /expanded=\{expanded\}/);
   assert.match(page, /className="i2i-stage-summary" aria-expanded=\{expanded\}/);
   assert.match(page, /className="i2i-stage-expand"/);
   assert.match(css, /\.i2i-stage-head-actions > \.i2i-stage-expand, \.postprocess-stage-head-actions > \.postprocess-stage-expand \{/);
@@ -293,14 +299,19 @@ test("image postprocess stages have independent collapse controls", async () => 
 test("image postprocess parameters reuse the text-to-image visual primitives", async () => {
   const [page, css] = await Promise.all([read("src/ImageToImagePage.jsx"), read("src/styles.css")]);
   assert.match(page, /function PostprocessSlider\([\s\S]*?className="slider-field"/);
-  for (const panel of ["hires", "adetailer", "rtx"]) assert.match(page, new RegExp(`className="${panel}-parameters"`));
-  for (const primitive of ["hires-scale", "hires-sliders", "adetailer-units", "adetailer-pager", "adetailer-sliders", "adetailer-mask-grid", "rtx-runtime-grid", "rtx-scale"]) {
+  for (const panel of ["adetailer", "rtx"]) assert.match(page, new RegExp(`className="${panel}-parameters"`));
+  for (const primitive of ["adetailer-units", "adetailer-pager", "adetailer-sliders", "adetailer-mask-grid", "rtx-runtime-grid", "rtx-scale"]) {
     assert.match(page, new RegExp(`className="${primitive}"`), `${primitive} is shared with text-to-image`);
+  }
+  // The resample body is the shared panel's, drawn from the same primitives.
+  const chainPanel = await read("src/ResampleChainPanel.jsx");
+  for (const primitive of ["resample-scale", "resample-sliders", "resample-tile-grid", "resample-seed-settings"]) {
+    assert.match(chainPanel, new RegExp(`className="${primitive}"`), `${primitive} is shared with text-to-image`);
   }
   assert.match(page, /className=\{`adetailer-unit \$\{unit\.enabled \? "on" : ""\}`\}/);
   assert.match(page, /className="bounded-number"/);
   assert.doesNotMatch(page, /i2i-hires-body|i2i-adetailer-body|i2i-adetailer-pager|i2i-adetailer-unit/);
-  assert.match(css, /\.i2i-stage-card > \.hires-parameters, \.i2i-stage-card > \.adetailer-parameters, \.i2i-stage-card > \.rtx-parameters, \.postprocess-stage-card > \.hires-parameters/);
+  assert.match(css, /\.i2i-stage-card > \.resample-parameters, \.i2i-stage-card > \.adetailer-parameters, \.i2i-stage-card > \.rtx-parameters, \.postprocess-stage-card > \.resample-parameters/);
   assert.match(css, /\.workspace input\[type="range"\]::-webkit-slider-thumb, \.i2i-stage-card \.slider-field > input\[type="range"\]::-webkit-slider-thumb \{[^}]*border-radius: 50%/);
   assert.match(css, /\.workspace input\[type="range"\]::-moz-range-thumb, \.i2i-stage-card \.slider-field > input\[type="range"\]::-moz-range-thumb \{[^}]*border-radius: 50%/);
 });

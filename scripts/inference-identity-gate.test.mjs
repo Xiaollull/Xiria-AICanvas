@@ -8,7 +8,7 @@ import { INFERENCE_IDENTITY_GATE_ERROR, guardedInferenceResponse, inferenceIdent
 // The health fixture has to agree with the shipped `inferenceProtocol`, because the tests below
 // drive the real plugin from `vite.config.js`. Drift between the four declarations of the
 // protocol is owned by `inference-protocol.test.mjs`.
-const protocol = 35;
+const protocol = 36;
 const expected = { status: "ready", protocol, workspace_id: inferenceWorkspaceId };
 
 function middlewareServer() {

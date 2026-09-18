@@ -47,13 +47,17 @@ test("writing one engine's record leaves every other engine untouched", () => {
 
 test("a round trip through another engine brings the first one back unchanged", () => {
   // This is the reported bug in miniature: leave SD, work in Krea 2, come back.
-  const sd = { ...engineSettingsDefaults("SD"), steps: 32, cfg: 8, sampler: "dpmpp_2m", checkpoint: "sd.safetensors", hires: { ...engineSettingsDefaults("SD").hires, enabled: true, scale: 2 } };
+  const defaults = engineSettingsDefaults("SD");
+  const sd = {
+    ...defaults, steps: 32, cfg: 8, sampler: "dpmpp_2m", checkpoint: "sd.safetensors",
+    postprocessChain: defaults.postprocessChain.map((stage) => (stage.type === "resample" ? { ...stage, enabled: true, scale: 2 } : stage)),
+  };
   let map = withEngineSettings(emptyEngineSettingsMap(), "SD", sd);
   const stored = engineSettingsFor(map, "SD");
 
   map = withEngineSettings(map, "Krea2", { ...engineSettingsDefaults("Krea2"), steps: 8, cfg: 1, diffusionModel: "krea2.safetensors" });
   assert.deepEqual(engineSettingsFor(map, "SD"), stored, "working in Krea 2 changed the SD record");
-  assert.equal(engineSettingsFor(map, "SD").hires.enabled, true);
+  assert.equal(engineSettingsFor(map, "SD").postprocessChain[0].enabled, true);
   assert.equal(engineSettingsFor(map, "Krea2").steps, 8);
 });
 
@@ -134,7 +138,8 @@ test("an engine missing from a saved map is an empty scope, not a corrupt file",
 test("out-of-range values are clamped rather than passed to the service", () => {
   const record = normalizeEngineSettings("SD", {
     steps: 9999, cfg: -4, denoise: 3, imagesPerBatch: 100, batchCount: 0,
-    size: { width: 99999, height: 50 }, rtx: { scale: 42, quality: "insane" },
+    size: { width: 99999, height: 50 },
+    postprocessChain: [{ type: "rtx", enabled: true, scale: 42, quality: "insane" }],
   });
   assert.equal(record.steps, 60);
   assert.equal(record.cfg, 1);
@@ -142,15 +147,30 @@ test("out-of-range values are clamped rather than passed to the service", () => 
   assert.equal(record.imagesPerBatch, 10);
   assert.equal(record.batchCount, 1);
   assert.equal(record.size.width, 2048);
-  assert.equal(record.rtx.scale, 4);
-  assert.equal(record.rtx.quality, "ultra");
+  const rtx = record.postprocessChain.find((stage) => stage.type === "rtx");
+  assert.equal(rtx.scale, 4);
+  assert.equal(rtx.quality, "ultra");
   // Canvas dimensions stay on the 64-pixel grid the samplers require.
   assert.equal(record.size.height % 64, 0);
 });
 
-test("a post-processing order that lost a stage still runs it", () => {
-  const record = normalizeEngineSettings("SD", { postprocessOrder: ["rtx", "rtx", "nonsense"] });
-  assert.deepEqual(record.postprocessOrder, ["rtx", "hires", "adetailer"]);
+test("a chain that lost a single-instance stage still offers it", () => {
+  // ADetailer and RTX are always present; a saved chain missing one gets it back, switched off.
+  const record = normalizeEngineSettings("SD", { postprocessChain: [{ type: "rtx", enabled: true }, { type: "nonsense" }] });
+  assert.deepEqual(record.postprocessChain.map((stage) => stage.type), ["rtx", "adetailer"]);
+  assert.equal(record.postprocessChain[1].enabled, false);
+});
+
+test("a record saved before the chain migrates its three blocks into one", () => {
+  const record = normalizeEngineSettings("SD", {
+    hires: { enabled: true, model: "x4.pth", scale: 2 },
+    adetailer: { enabled: true, units: [{ detector: "face.pt" }] },
+    rtx: { enabled: false },
+    postprocessOrder: ["adetailer", "hires", "rtx"],
+  });
+  assert.deepEqual(record.postprocessChain.map((stage) => stage.type), ["adetailer", "resample", "rtx"]);
+  assert.equal(record.postprocessChain[1].upscaler, "x4.pth");
+  assert.equal(record.hires, undefined);
 });
 
 test("an unknown engine cannot address the map", () => {

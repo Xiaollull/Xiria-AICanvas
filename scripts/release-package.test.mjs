@@ -63,18 +63,26 @@ test("release staging uses a deterministic allowlist and nested model config fil
     await Promise.all([
       mkdir(path.join(source, "models", "checkpoints"), { recursive: true }),
       mkdir(path.join(source, "state-cache", "assistant-personas"), { recursive: true }),
+      mkdir(path.join(source, "backend", "tests"), { recursive: true }),
     ]);
     await Promise.all([
       writeFile(path.join(source, "models", "checkpoints", "user.safetensors"), "weight"),
       writeFile(path.join(source, "src", "App.test.jsx"), "test"),
       writeFile(path.join(source, "opencode.json"), "{}"),
       writeFile(path.join(source, "state-cache", "assistant-personas", "user.json"), "{}"),
+      // The backend suite, including a file whose name alone would not keep it out.
+      writeFile(path.join(source, "backend", "tests", "test_gallery.py"), "import unittest\n"),
+      writeFile(path.join(source, "backend", "tests", "fixtures.py"), "CHECKPOINT = None\n"),
     ]);
     const result = await stageReleasePackage({ projectRoot: source, stagingDirectory: staging, wrapperName: "release" });
     assert.deepEqual(result.manifest.files, [...result.manifest.files].sort(comparePortablePaths));
     assert.ok(result.manifest.files.includes("assistant/personas/builtin.json"));
     assert.ok(result.manifest.files.includes("models/model-paths.json"));
-    for (const forbidden of ["models/checkpoints/user.safetensors", "src/App.test.jsx", "opencode.json", "state-cache/assistant-personas/user.json"]) {
+    assert.ok(result.manifest.files.includes("backend/requirements.txt"), "the backend itself still ships");
+    for (const forbidden of [
+      "models/checkpoints/user.safetensors", "src/App.test.jsx", "opencode.json", "state-cache/assistant-personas/user.json",
+      "backend/tests/test_gallery.py", "backend/tests/fixtures.py",
+    ]) {
       assert.equal(result.manifest.files.includes(forbidden), false, forbidden);
       await assert.rejects(access(path.join(result.packageRoot, ...forbidden.split("/"))));
     }

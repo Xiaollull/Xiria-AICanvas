@@ -1,4 +1,6 @@
-import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { QUEUE_WINDOW_DEFAULT_SIZE, clampQueueWindow, queueWindowDrag, queueWindowPlacement } from "./queue-window.js";
 import { fitViewerZoom, inverseViewerHandleScale, intrinsicDimensions, viewerBrushCursorSize, viewerLayerBounds, viewerMarqueeRect, viewerResizeGestureMove, viewerResizeDisableDecision, viewerZoomAtPoint, VIEWER_MAX_ZOOM, VIEWER_MIN_ZOOM } from "./viewer-geometry.js";
 import { createViewerRafScheduler, ViewerAsyncSession, viewerOpenPlan } from "./viewer-async-session.js";
 import { VIEWER_TOOLBAR_POPOVER_LAYOUT, VIEWER_TOOLBAR_POPOVER_TEMPLATES, viewerEscapeAction, viewerToolbarPopoverTransition } from "./viewer-toolbar.js";
@@ -112,11 +114,19 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import ResampleChainPanel from "./ResampleChainPanel.jsx";
 import {
-  POSTPROCESS_STAGE_IDS,
-  normalizePostprocessOrder,
-  postprocessTargetSize,
-} from "./postprocessing";
+  chainStage,
+  createAdetailerStage,
+  createRtxStage,
+  enabledChainStages,
+  migrateResampleChain,
+  resampleChainIssue,
+  resampleChainPayload,
+  resampleChainPlan,
+  resampleUnits,
+  updateChainStage,
+} from "./resample-chain.js";
 import { DEFAULT_PERFORMANCE, performanceDefaultsFor, performancePresetsFor } from "./performance-defaults.js";
 import { APP_VERSION } from "./app-version";
 import { BrandLogo, LoadingLogo } from "./BrandLogo";
@@ -124,7 +134,7 @@ import { formatFileSize } from "./format-size";
 import { DEFAULT_THEME, applyThemeToDocument, deriveLogoTheme, loadThemeState, normalizeHex } from "./theme";
 import { AddToGalleryDialog } from "./Gallery";
 import { useDialogLifecycle } from "./gallery-core";
-import { generationHiresSeedSettings, hiresEffectiveSteps as hiresEffectiveStepCount, hiresSeedPayload, normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
+import { normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
 import LoraDetailsDialog from "./LoraDetailsDialog";
 import { appLoraDragLocked } from "./lora-drag-handle";
 import { formatWeight } from "./lora-weight";
@@ -204,10 +214,7 @@ import {
 } from "./prompt-presets";
 import { SAMPLER_NAMES as samplerNames, SCHEDULER_NAMES as schedulerNames } from "./sampling-options";
 import {
-  ADETAILER_DEFAULTS,
-  HIRES_DEFAULTS,
   PAG_DEFAULTS,
-  RTX_DEFAULTS,
   SETTINGS_ENGINES,
   emptyEngineSettingsMap,
   engineSettingsFor,
@@ -217,6 +224,7 @@ import {
 import {
   ADETAILER_UNIT_LIMIT,
   DISTILLED_GUIDANCE_ENGINES,
+  NATIVE_STEP_ENGINES,
   activeADetailerUnits,
   adetailerPageIndex,
   adetailerPayload,
@@ -307,12 +315,64 @@ function modelAssetName(value) {
   return typeof value === "string" && value ? value.split(/[\\/]/).pop() : "";
 }
 
-function QueueList({ jobs, counts, error, watching, onCancel, onClose, onSelect }) {
+function QueueList({ jobs, counts, error, watching, onCancel, onClose, onSelect, position, onMove }) {
   const ordered = [...jobs].reverse();
-  return (
-    <div className="queue-dropdown" role="dialog" aria-label="任务队列">
-      <header>
-        <div><span>GENERATION QUEUE</span><strong>任务队列</strong><small>本次会话 · {jobs.length} 个任务</small></div>
+  const panelRef = useRef(null);
+  const dragRef = useRef(null);
+  const [dragging, setDragging] = useState(false);
+  const viewport = () => ({ width: window.innerWidth, height: window.innerHeight });
+  const panelSize = () => {
+    const panel = panelRef.current;
+    return panel ? { width: panel.offsetWidth, height: panel.offsetHeight } : QUEUE_WINDOW_DEFAULT_SIZE;
+  };
+  // The placement arrives as an estimate made from the stylesheet's width before the window exists.
+  // Once it does, its real size decides whether that estimate was still on screen.
+  useLayoutEffect(() => {
+    const settled = clampQueueWindow(position, panelSize(), viewport());
+    if (settled.x !== position?.x || settled.y !== position?.y) onMove(settled);
+  }, [position, onMove]);
+  // A window the user parked near an edge must not be left off-screen by a resize.
+  useEffect(() => {
+    const onResize = () => onMove(clampQueueWindow(position, panelSize(), viewport()));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [position, onMove]);
+
+  const startDrag = (event) => {
+    // The header carries the close button; a press on that is a click, not a grab.
+    if (event.button !== 0 || event.target.closest("button")) return;
+    dragRef.current = { pointerId: event.pointerId, x: position.x, y: position.y, pointerX: event.clientX, pointerY: event.clientY };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setDragging(true);
+  };
+  const moveDrag = (event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    onMove(queueWindowDrag(drag, { x: event.clientX, y: event.clientY }, panelSize(), viewport()));
+  };
+  const endDrag = (event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    setDragging(false);
+  };
+
+  return createPortal(
+    <div
+      ref={panelRef}
+      className={`queue-dropdown ${dragging ? "dragging" : ""}`}
+      role="dialog"
+      aria-label="任务队列"
+      style={{ left: `${position?.x ?? 0}px`, top: `${position?.y ?? 0}px` }}
+    >
+      <header
+        onPointerDown={startDrag}
+        onPointerMove={moveDrag}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        <div><span>GENERATION QUEUE</span><strong>任务队列</strong><small>本次会话 · {jobs.length} 个任务 · 可拖动</small></div>
         <button type="button" className="icon-button" title="关闭队列" onClick={onClose}><X size={15} /></button>
       </header>
       {counts && <div className="queue-counts">
@@ -370,7 +430,8 @@ function QueueList({ jobs, counts, error, watching, onCancel, onClose, onSelect 
           );
         })}
       </ul>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -801,7 +862,6 @@ function loadWorkspaceState(saved) {
     if (!saved || typeof saved !== "object") return null;
     const savedModel = READY_ENGINES.includes(saved.model) ? saved.model : "SD";
     const isAnima = savedModel === "Anima";
-    const savedModelTilesHires = supportsUsduTiled(savedModel);
     const isSplitModel = SPLIT_MODEL_ENGINES.includes(savedModel);
     const numberInRange = (value, fallback, minimum, maximum) => {
       const number = Number(value);
@@ -814,17 +874,6 @@ function loadWorkspaceState(saved) {
     const savedPag = saved.pag && typeof saved.pag === "object" ? saved.pag : {};
     const hasPromptPresets = Object.prototype.hasOwnProperty.call(saved, "promptPresets");
     const promptPresetLibrary = normalizePromptPresetContainer(saved.promptPresets, { missing: !hasPromptPresets });
-    const savedHiresTileSize = Math.round(numberInRange(savedHires.tileSize, 192, 32, 2048));
-    const savedHiresTileOverlap = Math.min(
-      Math.round(numberInRange(savedHires.tileOverlap, 16, 0, 512)),
-      Math.floor(savedHiresTileSize / 2),
-    );
-    const hiresExecutionMode = savedModelTilesHires && !["full_frame", "usdu_tiled"].includes(savedHires.executionMode)
-      ? "usdu_tiled"
-      : savedHires.executionMode === "usdu_tiled" && savedModelTilesHires ? "usdu_tiled" : "full_frame";
-    const normalizeHiresTileDimension = (value) => value === "auto" || value === undefined || value === null
-      ? "auto"
-      : Math.round(numberInRange(value, 0, 1, 8192));
     const modelIdentity = {
       model: savedModel,
       checkpoint: typeof saved.checkpoint === "string" ? saved.checkpoint : "",
@@ -899,36 +948,21 @@ function loadWorkspaceState(saved) {
       backgroundRemovalModel: typeof saved.backgroundRemovalModel === "string" ? saved.backgroundRemovalModel : "",
       samplingExpanded: saved.samplingExpanded !== false,
       runInfoVisible: saved.runInfoVisible !== false,
-      hires: {
-        enabled: savedHires.enabled === true,
-        expanded: savedHires.expanded === true,
-        model: typeof savedHires.model === "string" ? savedHires.model : "",
-        ...savedHiresSeed,
-        scale: Math.round(numberInRange(savedHires.scale, 1, 1, 4) * 10) / 10,
-        denoise: numberInRange(savedHires.denoise, 0.35, 0.05, 1),
-        steps: Math.round(numberInRange(savedHires.steps, 20, 1, 100)),
-        cfg: numberInRange(savedHires.cfg, 7, 0, 30),
-        tileSize: savedHiresTileSize,
-        tileOverlap: savedHiresTileOverlap,
-        executionMode: hiresExecutionMode,
-        sampler: (isSplitModel ? ANIMA_SAMPLERS : samplerNames).includes(savedHires.sampler) ? savedHires.sampler : null,
-        scheduler: (isSplitModel ? ANIMA_SCHEDULERS : schedulerNames).includes(savedHires.scheduler) ? savedHires.scheduler : null,
-        tileWidth: normalizeHiresTileDimension(savedHires.tileWidth),
-        tileHeight: normalizeHiresTileDimension(savedHires.tileHeight),
-        padding: Math.round(numberInRange(savedHires.padding, 32, 0, 256)),
-        maskBlur: Math.round(numberInRange(savedHires.maskBlur, 8, 0, 64)),
-        seamMode: "none",
-        uniformTiles: savedHires.uniformTiles !== false,
-        tiledDecode: savedHires.tiledDecode !== false,
-      },
-      adetailer: normalizeADetailerStage(savedADetailer),
-      rtx: {
-        enabled: savedRtx.enabled === true,
-        expanded: savedRtx.expanded === true,
-        scale: Math.round(numberInRange(savedRtx.scale, 2, 1, 4) * 100) / 100,
-        quality: RTX_QUALITY_LEVELS.includes(savedRtx.quality) ? savedRtx.quality : "ultra",
-      },
-      postprocessOrder: normalizePostprocessOrder(saved.postprocessOrder ?? saved.postprocess_order, savedHires.order),
+      // A workspace written before the chain holds `hires`, `adetailer`, `rtx` and an order; one
+      // written after holds the chain itself. `migrateResampleChain` reads either and is
+      // idempotent, so reopening a migrated file cannot insert the unit a second time.
+      postprocessChain: migrateResampleChain({
+        postprocessChain: saved.postprocessChain,
+        hires: { ...savedHires, ...savedHiresSeed },
+        adetailer: savedADetailer,
+        rtx: savedRtx,
+        postprocessOrder: saved.postprocessOrder ?? saved.postprocess_order
+          ?? (savedHires.order === "after_adetailer" ? ["adetailer", "hires", "rtx"] : null),
+      }, {
+        engine: savedModel,
+        samplers: isSplitModel ? ANIMA_SAMPLERS : samplerNames,
+        schedulers: isSplitModel ? ANIMA_SCHEDULERS : schedulerNames,
+      }),
       loraCategory: typeof saved.loraCategory === "string" && saved.loraCategory.length <= 300 ? saved.loraCategory : "character",
       loraSearch: typeof saved.loraSearch === "string" ? saved.loraSearch : "",
       // `loras` stays as a compatibility mirror only. The keyed map owns all
@@ -1086,13 +1120,24 @@ function CountField({ label, detail, value, min = 1, max, disabled = false, onCh
   );
 }
 
-function PostprocessStageHeader({ title, detail, enabled, expanded, onToggleExpanded, onToggleEnabled, switchDisabled }) {
+/** Switch every stage off, which is what ultra-low memory mode does to the chain. */
+function disableChain(chain) {
+  return chain.some((stage) => stage.enabled) ? chain.map((stage) => (stage.enabled ? { ...stage, enabled: false } : stage)) : chain;
+}
+
+/** `BoundedNumberInput` under the `onChange` name the shared chain panel uses. */
+function ChainNumberInput({ onChange, ...props }) {
+  return <BoundedNumberInput {...props} onCommit={onChange} />;
+}
+
+function PostprocessStageHeader({ title, detail, enabled, expanded, onToggleExpanded, onToggleEnabled, switchDisabled, actions = null }) {
   const expandLabel = `${expanded ? "收起" : "展开"} ${title} 参数`;
   return <div className="postprocess-stage-head">
     <button type="button" className="postprocess-stage-summary" aria-expanded={expanded} onClick={onToggleExpanded}>
       <strong>{title}</strong><small>{detail}</small>
     </button>
     <div className="postprocess-stage-head-actions">
+      {actions}
       <button type="button" role="switch" aria-label={`启用 ${title}`} aria-checked={enabled} className={enabled ? "active" : ""} disabled={switchDisabled} onClick={onToggleEnabled}><i /></button>
       <button type="button" className="postprocess-stage-expand" aria-label={expandLabel} title={expandLabel} onClick={onToggleExpanded}><ChevronDown size={15} /></button>
     </div>
@@ -1343,6 +1388,14 @@ function App() {
   const [promptConditioning, setPromptConditioning] = useState(null);
   const [generatedImage, setGeneratedImage] = useState("");
   const [generatedName, setGeneratedName] = useState("");
+  // The last picture that finished, kept past the end of the run that made it.
+  //
+  // The preview used to empty the moment the next task was submitted, so queueing one more image
+  // cost you the sight of the one you were still looking at, and a cancelled run replaced it with a
+  // notice. Neither is what the box is for: until there is something newer to show, the newest
+  // thing there is stays on screen. It is replaced the moment the next run publishes a stage, and
+  // again when that run finishes.
+  const [heldPreview, setHeldPreview] = useState(null);
   const [generatedOutputs, setGeneratedOutputs] = useState([]);
   const [selectedOutputIndex, setSelectedOutputIndex] = useState(0);
   const [generatedSettings, setGeneratedSettings] = useState(null);
@@ -1372,6 +1425,19 @@ function App() {
   const [queue, setQueue] = useState([]);
   const [queueCounts, setQueueCounts] = useState(null);
   const [queueOpen, setQueueOpen] = useState(false);
+  // Where the queue window is. Kept across open and close, because a window the user moved once
+  // has been put where they want it; reopening it somewhere else would undo that every time.
+  const [queueWindowPosition, setQueueWindowPosition] = useState(null);
+  const queueButtonRef = useRef(null);
+  const toggleQueueWindow = () => {
+    setQueueOpen((current) => {
+      if (!current && !queueWindowPosition) {
+        const anchor = queueButtonRef.current?.getBoundingClientRect() || null;
+        setQueueWindowPosition(queueWindowPlacement(anchor, QUEUE_WINDOW_DEFAULT_SIZE, { width: window.innerWidth, height: window.innerHeight }));
+      }
+      return !current;
+    });
+  };
   const [queueError, setQueueError] = useState("");
   // The stage pictures of the job being watched: the base sample, then the Hires result, then the
   // ADetailer result, each staying on screen for the whole of the stage that follows it.
@@ -1460,14 +1526,25 @@ function App() {
   // the tokenizer conditioning count and the engine's sampling notice. Useful while setting a run
   // up and pure noise once it is settled, so it is the user's call whether to keep it on screen.
   const [runInfoVisible, setRunInfoVisible] = useState(true);
-  const [hires, setHires] = useState(HIRES_DEFAULTS);
   const [upscalersRefreshing, setUpscalersRefreshing] = useState(false);
-  const [adetailer, setADetailer] = useState(ADETAILER_DEFAULTS);
+  // The whole post-processing chain, in execution order: resample units, the ADetailer stage and
+  // the RTX stage, as one list. ADetailer and RTX are still single-instance, so they are read back
+  // out by name; everything that used to hold them separately reads these instead, and every write
+  // goes through the chain so the order and the settings can never disagree.
+  const [postprocessChain, setPostprocessChain] = useState(() => migrateResampleChain({}));
+  const adetailer = chainStage(postprocessChain, "adetailer") || createAdetailerStage();
+  const rtx = chainStage(postprocessChain, "rtx") || createRtxStage();
+  const setChainStageState = (type, updater) => setPostprocessChain((chain) => {
+    const stage = chainStage(chain, type);
+    if (!stage) return chain;
+    const next = typeof updater === "function" ? updater(stage) : updater;
+    return updateChainStage(chain, stage.id, { ...next, type, id: stage.id });
+  });
+  const setADetailer = (updater) => setChainStageState("adetailer", updater);
+  const setRtx = (updater) => setChainStageState("rtx", updater);
   // Which unit the pager is showing. View state, not configuration: it is never
   // persisted, because where the user last paged to says nothing about the render.
   const [adetailerPage, setADetailerPage] = useState("");
-  const [rtx, setRtx] = useState(RTX_DEFAULTS);
-  const [postprocessOrder, setPostprocessOrder] = useState(POSTPROCESS_STAGE_IDS);
   const [adetailerModels, setADetailerModels] = useState([]);
   const [adetailerInfo, setADetailerInfo] = useState({ loading: true, available: false, runtimeAvailable: false, directory: "", builtins: [], error: "" });
   const [adetailerDownload, setADetailerDownload] = useState(null);
@@ -1673,7 +1750,7 @@ function App() {
     checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
     steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     sampler, scheduler, guidance, pag, size,
-    hires, adetailer, rtx, postprocessOrder, backgroundRemovalModel,
+    postprocessChain, backgroundRemovalModel,
     // The image page's parameters belong to the engine as much as the generate page's do, so they
     // are put down and picked up by the same swap rather than surviving the switch unchanged.
     imageToImage,
@@ -1705,10 +1782,7 @@ function App() {
     setGuidance(settings.guidance);
     setPag(settings.pag);
     setSize(settings.size);
-    setHires(settings.hires);
-    setADetailer(settings.adetailer);
-    setRtx(settings.rtx);
-    setPostprocessOrder(settings.postprocessOrder);
+    setPostprocessChain(settings.postprocessChain);
     setBackgroundRemovalModel(settings.backgroundRemovalModel);
     setImageToImage(settings.imageToImage);
   };
@@ -1725,7 +1799,7 @@ function App() {
     model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     promptPresets: persistedPromptPresets,
     activePromptPresets,
-    sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch,
+    sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, postprocessChain, loraCategory, loraSearch,
     // The selected engine's record is the live hooks, which have not been written back to the map
     // yet -- that happens on the way out of an engine. Folding them in here is what makes a reload
     // in the middle of a session come back to what was on screen rather than to the last switch.
@@ -1733,7 +1807,7 @@ function App() {
       checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
       steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
       sampler, scheduler, guidance, pag, size,
-      hires, adetailer, rtx, postprocessOrder, backgroundRemovalModel,
+      postprocessChain, backgroundRemovalModel,
       imageToImage,
     }),
     mountedLorasByEngine: shouldPersistMountedLoras ? mountedLorasByEngine : mountedLorasRaw,
@@ -1950,7 +2024,7 @@ function App() {
     if (!uiStateReady) return undefined;
     const timer = window.setTimeout(persistUiState, 300);
     return () => window.clearTimeout(timer);
-  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, activePromptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, hires, adetailer, rtx, postprocessOrder, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
+  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, activePromptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, postprocessChain, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
 
   useEffect(() => {
     const saveBeforeExit = () => persistUiState(true);
@@ -2416,9 +2490,7 @@ function App() {
 
   useEffect(() => {
     if (!uiStateReady || inferenceHealth?.performance_settings?.memory_mode !== "ultra_low_vram") return;
-    setHires((current) => current.enabled ? { ...current, enabled: false } : current);
-    setADetailer((current) => current.enabled ? { ...current, enabled: false } : current);
-    setRtx((current) => current.enabled ? { ...current, enabled: false } : current);
+    setPostprocessChain(disableChain);
     commitMountedLoras(() => []);
     // `model` is a dependency because the parameters are per-engine now: the mode is a property of
     // the machine rather than of one engine, so an engine opened later with its own Hires chain
@@ -2429,9 +2501,9 @@ function App() {
     const models = inferenceHealth?.upscalers?.models || [];
     const compatible = models.filter((item) => item.compatible);
     if (!compatible.length) return;
-    setHires((current) => compatible.some((item) => item.id === current.model)
-      ? current
-      : { ...current, model: compatible[0].id });
+    setPostprocessChain((chain) => chain.map((stage) => (stage.type === "resample" && stage.upscaler && !compatible.some((item) => item.id === stage.upscaler)
+      ? { ...stage, upscaler: compatible[0].id }
+      : stage)));
   }, [inferenceHealth?.upscalers?.models]);
 
   useEffect(() => {
@@ -2454,9 +2526,7 @@ function App() {
         setInferenceHealth(health);
         attempts = health.status === "ready" ? 0 : attempts + 1;
         if (health.performance_settings?.memory_mode === "ultra_low_vram") {
-          setHires((current) => current.enabled ? { ...current, enabled: false } : current);
-          setADetailer((current) => current.enabled ? { ...current, enabled: false } : current);
-          setRtx((current) => current.enabled ? { ...current, enabled: false } : current);
+          setPostprocessChain(disableChain);
           commitMountedLoras(() => []);
         }
         retryTimer = window.setTimeout(checkHealth, health.status === "ready" ? 2000 : 1000);
@@ -2723,6 +2793,12 @@ function App() {
   const canAddGeneratedToGallery = Boolean(generatedSettings) && generatedOutputs.some((output) => output.asset_id);
   // The most recent finished stage. It is what the panel shows while the next stage runs.
   const latestStagePreview = stagePreviews.length ? stagePreviews[stagePreviews.length - 1] : null;
+  // Recorded from whatever the panel is showing as finished, so it covers a run that completed here
+  // and a finished job picked out of the queue alike, without either path having to remember to.
+  useEffect(() => {
+    if (status !== "complete" || !generatedImage) return;
+    setHeldPreview({ url: generatedImage, name: generatedName });
+  }, [status, generatedImage, generatedName]);
   const cancelQueuedJob = async (jobId) => {
     try {
       await fetch(`/api/inference/jobs/${jobId}/cancel`, { method: "POST" });
@@ -2768,7 +2844,6 @@ function App() {
       setGenerationJob(job.id);
         setGenerationRunIdentity(generationJobIdentity(detail));
       setStatus("complete");
-      setQueueOpen(false);
       } catch (error) {
         if (queueSettingsRequestToken.current === settingsRequestToken) setQueueError(error.message);
       }
@@ -2799,7 +2874,6 @@ function App() {
     setGeneratedImage("");
     setGeneratedName("");
     setGenerationProgressCollapsed(false);
-    setQueueOpen(false);
   };
 
   // When the watched job ends, follow whatever the service moved on to. Without this the panel
@@ -2893,8 +2967,6 @@ function App() {
     // then what was typed. Each is its own paragraph, and the box itself is never rewritten.
     const generationPrompt = composeGenerationPrompt({ groupPrompt: generationGroupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: positive });
     const generationNegative = composeGenerationPrompt({ records: promptPresets.records, activeIds: activePromptPresets.negative, type: "negative", prompt: negative });
-    const generationHiresSeed = generationHiresSeedSettings(hires);
-    const generationHires = { ...hires, ...generationHiresSeed };
     setSeed(generationSeed);
     const submittedSettings = JSON.parse(JSON.stringify({
       ...gallerySettingsWithoutPromptPresets(workspaceSnapshot.current),
@@ -2902,9 +2974,7 @@ function App() {
       sampler: nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
       scheduler: nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
       guidance: distilledGeneration ? "none" : guidance,
-      hires: generationHires,
-      adetailer,
-      rtx,
+      postprocessChain,
       loras: generationLoras,
       loraGroups: generationGroups.map((group) => ({ id: group.id, name: group.name, presetPrompt: group.presetPrompt })),
       loraGroupPrompt: generationGroupPrompt,
@@ -2946,35 +3016,9 @@ function App() {
           guidance: distilledGeneration ? "none" : guidance,
           pag: { scale: pag.scale, applied_layers: pag.appliedLayers },
           background_removal_model: transparentPromptEnabled ? backgroundRemovalModel : null,
-          hires: {
-            // Protocol 27 carries strict execution and lossless Hires seed contracts.
-            enabled: hires.enabled,
-            model: hires.model,
-            ...hiresSeedPayload(generationHiresSeed),
-            scale: hires.scale,
-            denoise: hires.denoise,
-            steps: hires.steps,
-            cfg: hires.cfg,
-            tile_size: hires.tileSize,
-            tile_overlap: hires.tileOverlap,
-            execution_mode: tiledHiresGeneration && hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
-            ...(hires.sampler ? { sampler: hires.sampler } : {}),
-            ...(hires.scheduler ? { scheduler: hires.scheduler } : {}),
-            tile_width: hires.tileWidth,
-            tile_height: hires.tileHeight,
-            padding: hires.padding,
-            mask_blur: hires.maskBlur,
-            seam_mode: "none",
-            uniform_tiles: hires.uniformTiles !== false,
-            tiled_decode: hires.tiledDecode !== false,
-          },
-          adetailer: adetailerPayload(adetailer, model),
-          rtx: {
-            enabled: rtx.enabled,
-            scale: rtx.scale,
-            quality: rtx.quality,
-          },
-          postprocess_order: normalizePostprocessOrder(postprocessOrder),
+          // The chain in execution order, stage by stage. Protocol 36 carries strict per-unit
+          // execution and lossless per-unit seed contracts.
+          postprocess_chain: resampleChainPayload(postprocessChain, { engine: model }),
           loras: generationLoras.filter((lora) => lora.enabled !== false).map((lora) => ({ path: lora.value, weight: lora.weight })),
           gallery_settings: gallerySettings,
         }),
@@ -3025,7 +3069,6 @@ function App() {
       schedulers: activeSchedulerNames,
     });
     const runSeed = settings.seedMode === "random" ? randomSeed() : normalizeSourceSeed(settings.seed);
-    const runHiresSeed = generationHiresSeedSettings(settings.hires);
     // The same LoRA mounts back this page, so the same combinations apply: a group contributes its
     // members *and* the trigger words that make them work. Composed onto the request body only —
     // the prompt box is never rewritten — exactly as on the text-to-image page.
@@ -3054,11 +3097,8 @@ function App() {
       size: outputSize(runSource, settings),
       imagesPerBatch: settings.imagesPerBatch,
       batchCount: settings.batchCount,
-      imageToImage: { ...settings, hires: { ...settings.hires, ...runHiresSeed } },
-      hires: { ...settings.hires, ...runHiresSeed },
-      adetailer: settings.adetailer,
-      rtx: settings.rtx,
-      postprocessOrder: settings.postprocessOrder,
+      imageToImage: settings,
+      postprocessChain: settings.postprocessChain,
       loras: runLoras,
       loraGroups: runGroups.map((group) => ({ id: group.id, name: group.name, presetPrompt: group.presetPrompt })),
       loraGroupPrompt: runGroupPrompt,
@@ -3094,7 +3134,6 @@ function App() {
           source: runSource,
           settings: { ...settings, positive: runPrompt },
           seed: runSeed,
-          hiresSeed: runHiresSeed,
           gallerySettings,
           samplers: activeSamplerNames,
           schedulers: activeSchedulerNames,
@@ -3272,14 +3311,15 @@ function App() {
     if (SPLIT_MODEL_ENGINES.includes(targetModel)) {
       const features = targetHealthPayload?.engines?.[targetModel]?.features || {};
       const effectiveLoras = selectedGroups.has("loras") ? galleryTargetLoras : (engineChanged || checkpointChanged || splitAssetsChanged) ? galleryTargetLoras : current.loras;
-      const effectiveHires = selectedGroups.has("hires") ? normalized.hires : current.hires;
-      const effectiveADetailer = selectedGroups.has("adetailer") ? normalized.adetailer : current.adetailer;
-      const effectiveRtx = selectedGroups.has("rtx") ? normalized.rtx : current.rtx;
+      const effectiveChain = selectedGroups.has("chain") ? normalized.postprocessChain : current.postprocessChain;
+      const effectiveUnits = resampleUnits(effectiveChain).filter((unit) => unit.enabled);
+      const effectiveADetailer = chainStage(effectiveChain, "adetailer") || { enabled: false, units: [] };
+      const effectiveRtx = chainStage(effectiveChain, "rtx") || { enabled: false };
       const requestedFeatures = [
         [(engineChanged || selectedGroups.has("loras")) && effectiveLoras.some((item) => item.enabled !== false), "lora", "LoRA"],
-        [(engineChanged || selectedGroups.has("hires")) && effectiveHires.enabled, "hires", "Hires.fix"],
-        [(engineChanged || selectedGroups.has("adetailer")) && effectiveADetailer.enabled, "adetailer", "ADetailer"],
-        [(engineChanged || selectedGroups.has("rtx")) && effectiveRtx.enabled, "rtx", "RTX VSR"],
+        [(engineChanged || selectedGroups.has("chain")) && effectiveUnits.length > 0, "hires", "重采样"],
+        [(engineChanged || selectedGroups.has("chain")) && effectiveADetailer.enabled, "adetailer", "ADetailer"],
+        [(engineChanged || selectedGroups.has("chain")) && effectiveRtx.enabled, "rtx", "RTX VSR"],
       ];
       const unsupported = requestedFeatures.find(([enabled, feature]) => enabled && features[feature] !== true);
       if (unsupported) throw new Error(`当前推理服务未声明 ${targetModel} ${unsupported[2]} 能力，${label}尚未应用`);
@@ -3291,21 +3331,22 @@ function App() {
         const available = new Set((loraPayload.categories || []).flatMap((category) => category.models || []).map((item) => item.value));
         if (enabledLoras.some((item) => !available.has(item.value))) throw new Error(`${label}的 ${targetModel} LoRA 文件未安装或已移动`);
       }
-      if ((engineChanged || selectedGroups.has("hires")) && effectiveHires.enabled) {
+      if ((engineChanged || selectedGroups.has("chain")) && effectiveUnits.length) {
         const upscalers = targetHealthPayload?.upscalers || {};
-        const selected = (upscalers.models || []).find((item) => item.id === effectiveHires.model);
-        if (!upscalers.runtime_available || !selected?.compatible) throw new Error(`${label}的 Hires.fix 超分模型尚未就绪`);
-        if (Math.floor(effectiveHires.steps * effectiveHires.denoise) < 1 || effectiveHires.tileOverlap > Math.floor(effectiveHires.tileSize / 2)) {
-          throw new Error(`${label}的 Hires.fix 参数无效`);
-        }
+        const issue = resampleChainIssue(effectiveChain, {
+          baseSteps: selectedGroups.has("sampling") ? normalized.steps : current.steps,
+          engine: targetModel,
+          nativeEngines: NATIVE_STEP_ENGINES,
+          upscalers: upscalers.runtime_available ? upscalers.models || [] : [],
+        });
+        if (issue) throw new Error(`${label}的${issue}`);
       }
-      if ((engineChanged || selectedGroups.has("adetailer")) && effectiveADetailer.enabled) {
-        const detectorReady = adetailerInfo.available && adetailerModels.some((item) => item.value === effectiveADetailer.detector);
+      if ((engineChanged || selectedGroups.has("chain")) && effectiveADetailer.enabled) {
         const baseSteps = selectedGroups.has("sampling") ? normalized.steps : current.steps;
-        const effectiveSteps = Math.floor((effectiveADetailer.useSteps ? effectiveADetailer.steps : baseSteps) * effectiveADetailer.denoise);
-        if (!detectorReady || effectiveSteps < 1) throw new Error(`${label}的 ADetailer 检测模型或重绘参数尚未就绪`);
+        const issue = adetailerStageIssue(effectiveADetailer, baseSteps, (detector) => adetailerInfo.available && adetailerModels.some((item) => item.value === detector), targetModel);
+        if (issue) throw new Error(`${label}的 ${issue}`);
       }
-      if ((engineChanged || selectedGroups.has("rtx")) && effectiveRtx.enabled && targetHealthPayload?.rtx_vsr?.available !== true) {
+      if ((engineChanged || selectedGroups.has("chain")) && effectiveRtx.enabled && targetHealthPayload?.rtx_vsr?.available !== true) {
         throw new Error(targetHealthPayload?.rtx_vsr?.reason || `${label}需要的 RTX VSR 运行时尚未就绪`);
       }
     }
@@ -3325,7 +3366,7 @@ function App() {
       setADetailer((currentValue) => ({
         ...currentValue,
         units: currentValue.units.map((unit, index) => {
-          const source = normalized.adetailer.units[index];
+          const source = (chainStage(normalized.postprocessChain, "adetailer")?.units || [])[index];
           return source ? { ...unit, prompt: source.prompt, negativePrompt: source.negativePrompt } : unit;
         }),
       }));
@@ -3344,20 +3385,22 @@ function App() {
       setPag(normalized.pag);
     }
     if (selectedGroups.has("canvas")) setSize(normalized.size);
-    if (selectedGroups.has("hires")) setHires({ ...HIRES_DEFAULTS, ...normalized.hires });
-    if (selectedGroups.has("adetailer")) setADetailer((currentValue) => normalizeADetailerStage({
-      ...normalized.adetailer,
-      // Prompts are their own group: taking the card's units without its prompts
-      // keeps whatever the user has typed here, unit by unit.
-      units: normalized.adetailer.units.map((unit, index) => (selectedGroups.has("prompts") ? unit : {
-        ...unit,
-        prompt: currentValue.units[index]?.prompt ?? "",
-        negativePrompt: currentValue.units[index]?.negativePrompt ?? "",
-      })),
-    }));
-    if (selectedGroups.has("rtx")) {
-      setRtx({ ...RTX_DEFAULTS, ...normalized.rtx });
-      setPostprocessOrder(normalized.postprocessOrder);
+    if (selectedGroups.has("chain")) {
+      setPostprocessChain((currentChain) => {
+        const currentDetail = chainStage(currentChain, "adetailer");
+        // Prompts are their own group: taking the card's chain without its prompts keeps whatever
+        // the user has typed here, unit by unit.
+        return normalized.postprocessChain.map((stage) => (stage.type === "adetailer" && !selectedGroups.has("prompts")
+          ? normalizeADetailerStage({
+            ...stage,
+            units: stage.units.map((unit, index) => ({
+              ...unit,
+              prompt: currentDetail?.units?.[index]?.prompt ?? "",
+              negativePrompt: currentDetail?.units?.[index]?.negativePrompt ?? "",
+            })),
+          })
+          : stage));
+      });
     }
     if (selectedGroups.has("auxiliary")) {
       setBackgroundRemovalModel(normalized.backgroundRemovalModel);
@@ -5533,24 +5576,11 @@ function App() {
     ...current,
     units: current.units.map((unit) => (unit.id === id ? { ...unit, ...updates } : unit)),
   }));
-  const updateHires = (updates) => setHires((current) => ({ ...current, ...updates }));
+
   const updateRtx = (updates) => setRtx((current) => ({ ...current, ...updates }));
-  const movePostprocessStage = (stage, direction) => {
-    if (modelSwitching) return;
-    setPostprocessOrder((current) => {
-      const normalized = normalizePostprocessOrder(current);
-      const from = normalized.indexOf(stage);
-      const to = from + direction;
-      if (from < 0 || to < 0 || to >= normalized.length) return normalized;
-      const next = [...normalized];
-      [next[from], next[to]] = [next[to], next[from]];
-      return next;
-    });
-  };
   const updateOverallTheme = (overall) => setTheme((current) => ({ ...current, overall, ...deriveLogoTheme(overall) }));
   const updateLogoTheme = (key, value) => setTheme((current) => ({ ...current, [key]: value }));
   const resetTheme = () => setTheme({ ...DEFAULT_THEME });
-  const toggleLightTheme = () => setTheme((current) => ({ ...current, light: !current.light }));
   const resizeConsole = (event) => {
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -5610,13 +5640,13 @@ function App() {
           guidance,
           pag,
           lora_count: loras.filter((lora) => lora.enabled !== false).length,
-          hires_enabled: hires.enabled,
+          resample_units: activeResampleUnits.length,
           adetailer_enabled: adetailer.enabled,
           adetailer_units: activeADetailerUnits(adetailer).length,
           rtx_enabled: rtx.enabled,
           rtx_scale: rtx.scale,
           rtx_quality: rtx.quality,
-          postprocess_order: normalizePostprocessOrder(postprocessOrder),
+          postprocess_chain: enabledChainStages(postprocessChain).map((stage) => stage.type),
         },
       }),
     }).catch(() => {});
@@ -5654,9 +5684,7 @@ function App() {
       if (!response.ok) throw new Error(payload.detail || "无法保存性能配置");
       applyPerformancePayload(payload);
       if (payload.settings?.memory_mode === "ultra_low_vram") {
-        setHires((current) => ({ ...current, enabled: false }));
-        setADetailer((current) => ({ ...current, enabled: false }));
-        setRtx((current) => ({ ...current, enabled: false }));
+        setPostprocessChain(disableChain);
         commitMountedLoras(() => []);
       }
       setInferenceHealth((current) => current ? {
@@ -6047,10 +6075,12 @@ function App() {
       ? "ADETAILER INPAINT"
       : generationStage === "rtx_upscale"
         ? "RTX VSR UPSCALE"
-      : generationStage === "hires_upscale"
-        ? "HIRES UPSCALE"
-        : generationStage === "hires_sampling"
-          ? "HIRES DIFFUSION"
+      : generationStage === "resample_upscale"
+        ? "RESAMPLE UPSCALE"
+        : generationStage === "resample_resize"
+          ? "RESAMPLE RESIZE"
+        : generationStage === "resample_sampling"
+          ? "RESAMPLE DIFFUSION"
       : generationStage === "base_sampling"
         ? "SAMPLING"
         : generationStage === "postprocess_source"
@@ -6131,26 +6161,20 @@ function App() {
   const adetailerLocked = modelSwitching;
   const upscalerModels = inferenceHealth?.upscalers?.models || [];
   const compatibleUpscalers = upscalerModels.filter((item) => item.compatible);
-  const selectedUpscaler = upscalerModels.find((item) => item.id === hires.model) || null;
-  const hiresEffectiveSteps = hiresEffectiveStepCount(hires, model);
-  const hiresConfigurationReady = hiresEffectiveSteps >= 1 && hires.tileOverlap <= Math.floor(hires.tileSize / 2);
-  const hiresSeedReady = hires.seedMode !== "fixed" || normalizeUint64Seed(hires.seed) !== null;
-  const hiresReady = !hires.enabled || Boolean(inferenceHealth?.upscalers?.runtime_available && selectedUpscaler?.compatible && hiresConfigurationReady && hiresSeedReady);
+  const chainResampleUnits = resampleUnits(postprocessChain);
+  const activeResampleUnits = chainResampleUnits.filter((unit) => unit.enabled);
+  const chainUsesUpscaler = activeResampleUnits.some((unit) => unit.upscaler);
+  const chainIssue = resampleChainIssue(postprocessChain, {
+    baseSteps: steps,
+    engine: model,
+    nativeEngines: NATIVE_STEP_ENGINES,
+    upscalers: upscalerModels,
+  });
+  const upscalerRuntimeReady = inferenceHealth?.upscalers?.runtime_available === true;
+  const hiresReady = !chainUsesUpscaler || upscalerRuntimeReady;
   const hiresControlsLocked = modelSwitching;
-  const normalizedPostprocessOrder = normalizePostprocessOrder(postprocessOrder);
-  const postprocessSettings = { hires, adetailer, rtx };
-  const postprocessDimensions = postprocessTargetSize(size, normalizedPostprocessOrder, postprocessSettings);
-  const hiresPreviewDimensions = postprocessTargetSize(size, normalizedPostprocessOrder, {
-    ...postprocessSettings,
-    hires: { ...hires, enabled: true },
-  });
-  const hiresStageTrace = hiresPreviewDimensions.trace.find((entry) => entry.stage === "hires");
-  const hiresTargetSize = hiresStageTrace?.output || size;
-  const rtxPreviewDimensions = postprocessTargetSize(size, normalizedPostprocessOrder, {
-    ...postprocessSettings,
-    rtx: { ...rtx, enabled: true },
-  });
-  const rtxStageTrace = rtxPreviewDimensions.trace.find((entry) => entry.stage === "rtx");
+  const postprocessDimensions = resampleChainPlan(size, postprocessChain, model);
+  const rtxStageTrace = postprocessDimensions.trace.find((entry) => entry.type === "rtx");
   const rtxHealth = inferenceHealth?.rtx_vsr || {};
   const rtxReady = !rtx.enabled || rtxHealth.available === true;
   const rtxStatusReason = rtxHealth.probing
@@ -6208,7 +6232,7 @@ function App() {
                         : isSplitModel && animaSettingsUnsupported ? `当前 ${engineLabel} 参数包含不受支持的采样或引导设置`
                          : !loraReady ? `当前推理服务未声明 ${engineLabel} LoRA 能力`
                            : !loraResourcesReady ? "已启用的 LoRA 文件未安装、已移动或目录尚未就绪"
-                             : hires.enabled && !engineAllowsHires ? `当前推理服务未声明 ${engineLabel} Hires.fix 能力`
+                             : activeResampleUnits.length && !engineAllowsHires ? `当前推理服务未声明 ${engineLabel} 重采样能力`
                              : adetailer.enabled && !engineAllowsADetailer ? `当前推理服务未声明 ${engineLabel} ADetailer 能力`
                                : rtx.enabled && !engineAllowsRtx ? `当前推理服务未声明 ${engineLabel} RTX VSR 能力`
                          : !isSplitModel && !checkpoint ? "请先选择可用底模"
@@ -6219,13 +6243,14 @@ function App() {
           : transparentPromptEnabled && !selectedBackgroundRemovalModel?.installed ? "所选透明背景模型尚未下载"
           : transparentPromptEnabled && !inferenceHealth?.background_removal?.runtime_available ? "ONNX Runtime 尚未就绪，请重新运行环境配置器"
           : !canvasSizeValid ? "画布尺寸必须为 64 的倍数且不超过 2048"
-            : ultraLowMode && (hires.enabled || adetailer.enabled || rtx.enabled) ? "极限省存模式正在关闭附加后处理阶段"
+            : ultraLowMode && enabledChainStages(postprocessChain).length ? "极限省存模式正在关闭附加后处理阶段"
               : ultraLowMode && guidance !== "none" ? "极限省存模式不支持引导增强"
                 : !guidanceReady ? `当前 ${model} 推理运行时未声明 ${guidance === "pag" ? "PAG" : "CFG-Zero*"} 可用`
-               : !hiresReady ? !inferenceHealth?.upscalers?.runtime_available ? "Hires.fix 运行环境尚未配置，请重新运行环境配置器" : !selectedUpscaler?.compatible ? "Hires.fix 已启用，但没有可用的兼容超分模型" : !hiresSeedReady ? "固定 Hires Seed 必须是 0 到 18446744073709551615" : hiresEffectiveSteps < 1 ? "Hires 步数乘以重绘强度至少需要产生 1 个有效步骤" : "Hires 分块重叠不能超过分块尺寸的一半"
+               : !hiresReady ? "超分运行环境尚未配置，请重新运行环境配置器"
+               : chainIssue ? chainIssue
               : !adetailerReady ? adetailerIssue || "ADetailer 已启用，但检测模型尚未就绪"
                 : !rtxReady ? rtxStatusReason
-                  : !postprocessDimensions.valid ? "RTX VSR 中间目标超过 8192 边长或 32 MP 安全限制"
+                  : !postprocessDimensions.valid ? postprocessDimensions.reason
                   : rtx.enabled && rtxHealth.probing ? rtxStatusReason
                     : inferenceHealth?.status !== "ready" ? inferenceHealth?.status === "error" || inferenceHealth?.status === "offline"
                 ? `推理服务不可用：${inferenceHealth.error || "正在自动重启"}`
@@ -6328,8 +6353,8 @@ function App() {
   };
 
   return (
-    <main className={`app-shell ${theme.light ? "theme-light" : ""}`}>
-      {initialLoading && <div className={`app-loader ${loaderLeaving ? "leaving" : ""} ${theme.light ? "theme-light" : ""}`} role="status" aria-live="polite" aria-label={loaderStatus}>
+    <main className="app-shell">
+      {initialLoading && <div className={`app-loader ${loaderLeaving ? "leaving" : ""}`} role="status" aria-live="polite" aria-label={loaderStatus}>
          <div className="loader-grid" />
          <div className="loader-content">
            <div className="loader-emblem">
@@ -6461,197 +6486,177 @@ function App() {
             </div>}
 
             <section className="postprocess-stage-stack" aria-labelledby="postprocess-stage-title">
-              <div className="section-heading"><span>04</span><h2 id="postprocess-stage-title">后处理增强</h2><small>生成后按顺序执行</small></div>
-              <section className={`postprocess-stage-card ${hires.enabled ? "enabled" : ""} ${hires.expanded ? "expanded" : ""}`}>
-                <PostprocessStageHeader
-                  title="Hires.fix"
-                  detail={hires.enabled ? `${hires.scale.toFixed(1)}x · ${hiresTargetSize.width} × ${hiresTargetSize.height}` : "关闭"}
-                  enabled={hires.enabled}
-                  expanded={hires.expanded}
-                  onToggleExpanded={() => updateHires({ expanded: !hires.expanded })}
-                  onToggleEnabled={() => (engineAllowsHires || hires.enabled) && updateHires({ enabled: !hires.enabled })}
-                  switchDisabled={modelSwitching || (!engineAllowsHires && !hires.enabled) || ultraLowMode || (!inferenceHealth?.upscalers?.runtime_available && !hires.enabled)}
-                />
-            {hires.expanded && <div className={`hires-parameters ${hires.enabled ? "enabled" : ""}`}>
-              <p className="postprocess-stage-description">超分放大后，使用当前底模、LoRA 和提示词进行第二次扩散精修。</p>
-              {!engineAllowsHires && <p className="hires-unavailable">当前推理服务未声明 {model} Hires.fix 能力。</p>}
-              {ultraLowMode && <p className="hires-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
-              {engineAllowsHires && !inferenceHealth?.upscalers?.runtime_available && <p className="hires-unavailable">超分运行库尚未安装，请重新运行 Setup-XirAI 配置环境。</p>}
-              {engineAllowsHires && inferenceHealth?.upscalers?.runtime_available && compatibleUpscalers.length === 0 && <p className="hires-unavailable">尚无兼容超分模型。请前往模型下载器下载推荐模型，或手动放入 models/upscalers 后刷新。</p>}
-              <label className="hires-model">超分模型<span><WorkspaceSelect ariaLabel="超分模型" value={hires.model} disabled={modelSwitching || compatibleUpscalers.length === 0} onChange={(modelValue) => updateHires({ model: modelValue })} options={compatibleUpscalers.length ? compatibleUpscalers.map((item) => ({ value: item.id, label: `${item.label} · ${item.architecture} · ${item.scale}x` })) : [{ value: "", label: "暂无兼容模型", disabled: true }]} /><button type="button" title="重新扫描超分模型" disabled={upscalersRefreshing || modelSwitching} onClick={() => void refreshUpscalers()}><RefreshCw className={upscalersRefreshing ? "spin" : ""} size={12} /></button></span></label>
-              <div className="hires-scale"><Slider label="放大倍率" value={hires.scale} min={1} max={4} step={0.1} inputStep={0.1} fixed={1} disabled={hiresControlsLocked} onChange={(scale) => updateHires({ scale: Math.round(scale * 10) / 10 })} suffix="x" /><p><span>INPUT {hiresStageTrace?.input.width || size.width} × {hiresStageTrace?.input.height || size.height}</span><b>OUTPUT {hiresTargetSize.width} × {hiresTargetSize.height}</b></p></div>
-              <div className="hires-sliders">
-                <Slider label="二次重绘强度" value={hires.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} disabled={hiresControlsLocked} onChange={(value) => updateHires({ denoise: value })} />
-                <Slider label="Hires 步数" value={hires.steps} min={1} max={100} integer disabled={hiresControlsLocked} onChange={(value) => updateHires({ steps: value })} />
-                <Slider label="Hires CFG" value={hires.cfg} min={0} max={30} step={0.5} inputStep={0.1} disabled={hiresControlsLocked} onChange={(value) => updateHires({ cfg: value })} />
-               </div>
-               <div className="hires-seed-settings">
-                 <label>Hires Seed 模式<WorkspaceSelect ariaLabel="Hires Seed 模式" value={hires.seedMode} disabled={hiresControlsLocked} onChange={(seedModeValue) => updateHires({ seedMode: seedModeValue, seed: seedModeValue === "fixed" ? normalizeUint64Seed(hires.seed, normalizeSeed(seed)) : "" })} options={[{ value: "inherit", label: "继承每张首轮 Seed" }, { value: "fixed", label: "固定 Hires Seed" }, { value: "random", label: "每张安全随机" }]} /></label>
-                 {hires.seedMode === "fixed" && <label className="hires-seed-field">Hires Seed<span><input inputMode="numeric" maxLength="20" value={hires.seed} disabled={hiresControlsLocked} onChange={(event) => updateHires({ seed: event.target.value.replace(/\D/g, "") })} onBlur={() => updateHires({ seed: normalizeUint64Seed(hires.seed, "0") })} /><button type="button" title="生成固定 Hires Seed" disabled={hiresControlsLocked} onClick={() => updateHires({ seed: randomSeed() })}><RefreshCw size={13} /></button></span></label>}
-                 <small>{hires.seedMode === "inherit" ? "每张结果继承该张首轮 Seed" : hires.seedMode === "fixed" ? "所有结果使用同一个无损 uint64 Hires Seed" : "每张结果在后端独立解析一次安全 uint64 Hires Seed"}</small>
-               </div>
-               {hires.enabled && hiresEffectiveSteps < 1 && <p className="hires-unavailable">当前步数与重绘强度不会产生有效扩散步骤，请提高其中一项。</p>}
-               {tilesHires && <label className="hires-model">重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={hires.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame"} disabled={hiresControlsLocked} onChange={(executionMode) => updateHires({ executionMode })} options={[{ value: "usdu_tiled", label: "USDU 分块重绘（推荐）" }, { value: "full_frame", label: "整图重绘（兼容）" }]} /></label>}
-               <div className="hires-tile-grid">
-                 <label>Hires 采样器<WorkspaceSelect ariaLabel="Hires 采样器" value={hires.sampler || ""} disabled={hiresControlsLocked} onChange={(samplerValue) => updateHires({ sampler: samplerValue || null })} options={[{ value: "", label: "跟随首轮" }, ...(model === "Anima" ? ANIMA_SAMPLERS : samplerNames).map((item) => ({ value: item, label: item }))]} /></label>
-                 <label>Hires 调度器<WorkspaceSelect ariaLabel="Hires 调度器" value={hires.scheduler || ""} disabled={hiresControlsLocked} onChange={(schedulerValue) => updateHires({ scheduler: schedulerValue || null })} options={[{ value: "", label: "跟随首轮" }, ...(model === "Anima" ? ANIMA_SCHEDULERS : schedulerNames).map((item) => ({ value: item, label: item }))]} /></label>
-               </div>
-              {tilesHires && hires.executionMode === "usdu_tiled" && <div className="hires-tile-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div>}
-              {tilesHires && hires.executionMode === "usdu_tiled" && <p className="hires-incompatible">Auto = 首轮源图宽高（当前 {size.width} × {size.height}），本轮 2x 会形成 2 × 2；padding 32；mask blur 8；uniform tiles；per-tile VAE tiled decode；seam None；每 tile 执行 Hires steps。</p>}
-              <div className="hires-tile-grid">
-                <label>RealESRGAN / SR 像素放大分块<BoundedNumberInput value={hires.tileSize} min={32} max={2048} integer disabled={hiresControlsLocked} onCommit={(tileSize) => updateHires({ tileSize, tileOverlap: Math.min(hires.tileOverlap, Math.floor(tileSize / 2)) })} /></label>
-                <label>RealESRGAN / SR 像素放大分块重叠<BoundedNumberInput value={hires.tileOverlap} min={0} max={Math.min(512, Math.floor(hires.tileSize / 2))} integer disabled={hiresControlsLocked} onCommit={(tileOverlap) => updateHires({ tileOverlap })} /></label>
-               </div>
-              {upscalerModels.some((item) => !item.compatible) && <p className="hires-incompatible">检测到 {upscalerModels.filter((item) => !item.compatible).length} 个不兼容文件；已从选择列表隐藏。</p>}
-              <p className="hires-path" title={inferenceHealth?.upscalers?.directory}>模型目录 · {inferenceHealth?.upscalers?.directory || "models/upscalers"} · 支持 PTH / PT / CKPT 权重字典及 Safetensors，不加载 TorchScript</p>
-            </div>}
-              </section>
-
-              <section className={`postprocess-stage-card ${adetailer.enabled ? "enabled" : ""} ${adetailer.expanded ? "expanded" : ""}`}>
-                <PostprocessStageHeader
-                  title="ADetailer"
-                  detail={adetailer.enabled ? adetailerSummary(adetailer) : "关闭"}
-                  enabled={adetailer.enabled}
-                  expanded={adetailer.expanded}
-                  onToggleExpanded={() => updateADetailer({ expanded: !adetailer.expanded })}
-                  onToggleEnabled={() => (engineAllowsADetailer || adetailer.enabled) && updateADetailer({ enabled: !adetailer.enabled })}
-                  switchDisabled={adetailerLocked || (!engineAllowsADetailer && !adetailer.enabled) || ultraLowMode || (!adetailerInfo.runtimeAvailable && !adetailer.enabled)}
-                />
-            {adetailer.expanded && <div className={`adetailer-parameters ${adetailer.enabled ? "enabled" : ""}`}>
-              <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
-              {!engineAllowsADetailer && <p className="adetailer-unavailable">当前推理服务未声明 {model} ADetailer 能力。</p>}
-              {ultraLowMode && <p className="adetailer-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
-              {engineAllowsADetailer && !adetailerInfo.available && <p className="adetailer-unavailable">{adetailerInfo.loading ? "正在读取检测模型..." : adetailerInfo.error || (adetailerInfo.runtimeAvailable ? "尚未安装 YOLO 检测模型，请从下方模型库下载或手动放入 models/yolo" : "项目 YOLO 运行环境不可用，请重新运行环境配置")}</p>}
-              <div className="adetailer-model-library">
-                <div className="adetailer-library-heading"><strong>基础推荐模型</strong><span><small>{adetailerInfo.builtins.filter((item) => item.installed).length} / {adetailerInfo.builtins.length} 已就绪</small><button type="button" title="刷新 YOLO 模型列表" aria-label="刷新 YOLO 模型列表" disabled={adetailerInfo.loading || status === "running"} onClick={() => { void refreshADetailerModels(); }}><RefreshCw className={adetailerInfo.loading ? "spin" : ""} size={11} /></button></span></div>
-                <div className="adetailer-recommended-model">
-                  <span><b>ADetailer 基础模型包</b><small>包含面部、手部和人物分割检测所需的 5 个官方模型</small></span>
-                  {adetailerInfo.builtins.length > 0 && adetailerInfo.builtins.every((item) => item.installed)
-                    ? <em><Check size={12} />已安装</em>
-                    : <button type="button" disabled={status === "running" || adetailerDownload?.status === "downloading"} onClick={downloadRecommendedYoloModels}><Download size={12} />一键下载全部（5）</button>}
-                </div>
-              </div>
-              {adetailerDownload && <div className={`adetailer-download-status ${adetailerDownload.status}`} aria-live="polite">
-                <div><b>{adetailerDownload.label}{adetailerDownload.modelIndex ? ` · ${adetailerDownload.modelIndex} / ${adetailerDownload.totalModels}` : ""}</b><span>{adetailerDownload.message}</span></div>
-                {adetailerDownload.totalBytes > 0 && <i><i style={{ width: `${Math.min(100, adetailerDownload.currentBytes / adetailerDownload.totalBytes * 100)}%` }} /></i>}
-                <small>{adetailerDownload.currentBytes > 0 ? `${formatFileSize(adetailerDownload.currentBytes)} / ${formatFileSize(adetailerDownload.totalBytes)}` : ""}{adetailerDownload.speedBps > 0 ? ` · ${formatFileSize(adetailerDownload.speedBps)}/s` : ""}{adetailerDownload.connections > 1 ? ` · ${adetailerDownload.connections} 路分片` : ""}</small>
-              </div>}
-              {(() => {
-                const unitLocked = adetailerLocked;
-                const index = adetailerPageIndex(adetailerUnits, adetailerPage);
-                const unit = adetailerUnits[index];
-                if (!unit) return null;
-                const unitSteps = adetailerUnitSteps(unit, steps, model);
-                return <div className="adetailer-units">
-                  {adetailerUnits.length > 1 && <nav className="adetailer-pager" aria-label="ADetailer 检测单元">
-                    <button type="button" aria-label="上一个检测单元" disabled={index < 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, -1))}><ChevronLeft size={14} /></button>
-                    <ol>
-                      {adetailerUnits.map((entry, position) => <li key={entry.id}>
-                        <button
-                          type="button"
-                          className={`${position === index ? "current" : ""} ${entry.enabled ? "on" : ""}`}
-                          aria-current={position === index ? "true" : undefined}
-                          aria-label={`第 ${position + 1} 个检测单元${entry.enabled ? "" : "（已关闭）"}`}
-                          onClick={() => setADetailerPage(entry.id)}
-                        >{position + 1}</button>
-                      </li>)}
-                    </ol>
-                    <button type="button" aria-label="下一个检测单元" disabled={index >= adetailerUnits.length - 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, 1))}><ChevronRight size={14} /></button>
-                  </nav>}
-                  {/* Keyed by the unit so paging *replaces* the controls rather than
-                      reusing them: `BoundedNumberInput` holds an uncommitted draft of
-                      its own, and reused controls would carry one unit's half-typed
-                      value onto the next unit's field. */}
-                  <section className={`adetailer-unit ${unit.enabled ? "on" : ""}`} key={unit.id}>
-                    <header>
-                      <span>{String(index + 1).padStart(2, "0")}</span>
-                      <strong>{adetailerUnitLabel(index, adetailerUnits.length)}</strong>
-                      <small>{unit.detector ? unit.detector.split("/").pop() : "未选择模型"}</small>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-label={`启用第 ${index + 1} 个 ADetailer 单元`}
-                        aria-checked={unit.enabled}
-                        className={unit.enabled ? "active" : ""}
-                        disabled={unitLocked}
-                        onClick={() => updateADetailerUnit(unit.id, { enabled: !unit.enabled })}
-                      ><i /></button>
-                    </header>
-                    <div className="adetailer-unit-body">
-                      <label className="adetailer-model">检测模型<WorkspaceSelect ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`} value={unit.detector} disabled={unitLocked} onChange={(detector) => updateADetailerUnit(unit.id, { detector })} options={adetailerModels.length ? adetailerModels.map((item) => ({ value: item.value, label: `${item.label || item.name}${item.source === "community" ? " · 社区" : ""}` })) : [{ value: "", label: "暂无模型", disabled: true }]} /></label>
-                      <div className="adetailer-sliders">
-                        <Slider label="检测置信度" value={unit.confidence} min={0.05} max={1} step={0.05} inputStep={0.01} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { confidence: value })} />
-                        <Slider label="最多处理区域" value={unit.maxDetections} min={1} max={8} integer disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { maxDetections: value })} />
-                        <Slider label="最小区域比例" value={unit.maskMinRatio} min={0} max={0.5} step={0.01} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { maskMinRatio: value, maskMaxRatio: Math.max(value, unit.maskMaxRatio) })} />
-                        <Slider label="最大区域比例" value={unit.maskMaxRatio} min={0.05} max={1} step={0.05} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { maskMaxRatio: value, maskMinRatio: Math.min(value, unit.maskMinRatio) })} />
-                      </div>
-                      <div className="adetailer-mask-grid">
-                        <label>膨胀 / 腐蚀<BoundedNumberInput value={unit.dilateErode} min={-128} max={128} integer disabled={unitLocked} onCommit={(dilateErode) => updateADetailerUnit(unit.id, { dilateErode })} /></label>
-                        <label>蒙版模糊<BoundedNumberInput value={unit.maskBlur} min={0} max={64} integer disabled={unitLocked} onCommit={(maskBlur) => updateADetailerUnit(unit.id, { maskBlur })} /></label>
-                        <label>局部边距<BoundedNumberInput value={unit.padding} min={0} max={256} integer disabled={unitLocked} onCommit={(padding) => updateADetailerUnit(unit.id, { padding })} /></label>
-                      </div>
-                      <div className="adetailer-denoise"><Slider label="重绘强度" value={unit.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { denoise: value })} /></div>
-                      <div className="adetailer-overrides">
-                        <label><input type="checkbox" checked={unit.useSteps} disabled={unitLocked} onChange={(event) => updateADetailerUnit(unit.id, { useSteps: event.target.checked })} /><span>独立步数</span><BoundedNumberInput value={unit.steps} min={1} max={100} integer disabled={unitLocked || !unit.useSteps} onCommit={(unitStepCount) => updateADetailerUnit(unit.id, { steps: unitStepCount })} /></label>
-                        <label><input type="checkbox" checked={unit.useCfg} disabled={unitLocked} onChange={(event) => updateADetailerUnit(unit.id, { useCfg: event.target.checked })} /><span>独立 CFG</span><BoundedNumberInput value={unit.cfg} min={0} max={30} step={0.1} disabled={unitLocked || !unit.useCfg} onCommit={(cfg) => updateADetailerUnit(unit.id, { cfg })} /></label>
-                      </div>
-                      <div className="adetailer-prompts">
-                        <label>正向提示词<textarea value={unit.prompt} disabled={unitLocked} onChange={(event) => updateADetailerUnit(unit.id, { prompt: event.target.value })} placeholder="留空继承主提示词；[PROMPT] 插入主提示词" /></label>
-                        <label>负向提示词<textarea value={unit.negativePrompt} disabled={unitLocked || !engineAllowsNegativePrompt} onChange={(event) => updateADetailerUnit(unit.id, { negativePrompt: event.target.value })} placeholder={engineAllowsNegativePrompt ? "留空继承主负向提示词" : "FLUX.1 没有无条件分支，负向提示词不会参与生成"} /></label>
-                      </div>
-                      {unit.enabled && unitSteps < 1 && <p className="adetailer-unavailable">该单元有效步数为 0，请提高主采样或独立步数，或提高重绘强度。</p>}
-                    </div>
+              <div className="section-heading"><span>04</span><h2 id="postprocess-stage-title">后处理增强</h2><small>按链表顺序依次执行</small></div>
+              <ResampleChainPanel
+                chain={postprocessChain}
+                onChange={setPostprocessChain}
+                engine={model}
+                samplers={model === "Anima" ? ANIMA_SAMPLERS : samplerNames}
+                schedulers={model === "Anima" ? ANIMA_SCHEDULERS : schedulerNames}
+                baseSize={size}
+                baseSteps={steps}
+                baseCfg={cfg}
+                upscalers={upscalerModels}
+                upscalerRuntimeReady={upscalerRuntimeReady}
+                upscalersRefreshing={upscalersRefreshing}
+                onRefreshUpscalers={() => void refreshUpscalers()}
+                locked={hiresControlsLocked}
+                addDisabled={ultraLowMode}
+                unitUnavailableReason={!engineAllowsHires ? `当前推理服务未声明 ${model} 重采样能力。` : ultraLowMode ? "极限省存模式会关闭全部附加后处理阶段。" : ""}
+                Slider={Slider}
+                NumberInput={ChainNumberInput}
+                randomSeed={randomSeed}
+                renderCard={({ title, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
+                  <section className={`postprocess-stage-card ${enabled ? "enabled" : ""} ${expanded ? "expanded" : ""}`}>
+                    <PostprocessStageHeader
+                      title={title}
+                      detail={detail}
+                      enabled={enabled}
+                      expanded={expanded}
+                      actions={actions}
+                      onToggleExpanded={onToggleExpanded}
+                      onToggleEnabled={() => (engineAllowsHires || enabled) && onToggleEnabled()}
+                      switchDisabled={modelSwitching || (!engineAllowsHires && !enabled) || ultraLowMode}
+                    />
+                    {children}
                   </section>
-                </div>;
-              })()}
-              <div className="adetailer-unit-add">
-                <small>{ADETAILER_UNIT_LIMIT} 个检测单元 · 已启用 {activeADetailerUnits(adetailer).length} 个 · 按编号顺序依次执行，后一个在前一个的结果上继续修复</small>
-              </div>
-              <p className="adetailer-path" title={adetailerInfo.directory}>CPU 检测 · 重绘继承当前采样器、调度器、底模与 LoRA</p>
-            </div>}
-              </section>
-
-              <section className={`postprocess-stage-card ${rtx.enabled ? "enabled" : ""} ${rtx.expanded ? "expanded" : ""}`}>
-                <PostprocessStageHeader
-                  title="RTX VSR"
-                  detail={rtx.enabled ? `${rtx.scale.toFixed(2)}x · ${rtxStageTrace?.output.width || size.width} × ${rtxStageTrace?.output.height || size.height}` : "关闭"}
-                  enabled={rtx.enabled}
-                  expanded={rtx.expanded}
-                  onToggleExpanded={() => updateRtx({ expanded: !rtx.expanded })}
-                  onToggleEnabled={() => (engineAllowsRtx || rtx.enabled) && updateRtx({ enabled: !rtx.enabled })}
-                  switchDisabled={modelSwitching || (!engineAllowsRtx && !rtx.enabled) || ultraLowMode || ((!rtxHealth.available || !rtxPreviewDimensions.valid) && !rtx.enabled)}
-                />
-            {rtx.expanded && <div className={`rtx-parameters ${rtx.enabled ? "enabled" : ""}`}>
-              <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
-              {!engineAllowsRtx && <p className="rtx-unavailable">当前推理服务未声明 {model} RTX VSR 能力。</p>}
-              {ultraLowMode && <p className="rtx-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
-              {engineAllowsRtx && !rtxHealth.available && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`} role="status" aria-live="polite">{rtxStatusReason}</p>}
-              {engineAllowsRtx && rtxHealth.available && rtxHealth.warning && <p className="rtx-unavailable">{rtxHealth.warning}</p>}
-              {engineAllowsRtx && rtxHealth.available && !rtxPreviewDimensions.valid && <p className="rtx-unavailable">当前顺序中的 RTX 中间目标超过 8192 边长或 32 MP 安全限制，请降低倍率、Hires 倍率或调整顺序。</p>}
-              <div className="rtx-runtime-grid" aria-label="RTX VSR 运行环境">
-                <div><span>状态</span><strong>{rtxHealth.probing ? "PROBING" : rtxHealth.available ? "READY" : rtxHealth.supported ? "RUNTIME REQUIRED" : "UNSUPPORTED"}</strong></div>
-                <div><span>运行时</span><strong>{rtxHealth.runtime_version || "--"}</strong></div>
-                <div><span>设备</span><strong title={rtxHealth.device}>{rtxHealth.device || "--"}</strong></div>
-                <div><span>CUDA 能力</span><strong>{rtxHealth.compute_capability || "--"}</strong></div>
-                <div><span>驱动</span><strong>{rtxHealth.driver_version || "--"}</strong></div>
-              </div>
-              <div className="rtx-scale"><Slider label="放大倍率" value={rtx.scale} min={1} max={4} step={0.01} inputStep={0.01} fixed={2} disabled={modelSwitching} onChange={(scale) => updateRtx({ scale: Math.round(scale * 100) / 100 })} suffix="x" /><p><span>INPUT {rtxStageTrace?.input.width || size.width} × {rtxStageTrace?.input.height || size.height}</span><b>OUTPUT {rtxStageTrace?.output.width || size.width} × {rtxStageTrace?.output.height || size.height}</b></p><p><span>ORDERED FINAL</span><b>{rtxPreviewDimensions.width} × {rtxPreviewDimensions.height}</b></p></div>
-              <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={rtx.quality} disabled={modelSwitching} onChange={(quality) => updateRtx({ quality })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
-              <p className="rtx-proprietary">RTX VSR 依赖 NVIDIA 专有 Video Effects 运行时，仅在受支持的 x64 Windows / Linux NVIDIA RTX 设备上可用；生成内容仍在本机处理。</p>
-            </div>}
-              </section>
-
-            <section className="postprocess-order" aria-labelledby="postprocess-order-title">
-              <header><div><span>05</span><strong id="postprocess-order-title">后处理顺序</strong><small>禁用阶段仍可排序；生成期间锁定</small></div><b>FINAL {postprocessDimensions.width} × {postprocessDimensions.height}</b></header>
-              <div className="postprocess-order-list">
-                {normalizedPostprocessOrder.map((stage, index) => {
-                  const stageSettings = postprocessSettings[stage];
-                  const labels = { hires: ["Hires.fix", "扩散精修"], adetailer: ["ADetailer", "局部重绘"], rtx: ["RTX VSR", "NVIDIA 超分"] };
-                  return <div className={stageSettings.enabled ? "enabled" : "disabled"} key={stage}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{labels[stage][0]}</strong><small>{labels[stage][1]} · {stageSettings.enabled ? "启用" : "关闭"}</small></div><div className="postprocess-order-actions"><button type="button" aria-label={`上移 ${labels[stage][0]}`} title={`上移 ${labels[stage][0]}`} disabled={modelSwitching || index === 0} onClick={() => movePostprocessStage(stage, -1)}><ArrowUp size={13} /></button><button type="button" aria-label={`下移 ${labels[stage][0]}`} title={`下移 ${labels[stage][0]}`} disabled={modelSwitching || index === normalizedPostprocessOrder.length - 1} onClick={() => movePostprocessStage(stage, 1)}><ArrowDown size={13} /></button></div></div>;
-                })}
-              </div>
-              {!postprocessDimensions.valid && <p>RTX VSR 中间目标超过 8192 边长或 32 MP 安全限制。</p>}
-            </section>
+                )}
+                renderStage={(stage, index, actions) => (stage.type === "adetailer" ? (
+                  <section className={`postprocess-stage-card ${adetailer.enabled ? "enabled" : ""} ${adetailer.expanded ? "expanded" : ""}`}>
+                    <PostprocessStageHeader
+                      title="ADetailer"
+                      detail={adetailer.enabled ? adetailerSummary(adetailer) : "关闭"}
+                      enabled={adetailer.enabled}
+                      expanded={adetailer.expanded}
+                      onToggleExpanded={() => updateADetailer({ expanded: !adetailer.expanded })}
+                      onToggleEnabled={() => (engineAllowsADetailer || adetailer.enabled) && updateADetailer({ enabled: !adetailer.enabled })}
+                      switchDisabled={adetailerLocked || (!engineAllowsADetailer && !adetailer.enabled) || ultraLowMode || (!adetailerInfo.runtimeAvailable && !adetailer.enabled)}
+                    />
+                    {adetailer.expanded && <div className={`adetailer-parameters ${adetailer.enabled ? "enabled" : ""}`}>
+                  <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
+                  {!engineAllowsADetailer && <p className="adetailer-unavailable">当前推理服务未声明 {model} ADetailer 能力。</p>}
+                  {ultraLowMode && <p className="adetailer-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
+                  {engineAllowsADetailer && !adetailerInfo.available && <p className="adetailer-unavailable">{adetailerInfo.loading ? "正在读取检测模型..." : adetailerInfo.error || (adetailerInfo.runtimeAvailable ? "尚未安装 YOLO 检测模型，请从下方模型库下载或手动放入 models/yolo" : "项目 YOLO 运行环境不可用，请重新运行环境配置")}</p>}
+                  <div className="adetailer-model-library">
+                    <div className="adetailer-library-heading"><strong>基础推荐模型</strong><span><small>{adetailerInfo.builtins.filter((item) => item.installed).length} / {adetailerInfo.builtins.length} 已就绪</small><button type="button" title="刷新 YOLO 模型列表" aria-label="刷新 YOLO 模型列表" disabled={adetailerInfo.loading || status === "running"} onClick={() => { void refreshADetailerModels(); }}><RefreshCw className={adetailerInfo.loading ? "spin" : ""} size={11} /></button></span></div>
+                    <div className="adetailer-recommended-model">
+                      <span><b>ADetailer 基础模型包</b><small>包含面部、手部和人物分割检测所需的 5 个官方模型</small></span>
+                      {adetailerInfo.builtins.length > 0 && adetailerInfo.builtins.every((item) => item.installed)
+                        ? <em><Check size={12} />已安装</em>
+                        : <button type="button" disabled={status === "running" || adetailerDownload?.status === "downloading"} onClick={downloadRecommendedYoloModels}><Download size={12} />一键下载全部（5）</button>}
+                    </div>
+                  </div>
+                  {adetailerDownload && <div className={`adetailer-download-status ${adetailerDownload.status}`} aria-live="polite">
+                    <div><b>{adetailerDownload.label}{adetailerDownload.modelIndex ? ` · ${adetailerDownload.modelIndex} / ${adetailerDownload.totalModels}` : ""}</b><span>{adetailerDownload.message}</span></div>
+                    {adetailerDownload.totalBytes > 0 && <i><i style={{ width: `${Math.min(100, adetailerDownload.currentBytes / adetailerDownload.totalBytes * 100)}%` }} /></i>}
+                    <small>{adetailerDownload.currentBytes > 0 ? `${formatFileSize(adetailerDownload.currentBytes)} / ${formatFileSize(adetailerDownload.totalBytes)}` : ""}{adetailerDownload.speedBps > 0 ? ` · ${formatFileSize(adetailerDownload.speedBps)}/s` : ""}{adetailerDownload.connections > 1 ? ` · ${adetailerDownload.connections} 路分片` : ""}</small>
+                  </div>}
+                  {(() => {
+                    const unitLocked = adetailerLocked;
+                    const index = adetailerPageIndex(adetailerUnits, adetailerPage);
+                    const unit = adetailerUnits[index];
+                    if (!unit) return null;
+                    const unitSteps = adetailerUnitSteps(unit, steps, model);
+                    return <div className="adetailer-units">
+                      {adetailerUnits.length > 1 && <nav className="adetailer-pager" aria-label="ADetailer 检测单元">
+                        <button type="button" aria-label="上一个检测单元" disabled={index < 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, -1))}><ChevronLeft size={14} /></button>
+                        <ol>
+                          {adetailerUnits.map((entry, position) => <li key={entry.id}>
+                            <button
+                              type="button"
+                              className={`${position === index ? "current" : ""} ${entry.enabled ? "on" : ""}`}
+                              aria-current={position === index ? "true" : undefined}
+                              aria-label={`第 ${position + 1} 个检测单元${entry.enabled ? "" : "（已关闭）"}`}
+                              onClick={() => setADetailerPage(entry.id)}
+                            >{position + 1}</button>
+                          </li>)}
+                        </ol>
+                        <button type="button" aria-label="下一个检测单元" disabled={index >= adetailerUnits.length - 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, 1))}><ChevronRight size={14} /></button>
+                      </nav>}
+                      {/* Keyed by the unit so paging *replaces* the controls rather than
+                          reusing them: `BoundedNumberInput` holds an uncommitted draft of
+                          its own, and reused controls would carry one unit's half-typed
+                          value onto the next unit's field. */}
+                      <section className={`adetailer-unit ${unit.enabled ? "on" : ""}`} key={unit.id}>
+                        <header>
+                          <span>{String(index + 1).padStart(2, "0")}</span>
+                          <strong>{adetailerUnitLabel(index, adetailerUnits.length)}</strong>
+                          <small>{unit.detector ? unit.detector.split("/").pop() : "未选择模型"}</small>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-label={`启用第 ${index + 1} 个 ADetailer 单元`}
+                            aria-checked={unit.enabled}
+                            className={unit.enabled ? "active" : ""}
+                            disabled={unitLocked}
+                            onClick={() => updateADetailerUnit(unit.id, { enabled: !unit.enabled })}
+                          ><i /></button>
+                        </header>
+                        <div className="adetailer-unit-body">
+                          <label className="adetailer-model">检测模型<WorkspaceSelect ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`} value={unit.detector} disabled={unitLocked} onChange={(detector) => updateADetailerUnit(unit.id, { detector })} options={adetailerModels.length ? adetailerModels.map((item) => ({ value: item.value, label: `${item.label || item.name}${item.source === "community" ? " · 社区" : ""}` })) : [{ value: "", label: "暂无模型", disabled: true }]} /></label>
+                          <div className="adetailer-sliders">
+                            <Slider label="检测置信度" value={unit.confidence} min={0.05} max={1} step={0.05} inputStep={0.01} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { confidence: value })} />
+                            <Slider label="最多处理区域" value={unit.maxDetections} min={1} max={8} integer disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { maxDetections: value })} />
+                            <Slider label="最小区域比例" value={unit.maskMinRatio} min={0} max={0.5} step={0.01} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { maskMinRatio: value, maskMaxRatio: Math.max(value, unit.maskMaxRatio) })} />
+                            <Slider label="最大区域比例" value={unit.maskMaxRatio} min={0.05} max={1} step={0.05} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { maskMaxRatio: value, maskMinRatio: Math.min(value, unit.maskMinRatio) })} />
+                          </div>
+                          <div className="adetailer-mask-grid">
+                            <label>膨胀 / 腐蚀<BoundedNumberInput value={unit.dilateErode} min={-128} max={128} integer disabled={unitLocked} onCommit={(dilateErode) => updateADetailerUnit(unit.id, { dilateErode })} /></label>
+                            <label>蒙版模糊<BoundedNumberInput value={unit.maskBlur} min={0} max={64} integer disabled={unitLocked} onCommit={(maskBlur) => updateADetailerUnit(unit.id, { maskBlur })} /></label>
+                            <label>局部边距<BoundedNumberInput value={unit.padding} min={0} max={256} integer disabled={unitLocked} onCommit={(padding) => updateADetailerUnit(unit.id, { padding })} /></label>
+                          </div>
+                          <div className="adetailer-denoise"><Slider label="重绘强度" value={unit.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} disabled={unitLocked} onChange={(value) => updateADetailerUnit(unit.id, { denoise: value })} /></div>
+                          <div className="adetailer-overrides">
+                            <label><input type="checkbox" checked={unit.useSteps} disabled={unitLocked} onChange={(event) => updateADetailerUnit(unit.id, { useSteps: event.target.checked })} /><span>独立步数</span><BoundedNumberInput value={unit.steps} min={1} max={100} integer disabled={unitLocked || !unit.useSteps} onCommit={(unitStepCount) => updateADetailerUnit(unit.id, { steps: unitStepCount })} /></label>
+                            <label><input type="checkbox" checked={unit.useCfg} disabled={unitLocked} onChange={(event) => updateADetailerUnit(unit.id, { useCfg: event.target.checked })} /><span>独立 CFG</span><BoundedNumberInput value={unit.cfg} min={0} max={30} step={0.1} disabled={unitLocked || !unit.useCfg} onCommit={(cfg) => updateADetailerUnit(unit.id, { cfg })} /></label>
+                          </div>
+                          <div className="adetailer-prompts">
+                            <label>正向提示词<textarea value={unit.prompt} disabled={unitLocked} onChange={(event) => updateADetailerUnit(unit.id, { prompt: event.target.value })} placeholder="留空继承主提示词；[PROMPT] 插入主提示词" /></label>
+                            <label>负向提示词<textarea value={unit.negativePrompt} disabled={unitLocked || !engineAllowsNegativePrompt} onChange={(event) => updateADetailerUnit(unit.id, { negativePrompt: event.target.value })} placeholder={engineAllowsNegativePrompt ? "留空继承主负向提示词" : "FLUX.1 没有无条件分支，负向提示词不会参与生成"} /></label>
+                          </div>
+                          {unit.enabled && unitSteps < 1 && <p className="adetailer-unavailable">该单元有效步数为 0，请提高主采样或独立步数，或提高重绘强度。</p>}
+                        </div>
+                      </section>
+                    </div>;
+                  })()}
+                  <div className="adetailer-unit-add">
+                    <small>{ADETAILER_UNIT_LIMIT} 个检测单元 · 已启用 {activeADetailerUnits(adetailer).length} 个 · 按编号顺序依次执行，后一个在前一个的结果上继续修复</small>
+                  </div>
+                  <p className="adetailer-path" title={adetailerInfo.directory}>CPU 检测 · 重绘继承当前采样器、调度器、底模与 LoRA</p>
+                    </div>}
+                  </section>
+                ) : (
+                  <section className={`postprocess-stage-card ${rtx.enabled ? "enabled" : ""} ${rtx.expanded ? "expanded" : ""}`}>
+                    <PostprocessStageHeader
+                      title="RTX VSR"
+                      detail={rtx.enabled ? `${rtx.scale.toFixed(2)}x · ${rtxStageTrace?.output.width || size.width} × ${rtxStageTrace?.output.height || size.height}` : "关闭"}
+                      enabled={rtx.enabled}
+                      expanded={rtx.expanded}
+                      onToggleExpanded={() => updateRtx({ expanded: !rtx.expanded })}
+                      onToggleEnabled={() => (engineAllowsRtx || rtx.enabled) && updateRtx({ enabled: !rtx.enabled })}
+                      switchDisabled={modelSwitching || (!engineAllowsRtx && !rtx.enabled) || ultraLowMode || ((!rtxHealth.available || !postprocessDimensions.valid) && !rtx.enabled)}
+                    />
+                    {rtx.expanded && <div className={`rtx-parameters ${rtx.enabled ? "enabled" : ""}`}>
+                  <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
+                  {!engineAllowsRtx && <p className="rtx-unavailable">当前推理服务未声明 {model} RTX VSR 能力。</p>}
+                  {ultraLowMode && <p className="rtx-unavailable">极限省存模式会关闭全部附加后处理阶段。</p>}
+                  {engineAllowsRtx && !rtxHealth.available && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`} role="status" aria-live="polite">{rtxStatusReason}</p>}
+                  {engineAllowsRtx && rtxHealth.available && rtxHealth.warning && <p className="rtx-unavailable">{rtxHealth.warning}</p>}
+                  {engineAllowsRtx && rtxHealth.available && !postprocessDimensions.valid && <p className="rtx-unavailable">{postprocessDimensions.reason}</p>}
+                  <div className="rtx-runtime-grid" aria-label="RTX VSR 运行环境">
+                    <div><span>状态</span><strong>{rtxHealth.probing ? "PROBING" : rtxHealth.available ? "READY" : rtxHealth.supported ? "RUNTIME REQUIRED" : "UNSUPPORTED"}</strong></div>
+                    <div><span>运行时</span><strong>{rtxHealth.runtime_version || "--"}</strong></div>
+                    <div><span>设备</span><strong title={rtxHealth.device}>{rtxHealth.device || "--"}</strong></div>
+                    <div><span>CUDA 能力</span><strong>{rtxHealth.compute_capability || "--"}</strong></div>
+                    <div><span>驱动</span><strong>{rtxHealth.driver_version || "--"}</strong></div>
+                  </div>
+                  <div className="rtx-scale"><Slider label="放大倍率" value={rtx.scale} min={1} max={4} step={0.01} inputStep={0.01} fixed={2} disabled={modelSwitching} onChange={(scale) => updateRtx({ scale: Math.round(scale * 100) / 100 })} suffix="x" /><p><span>INPUT {rtxStageTrace?.input.width || size.width} × {rtxStageTrace?.input.height || size.height}</span><b>OUTPUT {rtxStageTrace?.output.width || size.width} × {rtxStageTrace?.output.height || size.height}</b></p><p><span>CHAIN FINAL</span><b>{postprocessDimensions.width} × {postprocessDimensions.height}</b></p></div>
+                  <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={rtx.quality} disabled={modelSwitching} onChange={(quality) => updateRtx({ quality })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
+                  <p className="rtx-proprietary">RTX VSR 依赖 NVIDIA 专有 Video Effects 运行时，仅在受支持的 x64 Windows / Linux NVIDIA RTX 设备上可用；生成内容仍在本机处理。</p>
+                    </div>}
+                  </section>
+                ))}
+              />
             </section>
           </div>
         </aside>
@@ -6731,10 +6736,10 @@ function App() {
               </button>
               <button type="button" className="unload-model-button gallery-preview-add" title={canAddGeneratedToGallery ? "把一张或多张生成结果加入画廊" : "该旧任务没有可验证的参数快照"} disabled={!canAddGeneratedToGallery} onClick={() => setGalleryAddOpen(true)}><ImagePlus size={13} /><span>加入画廊</span></button>
               <div className="queue-control">
-                <button type="button" className={`unload-model-button queue-button ${queueOutstanding ? "busy" : ""}`} aria-expanded={queueOpen} title="查看本次会话的任务队列" onClick={() => setQueueOpen((current) => !current)}><ListChecks size={13} /><span>队列</span>
+                <button ref={queueButtonRef} type="button" className={`unload-model-button queue-button ${queueOutstanding ? "busy" : ""}`} aria-expanded={queueOpen} title="查看本次会话的任务队列" onClick={toggleQueueWindow}><ListChecks size={13} /><span>队列</span>
                   {queue.length > 0 && <b className="queue-badge">{queuePendingCount > 0 ? `${queuePendingCount} 等待` : queue.length}</b>}
                 </button>
-                {queueOpen && <QueueList jobs={queue} counts={queueCounts} error={queueError} watching={generationJob} onCancel={cancelQueuedJob} onClose={() => setQueueOpen(false)} onSelect={selectQueueJob} />}
+                {queueOpen && <QueueList jobs={queue} counts={queueCounts} error={queueError} watching={generationJob} onCancel={cancelQueuedJob} onClose={() => setQueueOpen(false)} onSelect={selectQueueJob} position={queueWindowPosition} onMove={setQueueWindowPosition} />}
               </div>
               <button type="button" className={`icon-button ${runInfoVisible ? "active" : ""}`} aria-pressed={runInfoVisible} aria-controls="generation-run-info" title={runInfoVisible ? "隐藏模型、显存与条件信息" : "显示模型、显存与条件信息"} onClick={() => setRunInfoVisible((current) => !current)}>{runInfoVisible ? <Eye size={17} /> : <EyeOff size={17} />}</button>
               <button className="icon-button" title="打开图片预览与拼图工作区" onClick={openImageViewer}><Maximize2 size={17} /></button>
@@ -6746,11 +6751,17 @@ function App() {
             <div className="preview-grid" />
             {status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>等待生成</strong><p>也可以直接打开 outputs 图片<br />进入预览与拼图工作区</p><button type="button" onClick={openImageViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
             {status === "running" && <div className={`generating-preview ${generationStage}`}>
-              <StagePreviewLive stage={latestStagePreview} stageLabel={stageLabel} onEnlarge={setEnlargedStage} />
+              <StagePreviewLive stage={latestStagePreview} stageLabel={stageLabel} onEnlarge={setEnlargedStage} held={heldPreview} />
               {generationStage === "adetailer_inpaint" && <div className="preview-stage-badge detail"><span>局部放大</span><b>{activeDetail?.class_name || "区域"} · {(activeDetail?.confidence * 100 || 0).toFixed(0)}%</b></div>}
             </div>}
             {status === "complete" && <button className={`completed-preview ${selectedOutput?.transparent_background ? "transparent-preview" : ""}`} onClick={openImageViewer} title="点击放大预览"><img className="generated-image" src={generatedImage} alt={`第 ${selectedOutputIndex + 1} 张 AI 生成结果`} />{selectedOutput?.transparent_background && <div className="transparent-output-badge">RGBA · {selectedOutput.background_removal?.method === "birefnet-lite-fp16" ? "BIREFNET LITE" : selectedOutput.background_removal?.method === "bria-rmbg-2-fp16" ? "RMBG 2.0" : selectedOutput.background_removal?.method === "u2netp-onnx" ? "U-2-NETP" : selectedOutput.background_removal?.method?.startsWith("local:") ? "LOCAL ONNX" : "ALGORITHM"}</div>}<div className="image-caption"><span>{selectedOutput?.width || size.width} × {selectedOutput?.height || size.height} · 批 {selectedOutput?.batch_index || 1} / 图 {selectedOutput?.image_index || 1}</span><span>Seed {selectedOutput?.seed ?? seed} · {generationElapsed.toFixed(1)} 秒</span></div></button>}
-            {status === "cancelled" && <div className="generation-cancelled"><Square size={30} /><strong>生成已终止</strong><p>已安全停止任务，没有保存未完成图片</p><button onClick={() => setStatus("idle")}>返回调整参数</button></div>}
+            {status === "cancelled" && (heldPreview?.url
+              ? <div className="stage-preview-image held-preview cancelled-held">
+                <img src={heldPreview.url} alt="上一次生成结果" />
+                <span className="stage-preview-tag">已终止 · 显示上一次完成的结果</span>
+                <button type="button" className="held-preview-reset" onClick={() => setStatus("idle")}>返回调整参数</button>
+              </div>
+              : <div className="generation-cancelled"><Square size={30} /><strong>生成已终止</strong><p>已安全停止任务，没有保存未完成图片</p><button onClick={() => setStatus("idle")}>返回调整参数</button></div>)}
             {status === "error" && <div className="generation-error"><X size={32} /><strong>生成失败</strong><p>{generationError}</p><button onClick={() => setStatus("idle")}>返回调整参数</button></div>}
             <div className="corner corner-tl" /><div className="corner corner-tr" /><div className="corner corner-bl" /><div className="corner corner-br" />
           </div>
@@ -6847,6 +6858,8 @@ function App() {
           elapsed: generationElapsed,
           taskStatus: generationTaskStatus,
           controlBusy: generationControlBusy,
+          // Both pages watch the same run, so they hold the same last picture.
+          held: heldPreview,
         }}
         settings={imageToImage}
         source={imageSource}
@@ -7147,8 +7160,8 @@ function App() {
               {settingsTab === "theme" && <section className="settings-section theme-section">
                 <div className="settings-section-title"><span>THEME PALETTE</span><h3>主题设置</h3><p>主题会立即应用并自动保存，重新打开应用和加载界面时继续使用。</p></div>
                 <div className="theme-toolbar">
-                  <div><BrandLogo className="theme-preview-logo" /><span><strong>实时主题预览</strong><small>{theme.light ? "白色背景主题已启用" : `${theme.overall} · 暗色背景主题`}</small></span></div>
-                  <div className="theme-toolbar-actions"><button type="button" role="switch" aria-checked={theme.light} className={`theme-mode-toggle ${theme.light ? "active" : ""}`} onClick={toggleLightTheme}><i /><span>黑 / 白主题</span></button><button type="button" className="theme-reset" onClick={resetTheme}><RefreshCw size={13} />恢复默认主题</button></div>
+                  <div><BrandLogo className="theme-preview-logo" /><span><strong>实时主题预览</strong><small>{`${theme.overall} · 暗色背景主题`}</small></span></div>
+                  <div className="theme-toolbar-actions"><button type="button" className="theme-reset" onClick={resetTheme}><RefreshCw size={13} />恢复默认主题</button></div>
                 </div>
                 <div className="theme-group-label"><span>整体主题调色板</span><small>影响整个工具的强调色，并自动派生 Logo 配色</small></div>
                 <ThemeColorField label="整体主题" detail="界面强调色 / 自动生成完整 Logo 配色" value={theme.overall} onChange={updateOverallTheme} />
@@ -7159,7 +7172,6 @@ function App() {
                   <ThemeColorField label="圆盘色" detail="Logo 内部背景" value={theme.disc} onChange={(value) => updateLogoTheme("disc", value)} />
                   <ThemeColorField label="辅助线" detail="细环 / 第三轨道" value={theme.guide} onChange={(value) => updateLogoTheme("guide", value)} />
                 </div>
-                {theme.light && <p className="theme-mode-note">白色主题只切换界面背景、面板和文字明暗；整体主题色与 Logo 调色板保持不变。</p>}
               </section>}
               {settingsTab === "plugins" && <section className="settings-section plugins-section">
                 <div className="settings-section-title"><span>EXTENSION PORT</span><h3>插件扩展</h3><p>把插件文件夹放进项目根目录的 <code>plugins</code> 后在这里管理。宿主只读取 <code>plugins/&lt;id&gt;/plugin.json</code>。</p></div>

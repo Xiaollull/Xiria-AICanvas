@@ -39,6 +39,7 @@
       <li><a href="#lora-cards">LoRA 卡片</a></li>
       <li><a href="#samplers">采样器与调度器</a></li>
       <li><a href="#batches">图像批次</a></li>
+      <li><a href="#postprocess">后处理链</a></li>
       <li><a href="#workspace">图像查看器工作区</a></li>
     </ul>
   </aside>
@@ -141,6 +142,36 @@
     <p>种子会按输出位置在整个任务中递增，并在无符号 64
       位范围内安全回绕。结果浏览器按批次对输出分组，并允许你选择当前批次中的任意图像；缩放与下载操作始终使用所选图像。取消或失败的多批次任务会移除部分输出，而完成的
       PNG 文件会在元数据中记录其批次、图像、种子和总批次设置。</p>
+
+    <h2 id="postprocess">后处理链</h2>
+    <p><strong>后处理增强</strong>面板是一个有序的阶段列表，在采样之后从上到下依次执行：最多 8 个<strong>重采样单元</strong>，加上
+      ADetailer 与 RTX VSR 两个阶段，可按任意顺序交错排列——例如先重采样、再 ADetailer、再重采样一次、最后 RTX。添加单元即插入列表；用箭头调整顺序；每个阶段都可以单独开关。</p>
+    <p>一个重采样单元由三个可选步骤组成：先用超分模型放大，再用普通算法缩放到目标尺寸，最后用当前的底模、LoRA 和提示词重绘。每一种组合都是有效的配置：</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>超分模型</th><th>倍率</th><th>重绘强度</th><th>单元的作用</th></tr></thead>
+        <tbody>
+          <tr><td>有</td><td>&gt; 1</td><td>&gt; 0</td><td>经典的 Hires.fix 第二遍。</td></tr>
+          <tr><td>有</td><td>&gt; 1</td><td>0</td><td>用模型放大，不重绘。</td></tr>
+          <tr><td>无</td><td>&gt; 1</td><td>0</td><td>单纯的图像缩放。</td></tr>
+          <tr><td>无</td><td>&gt; 1</td><td>&gt; 0</td><td>缩放后重绘。</td></tr>
+          <tr><td>无</td><td>1</td><td>&gt; 0</td><td>同尺寸的细节重绘。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><strong>尺寸是精确的。</strong>每个单元的目标尺寸是它收到的图像的 <code>round(边长 × 倍率)</code>，与 ComfyUI 的
+      <code>ImageScaleBy</code> 算法一致，不会向上取整到 64。重绘仍然必须落在引擎的潜空间网格上——SD 与 Illustrious 为 8 像素，FLUX.1、FLUX.2 与
+      Krea 2 为 16，Anima 为 32——因此面板会在目标尺寸旁显示重绘实际使用的尺寸；勾选<strong>精确输出尺寸</strong>会在重绘后再缩放回精确的目标尺寸，代价是多一次缩放。重绘的边长上限在
+      SD 与 Illustrious 上为 8192 像素，其他引擎为 4096；不重绘的单元不受这两个限制。</p>
+    <p>缩放算法是 ComfyUI <code>ImageScale</code> 的算法集合，去掉了只适用于潜空间的 <code>bislerp</code>：Lanczos（默认，放大时最锐利）、Bicubic、Bilinear、Area（缩小时最佳）和
+      Nearest。</p>
+    <p>重绘默认继承主设置的步数、CFG、采样器和调度器，也可以用<strong>独立步数</strong>、<strong>独立 CFG</strong>
+      及单元自己的选择器单独设置。它的 Seed 默认跟随每张图的首轮 Seed，也可以让所有图使用同一个固定 Seed，或每张图各取一个安全随机
+      Seed。Anima 与 Krea 2 还可以用 USDU 分块重绘代替整图重绘。</p>
+    <p>在后处理链出现之前保存的设置——工作区、各引擎设置、画廊卡片和 PNG 元数据——打开时会把原来的 Hires.fix
+      作为第一个重采样单元，并保留原来的阶段顺序，因此旧工作区仍会跑出与以前相同的流程。</p>
 
     <h2 id="workspace">图像查看器工作区</h2>
     <p>本地图像工作区可以从预览头部打开，或在任何图像生成之前从其空状态打开。右上角的 <strong>全屏</strong> 按钮无需使用 F11

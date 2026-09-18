@@ -66,7 +66,7 @@ test("a shared reference keeps the relative shape and refuses every escape", () 
 });
 
 test("root ids follow the folder, not the spelling, and match the Python twin", () => {
-  // Pinned against backend/test_shared_model_paths.py: both planes must derive
+  // Pinned against backend/tests/test_shared_model_paths.py: both planes must derive
   // the same id or every mounted shared LoRA breaks at generation time. The
   // folding mode is passed explicitly so the vectors hold on either host.
   const windows = { caseInsensitive: true };

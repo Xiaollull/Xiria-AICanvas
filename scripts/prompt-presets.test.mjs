@@ -319,7 +319,7 @@ test("the workspace remembers which presets are on, and a gallery card records w
   assert.match(gallery, /effectivePrompt\(settings\) !== settings\.positive && \(/);
 });
 
-test("a preset card says it is on, in both themes, and the box counts them", () => {
+test("a preset card says it is on, and the box counts them", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
   const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(app, /className=\{`prompt-preset-card \$\{active \? "active" : ""\}`\}/);
@@ -327,5 +327,4 @@ test("a preset card says it is on, in both themes, and the box counts them", () 
   assert.match(app, /已启用/);
   // The accent border is the signal, and hovering an inactive card must not be able to imitate it.
   assert.match(css, /\.prompt-preset-card\.active, \.prompt-preset-card\.active:hover \{ border-color: var\(--lime\);/);
-  assert.match(css, /html\[data-theme-mode="light"\] \.prompt-preset-card\.active \{ border-color: #7a4fe0;/);
 });

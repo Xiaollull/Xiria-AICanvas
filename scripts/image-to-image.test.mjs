@@ -139,11 +139,9 @@ test("the request body carries the picture, the strength and nothing the page do
     resize_mode: "contain",
     name: "cat.png",
   });
-  assert.deepEqual(body.postprocess_order, ["hires", "adetailer", "rtx"]);
+  assert.deepEqual(body.postprocess_chain.map((stage) => stage.type), ["resample", "adetailer", "rtx"]);
   assert.deepEqual(body.loras, [{ path: "a.safetensors", weight: 0.8 }]);
-  assert.equal(body.hires.enabled, false);
-  assert.equal(body.adetailer.enabled, false);
-  assert.equal(body.rtx.enabled, false);
+  for (const stage of body.postprocess_chain) assert.equal(stage.enabled, false);
   assert.equal(body.background_removal_model, null);
   assert.deepEqual(body.gallery_settings, { page: "image", positive: "a lantern", seed: "99" });
   for (const key of ["diffusion_model", "text_encoder", "vae"]) assert.equal(key in body, false, `${key} must not be sent`);
@@ -182,7 +180,8 @@ test("both generation pages share one reversible transparent Prompt directive", 
   assert.equal(toggleTransparentBackground(enabled), "portrait, studio light");
 });
 
-test("i2i owns independent postprocess settings and emits the existing stage contract", () => {
+test("i2i owns an independent chain and emits it in execution order", () => {
+  // A record saved before the chain is migrated on the way in, order included.
   const settings = normalizeImageToImageSettings({
     positive: "portrait",
     hires: { enabled: true, model: "anime-upscaler", scale: 2, denoise: 0.2, steps: 12, seedMode: "fixed", seed: "123" },
@@ -190,35 +189,40 @@ test("i2i owns independent postprocess settings and emits the existing stage con
     rtx: { enabled: true, scale: 1.5, quality: "high" },
     postprocessOrder: ["rtx", "hires", "adetailer"],
   });
-  assert.equal(settings.hires.enabled, true);
-  assert.equal(settings.adetailer.enabled, true);
-  assert.equal(settings.rtx.quality, "high");
-  assert.deepEqual(settings.postprocessOrder, ["rtx", "hires", "adetailer"]);
+  assert.deepEqual(settings.postprocessChain.map((stage) => stage.type), ["rtx", "resample", "adetailer"]);
+  const unit = settings.postprocessChain[1];
+  assert.equal(unit.enabled, true);
+  assert.equal(unit.upscaler, "anime-upscaler");
   const body = imageToImageRequestBody({ engine: "SD", checkpoint: "model.safetensors", source: source(1024, 1024), settings, seed: "99" });
-  assert.equal(body.hires.enabled, true);
-  assert.equal(body.hires.scale, 2);
-  assert.equal(body.hires.mode, "fixed");
-  assert.equal(body.hires.seed, "123");
+  assert.deepEqual(body.postprocess_chain.map((stage) => stage.type), ["rtx", "resample", "adetailer"]);
+  const sentUnit = body.postprocess_chain[1];
+  assert.equal(sentUnit.enabled, true);
+  assert.equal(sentUnit.scale, 2);
+  assert.equal(sentUnit.seed_mode, "fixed");
+  assert.equal(sentUnit.seed, "123");
   // The stage sends a run plan: one entry per unit that will actually run.
-  assert.equal(body.adetailer.units.length, 1);
-  assert.equal(body.adetailer.units[0].detector, "face_yolo");
-  assert.equal(body.rtx.scale, 1.5);
-  assert.deepEqual(body.postprocess_order, ["rtx", "hires", "adetailer"]);
+  const detail = body.postprocess_chain[2];
+  assert.equal(detail.units.length, 1);
+  assert.equal(detail.units[0].detector, "face_yolo");
+  assert.equal(body.postprocess_chain[0].scale, 1.5);
 });
 
-test("i2i exposes and sends the full text-to-image Hires and ADetailer parameter sets", async () => {
+test("i2i exposes and sends the full text-to-image resample and ADetailer parameter sets", async () => {
   const settings = normalizeImageToImageSettings({
     positive: "portrait",
     hires: { enabled: true, model: "upscaler", cfg: 9.5, sampler: "euler", scheduler: "simple", tileSize: 128, tileOverlap: 999 },
     adetailer: { enabled: true, detector: "face", confidence: 0.65, maxDetections: 6, maskMinRatio: 0.08, maskMaxRatio: 0.72, dilateErode: -3, maskBlur: 9, padding: 48, denoise: 0.55, useSteps: true, steps: 33, useCfg: true, cfg: 8.5, prompt: " detailed face ", negativePrompt: " blur " },
   }, { samplers: ["euler"], schedulers: ["simple"] });
-  assert.equal(settings.hires.tileOverlap, 64, "overlap is clamped to half the selected tile size");
+  const settingsUnit = settings.postprocessChain.find((stage) => stage.type === "resample");
+  assert.equal(settingsUnit.tileOverlap, 64, "overlap is clamped to half the selected tile size");
   const body = imageToImageRequestBody({ engine: "SD", checkpoint: "model.safetensors", source: source(1024, 1024), settings, seed: "99", samplers: ["euler"], schedulers: ["simple"] });
-  assert.deepEqual({ cfg: body.hires.cfg, sampler: body.hires.sampler, scheduler: body.hires.scheduler, tile_size: body.hires.tile_size, tile_overlap: body.hires.tile_overlap }, { cfg: 9.5, sampler: "euler", scheduler: "simple", tile_size: 128, tile_overlap: 64 });
-  const unit = body.adetailer.units[0];
+  const sentUnit = body.postprocess_chain.find((stage) => stage.type === "resample");
+  assert.deepEqual({ cfg: sentUnit.cfg, sampler: sentUnit.sampler, scheduler: sentUnit.scheduler, tile_size: sentUnit.tile_size, tile_overlap: sentUnit.tile_overlap }, { cfg: 9.5, sampler: "euler", scheduler: "simple", tile_size: 128, tile_overlap: 64 });
+  const unit = body.postprocess_chain.find((stage) => stage.type === "adetailer").units[0];
   assert.deepEqual({ max_detections: unit.max_detections, mask_min_ratio: unit.mask_min_ratio, mask_max_ratio: unit.mask_max_ratio, dilate_erode: unit.dilate_erode, mask_blur: unit.mask_blur, padding: unit.padding, use_steps: unit.use_steps, steps: unit.steps, use_cfg: unit.use_cfg, cfg: unit.cfg, prompt: unit.prompt, negative_prompt: unit.negative_prompt }, { max_detections: 6, mask_min_ratio: 0.08, mask_max_ratio: 0.72, dilate_erode: -3, mask_blur: 9, padding: 48, use_steps: true, steps: 33, use_cfg: true, cfg: 8.5, prompt: "detailed face", negative_prompt: "blur" });
-  const page = await readSource("src/ImageToImagePage.jsx");
-  for (const label of ["Hires CFG", "Hires 采样器", "Hires 调度器", "像素放大分块", "最多处理区域", "最小区域比例", "膨胀 / 腐蚀", "蒙版模糊", "局部边距", "独立步数", "独立 CFG", "正向提示词", "负向提示词"]) assert.ok(page.includes(label), `${label} control is required`);
+  // The resample controls live in the shared chain panel; the ADetailer ones stay on the page.
+  const page = [await readSource("src/ImageToImagePage.jsx"), await readSource("src/ResampleChainPanel.jsx")].join("\n");
+  for (const label of ["像素放大分块", "最多处理区域", "最小区域比例", "膨胀 / 腐蚀", "蒙版模糊", "局部边距", "独立步数", "独立 CFG", "正向提示词", "负向提示词"]) assert.ok(page.includes(label), `${label} control is required`);
 
   // Several detail passes in one run, each with its own settings: a face model
   // and a hand model are the case this exists for.
@@ -230,12 +234,17 @@ test("i2i exposes and sends the full text-to-image Hires and ADetailer parameter
     ] },
   });
   const pairBody = imageToImageRequestBody({ engine: "SD", checkpoint: "model.safetensors", source: source(1024, 1024), settings: pair, seed: "1" });
+  const pairDetail = pairBody.postprocess_chain.find((stage) => stage.type === "adetailer");
+  const pairSettingsDetail = pair.postprocessChain.find((stage) => stage.type === "adetailer");
   // Only the units that will run are sent, in the order they will run.
-  assert.deepEqual(pairBody.adetailer.units.map((entry) => entry.detector), ["face.pt", "hand.pt"]);
-  assert.deepEqual(pairBody.adetailer.units.map((entry) => entry.denoise), [0.45, 0.3]);
-  assert.deepEqual(pairBody.adetailer.units.map((entry) => entry.prompt), ["face", "hand"]);
+  assert.deepEqual(pairDetail.units.map((entry) => entry.detector), ["face.pt", "hand.pt"]);
+  assert.deepEqual(pairDetail.units.map((entry) => entry.denoise), [0.45, 0.3]);
+  assert.deepEqual(pairDetail.units.map((entry) => entry.prompt), ["face", "hand"]);
   // Units are addressed by a stable id, and normalising is idempotent.
-  assert.deepEqual(pair.adetailer.units.map((entry) => entry.id), normalizeImageToImageSettings(pair).adetailer.units.map((entry) => entry.id));
+  assert.deepEqual(
+    pairSettingsDetail.units.map((entry) => entry.id),
+    normalizeImageToImageSettings(pair).postprocessChain.find((stage) => stage.type === "adetailer").units.map((entry) => entry.id),
+  );
 });
 
 test("both generate surfaces page through ADetailer units instead of stacking cards", async () => {
@@ -274,7 +283,6 @@ test("both generate surfaces page through ADetailer units instead of stacking ca
   for (const rule of [".adetailer-pager", ".adetailer-pager ol button.current"]) {
     assert.ok(styles.includes(rule), `${rule} must be styled`);
   }
-  assert.match(styles, /html\[data-theme-mode="light"\] \.adetailer-pager,/);
 });
 
 test("an Anima request sends split model assets and refuses process previews", () => {
@@ -394,7 +402,8 @@ test("a gallery card records this page's parameters, not the text-to-image compo
   for (const field of ["positive", "negative", "steps", "cfg", "denoise", "sampler", "scheduler"]) {
     assert.match(run, new RegExp(`${field}: settings\\.${field}`), `${field} must come from this page`);
   }
-  for (const stage of ["hires", "adetailer", "rtx"]) assert.match(run, new RegExp(`${stage}: (?:settings\\.${stage}|\\{ \\.\\.\\.settings\\.${stage})`), `${stage} must be recorded from i2i settings`);
+  // The whole chain, in this page's own order, rather than the workspace composer's.
+  assert.match(run, /postprocessChain: settings\.postprocessChain/, "the chain must be recorded from i2i settings");
   assert.match(run, /const gallerySettings = galleryJobSnapshotPayload\(submittedSettings\);/);
   assert.match(run, /gallerySettings,/);
 });
@@ -412,19 +421,23 @@ test("a fixed Hires seed survives being chosen and being cleared mid-edit", () =
   // `normalizeHiresSeed` collapses "fixed with no number" to `inherit`. This normaliser runs on
   // every render, so applying that repair here made 固定 Hires Seed a dead control: the mode snapped
   // back before a digit could be typed, and again the moment the field was cleared.
+  const firstUnit = (settings) => settings.postprocessChain.find((stage) => stage.type === "resample");
   const chosen = normalizeImageToImageSettings({ positive: "x", hires: { enabled: true, model: "m", seedMode: "fixed", seed: "" } });
-  assert.equal(chosen.hires.seedMode, "fixed");
-  assert.equal(chosen.hires.seed, "");
-  assert.equal(normalizeImageToImageSettings({ hires: { seedMode: "fixed", seed: "42" } }).hires.seed, "42");
-  assert.equal(normalizeImageToImageSettings({ hires: { seedMode: "spiral" } }).hires.seedMode, "inherit");
+  assert.equal(firstUnit(chosen).seedMode, "fixed");
+  assert.equal(firstUnit(chosen).seed, "");
+  assert.equal(firstUnit(normalizeImageToImageSettings({ hires: { seedMode: "fixed", seed: "42" } })).seed, "42");
+  assert.equal(firstUnit(normalizeImageToImageSettings({ hires: { seedMode: "spiral" } })).seedMode, "inherit");
   // The unfinished edit is what the run blocker is for — the same guard the text-to-image page
-  // carries. `generationHiresSeedSettings` would otherwise submit a silent 0, which is a legal seed
+  // carries. Defaulting the number to 0 would submit a silent seed, which is a legal one
   // and therefore worse than a refusal: the run would succeed with a number nobody chose.
   assert.match(imageToImageBlockers({
     source: source(512, 512), settings: chosen, postprocess: { hiresReady: true },
-  }), /固定 Hires Seed/);
+  }), /固定 Seed/);
   const body = imageToImageRequestBody({ engine: "SD", checkpoint: "c", source: source(512, 512), settings: chosen, seed: "1" });
-  assert.match(body.hires.seed, /^[0-9]+$/, "whatever is sent is still a legal unsigned seed");
+  const sent = body.postprocess_chain.find((stage) => stage.type === "resample");
+  // The unfinished edit falls back to inherit rather than reaching the service as a silent 0.
+  assert.equal(sent.seed_mode, "inherit");
+  assert.equal("seed" in sent, false);
 });
 
 test("the page refuses a post-processing stage the run would refuse", () => {
@@ -468,8 +481,6 @@ test("the mode sits with the button it changes, and hides the controls it makes 
   assert.match(page, /\{postprocessOnly \? <>[\s\S]{0,900}?i2i-canvas-readout/);
   const css = await readSource("src/styles.css");
   assert.match(css, /^\.i2i-mode-switch \{[^}]*display: grid;/m);
-  assert.match(css, /html\[data-theme-mode="light"\] \.i2i-mode-switch button \{/,
-    "both themes paint it, like every other control on this page");
 });
 
 test("the vocabularies the backend validates against are the ones the page offers", () => {

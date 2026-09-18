@@ -514,7 +514,16 @@ export function parseXiria(parameters, chunks = {}) {
 
   const anima = parameters.engine === "Anima";
   const flags = [
-    { id: "hires", label: "Hires.fix", enabled: Boolean(parameters.hires), detail: parameters.hires?.upscaler || parameters.hires?.mode || "" },
+    // A file written since the chain carries `resample`, one written before carries a single
+    // `hires` block. Both are read: an old picture still reports the pass it ran.
+    {
+      id: "hires",
+      label: "重采样",
+      enabled: Array.isArray(parameters.resample) ? parameters.resample.length > 0 : Boolean(parameters.hires),
+      detail: Array.isArray(parameters.resample) && parameters.resample.length
+        ? parameters.resample.map((unit) => [`${unit.scale ?? 1}x`, unit.upscaler || "算法缩放"].join(" ")).join(" → ")
+        : parameters.hires?.upscaler || parameters.hires?.model || parameters.hires?.mode || "",
+    },
     { id: "adetailer", label: "ADetailer", enabled: Boolean(parameters.adetailer), detail: parameters.adetailer?.detector || "" },
     { id: "rtx", label: "RTX VSR", enabled: Boolean(parameters.rtx), detail: parameters.rtx?.quality ? `Q${parameters.rtx.quality}` : "" },
     { id: "img2img", label: "图生图", enabled: Boolean(parameters.source_image), detail: parameters.source_image?.resize_mode || "" },

@@ -9,6 +9,7 @@ import { recoverInterruptedUpdate } from "./archive-update.mjs";
 import { getVenvPythonPath, isolatedPythonEnv, loadLocalEnv, withoutUpdateSecrets } from "./python.mjs";
 import { readSetupMarker } from "./setup-state.mjs";
 import { createHttpFetch, viteInvocation } from "./node-tools.mjs";
+import { serviceRestartDecision, serviceRestartMessage } from "./service-supervisor.js";
 import { acquireOfflineUpdateLock } from "./offline-update-lock.mjs";
 import { requireBundledAnimaTokenizers } from "./anima-models.mjs";
 
@@ -24,7 +25,7 @@ const stateDirectory = path.resolve(projectRoot, process.env.XIRAI_STATE_DIR || 
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 35;
+const inferenceProtocol = 36;
 
 function fail(message) {
   writeDiagnosticLog(projectRoot, {
@@ -215,6 +216,7 @@ async function runConfigurator() {
 
 let service = "main";
 let openOnReady = true;
+let restartHistory = [];
 while (!shuttingDown) {
   try {
     const result = service === "main" ? await runMainService(openOnReady) : await runConfigurator();
@@ -234,6 +236,19 @@ while (!shuttingDown) {
       service = "main";
       openOnReady = false;
       continue;
+    }
+    // Everything above is an instruction carried by an exit code. Anything else that ends the main
+    // service is a fault, and a fault is not a reason to leave the port dead: the person this
+    // serves is usually on another device and would only find out by the page going blank.
+    if (service === "main") {
+      const decision = serviceRestartDecision({ code: result.code, signal: result.signal, shuttingDown, history: restartHistory });
+      const message = serviceRestartMessage(decision, result);
+      if (message) console.log(message);
+      restartHistory = decision.history;
+      if (decision.restart) {
+        openOnReady = false;
+        continue;
+      }
     }
     process.exit(result.signal ? 1 : (result.code ?? 0));
   } catch (error) {

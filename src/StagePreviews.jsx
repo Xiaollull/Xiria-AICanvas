@@ -10,12 +10,20 @@ import { Image as ImageIcon } from "lucide-react";
 /**
  * What the panel shows while a generation runs: the most recently finished stage stays on screen
  * for the whole of the stage that follows it, so the base sample is what is shown while Hires runs
- * and the Hires result while ADetailer runs. Before the first stage lands there is nothing to show
- * but the placeholder.
+ * and the Hires result while ADetailer runs.
+ *
+ * Before the first stage of this run lands there is nothing of its own to show, and that is where
+ * `held` comes in: the picture the previous run finished with stays up rather than the box going
+ * empty the moment the next task is submitted. It is marked as the previous result, because a
+ * picture with no caption in a box that says "generating" would read as this run's output.
  */
-export function StagePreviewLive({ stage, stageLabel, onEnlarge, placeholder = "正在生成，完成后显示结果" }) {
+export function StagePreviewLive({ stage, stageLabel, onEnlarge, placeholder = "正在生成，完成后显示结果", held = null }) {
   return <>
-    <div className="step-preview-empty">{stage ? null : <><ImageIcon size={28} /><span>{placeholder}</span></>}</div>
+    <div className="step-preview-empty">{stage || held?.url ? null : <><ImageIcon size={28} /><span>{placeholder}</span></>}</div>
+    {!stage && held?.url && <div className="stage-preview-image held-preview">
+      <img src={held.url} alt="上一次生成结果" />
+      <span className="stage-preview-tag">上一次结果 · {placeholder}</span>
+    </div>}
     {stage && <button
       type="button"
       className="stage-preview-image"

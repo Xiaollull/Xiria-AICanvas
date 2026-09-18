@@ -25,10 +25,11 @@ test("Anima workspace restore and generation preserve supported feature settings
   const restore = sourceBetween(app, "function loadWorkspaceState(saved)", "function reconcileModels");
   const generate = sourceBetween(app, "  const generate = async () => {", "  const releaseLoadedModel = async () => {");
 
-  assert.match(restore, /enabled: savedHires\.enabled === true/);
-  // The stage is a list of units now, and one shared normaliser owns its shape.
-  assert.match(restore, /adetailer: normalizeADetailerStage\(savedADetailer\)/);
-  assert.match(restore, /enabled: savedRtx\.enabled === true/);
+  // The three blocks are one chain now, and one shared migration owns its shape.
+  assert.match(restore, /postprocessChain: migrateResampleChain\(\{/);
+  assert.match(restore, /hires: \{ \.\.\.savedHires, \.\.\.savedHiresSeed \}/);
+  assert.match(restore, /adetailer: savedADetailer/);
+  assert.match(restore, /rtx: savedRtx/);
   assert.match(restore, /const mountedLoraMap = normalizeMountedLoraMap\(saved\.mountedLorasByEngine/);
   assert.match(restore, /mountedLorasByEngine: mountedLoraMap\.container/);
   assert.match(restore, /loras: mountedLoraMap\.activeLoras/);
@@ -39,17 +40,15 @@ test("Anima workspace restore and generation preserve supported feature settings
   assert.doesNotMatch(restore, /loras: isAnima \? \[\]/);
   assert.doesNotMatch(restore, /saved\.guidance !== "pag"/);
 
-  assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?guidance: distilledGeneration \? "none" : guidance,\s+hires: generationHires,/);
-  assert.match(generate, /hires: \{\s+(?:\/\/[^\n]*\n\s+)?enabled: hires\.enabled,/);
-  assert.match(generate, /adetailer: adetailerPayload\(adetailer, model\)/);
-  assert.match(generate, /rtx: \{\s+enabled: rtx\.enabled,/);
+  assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?guidance: distilledGeneration \? "none" : guidance,\s+postprocessChain,/);
+  assert.match(generate, /postprocess_chain: resampleChainPayload\(postprocessChain, \{ engine: model \}\)/);
   assert.match(generate, /scheduler: nativeGeneration && !ANIMA_SCHEDULERS\.includes\(scheduler\) \? "simple" : scheduler,\s+guidance: distilledGeneration \? "none" : guidance,\s+pag:/);
   assert.match(app, /import \{ SAMPLER_NAMES as samplerNames, SCHEDULER_NAMES as schedulerNames \} from "\.\/sampling-options"/);
   assert.match(app, /const ANIMA_SAMPLERS = samplerNames/);
   assert.match(app, /const ANIMA_SCHEDULERS = schedulerNames/);
   assert.match(generate, /const generationLoras = frozenMountedLorasForScope\(mountedLorasMapRef\.current, activeLoraScopeRef\.current\)/);
   assert.match(generate, /loras: generationLoras\.filter\(\(lora\) => lora\.enabled !== false\)/);
-  assert.doesNotMatch(generate, /animaGeneration \? \{ \.\.\.(?:hires|adetailer|rtx), enabled: false \}/);
+  assert.doesNotMatch(generate, /animaGeneration \? \{ \.\.\.(?:postprocessChain|adetailer|rtx), enabled: false \}/);
   assert.doesNotMatch(generate, /animaGeneration \? \[\] : loras/);
   assert.doesNotMatch(generate, /animaGeneration && guidance === "pag"/);
 });
@@ -59,39 +58,37 @@ test("Hires migrates execution mode by engine and sends the independent tiled-re
   const restore = sourceBetween(app, "function loadWorkspaceState(saved)", "function reconcileModels");
   const generate = sourceBetween(app, "  const generate = async () => {", "  const releaseLoadedModel = async () => {");
 
-  assert.match(restore, /savedModelTilesHires && !\["full_frame", "usdu_tiled"\]\.includes\(savedHires\.executionMode\)[\s\S]*?"usdu_tiled"/);
-  assert.match(restore, /savedHires\.executionMode === "usdu_tiled" && savedModelTilesHires \? "usdu_tiled" : "full_frame"/);
-  assert.match(restore, /sampler: \(isSplitModel \? ANIMA_SAMPLERS : samplerNames\)\.includes\(savedHires\.sampler\) \? savedHires\.sampler : null/);
-  assert.match(restore, /tileWidth: normalizeHiresTileDimension\(savedHires\.tileWidth\)/);
-  assert.match(restore, /padding: Math\.round\(numberInRange\(savedHires\.padding, 32, 0, 256\)\)/);
-  assert.match(restore, /maskBlur: Math\.round\(numberInRange\(savedHires\.maskBlur, 8, 0, 64\)\)/);
-
-  assert.match(generate, /execution_mode: tiledHiresGeneration && hires\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame"/);
-  assert.match(generate, /\.\.\.\(hires\.sampler \? \{ sampler: hires\.sampler \} : \{\}\)/);
-  assert.match(generate, /\.\.\.\(hires\.scheduler \? \{ scheduler: hires\.scheduler \} : \{\}\)/);
-  for (const field of ["tile_width: hires.tileWidth", "tile_height: hires.tileHeight", "padding: hires.padding", "mask_blur: hires.maskBlur", "seam_mode: \"none\"", "uniform_tiles: hires.uniformTiles !== false", "tiled_decode: hires.tiledDecode !== false"]) assert.match(generate, new RegExp(field));
-  assert.match(generate, /tile_size: hires\.tileSize,[\s\S]*?tile_overlap: hires\.tileOverlap,[\s\S]*?execution_mode/);
+  // The per-unit execution mode and every tiling field now live in the chain module, which the
+  // workspace, the gallery and image-to-image all normalise through.
+  const chain = await readSource("src/resample-chain.js");
+  assert.match(chain, /const executionMode = source\.executionMode === "usdu_tiled" && supportsUsduTiled\(engine\) \? "usdu_tiled" : "full_frame"/);
+  assert.match(chain, /sampler: samplers\.includes\(source\.sampler\) \? source\.sampler : null/);
+  assert.match(chain, /padding: Math\.round\(inRange\(source\.padding, 32, 0, 256\)\)/);
+  assert.match(chain, /maskBlur: Math\.round\(inRange\(source\.maskBlur, 8, 0, 64\)\)/);
+  assert.match(chain, /execution_mode: supportsUsduTiled\(engine\) && stage\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame"/);
+  for (const field of ["tile_width: \"auto\"", "tile_height: \"auto\"", "padding: stage.padding", "mask_blur: stage.maskBlur", "seam_mode: \"none\"", "uniform_tiles: stage.uniformTiles !== false", "tiled_decode: stage.tiledDecode !== false"]) assert.match(chain, new RegExp(field));
+  assert.match(chain, /tile_size: stage\.tileSize,[\s\S]*?tile_overlap: stage\.tileOverlap,[\s\S]*?execution_mode/);
   assert.doesNotMatch(app, /tileWidth:\s*512|tileHeight:\s*512|tile_width:\s*512|tile_height:\s*512/);
 
-  assert.match(app, /USDU 分块重绘（推荐）/);
-  assert.match(app, /整图重绘（兼容）/);
-  assert.match(app, /像素放大分块/);
-  assert.match(app, /扩散重绘分块宽度/);
-  assert.match(app, /跟随首轮/);
-  assert.match(app, /Auto = 首轮源图宽高/);
+  const panel = await readSource("src/ResampleChainPanel.jsx");
+  assert.match(panel, /USDU 分块重绘（推荐）/);
+  assert.match(panel, /整图重绘（兼容）/);
+  assert.match(panel, /像素放大分块/);
+  assert.match(panel, /跟随首轮/);
+  assert.match(panel, /Auto = 进入本单元的画布宽高/);
   // Delegation to the shared Hires normalizer, not a reimplementation. The
   // specifier now carries its extension so the module also loads under plain
   // Node, which is what makes gallery-core unit-testable rather than only
   // checkable as source text.
-  assert.match(galleryCore, /import \{[^}]*\bnormalizeGalleryHires\b[^}]*\} from "\.\/hires-settings(?:\.js)?"/);
-  assert.match(galleryCore, /hires: normalizeGalleryHires\(model, source\.hires, base\.hires/);
+  assert.match(galleryCore, /import \{ migrateResampleChain \} from "\.\/resample-chain\.js"/);
+  assert.match(galleryCore, /postprocessChain: migrateResampleChain\(/);
   assert.match(galleryPage, /USDU 分块重绘（推荐）/);
   assert.match(galleryPage, /像素放大分块/);
   for (const source of [galleryCore, galleryPage]) assert.doesNotMatch(source, /tileWidth:\s*512|tileHeight:\s*512/);
   assert.doesNotMatch(app, /Protocol 25 backend integration may return 422/);
   assert.match(app, /const hiresControlsLocked = modelSwitching;/);
-  assert.match(app, /RealESRGAN \/ SR 像素放大分块[\s\S]*?disabled=\{hiresControlsLocked\}/);
-  assert.match(app, /Auto = 首轮源图宽高[\s\S]*?mask blur 8[\s\S]*?uniform tiles[\s\S]*?per-tile VAE tiled decode[\s\S]*?seam None[\s\S]*?每 tile 执行 Hires steps/);
+  assert.match(panel, /像素放大分块[\s\S]*?disabled=\{locked\}/);
+  assert.match(panel, /Auto = 进入本单元的画布宽高[\s\S]*?mask blur 8[\s\S]*?uniform tiles[\s\S]*?per-tile VAE tiled decode[\s\S]*?seam None[\s\S]*?每 tile 执行本单元步数/);
   assert.match(galleryPage, /aria-pressed=\{selected\.has\(id\)\} disabled=\{busy\}/);
   assert.match(galleryPage, /USDU 分块重绘/);
 });
@@ -105,7 +102,9 @@ test("ADetailer request controls stay editable for the next queued task", async 
   assert.match(app, /const adetailerLocked = modelSwitching/);
   // Every field still reaches the request; the payload is built in one place so
   // the two generate surfaces cannot send different shapes.
-  assert.match(generate, /adetailer: adetailerPayload\(adetailer, model\)/);
+  // The stage's own payload is unchanged; only where it sits in the request moved.
+  const chainModule = await readSource("src/resample-chain.js");
+  assert.match(chainModule, /return \{ type: "adetailer", \.\.\.adetailerPayload\(stage, engine\) \};/);
   assert.match(units, /export function adetailerPayload/);
   for (const field of ["detector", "confidence", "max_detections", "mask_min_ratio", "mask_max_ratio", "dilate_erode", "mask_blur", "padding", "denoise", "use_steps", "steps", "use_cfg", "cfg", "prompt"]) {
     assert.match(units, new RegExp(`${field}: unit\\.`), `${field} is missing from the ADetailer request payload`);
@@ -146,7 +145,9 @@ test("ADetailer request controls stay editable for the next queued task", async 
   ]) assert.match(adetailer, new RegExp(control));
   assert.doesNotMatch(adetailer, /添加检测单元|删除第/);
   assert.doesNotMatch(adetailer, /cancel|取消任务/i);
-  assert.match(app, /RealESRGAN \/ SR 像素放大分块[\s\S]*?disabled=\{hiresControlsLocked\}/);
+  // The resample unit's own controls follow the same lock, from the shared panel.
+  assert.match(await readSource("src/ResampleChainPanel.jsx"), /像素放大分块[\s\S]*?disabled=\{locked\}/);
+  assert.match(app, /locked=\{hiresControlsLocked\}/);
 });
 
 test("performance settings expose a hardware-derived VRAM wall slider", async () => {
@@ -180,7 +181,7 @@ test("Anima controls and PAG fail closed from per-engine health without intrinsi
   assert.match(readiness, /loraReady = enabledLoras\.length === 0 \|\| engineAllowsLora/);
   // The engine names itself in the message now that two engines can produce it.
   assert.match(readiness, /当前推理服务未声明 \$\{engineLabel\} LoRA 能力/);
-  assert.match(readiness, /当前推理服务未声明 \$\{engineLabel\} Hires\.fix 能力/);
+  assert.match(readiness, /当前推理服务未声明 \$\{engineLabel\} 重采样能力/);
   assert.match(readiness, /当前推理服务未声明 \$\{engineLabel\} ADetailer 能力/);
   assert.match(readiness, /当前推理服务未声明 \$\{engineLabel\} RTX VSR 能力/);
   assert.match(readiness, /guidancePagCompatible = pagAvailableForEngine\(inferenceHealth, model\)/);
@@ -194,7 +195,7 @@ test("Anima controls and PAG fail closed from per-engine health without intrinsi
   assert.doesNotMatch(unsupported, /processPreview/);
   assert.doesNotMatch(unsupported, /guidance === "pag"|hires\.enabled|adetailer\.enabled|rtx\.enabled|loras\.length/);
 
-  assert.match(app, /\(!engineAllowsHires && !hires\.enabled\)/);
+  assert.match(app, /\(!engineAllowsHires && !enabled\)/);
   assert.match(app, /\(!engineAllowsADetailer && !adetailer\.enabled\)/);
   assert.match(app, /\(!engineAllowsRtx && !rtx\.enabled\)/);
   assert.match(app, /guidance === "pag" && !guidancePagCompatible/);
@@ -251,9 +252,10 @@ test("Gallery preserves, edits, and displays Anima PAG with other supported sett
   assert.match(editor, /const disabled = engineGuidance\(settings\.model, id\) !== id;/);
   assert.doesNotMatch(editor, /isAnima && (?:id|settings\.guidance|next) === "pag"/);
   assert.doesNotMatch(editor, /Anima 不支持 PAG/);
-  assert.match(editor, /label="启用 Hires\.fix"[\s\S]*?checked=\{settings\.hires\.enabled\} onChange=/);
-  assert.match(editor, /label="启用 ADetailer"[\s\S]*?checked=\{settings\.adetailer\.enabled\} onChange=/);
-  assert.match(editor, /label="启用 RTX VSR"[\s\S]*?checked=\{settings\.rtx\.enabled\} onChange=/);
+  assert.match(editor, /<summary><Zap size=\{14\} \/>后处理链<\/summary>/);
+  assert.match(editor, /settings\.postprocessChain\.map\(\(stage, index\) =>/);
+  // Every stage in the chain is switched the same way, whatever its type.
+  assert.match(editor, /<ToggleField label="启用" detail="" checked=\{stage\.enabled\} onChange=\{\(value\) => setStage\(stage\.id, \{ enabled: value \}\)\} \/>/);
   assert.doesNotMatch(editor, /label="启用 (?:Hires\.fix|ADetailer|RTX VSR)"[^>]*disabled=\{isAnima\}/);
   assert.doesNotMatch(gallery, /settings\.model === "Anima" \? 0 : settings\.loras/);
   assert.doesNotMatch(gallery, /Anima 首版不支持 (?:LoRA|Hires\.fix|ADetailer|RTX VSR)/);
@@ -265,7 +267,7 @@ test("manual Gallery card model selections persist through edit and workspace ap
   const save = sourceBetween(editor, "  const save = async", "  return <div className=\"gallery-editor-backdrop\"");
   const applyGallery = sourceBetween(app, "  const applyGallerySettings = async", "  // Choosing a different engine");
 
-  assert.match(editor, /card\s*\? normalizedSettings\(card\.settings, DEFAULT_SETTINGS, \{ hiresSourceKind: "persisted_card" \}\)\s*: normalizedSettings\(undefined, initialSettings, \{ hiresSourceKind: "workspace_inheritance" \}\)/);
+  assert.match(editor, /card\s*\? normalizedSettings\(card\.settings, DEFAULT_SETTINGS\)\s*: normalizedSettings\(undefined, initialSettings\)/);
   assert.match(editor, /value=\{settings\.checkpoint\} onChange=\{\(event\) => setField\("checkpoint", event\.target\.value\)\}/);
   assert.match(editor, /value=\{settings\[key\]\} onChange=\{\(event\) => setField\(key, event\.target\.value\)\}/);
   assert.match(save, /const savedSettings = isSplit \? \{[\s\S]*?checkpoint: "",[\s\S]*?\} : \{[\s\S]*?diffusionModel: "",[\s\S]*?textEncoder: "",[\s\S]*?vae: "",/);

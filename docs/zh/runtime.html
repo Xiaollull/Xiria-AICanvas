@@ -67,6 +67,10 @@
       <p>它会把开发 UI 和经代理的本地推理 API 暴露给任何能够访问 7709 端口的设备。</p>
     </div>
 
+    <p>服务崩溃后，启动器会自动把它重新启动——使用者往往在另一台设备上，终端前并没有人。一分钟内崩溃 5
+      次会被视为重启解决不了的故障：启动器停止重启，把错误信息留在屏幕上，而不是让它被不断的重启刷走。你主动要求的停止——Ctrl-C，或服务管理器发出的
+      <code>SIGTERM</code>——永远不会被撤销。</p>
+
     <h2 id="paths">运行时路径</h2>
     <p>运行时路径可以移到只读检出目录之外：</p>
 <pre><code>XIRAI_CACHE_DIR=.cache
@@ -81,17 +85,19 @@ LoRA · 3 mounted                       0.75 · kazutake-hazano_v2_epoch28.safet
                                        0.15 · anima_lokr_ningen_mame.safetensors · 89 MB
                                        0.25 · ashima_v4.safetensors · 210 MB
 Batch 1/1 · Sampling 1 images          60%|████████████        |     18/30 [00:50&lt;00:33, 2.81s/it]  job 01:03
-Hires.fix · Upscaling 2176 x 2816     100%|████████████████████|     56/56 [00:03&lt;00:00, 0.07s/tile]  job 02:04
-Hires.fix · Tile 2/4                  100%|████████████████████|     15/15 [00:52&lt;00:00, 3.50s/it]  job 30/60, 03:20
-Complete                              1 image · 60 steps · 05:31 elapsed · 5.52s/it average · XirAI_0002.png</code></pre>
+Resample 1 · Upscaling 2176 x 2816    100%|████████████████████|     56/56 [00:03&lt;00:00, 0.07s/tile]  job 02:04
+Resample 1 · Tile 2/4                 100%|████████████████████|     15/15 [00:52&lt;00:00, 3.50s/it]  job 30/60, 03:20
+Complete                              1 image · 60 steps · 05:31 elapsed · 3.16s/it sampling · XirAI_0002.png</code></pre>
     <p>每类工作打印多少行是刻意设计的。<strong>一次采样运行拥有固定的行数预算</strong>（默认 12
       行），均匀分布在它的全部步数上，因此 30 步与 1000 步的运行产生同样多的输出。<strong>以分块计数的工作只就地重绘一行</strong>并在结束时提交，因此
-      56 块的放大只留下 1 行，而不是 56 行。<strong>分块式 Hires.fix 精修则每块一行</strong>，因为它的每一块本身就是一段完整的采样：4
+      56 块的放大只留下 1 行，而不是 56 行。<strong>分块式重采样重绘则每块一行</strong>，因为它的每一块本身就是一段完整的采样：4
       个分块最终恰好留下 4 行。</p>
     <p>括号之前的每个字段都是固定宽度，因此无论由哪个阶段写出，进度条都占据相同的列。</p>
-    <p>速率按阶段测量，分块阶段则按每个分块测量，而非按任务测量：基础采样、每一个 Hires.fix 分块、每一个 ADetailer
+    <p>速率按阶段测量，分块阶段则按每个分块测量，而非按任务测量：基础采样、每一个重采样分块、每一个 ADetailer
       区域的速度各不相同，把它们平均起来将无法描述其中任何一个。暂停期间的时间不计入。行尾的 <code>job</code>
-      数值是整次任务的步数与已用时间，仅在阶段报告它们时出现。放大与分块 VAE 解码以整块为单位，因此以 <code>s/tile</code> 计量。两个设置可以调整这一行为：</p>
+      数值是整次任务的步数与已用时间，仅在阶段报告它们时出现。放大与分块 VAE 解码以整块为单位，因此以 <code>s/tile</code> 计量。</p>
+    <p>最后一行的速率是采样时间除以采样步数，累计所有进行采样的阶段——基础采样、每个重采样重绘、每个 ADetailer
+      区域。加载、放大与解码计入已用时间，但不计入速率，因此这个数值可以直接与采样器自身的 <code>s/it</code> 对比。两个设置可以调整输出：</p>
 <pre><code>XIRAI_PROGRESS_LINES=12
 XIRAI_PROGRESS_CONSOLE=1</code></pre>
     <p><code>XIRAI_PROGRESS_LINES</code> 是一次采样运行可用的行数预算；分块处理的工作不受它约束，始终保持每块一行。
@@ -137,6 +143,34 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
     <p>如果 Anima 的驻留 Transformer 路径遇到真实的 CUDA 内存不足（OOM），XirAI 会恢复 CPU
       生成器状态，并使用单块组卸载自动重放该采样块。这使自动模式保持速度优先，同时不会让显存紧张的机器变成失败的任务，也不会改变其 Seed 轨迹。</p>
 
+    <h3 id="sd-placement">SD 与 Illustrious：按阶段决定放置方式</h3>
+    <p>SD 与 Illustrious 只要最大的单个组件连同其工作内存能装进显卡，就会以 <code>NORMAL_VRAM</code>
+      运行，而不再要求开始前空闲显存就能容纳整个管道——正是旧规则让 8 GB 显卡上 6.5 GB 的 Illustrious
+      检查点走上了最慢的路径。随后 UNet 放在哪里，会在基础采样开始时、以及每个重采样重绘开始时，按当时的空闲显存重新决定，取下表中第一个装得下的方式：</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>控制台名称</th><th>放置方式</th></tr></thead>
+        <tbody>
+          <tr><td><code>resident</code></td><td>整个管道常驻 GPU。</td></tr>
+          <tr><td><code>component</code></td><td>每次只有一个组件在 GPU 上；UNet 在整个采样循环期间留在 GPU。</td></tr>
+          <tr><td><code>leaf stream</code></td><td>UNet 的各层在独立的 CUDA 流上流式传入 GPU，计算上一层的同时预取下一层。</td></tr>
+          <tr><td><code>block stream</code></td><td>同上，但每次传入一整个块。</td></tr>
+          <tr><td><code>submodule</code></td><td>顺序卸载，每次一个子模块。最后的手段。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>逐层流式排在逐块流式之前，因为在 8 GB 显卡上实测更快。开启<strong>采样后卸载再解码</strong>时（16 GB
+      及以下显卡默认开启），解码前 UNet 会被停放，把显存让给自动编码器；解码本身按当时的空闲显存决定整图解码还是分块解码。每次移动都会打印一行：</p>
+<pre><code>Residency · base sampling    component → leaf stream · 5.19 GB free · stage plan demote
+Residency · base sampling    leaf stream → parked · 6.88 GB free · park for decode</code></pre>
+    <p>如果采样仍然显存不足，会下降一行并从同一份噪声重放该采样块，因此这个 Seed 的画面不变。采样期间，进程可用的显存上限被设为它已占用的量加上该阶段开始时的空闲量：否则
+      Windows 会把共享系统内存借给进程，而不是报告显存已满，溢出到共享内存的任务会慢上数倍却永远不会报错。正向与负向提示词只有在显存比所需多出一半时才合并为一批采样，否则先后依次采样——这是
+      ComfyUI 使用的规则。SD 与 Illustrious 还关闭了 cuDNN 自动调优，因此同一个 Seed 在重启之后也能画出同一张图，而不只是在同一次会话内。</p>
+    <p>在 8 GB 的笔记本 RTX 4060 上实测：6.5 GB 的 Illustrious 检查点、6 个 LoRA、28 步基础采样加 8
+      步重绘，同一个任务在本版本之前耗时 444.6 秒，现在冷启动 81–84 秒、预热后 48.5 秒。ComfyUI 在同一台机器上跑同一个任务用时 119–131 秒。</p>
+
     <p>高级用户可以用 <code>XIRAI_MEMORY_MODE</code> 强制 <code>high_vram</code>、<code>normal_vram</code> 或
       <code>low_vram</code>；不安全的强制模式会自动降级。设置 <code>XIRAI_RESERVE_VRAM_GB</code> 以覆盖默认的操作系统/应用预留量。</p>
 
@@ -151,9 +185,12 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
       失败的生成之后缓存已加载的管道对象，因此使用相同引擎与模型身份的另一次生成无需再次读取并重建模型。对于原生
       Anima，该身份包括扩散模型、文本编码器、VAE、固定的 tokenizer 修订版以及按顺序排列的非零适配器修订版与权重。</p>
 
-    <p>当引擎/模型选择改变、CUDA 报告内存不足错误、中断的卸载链无法安全恢复，或推理服务关闭时，缓存会被释放。SD/iL LoRA
-      更改不会重新加载基础模型；原生 Anima 适配器会被密集融合到其组合运行时身份中。可用时自动使用 PyTorch SDPA，安装兼容原生扩展时优先使用
-      xformers。</p>
+    <p>当引擎/模型选择改变、CUDA 报告内存不足错误、中断的卸载链无法安全恢复，或推理服务关闭时，缓存会被释放。原生 Anima
+      适配器会被密集融合到其组合运行时身份中。可用时自动使用 PyTorch SDPA，安装兼容原生扩展时优先使用 xformers。</p>
+
+    <p>SD 与 Illustrious 的 LoRA 会像 ComfyUI 一样一次性融合进模型权重，因此每个采样步不再有额外开销。之后的任务如果使用相同的 LoRA
+      和相同的权重，会直接复用已融合的模型，完全跳过加载。使用不同组合的任务会从检查点重新构建管道，因为融合无法再拆出来。无法融合的组合仍然可以运行，像以前一样在每一步施加。融合会让运算略有不同，因此带
+      LoRA 的固定 Seed 画出的图会与 1.0.9 略有差异；这与 ComfyUI 执行的是同一种操作，并不是画质下降。</p>
 
     <h2 id="downloader">模型下载器</h2>
     <p>模型下载器为粘贴的链接和推荐的模型选择维护一条串行队列。当一个文件正在下载时，你可以继续添加链接、打开推荐模型浏览器并追加更多选择，而不会中断当前传输。已经通过目录大小与

@@ -100,9 +100,55 @@ def estimate_inference_bytes(family, width, height, guidance_scale=7.5, images_p
         # 2048x2944 Hires pass — 15.7 GiB of a 23.5 GiB card, measured — down the block-streaming
         # path, where it took 690 seconds instead of running resident.
         estimate_gb = 0.35 + 0.90 * megapixels * batch_factor
+    elif family == "anima":
+        # Anima was the last native engine still sized by the generic fallback below, which was
+        # written for SD-era UNets. Its DiT is 2048 wide over 28 blocks and patchifies to (W/16 x
+        # H/16), so what scales with the canvas is far cheaper than a UNet's feature pyramid, and
+        # the fallback's 0.40/MP over-budgets it. That matters on a card where the transformer is
+        # already half the device: a 1088x1408 base with a full-frame 2x resample unit is admitted
+        # against the 2176x2816 redraw, and 0.40/MP put that at 2.99 GiB, which alone lifted
+        # NORMAL past an 8 GB card's total and sent the whole job — the cheap base pass included —
+        # onto block streaming.
+        #
+        # Measured on an RTX 4060 Laptop (8 GB) with anima_baseV10 BF16, at a 1120x1440 tile:
+        #
+        #     sampling, beside the resident DiT   0.24 GiB      VAE decode, DiT evicted  1.29 GiB
+        #     VAE encode, beside the resident DiT 0.66 GiB
+        #
+        # The slope follows the sampling figure (0.156/MP) with headroom, because that is the only
+        # part that grows with the canvas — the VAE runs tiled, so its working set is in the base.
+        # The base also stays above the standalone decode peak, which never has to share the card
+        # with the transformer but is the largest single number of the three. One canvas, one card:
+        # this is an anchor, not the four-point fit `krea2` above got.
+        estimate_gb = 0.90 + 0.26 * megapixels * batch_factor
     else:
         estimate_gb = 0.65 + 0.40 * megapixels * batch_factor
     return max(int(0.8 * GIB), int(estimate_gb * GIB))
+
+
+def estimate_vae_decode_bytes(width, height, images_per_batch=1, sliced=True):
+    """Peak allocation of one whole-image SD/SDXL autoencoder decode.
+
+    The decoder works at full resolution and SDXL's is upcast to float32 (`force_upcast`), so this
+    is the largest single allocation in a job — larger than the sampler's, and it grows with the
+    canvas far faster. Measured on an RTX 4060 Laptop (8188 MiB) with `waiIllustriousSDXL_v170`'s
+    VAE, as `torch.cuda.max_memory_allocated` around a batch-of-one decode:
+
+        768x1280  (0.94 MP)   3.84 GiB whole-image    3.14 GiB tiled
+        1152x1920 (2.11 MP)   8.24 GiB whole-image    4.09 GiB tiled
+
+    which is 0.32 + 3.76/MP. The point of having it is that the second of those does not fit beside
+    a 600 MiB platform reserve on an 8 GB card, and Windows answers an allocation it cannot serve by
+    spilling into host memory rather than raising: the decode still returns a correct picture, and
+    takes a hundred seconds instead of five. An OOM fallback never fires, so the size has to be
+    asked about in advance.
+
+    Slicing splits the batch, not the canvas, so it caps the peak at one image; tiling is what caps
+    the canvas. `sliced` says which of the two the caller has enabled.
+    """
+    megapixels = max(width * height, 64 * 64) / (1024 * 1024)
+    copies = 1 if sliced else max(1, int(images_per_batch))
+    return int((0.32 + 3.76 * megapixels) * copies * GIB)
 
 
 def estimate_largest_component_bytes(runtime_weight_bytes, family):
@@ -134,16 +180,37 @@ def select_memory_policy(
     inference_bytes,
     largest_component_bytes,
     reserved_bytes,
+    resident_first=False,
 ):
+    """Pick the offload rung this workload runs on.
+
+    `resident_first` changes what NORMAL has to prove, and only that. The default rule asks for
+    `largest component x 1.10 + inference + reserve` to be *free before the run starts*, which is an
+    "everything must fit up front" gate: on a card where the largest component is already most of
+    the device it can exceed the whole card, and the request is then silently downgraded to the
+    per-submodule path. Component offload never needs that — `enable_model_cpu_offload` holds one
+    whole component at a time and the rest sit on the host — so the resident-first rule asks the two
+    questions that path actually answers: does the largest component plus its activations plus the
+    platform reserve fit in the *device*, and is enough free right now to move that component in
+    while another process may own part of the card. `high` and `ultra_low` are untouched.
+    """
     requested_mode = normalize_memory_mode(requested_mode)
     if requested_mode == "sdxl_balanced":
         requested_mode = "normal_vram"
     minimum_inference_bytes = int(0.8 * GIB) + reserved_bytes
     maximum_weight_bytes = max(0, int(total_bytes * 0.88) - minimum_inference_bytes)
     high_required_bytes = int(runtime_weight_bytes * 1.08) + inference_bytes + reserved_bytes
-    normal_required_bytes = int(largest_component_bytes * 1.10) + inference_bytes + reserved_bytes
+    if resident_first:
+        # The reserve is already inside the sum, so the bound is the device total rather than a
+        # fraction of it; the free-memory guard only refuses a move that cannot land.
+        normal_required_bytes = largest_component_bytes + inference_bytes + reserved_bytes
+        normal_residency_bytes = largest_component_bytes + reserved_bytes
+        normal_available = normal_required_bytes <= total_bytes and free_bytes >= normal_residency_bytes
+    else:
+        normal_required_bytes = int(largest_component_bytes * 1.10) + inference_bytes + reserved_bytes
+        normal_residency_bytes = normal_required_bytes
+        normal_available = free_bytes >= normal_required_bytes
     high_available = runtime_weight_bytes <= maximum_weight_bytes and free_bytes >= high_required_bytes
-    normal_available = free_bytes >= normal_required_bytes
 
     automatic_mode = "high_vram" if high_available else "normal_vram" if normal_available else "low_vram"
     if requested_mode == "auto":
@@ -167,4 +234,6 @@ def select_memory_policy(
         "maximum_weight_bytes": maximum_weight_bytes,
         "high_required_bytes": high_required_bytes,
         "normal_required_bytes": normal_required_bytes,
+        "normal_residency_bytes": normal_residency_bytes,
+        "normal_admission_rule": "resident_first" if resident_first else "workspace_upfront",
     }

@@ -20,7 +20,9 @@ export const RELEASE_REQUIRED_DIRECTORIES = ["src", "backend", "scripts", "assis
 
 const ROOT_FILES = new Set(RELEASE_MANAGED_FILES);
 const DIRECTORY_ROOTS = new Set(RELEASE_MANAGED_DIRECTORIES);
-const FORBIDDEN_SEGMENTS = new Set([".git", ".venv", "node_modules", "dist", "outputs", "state-cache", ".cache", "logs", "plugins", ".claude", "__pycache__"]);
+// `tests` is the backend suite's folder. Its `test_*` files are refused by name as well, but a helper
+// module or `__init__.py` beside them has no such name and would otherwise ship.
+const FORBIDDEN_SEGMENTS = new Set([".git", ".venv", "node_modules", "dist", "outputs", "state-cache", ".cache", "logs", "plugins", ".claude", "__pycache__", "tests"]);
 const FORBIDDEN_FILE = /(^|\/)(?:\.?[^/]*\.test\.[^/]+|test_[^/]+)$/i;
 const HANDOFF_FILE = /(^|\/)(?:handoff|HANDOFF)(?:[._-]|$)/;
 

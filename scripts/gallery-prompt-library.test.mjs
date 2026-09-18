@@ -43,9 +43,8 @@ test("a library entry can replace both text-to-image and image-to-image prompts"
   assert.match(apply, /setActivePage\("generate"\)/);
 });
 
-test("prompt library layout has desktop, light-theme, and mobile contracts", async () => {
+test("prompt library layout has desktop and mobile contracts", async () => {
   const css = await read("src/styles.css");
   for (const selector of [".gallery-prompt-library", ".gallery-prompt-grid", ".gallery-prompt-card", ".gallery-prompt-dialog", ".gallery-prompt-library-nav"]) assert.ok(css.includes(`${selector} {`), `${selector} is styled`);
-  assert.match(css, /html\[data-theme-mode="light"\] \.gallery-prompt-card/);
   assert.match(css, /@media \(max-width: 720px\)[\s\S]*?\.gallery-prompt-grid \{ grid-template-columns: 1fr; \}/);
 });

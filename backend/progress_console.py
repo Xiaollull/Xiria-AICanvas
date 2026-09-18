@@ -38,8 +38,12 @@ import time
 # Stages whose steps are image tiles, not sampler iterations. Labelling a 50-second tile `s/it`
 # would invite the reader to compare it with a sampling step — and one tile deserves one line,
 # so these are never thinned out the way a sampling run is.
-STAGE_UNITS = {"vae_decode": "tile", "hires_upscale": "tile"}
+STAGE_UNITS = {"vae_decode": "tile", "resample_upscale": "tile"}
 DEFAULT_UNIT = "it"
+# The stages whose steps are sampler iterations — the only ones the job summary adds up. A list of
+# what counts rather than what does not, so a stage added later is left out of the rate rather than
+# folded into it: "Saving image 1/1" is a one-step stage too, and it is not a sampling step.
+SAMPLING_STAGES = frozenset({"base_sampling", "resample_sampling", "adetailer_inpaint"})
 
 TERMINAL_STATUSES = {"complete": "Complete", "cancelled": "Cancelled", "error": "Failed"}
 
@@ -201,7 +205,41 @@ def format_loras(mounted):
     return f"{heading}  {rows[0]}" + "".join(f"\n{indent}{row}" for row in rows[1:])
 
 
-def format_summary(status, *, images=None, steps=None, elapsed=None, error=None, output=None):
+RESIDENCY_NAMES = {
+    "T0": "resident", "T1": "component", "T2": "block stream", "T3": "leaf stream",
+    "T4": "submodule", "parked": "parked",
+}
+
+
+def format_residency(event):
+    """One move of the diffusion model, as the residency controller recorded it.
+
+    Printed where it happens rather than only stored on the job, so a run can be watched moving
+    between rungs — which is the only way to check from the console that each stage was placed by
+    what it needed.
+    """
+    if not isinstance(event, dict):
+        return None
+    source = RESIDENCY_NAMES.get(event.get("from"), str(event.get("from")))
+    target = RESIDENCY_NAMES.get(event.get("to"), str(event.get("to")))
+    parts = [f"{source} → {target}"]
+    if event.get("free_bytes") is not None:
+        parts.append(f"{format_size(event['free_bytes'])} free")
+    if event.get("reason"):
+        parts.append(str(event["reason"]).replace("_", " "))
+    stage = str(event.get("stage") or "").replace("_", " ")
+    return f"{format_phase(f'Residency · {stage}' if stage else 'Residency')}  {' · '.join(parts)}"
+
+
+def format_summary(status, *, images=None, steps=None, elapsed=None, sampling_seconds=None, error=None, output=None):
+    """How a job ended: what it produced, how many sampler steps it ran, and what they cost.
+
+    The rate is sampling time over sampling steps, both as the console measured them across every
+    sampling run in the job — never the job's wall clock over one stage's count. That was what this
+    line used to print, and on a base-plus-redraw job it came out as the whole job's 109.7 seconds,
+    model load and decodes included, divided by the redraw's 8 steps: 13.71 s/it, for a job whose
+    stages had actually run at 1.38 and 2.67. A figure that was not measured is left out.
+    """
     parts = []
     if images:
         parts.append(f"{images} image{'' if images == 1 else 's'}")
@@ -209,8 +247,8 @@ def format_summary(status, *, images=None, steps=None, elapsed=None, error=None,
         parts.append(f"{steps} steps")
     if elapsed is not None:
         parts.append(f"{format_clock(elapsed)} elapsed")
-        if steps:
-            parts.append(f"{format_rate(elapsed / steps)} average")
+    if steps and sampling_seconds:
+        parts.append(f"{format_rate(sampling_seconds / steps)} sampling")
     if output:
         parts.append(str(output))
     if error:
@@ -247,6 +285,9 @@ class ProgressConsole:
         self._run = None
         self._model_started = None
         self._open_width = None
+        # Sampler steps and seconds this job has finished, summed over every sampling run it had.
+        self._sampled_steps = 0
+        self._sampled_seconds = 0.0
 
     # ---- observation -------------------------------------------------------------------
 
@@ -255,15 +296,19 @@ class ProgressConsole:
             return None
         if job_id != self._job_id:
             self._job_id, self._run, self._model_started = job_id, None, None
+            self._sampled_steps, self._sampled_seconds = 0, 0.0
 
         status = updates.get("status")
         if status in TERMINAL_STATUSES:
-            self._run = None
+            self._close_run()
             return Line(format_summary(
                 status,
                 images=_count(job.get("completed_images")),
-                steps=_count(job.get("total_steps")),
+                # `total_steps` is whichever stage wrote it last — the redraw's 8, on a job whose
+                # base pass ran 28 — so the count comes from the runs this console timed.
+                steps=self._sampled_steps or None,
                 elapsed=_seconds(job.get("elapsed_seconds")),
+                sampling_seconds=self._sampled_seconds or None,
                 error=job.get("error") if status == "error" else None,
                 output=job.get("output_name") if status == "complete" else None,
             ))
@@ -277,6 +322,10 @@ class ProgressConsole:
         if "mounted_loras" in updates:
             block = format_loras(updates.get("mounted_loras"))
             return None if block is None else Line(block)
+
+        if "residency_event" in updates:
+            line = format_residency(updates.get("residency_event"))
+            return None if line is None else Line(line)
 
         # Only an update that moved a counter can advance a bar. Everything else — a phase rename,
         # a pause, a preview URL — passes through untouched.
@@ -329,9 +378,11 @@ class ProgressConsole:
         key = (stage, total, unit)
         run = self._run
         if run is None or run["key"] != key or local_step < run["local"]:
+            self._close_run()
             run = self._run = {
                 "key": key, "origin": local_step, "local": local_step, "started": now, "paused": paused,
                 "reported": None, "drawn": None,
+                "sampling": stage in SAMPLING_STAGES, "measured": 0, "elapsed": 0.0,
                 # Anything counted in tiles redraws one line rather than printing per tile: a
                 # 4-tile refinement and a 56-tile upscale both leave a single line behind. Only a
                 # sampling run spends the line budget, which is what bounds it to twelve.
@@ -339,6 +390,10 @@ class ProgressConsole:
                 "stride": line_stride(local_total, self.budget),
             }
         run["local"] = max(run["local"], local_step)
+        # Kept current on every update, printed or not, so the job summary can add up exactly what
+        # each run measured — the line budget decides what is shown, not what is counted.
+        run["measured"] = run["local"] - run["origin"]
+        run["elapsed"] = max(0.0, (now - run["started"]) - max(0.0, paused - run["paused"]))
         if local_step == run["reported"]:
             return None
 
@@ -375,6 +430,13 @@ class ProgressConsole:
         # The last step commits the line that has been redrawing itself, so whatever comes next
         # starts under it rather than over it.
         return Line(text, commit=complete or not run["inplace"])
+
+    def _close_run(self):
+        """Add a finished run's sampler steps and time to the job's totals, once."""
+        run, self._run = self._run, None
+        if run is not None and run["sampling"] and run["measured"] > 0:
+            self._sampled_steps += run["measured"]
+            self._sampled_seconds += run["elapsed"]
 
     def _due(self, run, step, complete, inplace, now):
         if complete:

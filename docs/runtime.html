@@ -71,6 +71,12 @@
         port 7709.</p>
     </div>
 
+    <p>If the service crashes, the launcher starts it again, because the person using it is often on
+      another device with nobody at the terminal. Five crashes within one minute are treated as a
+      fault that restarting will not fix: the launcher stops and leaves the error on screen rather
+      than scrolling it away. A stop you asked for — Ctrl-C, or a service manager's
+      <code>SIGTERM</code> — is never undone.</p>
+
     <h2 id="paths">Runtime paths</h2>
     <p>Runtime paths can be moved outside a read-only checkout:</p>
 <pre><code>XIRAI_CACHE_DIR=.cache
@@ -89,24 +95,28 @@ LoRA · 3 mounted                       0.75 · kazutake-hazano_v2_epoch28.safet
                                        0.15 · anima_lokr_ningen_mame.safetensors · 89 MB
                                        0.25 · ashima_v4.safetensors · 210 MB
 Batch 1/1 · Sampling 1 images          60%|████████████        |     18/30 [00:50&lt;00:33, 2.81s/it]  job 01:03
-Hires.fix · Upscaling 2176 x 2816     100%|████████████████████|     56/56 [00:03&lt;00:00, 0.07s/tile]  job 02:04
-Hires.fix · Tile 2/4                  100%|████████████████████|     15/15 [00:52&lt;00:00, 3.50s/it]  job 30/60, 03:20
-Complete                              1 image · 60 steps · 05:31 elapsed · 5.52s/it average · XirAI_0002.png</code></pre>
+Resample 1 · Upscaling 2176 x 2816    100%|████████████████████|     56/56 [00:03&lt;00:00, 0.07s/tile]  job 02:04
+Resample 1 · Tile 2/4                 100%|████████████████████|     15/15 [00:52&lt;00:00, 3.50s/it]  job 30/60, 03:20
+Complete                              1 image · 60 steps · 05:31 elapsed · 3.16s/it sampling · XirAI_0002.png</code></pre>
     <p>How much each kind of work prints is deliberate. <strong>A sampling run gets a fixed budget
       of lines</strong> — twelve by default — spread evenly across however many steps it has, so a
       thirty-step run and a thousand-step run produce the same amount of output. <strong>Anything
       counted in tiles redraws a single line in place</strong> and commits it once, so a fifty-six
-      tile upscale leaves one line rather than fifty-six. <strong>The tiled Hires.fix refinement
-      gets a line per tile</strong>, because each of its tiles is a run of sampling steps in its
-      own right: four tiles leave exactly four lines behind.</p>
+      tile upscale leaves one line rather than fifty-six. <strong>A tiled resample redraw gets a
+      line per tile</strong>, because each of its tiles is a run of sampling steps in its own
+      right: four tiles leave exactly four lines behind.</p>
     <p>Every field up to the brackets is fixed width, so the bar occupies the same columns on every
       line whatever stage wrote it.</p>
     <p>The rate is measured per stage, and per tile within a tiled stage, rather than per job: base
-      sampling, each Hires.fix tile and each ADetailer region run at different speeds, and a figure
+      sampling, each resample tile and each ADetailer region run at different speeds, and a figure
       averaged across them would describe none of them. Time spent paused is excluded. The trailing
       <code>job</code> figures are the whole run's step count and elapsed time where a stage reports
       them. Upscaling and the tiled VAE decode count whole tiles, so they are measured in
-      <code>s/tile</code>. Two settings adjust this:</p>
+      <code>s/tile</code>.</p>
+    <p>The closing line's rate is sampling time divided by sampling steps, summed over every stage
+      that sampled — base sampling, each resample redraw and each ADetailer region. Loading,
+      upscaling and decoding are in the elapsed time but not in the rate, so the figure can be
+      compared with a sampler's own <code>s/it</code>. Two settings adjust the output:</p>
 <pre><code>XIRAI_PROGRESS_LINES=12
 XIRAI_PROGRESS_CONSOLE=1</code></pre>
     <p><code>XIRAI_PROGRESS_LINES</code> is the budget one sampling run may spend; tiled work ignores
@@ -165,6 +175,47 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
       This keeps auto mode speed-first without turning a tight-VRAM machine into a failed job or
       changing its Seed trajectory.</p>
 
+    <h3 id="sd-placement">SD and Illustrious: placement per stage</h3>
+    <p>SD and Illustrious are admitted to <code>NORMAL_VRAM</code> when their largest single
+      component fits the card with its working memory, rather than only when the whole pipeline fits
+      in free memory up front — the rule that sent a 6.5 GB Illustrious checkpoint on an 8 GB card
+      to the slowest path. Where the UNet then lives is decided at the start of base sampling and
+      again at the start of each resample redraw, from the memory free at that moment, by taking the
+      first of these that fits:</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Console name</th><th>Placement</th></tr></thead>
+        <tbody>
+          <tr><td><code>resident</code></td><td>The whole pipeline on the GPU.</td></tr>
+          <tr><td><code>component</code></td><td>One component on the GPU at a time; the UNet stays there for its whole sampling loop.</td></tr>
+          <tr><td><code>leaf stream</code></td><td>The UNet's layers are streamed to the GPU on a separate CUDA stream, each one fetched while the previous one computes.</td></tr>
+          <tr><td><code>block stream</code></td><td>The same, a whole block at a time.</td></tr>
+          <tr><td><code>submodule</code></td><td>Sequential offload, one submodule at a time. The last resort.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Leaf streaming ranks above block streaming because it measured faster on an 8 GB card. With
+      <strong>采样后卸载再解码</strong> on — the default on cards of 16 GB or less — the UNet is
+      parked before decoding so the autoencoder gets the memory, and the decode itself runs whole or
+      tiled depending on what is free at that point. Each move prints a line:</p>
+<pre><code>Residency · base sampling    component → leaf stream · 5.19 GB free · stage plan demote
+Residency · base sampling    leaf stream → parked · 6.88 GB free · park for decode</code></pre>
+    <p>If sampling still runs out of memory, it steps one row down and replays the chunk from the same
+      noise, so the seed's picture is unchanged. While sampling, the process's share of the card is
+      capped at what it already holds plus what was free when the stage began: Windows otherwise
+      lends a process shared system memory
+      instead of reporting that it is full, and a job that overflows into it runs several times
+      slower without ever failing. The positive and negative prompts are sampled in one batch only
+      when there is half again as much memory as that needs, and one after the other otherwise,
+      which is the rule ComfyUI uses. SD and Illustrious also leave cuDNN autotuning off, so a seed
+      draws the same picture after a restart, not only within one session.</p>
+    <p>Measured on an 8 GB laptop RTX 4060 with a 6.5 GB Illustrious checkpoint, six LoRAs, 28 base
+      steps and an eight-step redraw, one job took 444.6 s before this release and now takes
+      81–84 s from a cold start and 48.5 s once warm. ComfyUI ran the same job on the same machine
+      in 119–131 s.</p>
+
     <p>Advanced users may force <code>high_vram</code>, <code>normal_vram</code> or
       <code>low_vram</code> with <code>XIRAI_MEMORY_MODE</code>; an unsafe forced mode
       automatically downgrades. Set <code>XIRAI_RESERVE_VRAM_GB</code> to override the default OS
@@ -188,9 +239,17 @@ XIRAI_PROGRESS_CONSOLE=1</code></pre>
 
     <p>The cache is released when the engine or model selection changes, CUDA reports an
       out-of-memory error, an interrupted offload chain cannot be safely restored, or the inference
-      service shuts down. SD/iL LoRA changes do not reload the base model; native Anima adapters are
-      densely fused into its composite runtime identity. PyTorch SDPA is used automatically when
-      available, with xformers preferred when its compatible native extension is installed.</p>
+      service shuts down. Native Anima adapters are densely fused into its composite runtime
+      identity. PyTorch SDPA is used automatically when available, with xformers preferred when its
+      compatible native extension is installed.</p>
+
+    <p>SD and Illustrious LoRAs are folded into the model's weights once, as ComfyUI does, so they
+      cost nothing per sampling step. A later job with the same LoRAs at the same weights reuses the
+      folded model and skips loading them at all. A job with a different set rebuilds the pipeline
+      from the checkpoint, because a fold cannot be taken back out. A set that cannot be folded
+      still runs, applied at each step as before. Folding changes the arithmetic slightly, so a
+      fixed seed with LoRAs draws a slightly different picture than it did in 1.0.9; it is the same
+      operation ComfyUI performs, not a loss of quality.</p>
 
     <h2 id="downloader">Model downloader</h2>
     <p>The model downloader keeps one serial queue for pasted links and recommended model

@@ -16,7 +16,7 @@ import {
 // are named here so the tests can prove a file using one is refused rather than offered.
 const TYPES = { F32: 0, F16: 1, Q4_0: 2, Q8_0: 8, Q4_K: 12, Q6_K: 14, IQ2_XXS: 16, IQ4_XS: 23, BF16: 30 };
 
-// The list `backend/test_gguf_loader.py` pins on the Python side. A type readable by only one of
+// The list `backend/tests/test_gguf_loader.py` pins on the Python side. A type readable by only one of
 // the two means the picker offers a file the runtime refuses, or hides one it could have loaded.
 const EXPECTED_SUPPORTED_TYPES = [
   "BF16", "F16", "F32", "F64", "I16", "I32", "I64", "I8", "IQ4_NL", "IQ4_XS",

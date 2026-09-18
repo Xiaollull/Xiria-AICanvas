@@ -89,7 +89,7 @@
           <tr><td><code>embeddings</code></td><td>Reserved for future textual inversion support.</td></tr>
           <tr><td><code>yolo</code></td><td>Ultralytics <code>.pt</code> detection or segmentation models for local ADetailer passes. Community models may be placed here, including in subdirectories.</td></tr>
           <tr><td><code>background-removal</code></td><td>Compatible ONNX foreground-extraction models. Recommended files are identified by fixed hashes even after nesting or renaming.</td></tr>
-          <tr><td><code>upscalers</code></td><td>Hires.fix pixel-space super-resolution weights. Compatible <code>.pth</code>, <code>.pt</code>, <code>.ckpt</code> and <code>.safetensors</code> files are discovered by their tensor structure, so renaming a file does not change compatibility. PyTorch files must contain weights or state dictionaries; TorchScript archives are intentionally not loaded.</td></tr>
+          <tr><td><code>upscalers</code></td><td>Pixel-space super-resolution weights for a resample unit's model upscale (<a href="usage.html#postprocess">post-processing chain</a>). Compatible <code>.pth</code>, <code>.pt</code>, <code>.ckpt</code> and <code>.safetensors</code> files are discovered by their tensor structure, so renaming a file does not change compatibility. PyTorch files must contain weights or state dictionaries; TorchScript archives are intentionally not loaded.</td></tr>
           <tr><td><code>configs</code></td><td>User and model runtime configuration artifacts.</td></tr>
         </tbody>
       </table>
@@ -127,8 +127,8 @@
         Hugging Face token. Both pair with a Qwen 3 8B text encoder and the FLUX.2 VAE.</li>
       <li><strong>Krea 2</strong> — the 12B model in Raw and Turbo variants, with a separately
         chosen 4B text encoder precision. Its VAE is shared with Anima.</li>
-      <li><strong>Upscalers</strong> — the official Real-ESRGAN models used by the first Hires.fix
-        stage.</li>
+      <li><strong>Upscalers</strong> — the official Real-ESRGAN models a resample unit can enlarge
+        with before it resizes and redraws.</li>
     </ul>
 
     <div class="note">

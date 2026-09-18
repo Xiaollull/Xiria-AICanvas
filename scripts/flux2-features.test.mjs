@@ -10,7 +10,10 @@ import {
   adetailerPayload,
   adetailerUnitSteps,
 } from "../src/adetailer-units.js";
-import { hiresEffectiveSteps } from "../src/hires-settings.js";
+import { normalizeResampleUnit, resampleUnitEffectiveSteps } from "../src/resample-chain.js";
+
+const NATIVE = ["Anima", "Flux", "Flux2", "Krea2"];
+const unitSteps = (unit, engine) => resampleUnitEffectiveSteps(normalizeResampleUnit({ enabled: true, ...unit }), 28, engine, NATIVE);
 import { imageToImageRequestBody } from "../src/image-to-image.js";
 import { READY_LORA_ENGINES, emptyMountedLoraMap, normalizeMountedLoraMap } from "../src/lora-model-scope.js";
 import { SHARED_LORA_ENGINES, normalizeSharedEngines } from "../src/shared-model-refs.js";
@@ -89,7 +92,9 @@ test("the image-to-image request mounts one Flux2 encoder and drops the negative
   assert.equal("preview_enabled" in body, false);
   assert.equal(body.guidance, "none");
   // USDU tiling stays Anima's.
-  assert.equal(body.hires.execution_mode, "full_frame");
+  for (const stage of body.postprocess_chain.filter((entry) => entry.type === "resample")) {
+    assert.equal(stage.execution_mode, "full_frame");
+  }
 });
 
 test("a Flux2 request drops per-unit ADetailer negative prompts without erasing them", () => {
@@ -108,7 +113,7 @@ test("Flux2 refinement steps are counted like the other native engines", () => {
   const unit = { useSteps: true, steps: 20, denoise: 0.2, detector: "face_yolov8n.pt" };
   assert.equal(adetailerUnitSteps(unit, 30, "Flux2"), 20);
   assert.equal(adetailerUnitSteps(unit, 30, "SD"), 4);
-  assert.equal(hiresEffectiveSteps({ steps: 12, denoise: 0.05 }, "Flux2"), 12);
+  assert.equal(unitSteps({ steps: 12, denoise: 0.05 }, "Flux2"), 12);
 });
 
 test("Flux2 has its own LoRA scope without invalidating libraries saved before it existed", () => {

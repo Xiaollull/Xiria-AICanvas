@@ -8,7 +8,10 @@ import {
   adetailerStageIssue,
   adetailerUnitSteps,
 } from "../src/adetailer-units.js";
-import { hiresEffectiveSteps } from "../src/hires-settings.js";
+import { normalizeResampleUnit, resampleUnitEffectiveSteps } from "../src/resample-chain.js";
+
+const NATIVE = ["Anima", "Flux", "Flux2", "Krea2"];
+const unitSteps = (unit, engine) => resampleUnitEffectiveSteps(normalizeResampleUnit({ enabled: true, ...unit }), 28, engine, NATIVE);
 import { normalizeEngineSettings } from "../src/engine-settings.js";
 import { imageToImageRequestBody } from "../src/image-to-image.js";
 import {
@@ -95,8 +98,10 @@ test("the image-to-image request carries both Flux encoders and drops the negati
   // server forbids unknown keys and would refuse the whole generation.
   assert.equal("preview_enabled" in body, false);
   assert.equal(body.guidance, "none");
-  // USDU tiling stays Anima's; a Flux request must never ask for it.
-  assert.equal(body.hires.execution_mode, "full_frame");
+  // USDU tiling stays Anima's and Krea 2's; a Flux request must never ask for it.
+  for (const stage of body.postprocess_chain.filter((entry) => entry.type === "resample")) {
+    assert.equal(stage.execution_mode, "full_frame");
+  }
 
   const anima = imageToImageRequestBody({
     engine: "Anima",
@@ -131,8 +136,8 @@ test("Flux refinement steps are counted like Anima's, not like Diffusers'", () =
   assert.equal(adetailerUnitSteps(unit, 30, "SD"), 4);
 
   const hires = { steps: 12, denoise: 0.05 };
-  assert.equal(hiresEffectiveSteps(hires, "Flux"), 12);
-  assert.equal(hiresEffectiveSteps(hires, "SD"), 0);
+  assert.equal(unitSteps(hires, "Flux"), 12);
+  assert.equal(unitSteps(hires, "SD"), 0);
 
   // A low-denoise unit that Diffusers would round to zero steps is a legal Flux configuration, so
   // the run blocker must not refuse it.

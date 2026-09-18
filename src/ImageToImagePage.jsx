@@ -40,9 +40,10 @@ import {
 } from "./image-to-image";
 import { i2iCompareHeight } from "./i2i-compare-fit.js";
 import SizeGrid from "./SizeGrid";
-import { normalizePostprocessOrder, postprocessTargetSize } from "./postprocessing";
+import ResampleChainPanel from "./ResampleChainPanel.jsx";
+import { chainStage, enabledChainStages, resampleChainIssue, resampleChainPlan, resampleUnitTitle, resampleUnits, updateChainStage } from "./resample-chain.js";
 import WorkspaceSelect from "./WorkspaceSelect";
-import { hiresEffectiveSteps, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
+import { secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
 import { formatWeight } from "./lora-weight";
 import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
 import { loraCardPresentation } from "./lora-cards.js";
@@ -51,6 +52,7 @@ import { toggleTransparentBackground, transparentBackgroundEnabled } from "./tra
 import {
   ADETAILER_UNIT_LIMIT,
   DISTILLED_GUIDANCE_ENGINES,
+  NATIVE_STEP_ENGINES,
   activeADetailerUnits,
   adetailerPageIndex,
   adetailerStageIssue,
@@ -151,12 +153,23 @@ function StageHeader({ title, detail, enabled, disabled, expanded, onToggle, onT
   );
 }
 
-function PostprocessControls({ config, engine, postprocess, running, canvas, dimensions, updateStage, moveStage, order, postprocessOnly }) {
+/** `NumberInput` under the `onChange` name the shared chain panel uses. */
+function ChainNumberInput({ className = "bounded-number", ...props }) {
+  return <NumberInput className={className} {...props} />;
+}
+
+function PostprocessControls({ config, engine, postprocess, running, canvas, dimensions, setChain, postprocessOnly }) {
   // Which unit the ADetailer pager is showing. View state, not configuration: it
   // is never persisted, because where the user last paged to says nothing about
   // the render.
   const [adetailerPage, setADetailerPage] = useState("");
-  const [expandedStages, setExpandedStages] = useState({ hires: false, adetailer: false, rtx: false });
+  const [expandedStages, setExpandedStages] = useState({ adetailer: false, rtx: false });
+  const adetailerStage = chainStage(config.postprocessChain, "adetailer") || { enabled: false, expanded: false, units: [] };
+  const rtxStage = chainStage(config.postprocessChain, "rtx") || { enabled: false, expanded: false, scale: 2, quality: "ultra" };
+  const updateStage = (type, updates) => {
+    const stage = chainStage(config.postprocessChain, type);
+    if (stage) setChain(updateChainStage(config.postprocessChain, stage.id, updates));
+  };
   const upscalers = Array.isArray(postprocess.upscalers) ? postprocess.upscalers : [];
   const adetailerModels = Array.isArray(postprocess.adetailerModels) ? postprocess.adetailerModels : [];
   const upscalerRuntime = postprocess.upscalerRuntime !== false;
@@ -176,156 +189,145 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
     if (stage === "rtx" && !rtxAvailable) return postprocess.rtxHealth?.reason || "RTX VSR 运行时不可用";
     return "";
   };
-  const selectedUpscaler = upscalers.find((item) => item.id === config.hires.model);
-  const hiresSteps = hiresEffectiveSteps(config.hires, engine.name);
   // A detail pass encodes its own negative prompt through the mounted runtime, so an engine with
   // no unconditional branch cannot use one. Same rule as the main negative prompt: the box is
   // disabled and the request drops the text, but the text itself is kept.
   const engineAllowsNegativePrompt = !DISTILLED_GUIDANCE_ENGINES.includes(engine.name);
   const distilledEngineLabel = engine.name === "Flux2" ? "FLUX.2" : "FLUX.1";
-  const adetailerUnits = config.adetailer.units;
+  const adetailerUnits = adetailerStage.units;
   const updateUnit = (id, updates) => updateStage("adetailer", {
     units: adetailerUnits.map((unit) => (unit.id === id ? { ...unit, ...updates } : unit)),
   });
   const adetailerIndex = adetailerPageIndex(adetailerUnits, adetailerPage);
   const adetailerUnit = adetailerUnits[adetailerIndex];
   const toggleStageExpanded = (stage) => setExpandedStages((current) => ({ ...current, [stage]: !current[stage] }));
-  const stagePreview = (stage) => postprocessTargetSize(canvas, order, {
-    ...config,
-    [stage]: { ...config[stage], enabled: true },
-  }).trace.find((entry) => entry.stage === stage);
-  const hiresPreview = stagePreview("hires");
-  const rtxPreview = stagePreview("rtx");
+  const chainPlan = resampleChainPlan(canvas, config.postprocessChain, engine.name);
+  const rtxPreview = chainPlan.trace.find((entry) => entry.type === "rtx");
   const rtxHealth = postprocess.rtxHealth || {};
 
   return (
     <div className="i2i-postprocess-stack">
       <div className="section-heading"><span>06</span><h2>后处理增强</h2><small className="i2i-section-kicker">{postprocessOnly ? "直接作用于来源图" : "生成后按顺序执行"}</small></div>
       {postprocessOnly && <p className="i2i-note">后处理模式下这里就是本次任务的全部内容：至少启用一个阶段，未启用的阶段会被跳过。</p>}
-      <section className={`i2i-stage-card ${config.hires.enabled ? "enabled" : ""} ${expandedStages.hires ? "expanded" : ""}`}>
-        <StageHeader title="Hires.fix" detail={config.hires.enabled ? `${config.hires.scale.toFixed(1)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("hires") || "关闭"} enabled={config.hires.enabled} disabled={stageLocked("hires") || (!upscalerRuntime && !config.hires.enabled)} expanded={expandedStages.hires} onToggle={() => updateStage("hires", { enabled: !config.hires.enabled })} onToggleExpanded={() => toggleStageExpanded("hires")} />
-        {expandedStages.hires && <div className="hires-parameters">
-          <p className="postprocess-stage-description">超分放大后，使用当前底模、LoRA 和提示词进行第二次扩散精修。</p>
-          {stageReason("hires") && <p className="hires-unavailable">{stageReason("hires")}</p>}
-          <label className="hires-model">超分模型<WorkspaceSelect ariaLabel="超分模型" value={config.hires.model} disabled={running} onChange={(value) => updateStage("hires", { model: value })} options={upscalers.filter((item) => item.compatible !== false).map((item) => ({ value: item.id, label: item.label || item.id })).concat(upscalers.some((item) => item.compatible !== false) ? [] : [{ value: "", label: "暂无兼容模型", disabled: true }])} /></label>
-          <div className="hires-scale">
-            <PostprocessSlider label="放大倍率" value={config.hires.scale} min={1} max={4} step={0.1} inputStep={0.1} fixed={1} suffix="×" disabled={running} onChange={(value) => updateStage("hires", { scale: Math.round(value * 10) / 10 })} />
-            <p><span>INPUT {hiresPreview?.input?.width || canvas.width} × {hiresPreview?.input?.height || canvas.height}</span><b>OUTPUT {hiresPreview?.output?.width || canvas.width} × {hiresPreview?.output?.height || canvas.height}</b></p>
-          </div>
-          <div className="hires-sliders">
-            <PostprocessSlider label="二次重绘强度" value={config.hires.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateStage("hires", { denoise: value })} />
-            <PostprocessSlider label="Hires 步数" value={config.hires.steps} min={1} max={100} integer disabled={running} onChange={(value) => updateStage("hires", { steps: value })} />
-            <PostprocessSlider label="Hires CFG" value={config.hires.cfg} min={0} max={30} step={0.5} inputStep={0.1} fixed={1} disabled={running} onChange={(value) => updateStage("hires", { cfg: value })} />
-          </div>
-          <div className="hires-seed-settings">
-            <label>Hires Seed 模式<WorkspaceSelect ariaLabel="Hires Seed 模式" value={config.hires.seedMode} disabled={running} onChange={(value) => updateStage("hires", { seedMode: value, seed: value === "fixed" ? config.hires.seed : "" })} options={[{ value: "inherit", label: "继承每张首轮 Seed" }, { value: "fixed", label: "固定 Hires Seed" }, { value: "random", label: "每张安全随机" }]} /></label>
-            {config.hires.seedMode === "fixed" && <label className="hires-seed-field">Hires Seed<span><input inputMode="numeric" maxLength="20" value={config.hires.seed} disabled={running} onChange={(event) => updateStage("hires", { seed: event.target.value.replace(/\D/g, "") })} placeholder="0–18446744073709551615" /><button type="button" title="生成固定 Hires Seed" disabled={running} onClick={() => updateStage("hires", { seed: secureRandomUint64Seed() })}><RefreshCw size={13} /></button></span></label>}
-            <small>{config.hires.seedMode === "inherit" ? "每张结果继承该张首轮 Seed" : config.hires.seedMode === "fixed" ? "所有结果使用同一个无损 uint64 Hires Seed" : "每张结果在后端独立解析一次安全 uint64 Hires Seed"}</small>
-          </div>
-          {supportsUsduTiled(engine.name) && <label className="hires-model">重绘方式<WorkspaceSelect ariaLabel="Hires 重绘方式" value={config.hires.executionMode} disabled={running} onChange={(value) => updateStage("hires", { executionMode: value })} options={[{ value: "usdu_tiled", label: "USDU 分块重绘（推荐）" }, { value: "full_frame", label: "整图重绘（兼容）" }]} /></label>}
-          <div className="hires-tile-grid">
-            <label>Hires 采样器<WorkspaceSelect ariaLabel="Hires 采样器" value={config.hires.sampler || ""} disabled={running} onChange={(value) => updateStage("hires", { sampler: value || null })} options={[{ value: "", label: "跟随首轮" }, ...engine.samplers.map((name) => ({ value: name, label: name }))]} /></label>
-            <label>Hires 调度器<WorkspaceSelect ariaLabel="Hires 调度器" value={config.hires.scheduler || ""} disabled={running} onChange={(value) => updateStage("hires", { scheduler: value || null })} options={[{ value: "", label: "跟随首轮" }, ...engine.schedulers.map((name) => ({ value: name, label: name }))]} /></label>
-          </div>
-          {supportsUsduTiled(engine.name) && config.hires.executionMode === "usdu_tiled" && <><div className="hires-tile-grid"><label>扩散重绘分块宽度<output>Auto（只读）</output></label><label>扩散重绘分块高度<output>Auto（只读）</output></label></div><p className="hires-incompatible">Auto = 首轮源图宽高；padding 32；mask blur 8；uniform tiles；per-tile VAE tiled decode；seam None；每 tile 执行 Hires steps。</p></>}
-          <div className="hires-tile-grid">
-            <label>RealESRGAN / SR 像素放大分块<NumberInput ariaLabel="像素放大分块" value={config.hires.tileSize} min={32} max={2048} integer className="bounded-number" disabled={running} onChange={(tileSize) => updateStage("hires", { tileSize, tileOverlap: Math.min(config.hires.tileOverlap, Math.floor(tileSize / 2)) })} /></label>
-            <label>RealESRGAN / SR 像素放大分块重叠<NumberInput ariaLabel="分块重叠" value={config.hires.tileOverlap} min={0} max={Math.min(512, Math.floor(config.hires.tileSize / 2))} integer className="bounded-number" disabled={running} onChange={(tileOverlap) => updateStage("hires", { tileOverlap })} /></label>
-          </div>
-          {!selectedUpscaler && <p className="hires-unavailable">请选择兼容的超分模型</p>}
-          {config.hires.seedMode === "fixed" && !config.hires.seed && <p className="hires-unavailable">固定 Hires Seed 需要填写 0 ～ 18446744073709551615</p>}
-          {hiresSteps < 1 && <p className="hires-unavailable">Hires 有效步数至少需要 1 步</p>}
-          <p className="hires-path">模型目录 · models/upscalers · 支持 PTH / PT / CKPT 权重字典及 Safetensors，不加载 TorchScript</p>
-        </div>}
-      </section>
-
-      <section className={`i2i-stage-card ${config.adetailer.enabled ? "enabled" : ""} ${expandedStages.adetailer ? "expanded" : ""}`}>
-        <StageHeader title="ADetailer" detail={config.adetailer.enabled ? adetailerSummary(config.adetailer) : stageReason("adetailer") || "关闭"} enabled={config.adetailer.enabled} disabled={stageLocked("adetailer") || (!adetailerRuntime && !config.adetailer.enabled)} expanded={expandedStages.adetailer} onToggle={() => updateStage("adetailer", { enabled: !config.adetailer.enabled })} onToggleExpanded={() => toggleStageExpanded("adetailer")} />
-        {expandedStages.adetailer && <div className="adetailer-parameters">
-          <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
-          {stageReason("adetailer") && <p className="adetailer-unavailable">{stageReason("adetailer")}</p>}
-          {adetailerRuntime && adetailerModels.length === 0 && <p className="adetailer-unavailable">尚未安装 YOLO 检测模型，请手动放入 models/yolo 后刷新。</p>}
-          <div className="adetailer-units">
-            {adetailerUnits.length > 1 && <nav className="adetailer-pager" aria-label="ADetailer 检测单元">
-              <button type="button" aria-label="上一个检测单元" disabled={adetailerIndex < 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, -1))}><ChevronLeft size={14} /></button>
-              <ol>
-                {adetailerUnits.map((entry, position) => <li key={entry.id}>
-                  <button
-                    type="button"
-                    className={`${position === adetailerIndex ? "current" : ""} ${entry.enabled ? "on" : ""}`}
-                    aria-current={position === adetailerIndex ? "true" : undefined}
-                    aria-label={`第 ${position + 1} 个检测单元${entry.enabled ? "" : "（已关闭）"}`}
-                    onClick={() => setADetailerPage(entry.id)}
-                  >{position + 1}</button>
-                </li>)}
-              </ol>
-              <button type="button" aria-label="下一个检测单元" disabled={adetailerIndex >= adetailerUnits.length - 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, 1))}><ChevronRight size={14} /></button>
-            </nav>}
-            {adetailerUnit && (() => {
-              const unit = adetailerUnit;
-              const index = adetailerIndex;
-              const unitSteps = adetailerUnitSteps(unit, config.steps, engine.name);
-              // Keyed by the unit so paging replaces the controls and cannot retain
-              // one unit's uncommitted number draft in the next unit.
-              return <section className={`adetailer-unit ${unit.enabled ? "on" : ""}`} key={unit.id}>
-                <header>
-                  <span>{String(index + 1).padStart(2, "0")}</span>
-                  <strong>{adetailerUnitLabel(index, adetailerUnits.length)}</strong>
-                  <small>{unit.detector ? unit.detector.split("/").pop() : "未选择模型"}</small>
-                  <button type="button" role="switch" aria-label={`启用第 ${index + 1} 个 ADetailer 单元`} aria-checked={unit.enabled} className={unit.enabled ? "active" : ""} disabled={running} onClick={() => updateUnit(unit.id, { enabled: !unit.enabled })}><i /></button>
-                </header>
-                <div className="adetailer-unit-body">
-                  <label className="adetailer-model">检测模型<WorkspaceSelect ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`} value={unit.detector} disabled={running} onChange={(value) => updateUnit(unit.id, { detector: value })} options={adetailerModels.map((item) => ({ value: item.value, label: item.label || item.name })).concat(adetailerModels.length ? [] : [{ value: "", label: "暂无模型", disabled: true }])} /></label>
-                  <div className="adetailer-sliders">
-                    <PostprocessSlider label="检测置信度" value={unit.confidence} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { confidence: value })} />
-                    <PostprocessSlider label="最多处理区域" value={unit.maxDetections} min={1} max={8} integer disabled={running} onChange={(value) => updateUnit(unit.id, { maxDetections: value })} />
-                    <PostprocessSlider label="最小区域比例" value={unit.maskMinRatio} min={0} max={0.5} step={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMinRatio: value, maskMaxRatio: Math.max(value, unit.maskMaxRatio) })} />
-                    <PostprocessSlider label="最大区域比例" value={unit.maskMaxRatio} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMaxRatio: value, maskMinRatio: Math.min(value, unit.maskMinRatio) })} />
-                  </div>
-                  <div className="adetailer-mask-grid">
-                    <label>膨胀 / 腐蚀<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 膨胀或腐蚀`} value={unit.dilateErode} min={-128} max={128} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { dilateErode: value })} /></label>
-                    <label>蒙版模糊<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 蒙版模糊`} value={unit.maskBlur} min={0} max={64} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { maskBlur: value })} /></label>
-                    <label>局部边距<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 局部边距`} value={unit.padding} min={0} max={256} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { padding: value })} /></label>
-                  </div>
-                  <div className="adetailer-denoise"><PostprocessSlider label="重绘强度" value={unit.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { denoise: value })} /></div>
-                  <div className="adetailer-overrides"><label><input type="checkbox" checked={unit.useSteps} disabled={running} onChange={(event) => updateUnit(unit.id, { useSteps: event.target.checked })} /><span>独立步数</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立步数`} value={unit.steps} min={1} max={100} integer className="bounded-number" disabled={running || !unit.useSteps} onChange={(value) => updateUnit(unit.id, { steps: value })} /></label><label><input type="checkbox" checked={unit.useCfg} disabled={running} onChange={(event) => updateUnit(unit.id, { useCfg: event.target.checked })} /><span>独立 CFG</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立 CFG`} value={unit.cfg} min={0} max={30} step={0.1} fixed={1} className="bounded-number" disabled={running || !unit.useCfg} onChange={(value) => updateUnit(unit.id, { cfg: value })} /></label></div>
-                  <div className="adetailer-prompts"><label>正向提示词<textarea value={unit.prompt} disabled={running} onChange={(event) => updateUnit(unit.id, { prompt: event.target.value })} placeholder="留空继承主提示词；[PROMPT] 插入主提示词" /></label><label>负向提示词<textarea value={unit.negativePrompt} disabled={running || !engineAllowsNegativePrompt} onChange={(event) => updateUnit(unit.id, { negativePrompt: event.target.value })} placeholder={engineAllowsNegativePrompt ? "留空继承主负向提示词" : `${distilledEngineLabel} 没有无条件分支，负向提示词不会参与生成`} /></label></div>
-                  {unit.enabled && unitSteps < 1 && <p className="adetailer-unavailable">该单元有效步数至少需要 1 步</p>}
-                </div>
-              </section>;
-            })()}
-          </div>
-          <div className="adetailer-unit-add">
-            <small>{ADETAILER_UNIT_LIMIT} 个检测单元 · 已启用 {activeADetailerUnits(config.adetailer).length} 个 · 按编号顺序依次执行，后一个在前一个的结果上继续修复</small>
-          </div>
-          <p className="adetailer-path">CPU 检测 · 重绘继承当前采样器、调度器、底模与 LoRA</p>
-        </div>}
-      </section>
-
-      <section className={`i2i-stage-card ${config.rtx.enabled ? "enabled" : ""} ${expandedStages.rtx ? "expanded" : ""}`}>
-        <StageHeader title="RTX VSR" detail={config.rtx.enabled ? `${config.rtx.scale.toFixed(2)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("rtx") || "关闭"} enabled={config.rtx.enabled} disabled={stageLocked("rtx") || (!rtxAvailable && !config.rtx.enabled)} expanded={expandedStages.rtx} onToggle={() => updateStage("rtx", { enabled: !config.rtx.enabled })} onToggleExpanded={() => toggleStageExpanded("rtx")} />
-        {expandedStages.rtx && <div className="rtx-parameters">
-          <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
-          {stageReason("rtx") && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`}>{stageReason("rtx")}</p>}
-          {rtxHealth.warning && <p className="rtx-unavailable">{rtxHealth.warning}</p>}
-          <div className="rtx-runtime-grid" aria-label="RTX VSR 运行环境">
-            <div><span>状态</span><strong>{rtxHealth.probing ? "PROBING" : rtxAvailable ? "READY" : rtxHealth.supported ? "RUNTIME REQUIRED" : "UNSUPPORTED"}</strong></div>
-            <div><span>运行时</span><strong>{rtxHealth.runtime_version || "--"}</strong></div>
-            <div><span>设备</span><strong title={rtxHealth.device}>{rtxHealth.device || "--"}</strong></div>
-            <div><span>CUDA 能力</span><strong>{rtxHealth.compute_capability || "--"}</strong></div>
-            <div><span>驱动</span><strong>{rtxHealth.driver_version || "--"}</strong></div>
-          </div>
-          <div className="rtx-scale">
-            <PostprocessSlider label="放大倍率" value={config.rtx.scale} min={1} max={4} step={0.01} fixed={2} suffix="×" disabled={running} onChange={(value) => updateStage("rtx", { scale: Math.round(value * 100) / 100 })} />
-            <p><span>INPUT {rtxPreview?.input?.width || canvas.width} × {rtxPreview?.input?.height || canvas.height}</span><b>OUTPUT {rtxPreview?.output?.width || canvas.width} × {rtxPreview?.output?.height || canvas.height}</b></p>
-            <p><span>ORDERED FINAL</span><b>{rtxPreview?.output?.width || dimensions.width} × {rtxPreview?.output?.height || dimensions.height}</b></p>
-          </div>
-          <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={config.rtx.quality} disabled={running} onChange={(value) => updateStage("rtx", { quality: value })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
-          <p className="rtx-proprietary">RTX VSR 依赖 NVIDIA 专有 Video Effects 运行时，仅在受支持的 x64 Windows / Linux NVIDIA RTX 设备上可用；生成内容仍在本机处理。</p>
-        </div>}
-      </section>
-
-      <div className="i2i-order-card"><div className="i2i-order-head"><span>07</span><strong>处理顺序</strong><b>FINAL {dimensions.width} × {dimensions.height}</b></div>{order.map((stage, index) => <div className={`i2i-order-row ${config[stage].enabled ? "enabled" : ""}`} key={stage}><span>{String(index + 1).padStart(2, "0")}</span><strong>{stage === "hires" ? "Hires.fix" : stage === "adetailer" ? "ADetailer" : "RTX VSR"}</strong><small>{config[stage].enabled ? "启用" : "关闭"}</small><div><button type="button" title="上移" disabled={running || index === 0} onClick={() => moveStage(stage, -1)}><ArrowUp size={13} /></button><button type="button" title="下移" disabled={running || index === order.length - 1} onClick={() => moveStage(stage, 1)}><ArrowDown size={13} /></button></div></div>)}</div>
+      <ResampleChainPanel
+        chain={config.postprocessChain}
+        onChange={setChain}
+        engine={engine.name}
+        samplers={engine.samplers}
+        schedulers={engine.schedulers}
+        baseSize={canvas}
+        baseSteps={config.steps}
+        baseCfg={config.cfg}
+        upscalers={upscalers}
+        upscalerRuntimeReady={upscalerRuntime}
+        locked={running}
+        addDisabled={postprocess.ultraLow === true}
+        unitUnavailableReason={stageReason("hires")}
+        Slider={PostprocessSlider}
+        NumberInput={ChainNumberInput}
+        randomSeed={secureRandomUint64Seed}
+        renderCard={({ title, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
+          <section className={`i2i-stage-card ${enabled ? "enabled" : ""} ${expanded ? "expanded" : ""}`}>
+            <StageHeader
+              title={title}
+              detail={enabled ? detail : stageReason("hires") || "关闭"}
+              enabled={enabled}
+              disabled={stageLocked("hires") && !enabled}
+              expanded={expanded}
+              onToggle={onToggleEnabled}
+              onToggleExpanded={onToggleExpanded}
+            >{actions}</StageHeader>
+            {children}
+          </section>
+        )}
+        renderStage={(stage, index, actions) => (stage.type === "adetailer" ? (
+          <section className={`i2i-stage-card ${adetailerStage.enabled ? "enabled" : ""} ${expandedStages.adetailer ? "expanded" : ""}`}>
+            <StageHeader title="ADetailer" detail={adetailerStage.enabled ? adetailerSummary(config.adetailer) : stageReason("adetailer") || "关闭"} enabled={adetailerStage.enabled} disabled={stageLocked("adetailer") || (!adetailerRuntime && !adetailerStage.enabled)} expanded={expandedStages.adetailer} onToggle={() => updateStage("adetailer", { enabled: !adetailerStage.enabled })} onToggleExpanded={() => toggleStageExpanded("adetailer")} />
+            {expandedStages.adetailer && <div className="adetailer-parameters">
+              <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
+              {stageReason("adetailer") && <p className="adetailer-unavailable">{stageReason("adetailer")}</p>}
+              {adetailerRuntime && adetailerModels.length === 0 && <p className="adetailer-unavailable">尚未安装 YOLO 检测模型，请手动放入 models/yolo 后刷新。</p>}
+              <div className="adetailer-units">
+                {adetailerUnits.length > 1 && <nav className="adetailer-pager" aria-label="ADetailer 检测单元">
+                  <button type="button" aria-label="上一个检测单元" disabled={adetailerIndex < 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, -1))}><ChevronLeft size={14} /></button>
+                  <ol>
+                    {adetailerUnits.map((entry, position) => <li key={entry.id}>
+                      <button
+                        type="button"
+                        className={`${position === adetailerIndex ? "current" : ""} ${entry.enabled ? "on" : ""}`}
+                        aria-current={position === adetailerIndex ? "true" : undefined}
+                        aria-label={`第 ${position + 1} 个检测单元${entry.enabled ? "" : "（已关闭）"}`}
+                        onClick={() => setADetailerPage(entry.id)}
+                      >{position + 1}</button>
+                    </li>)}
+                  </ol>
+                  <button type="button" aria-label="下一个检测单元" disabled={adetailerIndex >= adetailerUnits.length - 1} onClick={() => setADetailerPage(adetailerStepUnitId(adetailerUnits, adetailerPage, 1))}><ChevronRight size={14} /></button>
+                </nav>}
+                {adetailerUnit && (() => {
+                  const unit = adetailerUnit;
+                  const index = adetailerIndex;
+                  const unitSteps = adetailerUnitSteps(unit, config.steps, engine.name);
+                  // Keyed by the unit so paging replaces the controls and cannot retain
+                  // one unit's uncommitted number draft in the next unit.
+                  return <section className={`adetailer-unit ${unit.enabled ? "on" : ""}`} key={unit.id}>
+                    <header>
+                      <span>{String(index + 1).padStart(2, "0")}</span>
+                      <strong>{adetailerUnitLabel(index, adetailerUnits.length)}</strong>
+                      <small>{unit.detector ? unit.detector.split("/").pop() : "未选择模型"}</small>
+                      <button type="button" role="switch" aria-label={`启用第 ${index + 1} 个 ADetailer 单元`} aria-checked={unit.enabled} className={unit.enabled ? "active" : ""} disabled={running} onClick={() => updateUnit(unit.id, { enabled: !unit.enabled })}><i /></button>
+                    </header>
+                    <div className="adetailer-unit-body">
+                      <label className="adetailer-model">检测模型<WorkspaceSelect ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`} value={unit.detector} disabled={running} onChange={(value) => updateUnit(unit.id, { detector: value })} options={adetailerModels.map((item) => ({ value: item.value, label: item.label || item.name })).concat(adetailerModels.length ? [] : [{ value: "", label: "暂无模型", disabled: true }])} /></label>
+                      <div className="adetailer-sliders">
+                        <PostprocessSlider label="检测置信度" value={unit.confidence} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { confidence: value })} />
+                        <PostprocessSlider label="最多处理区域" value={unit.maxDetections} min={1} max={8} integer disabled={running} onChange={(value) => updateUnit(unit.id, { maxDetections: value })} />
+                        <PostprocessSlider label="最小区域比例" value={unit.maskMinRatio} min={0} max={0.5} step={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMinRatio: value, maskMaxRatio: Math.max(value, unit.maskMaxRatio) })} />
+                        <PostprocessSlider label="最大区域比例" value={unit.maskMaxRatio} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { maskMaxRatio: value, maskMinRatio: Math.min(value, unit.maskMinRatio) })} />
+                      </div>
+                      <div className="adetailer-mask-grid">
+                        <label>膨胀 / 腐蚀<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 膨胀或腐蚀`} value={unit.dilateErode} min={-128} max={128} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { dilateErode: value })} /></label>
+                        <label>蒙版模糊<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 蒙版模糊`} value={unit.maskBlur} min={0} max={64} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { maskBlur: value })} /></label>
+                        <label>局部边距<NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 局部边距`} value={unit.padding} min={0} max={256} integer className="bounded-number" disabled={running} onChange={(value) => updateUnit(unit.id, { padding: value })} /></label>
+                      </div>
+                      <div className="adetailer-denoise"><PostprocessSlider label="重绘强度" value={unit.denoise} min={0.05} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={running} onChange={(value) => updateUnit(unit.id, { denoise: value })} /></div>
+                      <div className="adetailer-overrides"><label><input type="checkbox" checked={unit.useSteps} disabled={running} onChange={(event) => updateUnit(unit.id, { useSteps: event.target.checked })} /><span>独立步数</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立步数`} value={unit.steps} min={1} max={100} integer className="bounded-number" disabled={running || !unit.useSteps} onChange={(value) => updateUnit(unit.id, { steps: value })} /></label><label><input type="checkbox" checked={unit.useCfg} disabled={running} onChange={(event) => updateUnit(unit.id, { useCfg: event.target.checked })} /><span>独立 CFG</span><NumberInput ariaLabel={`第 ${index + 1} 个 ADetailer 独立 CFG`} value={unit.cfg} min={0} max={30} step={0.1} fixed={1} className="bounded-number" disabled={running || !unit.useCfg} onChange={(value) => updateUnit(unit.id, { cfg: value })} /></label></div>
+                      <div className="adetailer-prompts"><label>正向提示词<textarea value={unit.prompt} disabled={running} onChange={(event) => updateUnit(unit.id, { prompt: event.target.value })} placeholder="留空继承主提示词；[PROMPT] 插入主提示词" /></label><label>负向提示词<textarea value={unit.negativePrompt} disabled={running || !engineAllowsNegativePrompt} onChange={(event) => updateUnit(unit.id, { negativePrompt: event.target.value })} placeholder={engineAllowsNegativePrompt ? "留空继承主负向提示词" : `${distilledEngineLabel} 没有无条件分支，负向提示词不会参与生成`} /></label></div>
+                      {unit.enabled && unitSteps < 1 && <p className="adetailer-unavailable">该单元有效步数至少需要 1 步</p>}
+                    </div>
+                  </section>;
+                })()}
+              </div>
+              <div className="adetailer-unit-add">
+                <small>{ADETAILER_UNIT_LIMIT} 个检测单元 · 已启用 {activeADetailerUnits(config.adetailer).length} 个 · 按编号顺序依次执行，后一个在前一个的结果上继续修复</small>
+              </div>
+              <p className="adetailer-path">CPU 检测 · 重绘继承当前采样器、调度器、底模与 LoRA</p>
+            </div>}
+          </section>
+        ) : (
+          <section className={`i2i-stage-card ${rtxStage.enabled ? "enabled" : ""} ${expandedStages.rtx ? "expanded" : ""}`}>
+            <StageHeader title="RTX VSR" detail={rtxStage.enabled ? `${rtxStage.scale.toFixed(2)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("rtx") || "关闭"} enabled={rtxStage.enabled} disabled={stageLocked("rtx") || (!rtxAvailable && !rtxStage.enabled)} expanded={expandedStages.rtx} onToggle={() => updateStage("rtx", { enabled: !rtxStage.enabled })} onToggleExpanded={() => toggleStageExpanded("rtx")} />
+            {expandedStages.rtx && <div className="rtx-parameters">
+              <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
+              {stageReason("rtx") && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`}>{stageReason("rtx")}</p>}
+              {rtxHealth.warning && <p className="rtx-unavailable">{rtxHealth.warning}</p>}
+              <div className="rtx-runtime-grid" aria-label="RTX VSR 运行环境">
+                <div><span>状态</span><strong>{rtxHealth.probing ? "PROBING" : rtxAvailable ? "READY" : rtxHealth.supported ? "RUNTIME REQUIRED" : "UNSUPPORTED"}</strong></div>
+                <div><span>运行时</span><strong>{rtxHealth.runtime_version || "--"}</strong></div>
+                <div><span>设备</span><strong title={rtxHealth.device}>{rtxHealth.device || "--"}</strong></div>
+                <div><span>CUDA 能力</span><strong>{rtxHealth.compute_capability || "--"}</strong></div>
+                <div><span>驱动</span><strong>{rtxHealth.driver_version || "--"}</strong></div>
+              </div>
+              <div className="rtx-scale">
+                <PostprocessSlider label="放大倍率" value={rtxStage.scale} min={1} max={4} step={0.01} fixed={2} suffix="×" disabled={running} onChange={(value) => updateStage("rtx", { scale: Math.round(value * 100) / 100 })} />
+                <p><span>INPUT {rtxPreview?.input?.width || canvas.width} × {rtxPreview?.input?.height || canvas.height}</span><b>OUTPUT {rtxPreview?.output?.width || canvas.width} × {rtxPreview?.output?.height || canvas.height}</b></p>
+                <p><span>ORDERED FINAL</span><b>{rtxPreview?.output?.width || dimensions.width} × {rtxPreview?.output?.height || dimensions.height}</b></p>
+              </div>
+              <label className="rtx-quality">处理质量<WorkspaceSelect ariaLabel="RTX VSR 处理质量" value={rtxStage.quality} disabled={running} onChange={(value) => updateStage("rtx", { quality: value })} options={[{ value: "low", label: "LOW · 低" }, { value: "medium", label: "MEDIUM · 中" }, { value: "high", label: "HIGH · 高" }, { value: "ultra", label: "ULTRA · 极致" }]} /></label>
+              <p className="rtx-proprietary">RTX VSR 依赖 NVIDIA 专有 Video Effects 运行时，仅在受支持的 x64 Windows / Linux NVIDIA RTX 设备上可用；生成内容仍在本机处理。</p>
+            </div>}
+          </section>
+        ))}
+      />
     </div>
   );
 }
@@ -368,10 +370,10 @@ export default function ImageToImagePage({
   const config = normalizeImageToImageSettings(settings, { samplers: engine.samplers, schedulers: engine.schedulers });
   const postprocessOnly = config.mode === "postprocess";
   const canvas = outputSize(source, config);
-  const order = normalizePostprocessOrder(config.postprocessOrder);
-  const dimensions = postprocessTargetSize(canvas, order, config);
-  const selectedUpscaler = postprocess.upscalers?.find((item) => item.id === config.hires.model);
-  const hiresSteps = hiresEffectiveSteps(config.hires, engine.name);
+  const dimensions = resampleChainPlan(canvas, config.postprocessChain, engine.name);
+  const chainUnits = resampleUnits(config.postprocessChain).filter((unit) => unit.enabled);
+  const adetailerStage = chainStage(config.postprocessChain, "adetailer") || { enabled: false, units: [] };
+  const rtxStage = chainStage(config.postprocessChain, "rtx") || { enabled: false };
   const loraSummaryHover = useLoraHoverPreview();
   // The newest finished stage is what the panel shows while the next one runs, the same rule the
   // generate page follows.
@@ -383,12 +385,18 @@ export default function ImageToImagePage({
   const transparentPromptEnabled = transparentBackgroundEnabled(config.positive);
   const backgroundRemovalModels = transparentBackground.models || [];
   const selectedBackgroundRemovalModel = backgroundRemovalModels.find((item) => item.id === transparentBackground.modelId) || null;
-  const hiresReady = !config.hires.enabled || (engine.features?.hires !== false && postprocess.upscalerRuntime !== false && Boolean(selectedUpscaler) && hiresSteps >= 1 && config.hires.tileOverlap <= Math.floor(config.hires.tileSize / 2));
-  const adetailerIssue = config.adetailer.enabled
-    ? adetailerStageIssue(config.adetailer, config.steps, (detector) => postprocess.adetailerModels?.some((item) => item.value === detector), engine.name)
+  const chainIssue = resampleChainIssue(config.postprocessChain, {
+    baseSteps: config.steps,
+    engine: engine.name,
+    nativeEngines: NATIVE_STEP_ENGINES,
+    upscalers: postprocess.upscalerRuntime === false ? [] : postprocess.upscalers || null,
+  });
+  const hiresReady = !chainUnits.length || (engine.features?.hires !== false && !chainIssue);
+  const adetailerIssue = adetailerStage.enabled
+    ? adetailerStageIssue(adetailerStage, config.steps, (detector) => postprocess.adetailerModels?.some((item) => item.value === detector), engine.name)
     : "";
-  const adetailerReady = !config.adetailer.enabled || (engine.features?.adetailer !== false && postprocess.adetailerInfo?.available === true && !adetailerIssue);
-  const rtxReady = !config.rtx.enabled || (engine.features?.rtx !== false && postprocess.rtxHealth?.available === true && dimensions.valid);
+  const adetailerReady = !adetailerStage.enabled || (engine.features?.adetailer !== false && postprocess.adetailerInfo?.available === true && !adetailerIssue);
+  const rtxReady = !rtxStage.enabled || (engine.features?.rtx !== false && postprocess.rtxHealth?.available === true && dimensions.valid);
   const [dragging, setDragging] = useState(false);
   const [loadingSource, setLoadingSource] = useState(false);
   const fileInputRef = useRef(null);
@@ -400,16 +408,7 @@ export default function ImageToImagePage({
   // controls describe the next queued request, not the one already rendering.
   const editingLocked = modelPicker.switching;
   const update = (patch) => onSettingsChange({ ...config, ...patch });
-  const updateStage = (stage, patch) => update({ [stage]: { ...config[stage], ...patch } });
-  const moveStage = (stage, direction) => {
-    if (editingLocked) return;
-    const index = order.indexOf(stage);
-    const target = index + direction;
-    if (index < 0 || target < 0 || target >= order.length) return;
-    const next = [...order];
-    [next[index], next[target]] = [next[target], next[index]];
-    update({ postprocessOrder: next });
-  };
+  const setChain = (postprocessChain) => { if (!editingLocked) update({ postprocessChain }); };
   const acceptFile = async (file) => {
     if (editingLocked) return;
     const problem = validateSourceFile(file);
@@ -484,7 +483,7 @@ export default function ImageToImagePage({
     serviceReady: engine.serviceReady,
     postprocess: {
       hiresReady,
-      hiresReason: postprocess.upscalerRuntime === false ? "Hires.fix 运行环境尚未配置" : "Hires 参数或超分模型未就绪",
+      hiresReason: postprocess.upscalerRuntime === false ? "超分运行环境尚未配置" : chainIssue || "重采样参数未就绪",
       adetailerReady,
       adetailerReason: "ADetailer 检测模型尚未就绪",
       rtxReady,
@@ -498,8 +497,8 @@ export default function ImageToImagePage({
   });
   const totalImages = config.imagesPerBatch * config.batchCount;
   const selectedOutput = job.outputs[job.selectedIndex];
-  const enabledStages = order.filter((stage) => config[stage].enabled);
-  const stageLabel = (stage) => (stage === "hires" ? "Hires.fix" : stage === "adetailer" ? "ADetailer" : "RTX VSR");
+  const enabledStages = enabledChainStages(config.postprocessChain);
+  const stageLabel = (stage) => (stage.type === "resample" ? resampleUnitTitle(config.postprocessChain, stage) : stage.type === "adetailer" ? "ADetailer" : "RTX VSR");
   const sourceIssue = postprocessOnly ? postprocessSourceIssue(source) : "";
 
   return (
@@ -639,10 +638,16 @@ export default function ImageToImagePage({
               <div className="preview-grid" />
               {job.status === "idle" && <div className="empty-preview"><div className="empty-orbit"><ImageIcon size={29} /></div><strong>{source ? "已就绪" : "等待来源图片"}</strong><p>{source ? (postprocessOnly ? "选择增强阶段与顺序后开始" : "调整重绘强度后开始生成") : "先放入一张来源图片"}</p><button type="button" onClick={onOpenViewer}><FolderOpen size={14} />打开预览工作区</button></div>}
               {job.status === "running" && <div className="generating-preview">
-                <StagePreviewLive stage={latestStagePreview} stageLabel={job.phase} onEnlarge={onEnlargeStage} placeholder="正在生成" />
+                <StagePreviewLive stage={latestStagePreview} stageLabel={job.phase} onEnlarge={onEnlargeStage} placeholder="正在生成" held={job.held} />
               </div>}
               {job.status === "complete" && selectedOutput && <button className="completed-preview" onClick={onOpenViewer} title="点击放大预览"><img className="generated-image" src={selectedOutput.url} alt={`第 ${job.selectedIndex + 1} 张图生图结果`} /></button>}
-              {job.status === "cancelled" && <div className="generation-cancelled"><Square size={30} /><strong>生成已终止</strong><p>已安全停止任务</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>}
+              {job.status === "cancelled" && (job.held?.url
+                ? <div className="stage-preview-image held-preview cancelled-held">
+                  <img src={job.held.url} alt="上一次生成结果" />
+                  <span className="stage-preview-tag">已终止 · 显示上一次完成的结果</span>
+                  <button type="button" className="held-preview-reset" onClick={() => onControl("reset")}>返回调整参数</button>
+                </div>
+                : <div className="generation-cancelled"><Square size={30} /><strong>生成已终止</strong><p>已安全停止任务</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>)}
               {job.status === "error" && <div className="generation-error"><X size={32} /><strong>生成失败</strong><p>{job.error}</p><button onClick={() => onControl("reset")}>返回调整参数</button></div>}
               <div className="corner corner-tl" /><div className="corner corner-tr" /><div className="corner corner-bl" /><div className="corner corner-br" />
             </div>
@@ -775,7 +780,7 @@ export default function ImageToImagePage({
           </div>}
           <p className="i2i-note">切换引擎或底模会同步到文生图；LoRA 挂载按引擎隔离并随之切换。</p>
 
-          <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={editingLocked} canvas={canvas} dimensions={dimensions} updateStage={updateStage} moveStage={moveStage} order={order} postprocessOnly={postprocessOnly} />
+          <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={editingLocked} canvas={canvas} dimensions={dimensions} setChain={setChain} postprocessOnly={postprocessOnly} />
         </div>
       </aside>
       <LoraHoverPreview preview={loraSummaryHover.preview} />

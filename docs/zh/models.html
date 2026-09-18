@@ -84,7 +84,7 @@
           <tr><td><code>embeddings</code></td><td>为将来的文本反转支持预留。</td></tr>
           <tr><td><code>yolo</code></td><td>用于本地 ADetailer 流程的 Ultralytics <code>.pt</code> 检测或分割模型。社区模型可以放在这里，包括放在子目录中。</td></tr>
           <tr><td><code>background-removal</code></td><td>兼容的 ONNX 前景提取模型。推荐文件即使被嵌套或改名，也按固定哈希识别。</td></tr>
-          <tr><td><code>upscalers</code></td><td>Hires.fix 像素空间超分辨率权重。兼容的 <code>.pth</code>、<code>.pt</code>、<code>.ckpt</code> 与 <code>.safetensors</code> 文件按张量结构发现，因此重命名文件不会改变兼容性。PyTorch 文件必须包含权重或 state dict；TorchScript 归档刻意不加载。</td></tr>
+          <tr><td><code>upscalers</code></td><td>重采样单元「超分模型放大」步骤使用的像素空间超分辨率权重（见<a href="usage.html#postprocess">后处理链</a>）。兼容的 <code>.pth</code>、<code>.pt</code>、<code>.ckpt</code> 与 <code>.safetensors</code> 文件按张量结构发现，因此重命名文件不会改变兼容性。PyTorch 文件必须包含权重或 state dict；TorchScript 归档刻意不加载。</td></tr>
           <tr><td><code>configs</code></td><td>用户与模型的运行时配置产物。</td></tr>
         </tbody>
       </table>
@@ -110,7 +110,7 @@
       <li><strong>FLUX.2</strong> —— Klein 9B True V3 的 Safetensors 或 GGUF 版本，以及官方 Klein 9B KV
         单文件版本（受限仓库，需接受许可并提供 Hugging Face Token）。两者都搭配 Qwen 3 8B 文本编码器与 FLUX.2 VAE。</li>
       <li><strong>Krea 2</strong> —— 12B 模型的 Raw 与 Turbo 变体，并可单独选择 4B 文本编码器精度。其 VAE 与 Anima 共用。</li>
-      <li><strong>放大模型</strong> —— Hires.fix 第一阶段所使用的 Real-ESRGAN 官方模型。</li>
+      <li><strong>放大模型</strong> —— 重采样单元在缩放与重绘之前可用来放大的 Real-ESRGAN 官方模型。</li>
     </ul>
 
     <div class="note">

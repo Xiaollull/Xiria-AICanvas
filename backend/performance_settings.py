@@ -161,6 +161,36 @@ def split_batch_value(value, start, end, batch_size):
     return value
 
 
+def join_batch_outputs(outputs):
+    """Reassemble one batch from the per-sample results of a split forward.
+
+    A tuple is what every Diffusers sampling loop asks the UNet for (`return_dict=False`), and it is
+    the only shape this used to accept. `UNet2DConditionModel` also answers with a
+    `UNet2DConditionOutput`, a `BaseOutput` dataclass, whenever a caller leaves `return_dict` alone
+    — the ADetailer and resample paths build their own pipelines, and a single such caller used to
+    turn the whole serial-CFG path into a `TypeError` at the first step. Both shapes are just an
+    ordered set of fields, so both are joined the same way and handed back as what came in.
+    """
+    first = outputs[0]
+    if isinstance(first, tuple):
+        return tuple(
+            torch.cat([output[index] for output in outputs], dim=0)
+            if torch.is_tensor(value) and value.shape[0] == 1 else value
+            for index, value in enumerate(first)
+        )
+    fields = getattr(first, "__dataclass_fields__", None)
+    if fields is not None:
+        joined = {}
+        for name in fields:
+            value = getattr(first, name)
+            joined[name] = (
+                torch.cat([getattr(output, name) for output in outputs], dim=0)
+                if torch.is_tensor(value) and value.shape[0] == 1 else value
+            )
+        return type(first)(**joined)
+    raise TypeError("Sequential batch forward requires tuple or dataclass results")
+
+
 def enable_sequential_batch_forward(module):
     if module.forward is getattr(module, "_xiriai_sequential_batch_forward", None):
         return
@@ -178,16 +208,25 @@ def enable_sequential_batch_forward(module):
                 key: split_batch_value(value, index, index + 1, batch_size) for key, value in kwargs.items()
             }
             outputs.append(original_forward(sample[index:index + 1], *chunk_args, **chunk_kwargs))
-        if isinstance(outputs[0], tuple):
-            return tuple(
-                torch.cat([output[component] for output in outputs], dim=0)
-                if torch.is_tensor(value) and value.shape[0] == 1 else value
-                for component, value in enumerate(outputs[0])
-            )
-        raise TypeError("Sequential batch forward requires tuple results")
+        return join_batch_outputs(outputs)
 
     module._xiriai_sequential_batch_forward = sequential_forward
     module.forward = sequential_forward
+
+
+def disable_sequential_batch_forward(module):
+    """Put the full-batch forward back, if this module is still wearing the serial wrapper.
+
+    The wrapper is installed after the offload hooks and wraps whatever forward they left behind, so
+    removing accelerate's hooks also discards it — but a resident pass carries no hooks, and then
+    nothing else would ever take it off. A job that is admitted for batched CFG after one that ran
+    serial has to get the batched forward back, or it would keep paying for two passes it no longer
+    needs.
+    """
+    wrapper = getattr(module, "_xiriai_sequential_batch_forward", None)
+    if wrapper is None or module.forward is not wrapper:
+        return
+    module.forward = module._xiriai_full_batch_forward
 
 
 def vae_decode_tile_count(latent_height, latent_width, tile_size, overlap_factor):

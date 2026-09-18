@@ -25,6 +25,7 @@
 import { normalizeADetailerStage } from "./adetailer-units.js";
 import { IMAGE_TO_IMAGE_DEFAULTS, normalizeImageToImageSettings } from "./image-to-image.js";
 import { normalizeUint64Seed } from "./hires-settings.js";
+import { migrateResampleChain } from "./resample-chain.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
 
 export const ENGINE_SETTINGS_SCHEMA_VERSION = 2;
@@ -41,35 +42,7 @@ const FLOW_MATCHING_ENGINES = new Set(["Anima", "Krea2"]);
 const DUAL_ENCODER_ENGINES = new Set(["Flux"]);
 const GUIDANCE_IDS = new Set(["none", "pag", "cfg_zero_star"]);
 const SEED_MODES = new Set(["fixed", "random", "increment", "decrement"]);
-const RTX_QUALITIES = new Set(["low", "medium", "high", "ultra"]);
-const POSTPROCESS_STAGES = ["hires", "adetailer", "rtx"];
-
 export const PAG_DEFAULTS = Object.freeze({ scale: 0.3, appliedLayers: "mid" });
-export const HIRES_DEFAULTS = Object.freeze({
-  enabled: false,
-  expanded: false,
-  model: "",
-  seedMode: "inherit",
-  seed: "",
-  scale: 1,
-  denoise: 0.35,
-  steps: 20,
-  cfg: 7,
-  tileSize: 192,
-  tileOverlap: 16,
-  executionMode: "full_frame",
-  sampler: null,
-  scheduler: null,
-  tileWidth: "auto",
-  tileHeight: "auto",
-  padding: 32,
-  maskBlur: 8,
-  seamMode: "none",
-  uniformTiles: true,
-  tiledDecode: true,
-});
-export const RTX_DEFAULTS = Object.freeze({ enabled: false, expanded: false, scale: 2, quality: "ultra" });
-export const ADETAILER_DEFAULTS = Object.freeze(normalizeADetailerStage({ enabled: false, expanded: false }));
 
 export function isSplitEngine(engine) { return SPLIT_ENGINES.has(engine); }
 export function isDistilledEngine(engine) { return DISTILLED_ENGINES.has(engine); }
@@ -130,10 +103,7 @@ export function engineSettingsDefaults(engine) {
     guidance: "none",
     pag: { ...PAG_DEFAULTS },
     size: { width: 1024, height: 1024 },
-    hires: { ...HIRES_DEFAULTS },
-    adetailer: normalizeADetailerStage({ enabled: false, expanded: false }),
-    rtx: { ...RTX_DEFAULTS },
-    postprocessOrder: [...POSTPROCESS_STAGES],
+    postprocessChain: migrateResampleChain({}, { engine }),
     backgroundRemovalModel: "",
     imageToImage: imageToImageDefaultsFor(engine),
   };
@@ -172,14 +142,6 @@ function normalizeSize(value, fallback) {
   return { width: dimension(source.width, fallback.width), height: dimension(source.height, fallback.height) };
 }
 
-function normalizePostprocessOrder(value) {
-  const source = Array.isArray(value) ? value.filter((stage) => POSTPROCESS_STAGES.includes(stage)) : [];
-  const unique = [...new Set(source)];
-  // A saved order that lost a stage still runs the missing one, in its default position, rather
-  // than silently dropping it from the pipeline.
-  return [...unique, ...POSTPROCESS_STAGES.filter((stage) => !unique.includes(stage))];
-}
-
 /** One engine's record, coerced to what that engine can actually accept. */
 export function normalizeEngineSettings(engine, value, fallback = null) {
   const defaults = fallback ? { ...engineSettingsDefaults(engine), ...fallback } : engineSettingsDefaults(engine);
@@ -209,16 +171,15 @@ export function normalizeEngineSettings(engine, value, fallback = null) {
       appliedLayers: ["mid", "all"].includes(source.pag?.appliedLayers) ? source.pag.appliedLayers : defaults.pag.appliedLayers,
     },
     size: normalizeSize(source.size, defaults.size),
-    hires: { ...HIRES_DEFAULTS, ...defaults.hires, ...(isPlainObject(source.hires) ? source.hires : {}) },
-    adetailer: normalizeADetailerStage({ ...defaults.adetailer, ...(isPlainObject(source.adetailer) ? source.adetailer : {}) }),
-    rtx: {
-      ...RTX_DEFAULTS,
-      ...defaults.rtx,
-      ...(isPlainObject(source.rtx) ? source.rtx : {}),
-      quality: RTX_QUALITIES.has(source.rtx?.quality) ? source.rtx.quality : defaults.rtx.quality,
-      scale: inRange(source.rtx?.scale, defaults.rtx.scale, 1, 4),
-    },
-    postprocessOrder: normalizePostprocessOrder(source.postprocessOrder ?? defaults.postprocessOrder),
+    // A record saved before the chain carries the three blocks and an order; one saved after
+    // carries the chain. `migrateResampleChain` reads either, so an engine opened for the first
+    // time since the upgrade finds the run it was left set up for.
+    postprocessChain: migrateResampleChain(
+      Array.isArray(source.postprocessChain) || isPlainObject(source.hires) || isPlainObject(source.rtx) || isPlainObject(source.adetailer)
+        ? source
+        : defaults,
+      { engine, samplers: SAMPLER_NAMES, schedulers: SCHEDULER_NAMES },
+    ),
     backgroundRemovalModel: text(source.backgroundRemovalModel) || defaults.backgroundRemovalModel,
     // A record saved under schema 1 has no image-to-image block; it starts from this engine's
     // defaults rather than from whatever the other engines happen to hold.

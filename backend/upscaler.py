@@ -7,6 +7,11 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file as load_safetensors_file
 
+try:
+    from .resize import DEFAULT_RESIZE_METHOD, resize_image, scaled_size
+except ImportError:
+    from resize import DEFAULT_RESIZE_METHOD, resize_image, scaled_size
+
 
 UPSCALER_EXTENSIONS = {".pth", ".pt", ".ckpt", ".safetensors"}
 _model_metadata_cache = {}
@@ -115,7 +120,7 @@ def discover_models(directory: Path):
 
 def resolve_model(directory: Path, reference: str):
     if not reference:
-        raise ValueError("Hires.fix requires an upscaler model")
+        raise ValueError("An upscaler model reference is required")
     relative = Path(reference)
     if relative.is_absolute():
         raise ValueError("Upscaler model path must be relative")
@@ -142,9 +147,16 @@ def status(directory: Path):
 
 
 def target_size(image: Image.Image, scale: float):
+    """`round(edge × scale)`, the size the chain asked for.
+
+    This used to round every edge up to a multiple of 64, which made the requested scale an
+    approximation: 1088 × 1.5 is 1632, and the snap turned it into 1664. A resample unit's target is
+    exact, and whatever grid an engine needs is applied by the caller that knows which engine is
+    mounted — not here, where only the picture is in hand.
+    """
     if not math.isfinite(scale) or scale < 1 or scale > 4:
-        raise ValueError("Hires.fix scale must be between 1.0 and 4.0")
-    return tuple(max(64, int(math.ceil(dimension * scale / 64)) * 64) for dimension in image.size)
+        raise ValueError("Resample scale must be between 1.0 and 4.0")
+    return scaled_size(image, scale)
 
 
 def _pil_to_bgr_tensor(image: Image.Image):
@@ -231,11 +243,17 @@ def _upscale_once(image: Image.Image, descriptor, tile_size: int, overlap: int, 
     return output, completed
 
 
-def upscale_image(image: Image.Image, directory: Path, reference: str, scale: float, tile_size=192, overlap=16, progress=None, device="cpu", checkpoint=None):
+def upscale_image(image: Image.Image, directory: Path, reference: str, scale: float, tile_size=192, overlap=16, progress=None, device="cpu", checkpoint=None, method=DEFAULT_RESIZE_METHOD, destination=None):
+    """Run the model until the picture is at least `destination`, then resize onto it with `method`.
+
+    `destination` defaults to the unit's exact target. A caller that has to land on an engine's
+    latent grid passes the aligned size instead, so the model pass and the resize agree on one
+    destination rather than resizing twice.
+    """
     path, metadata = resolve_model(directory, reference)
     tile_size = max(32, int(tile_size))
     overlap = max(0, min(int(overlap), tile_size // 2))
-    destination = target_size(image, scale)
+    destination = tuple(destination) if destination is not None else target_size(image, scale)
     native_scale = int(metadata["scale"])
     planned_sizes = []
     planned = image.size
@@ -252,6 +270,13 @@ def upscale_image(image: Image.Image, directory: Path, reference: str, scale: fl
     descriptor = None
     try:
         if not planned_sizes:
+            # The model has nothing to add — the picture already covers the destination — but the
+            # destination is still a promise: an engine grid can move it a few pixels off the source
+            # even at scale 1.0, and the redraw that follows would then be handed the wrong canvas.
+            if current.size != destination:
+                if checkpoint:
+                    checkpoint()
+                current = resize_image(current, destination[0], destination[1], method)
             return current, {
                 "model": reference,
                 "model_name": path.name,
@@ -260,6 +285,7 @@ def upscale_image(image: Image.Image, directory: Path, reference: str, scale: fl
                 "scale": scale,
                 "source_size": list(image.size),
                 "target_size": list(destination),
+                "resize_algorithm": method,
                 "tile_size": tile_size,
                 "tile_overlap": overlap,
                 "upscaler_applied": False,
@@ -273,7 +299,7 @@ def upscale_image(image: Image.Image, directory: Path, reference: str, scale: fl
         if current.size != destination:
             if checkpoint:
                 checkpoint()
-            current = current.resize(destination, Image.Resampling.LANCZOS)
+            current = resize_image(current, destination[0], destination[1], method)
         return current, {
             "model": reference,
             "model_name": path.name,
@@ -282,6 +308,7 @@ def upscale_image(image: Image.Image, directory: Path, reference: str, scale: fl
             "scale": scale,
             "source_size": list(image.size),
             "target_size": list(destination),
+            "resize_algorithm": method,
             "tile_size": tile_size,
             "tile_overlap": overlap,
             "upscaler_applied": True,

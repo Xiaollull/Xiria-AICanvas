@@ -7,7 +7,7 @@ import test from "node:test";
 // own; nothing lined up either, and a new dialog had no value to copy that was obviously right.
 //
 // These tests hold the two layers that replaced that: a neutral ramp of value tokens, and a
-// semantic contract for dialogs that resolves to different steps of the ramp per theme.
+// semantic contract for dialogs that resolves to steps of that ramp.
 
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 
@@ -16,7 +16,7 @@ function rulesOutsideRoot() {
   const rules = [];
   for (const match of styles.matchAll(/([^{}\n]+)\{([^{}]*)\}/g)) {
     const selector = match[1].trim();
-    if (selector === ":root" || /^html\[data-theme-mode="[a-z]+"\]$/.test(selector)) continue;
+    if (selector === ":root") continue;
     rules.push({ selector, body: match[2] });
   }
   return rules;
@@ -106,10 +106,11 @@ test("no ordinary dialog picks its own stacking number", () => {
   assert.deepEqual(loose, [], "these surfaces should be on the --z-* scale");
 });
 
-test("the dialog contract is redefined for light, so a dialog is legible without its own rule", () => {
-  const light = styles.slice(styles.indexOf('html[data-theme-mode="light"] {\n  --modal-backdrop'));
+test("the dialog contract is defined once, so a dialog is legible without its own rule", () => {
+  const root = styles.slice(styles.indexOf(":root {"), styles.indexOf("* { box-sizing"));
   for (const token of ["--modal-backdrop", "--modal-surface", "--modal-header", "--modal-footer", "--modal-line", "--modal-shadow"]) {
-    assert.ok(light.slice(0, 600).includes(token), `${token} has no light-theme value`);
+    assert.ok(root.includes(`${token}:`), `${token} has no value`);
+    assert.equal(styles.split(`${token}:`).length - 1, 1, `${token} is given a value in more than one place`);
   }
 });
 
@@ -150,7 +151,7 @@ test("the run diagnostics can be hidden, and the choice is project state", async
   // Persisted through the workspace document, not browser storage, and shown by default.
   assert.match(app, /runInfoVisible: saved\.runInfoVisible !== false/);
   assert.match(app, /setRunInfoVisible\(workspace\.runInfoVisible\)/);
-  assert.match(app, /size, samplingExpanded, runInfoVisible, hires/,
+  assert.match(app, /size, samplingExpanded, runInfoVisible, postprocessChain/,
     "the preference is missing from the workspace snapshot, so it would not survive a reload");
 
   // `[hidden]` alone loses to any later `display` rule matching the same element.

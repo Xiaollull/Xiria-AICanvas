@@ -10,7 +10,7 @@ import { readSafetensorsHeader } from "./anima-models.mjs";
 //
 // This is the JavaScript twin of `backend/gguf_loader.py`. The two must agree on which ggml types
 // are readable or the picker will offer a file the runtime then refuses; `gguf-header.test.mjs`
-// and `backend/test_gguf_loader.py` pin the same list on both sides.
+// and `backend/tests/test_gguf_loader.py` pin the same list on both sides.
 
 export const GGUF_MAGIC = "GGUF";
 export const GGUF_SUPPORTED_VERSIONS = new Set([2, 3]);

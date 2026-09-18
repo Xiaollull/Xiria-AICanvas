@@ -5,7 +5,7 @@ is the inference side of the same contract and deliberately only reads. It is
 the Python twin of `src/shared-model-refs.js` + `scripts/shared-model-paths.mjs`,
 so the reference format and the root-id derivation are mirrored here rather
 than re-invented — `scripts/shared-model-paths.test.mjs` and
-`backend/test_shared_model_paths.py` pin the same vectors on both sides.
+`backend/tests/test_shared_model_paths.py` pin the same vectors on both sides.
 """
 
 import hashlib
