@@ -31,6 +31,7 @@ import {
   SIZE_MODES,
   SOURCE_IMAGE_ACCEPT,
   imageToImageBlockers,
+  imageToImageFixStepsPlan,
   normalizeImageToImageSettings,
   outputSize,
   postprocessSourceIssue,
@@ -39,6 +40,8 @@ import {
   validateSourceFile,
 } from "./image-to-image";
 import { i2iCompareHeight } from "./i2i-compare-fit.js";
+import { clipSkipRange, normalizeClipSkip } from "./clip-skip.js";
+import { DEFAULT_CANVAS_MAX_EDGE, effectiveCanvasMaxEdge } from "./canvas-limit.js";
 import SizeGrid from "./SizeGrid";
 import ResampleChainPanel from "./ResampleChainPanel.jsx";
 import { chainStage, enabledChainStages, resampleChainIssue, resampleChainPlan, resampleUnitTitle, resampleUnits, updateChainStage } from "./resample-chain.js";
@@ -170,7 +173,10 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
     const stage = chainStage(config.postprocessChain, type);
     if (stage) setChain(updateChainStage(config.postprocessChain, stage.id, updates));
   };
-  const upscalers = Array.isArray(postprocess.upscalers) ? postprocess.upscalers : [];
+  const upscalers = Array.isArray(postprocess.upscalers)
+    ? postprocess.upscalers
+    : Array.isArray(postprocess.upscalers?.models) ? postprocess.upscalers.models : [];
+  const upscalerCatalog = postprocess.upscalerCatalog || (postprocess.upscalers && !Array.isArray(postprocess.upscalers) ? postprocess.upscalers : { models: upscalers, builtins: [] });
   const adetailerModels = Array.isArray(postprocess.adetailerModels) ? postprocess.adetailerModels : [];
   const upscalerRuntime = postprocess.upscalerRuntime !== false;
   const adetailerRuntime = postprocess.adetailerInfo?.runtimeAvailable === true;
@@ -204,6 +210,12 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
   const chainPlan = resampleChainPlan(canvas, config.postprocessChain, engine.name);
   const rtxPreview = chainPlan.trace.find((entry) => entry.type === "rtx");
   const rtxHealth = postprocess.rtxHealth || {};
+  const chainIssue = resampleChainIssue(config.postprocessChain, {
+    baseSteps: config.steps,
+    engine: engine.name,
+    nativeEngines: NATIVE_STEP_ENGINES,
+    upscalers,
+  });
 
   return (
     <div className="i2i-postprocess-stack">
@@ -218,15 +230,23 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
         baseSize={canvas}
         baseSteps={config.steps}
         baseCfg={config.cfg}
-        upscalers={upscalers}
+        upscalers={upscalerCatalog}
         upscalerRuntimeReady={upscalerRuntime}
+        upscalersRefreshing={postprocess.upscalersRefreshing}
+        onRefreshUpscalers={postprocess.onRefreshUpscalers || null}
+        upscalerDownloadJob={postprocess.upscalerDownloadJob}
+        upscalerDownloadBusy={postprocess.upscalerDownloadBusy}
+        upscalerDownloadError={postprocess.upscalerDownloadError}
+        onDownloadUpscaler={postprocess.onDownloadUpscaler}
+        onRetryUpscaler={postprocess.onRetryUpscaler}
         locked={running}
         addDisabled={postprocess.ultraLow === true}
         unitUnavailableReason={stageReason("hires")}
         Slider={PostprocessSlider}
-        NumberInput={ChainNumberInput}
-        randomSeed={secureRandomUint64Seed}
-        renderCard={({ title, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
+         NumberInput={ChainNumberInput}
+         randomSeed={secureRandomUint64Seed}
+         chainIssue={chainIssue}
+         renderCard={({ title, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
           <section className={`i2i-stage-card ${enabled ? "enabled" : ""} ${expanded ? "expanded" : ""}`}>
             <StageHeader
               title={title}
@@ -366,10 +386,17 @@ export default function ImageToImagePage({
   // shows them the same way rather than sitting on a placeholder until the final image lands.
   stagePreviews = [],
   onEnlargeStage,
+  // The Settings canvas bound (2048 unless raised): what the canvas picker offers and what a
+  // source picture is fitted into.
+  canvasMaxEdge = DEFAULT_CANVAS_MAX_EDGE,
 }) {
   const config = normalizeImageToImageSettings(settings, { samplers: engine.samplers, schedulers: engine.schedulers });
   const postprocessOnly = config.mode === "postprocess";
-  const canvas = outputSize(source, config);
+  const nativeFixSteps = NATIVE_STEP_ENGINES.includes(engine.name);
+  const fixStepsPlan = imageToImageFixStepsPlan(config, engine.name, source);
+  const canvasPickerMax = effectiveCanvasMaxEdge(canvasMaxEdge, engine.name);
+  const canvas = outputSize(source, config, { maxEdge: canvasPickerMax });
+  const clipSkipLimits = clipSkipRange(engine.name);
   const dimensions = resampleChainPlan(canvas, config.postprocessChain, engine.name);
   const chainUnits = resampleUnits(config.postprocessChain).filter((unit) => unit.enabled);
   const adetailerStage = chainStage(config.postprocessChain, "adetailer") || { enabled: false, units: [] };
@@ -478,6 +505,7 @@ export default function ImageToImagePage({
   const blocker = imageToImageBlockers({
     source,
     settings: config,
+    canvasMaxEdge,
     engine: engine.name,
     engineReady: engine.ready,
     serviceReady: engine.serviceReady,
@@ -720,10 +748,22 @@ export default function ImageToImagePage({
           <div className="i2i-slider-grid">
             <RangeField label="采样步数" value={config.steps} min={1} max={60} step={1} disabled={editingLocked} onChange={(value) => update({ steps: value })} />
             <RangeField label="CFG 引导" value={config.cfg} min={1} max={15} step={0.5} disabled={editingLocked} onChange={(value) => update({ cfg: value })} format={(value) => value.toFixed(1)} />
+            {clipSkipLimits && <RangeField label="CLIP skip" hint={engine.name === "iL" ? "SDXL/iL 两塔最小有效值为 2" : "默认 1 即最终层"} value={normalizeClipSkip(engine.name, config.clipSkip)} min={clipSkipLimits.minimum} max={clipSkipLimits.maximum} step={1} disabled={editingLocked} onChange={(value) => update({ clipSkip: normalizeClipSkip(engine.name, value) })} format={(value) => `${value}`} />}
           </div>
+          {!postprocessOnly && <label className={`i2i-fix-steps ${nativeFixSteps ? "disabled" : ""}`}>
+            <input type="checkbox" checked={config.fixSteps} disabled={editingLocked || nativeFixSteps} onChange={(event) => update({ fixSteps: event.target.checked })} />
+            <span>按滑条步数精确执行（关闭时，重绘强度越低实际执行越少）</span>
+            {nativeFixSteps && <small>原生引擎本就按采样步数精确执行，无需开启。</small>}
+          </label>}
           <p className="i2i-note">{postprocessOnly
             ? <>后处理不执行基础采样：这里的步数与 CFG 只在 ADetailer 未单独设置时被继承，Hires 使用自己的步数与 CFG。</>
-            : <>实际执行步数约为采样步数 × 重绘强度，当前约 <b>{Math.max(1, Math.floor(config.steps * config.denoise))}</b> 步。</>}</p>
+            : nativeFixSteps
+              ? <>原生引擎本就精确执行 <b>{config.steps}</b> 步，开关无需启用。</>
+              : fixStepsPlan.active && fixStepsPlan.scheduleSteps !== null
+                ? <>实际执行 <b>{fixStepsPlan.executedSteps}</b> 步（调度 <b>{fixStepsPlan.scheduleSteps}</b> 步）。</>
+                : fixStepsPlan.active
+                  ? <>{fixStepsPlan.issue}</>
+                  : <>实际执行步数约为采样步数 × 重绘强度，当前约 <b>{Math.max(1, Math.floor(config.steps * config.denoise))}</b> 步。</>}</p>
           <div className="i2i-select-row">
             <label>采样器<WorkspaceSelect ariaLabel="采样器" value={config.sampler} disabled={editingLocked} onChange={(value) => update({ sampler: value })} options={engine.samplers.map((name) => ({ value: name, label: name }))} /></label>
             <label>调度器<WorkspaceSelect ariaLabel="调度器" value={config.scheduler} disabled={editingLocked} onChange={(value) => update({ scheduler: value })} options={engine.schedulers.map((name) => ({ value: name, label: name }))} /></label>
@@ -749,9 +789,9 @@ export default function ImageToImagePage({
           </> : <>
             <div className="i2i-mode-row" role="group" aria-label="输出尺寸模式">{SIZE_MODES.map((mode) => <button key={mode.id} type="button" className={config.sizeMode === mode.id ? "active" : ""} title={mode.detail} disabled={editingLocked} onClick={() => update({ sizeMode: mode.id, ...(mode.id === "custom" ? { width: canvas.width, height: canvas.height } : {}) })}>{mode.label}</button>)}</div>
             {config.sizeMode === "scale" && <RangeField label="缩放倍数" value={config.scale} min={0.25} max={4} step={0.05} disabled={editingLocked} onChange={(value) => update({ scale: value })} format={(value) => `${value.toFixed(2)}×`} />}
-            {config.sizeMode === "custom" && <div className="i2i-canvas-picker"><div className="i2i-canvas-picker-head"><span>拖拽右下角调整画布</span><b>{canvas.width} × {canvas.height}</b></div><SizeGrid width={config.width} height={config.height} min={64} max={2048} step={64} disabled={editingLocked} onChange={(width, height) => update({ width, height })} /></div>}
+            {config.sizeMode === "custom" && <div className="i2i-canvas-picker"><div className="i2i-canvas-picker-head"><span>拖拽右下角调整画布</span><b>{canvas.width} × {canvas.height}</b></div><SizeGrid width={config.width} height={config.height} min={64} max={canvasPickerMax} step={64} disabled={editingLocked} onChange={(width, height) => update({ width, height })} /></div>}
             <p className="i2i-canvas-readout"><span>{source ? `${source.width} × ${source.height}` : "未选择图片"}</span><i>→</i><b>{canvas.width} × {canvas.height}</b></p>
-            <p className="i2i-note">输出尺寸对齐到 64 的倍数，最长边不超过 2048。</p>
+            <p className="i2i-note">输出尺寸对齐到 64 的倍数，最长边不超过 {canvasPickerMax}（画布上限在“设置 → 常规设置”中调整）。</p>
             <div className="i2i-mode-row" role="group" aria-label="缩放方式">{RESIZE_MODES.map((mode) => <button key={mode.id} type="button" className={config.resizeMode === mode.id ? "active" : ""} title={mode.detail} disabled={editingLocked} onClick={() => update({ resizeMode: mode.id })}>{mode.label}</button>)}</div>
             <p className="i2i-note">{resizeModeMatters(source, canvas) ? RESIZE_MODES.find((mode) => mode.id === config.resizeMode)?.detail : "画布与原图比例一致，缩放方式暂时没有区别。"}</p>
           </>}

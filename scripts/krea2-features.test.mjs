@@ -110,7 +110,7 @@ test("Krea2 refinement steps are counted like the other native engines", () => {
   assert.deepEqual(NATIVE_STEP_ENGINES, ["Anima", "Flux", "Flux2", "Krea2"]);
   const unit = { useSteps: true, steps: 20, denoise: 0.2, detector: "face_yolov8n.pt" };
   assert.equal(adetailerUnitSteps(unit, 30, "Krea2"), 20);
-  assert.equal(adetailerUnitSteps(unit, 30, "SD"), 4);
+  assert.equal(adetailerUnitSteps(unit, 30, "SD"), 20);
   assert.equal(unitSteps({ steps: 12, denoise: 0.05 }, "Krea2"), 12);
 });
 

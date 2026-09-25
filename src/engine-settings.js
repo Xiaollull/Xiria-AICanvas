@@ -16,19 +16,33 @@
 // here, and `mode` stays shared because it names which job the page is set up to run, not a
 // parameter of the engine.
 //
-// What is deliberately NOT in here: the prompt and its negative, the preset library, the LoRA
-// library (which has its own per-engine store in `lora-model-scope.js`), the search and category
-// filters, and the panel open/closed states. Prompts are content rather than parameters -- trying
-// the same prompt across engines is the normal reason to switch -- and the rest describe the
-// window, not the run.
+// Schema 3 moved the text-to-image prompt and its negative in as well, with the preset switches
+// that compose onto them and the SD/iL CLIP skip. A prompt written for Flux's language model is
+// not a prompt for an SD CLIP tower, and switching engines used to carry one into the other. The
+// shared prompt a schema-2 workspace held is copied into all six engines once, on upgrade; after
+// that each engine edits its own. The image page's prompts were already per engine.
+//
+// What is deliberately NOT in here: the preset *library* (one shared library of preset texts), the
+// LoRA library (which has its own per-engine store in `lora-model-scope.js`), the search and
+// category filters, and the panel open/closed states — they describe the window, not the run.
 
 import { normalizeADetailerStage } from "./adetailer-units.js";
+import { clipSkipRange, normalizeClipSkip } from "./clip-skip.js";
 import { IMAGE_TO_IMAGE_DEFAULTS, normalizeImageToImageSettings } from "./image-to-image.js";
 import { normalizeUint64Seed } from "./hires-settings.js";
 import { migrateResampleChain } from "./resample-chain.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
 
-export const ENGINE_SETTINGS_SCHEMA_VERSION = 2;
+export { clipSkipRange, normalizeClipSkip };
+export const ENGINE_SETTINGS_SCHEMA_VERSION = 3;
+export const DEFAULT_POSITIVE_PROMPT = "a quiet observatory above the clouds, lone astronomer, warm light, cinematic composition";
+export const DEFAULT_NEGATIVE_PROMPT = "low quality, blurry, malformed hands, oversaturated, watermark";
+
+function normalizeActivePresetIds(value) {
+  const source = isPlainObject(value) ? value : {};
+  const ids = (list) => (Array.isArray(list) ? [...new Set(list.filter((id) => typeof id === "string" && id))] : []);
+  return { positive: ids(source.positive), negative: ids(source.negative) };
+}
 export const SETTINGS_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"];
 // Engines that mount separate component files instead of one checkpoint.
 const SPLIT_ENGINES = new Set(["Anima", "Flux", "Flux2", "Krea2"]);
@@ -72,8 +86,9 @@ function engineDefaultScheduler(engine) { return isSplitEngine(engine) ? "simple
  * names, so what differs is which pair a fresh record starts on and how a saved one is normalized.
  */
 export function imageToImageDefaultsFor(engine, overrides = null) {
-  return normalizeImageToImageSettings(
-    { ...IMAGE_TO_IMAGE_DEFAULTS, ...(isPlainObject(overrides) ? overrides : {}) },
+  const source = isPlainObject(overrides) ? overrides : {};
+  const settings = normalizeImageToImageSettings(
+    { ...IMAGE_TO_IMAGE_DEFAULTS, ...source },
     {
       samplers: SAMPLER_NAMES,
       schedulers: SCHEDULER_NAMES,
@@ -81,11 +96,17 @@ export function imageToImageDefaultsFor(engine, overrides = null) {
       defaultScheduler: engineDefaultScheduler(engine),
     },
   );
+  // The image page's CLIP skip is its own, like the rest of its sampling block.
+  return { ...settings, clipSkip: normalizeClipSkip(engine, source.clipSkip) };
 }
 
 export function engineSettingsDefaults(engine) {
   const split = isSplitEngine(engine);
   return {
+    positive: DEFAULT_POSITIVE_PROMPT,
+    negative: DEFAULT_NEGATIVE_PROMPT,
+    activePromptPresets: { positive: [], negative: [] },
+    clipSkip: normalizeClipSkip(engine, null),
     checkpoint: "",
     diffusionModel: "",
     textEncoder: "",
@@ -136,9 +157,13 @@ function normalizeSeedText(value, fallback) {
   return digits ? normalizeUint64Seed(digits, fallback) : fallback;
 }
 
+// The hard sampling ceiling. What the user may pick is the configurable canvas bound, checked by the
+// page against the canvas it has; a stored canvas is never cut down to a lower bound silently.
+export const MAX_CANVAS_EDGE = 8192;
+
 function normalizeSize(value, fallback) {
   const source = isPlainObject(value) ? value : {};
-  const dimension = (input, previous) => Math.round(inRange(input, previous, 0, 2048) / 64) * 64;
+  const dimension = (input, previous) => Math.round(inRange(input, previous, 0, MAX_CANVAS_EDGE) / 64) * 64;
   return { width: dimension(source.width, fallback.width), height: dimension(source.height, fallback.height) };
 }
 
@@ -148,6 +173,12 @@ export function normalizeEngineSettings(engine, value, fallback = null) {
   const source = isPlainObject(value) ? value : {};
   const split = isSplitEngine(engine);
   return {
+    // An empty prompt is a real value — someone cleared the box — so only a missing or non-text
+    // one falls back.
+    positive: typeof source.positive === "string" ? source.positive : defaults.positive,
+    negative: typeof source.negative === "string" ? source.negative : defaults.negative,
+    activePromptPresets: normalizeActivePresetIds(isPlainObject(source.activePromptPresets) ? source.activePromptPresets : defaults.activePromptPresets),
+    clipSkip: normalizeClipSkip(engine, source.clipSkip ?? defaults.clipSkip),
     // A checkpoint means nothing to a split engine and component files mean nothing to a
     // single-file one, so each engine stores only the pickers it actually has. Keeping both would
     // let a stale value from the other kind reappear as a phantom selection.
@@ -203,7 +234,7 @@ export function emptyEngineSettingsMap() {
  * other engine would open on defaults. Each copy is coerced to what that engine accepts, so an SD
  * sampler landing in Flux's record becomes Flux's default rather than an invalid request.
  */
-export function normalizeEngineSettingsMap(value, { fieldMissing = false, legacy = null, legacyImageToImage = null } = {}) {
+export function normalizeEngineSettingsMap(value, { fieldMissing = false, legacy = null, legacyImageToImage = null, legacyPrompts = null } = {}) {
   const container = emptyEngineSettingsMap();
   let rejected = 0;
 
@@ -228,18 +259,31 @@ export function normalizeEngineSettingsMap(value, { fieldMissing = false, legacy
   // so that set seeds every engine -- folded the same way the original single-set workspace was --
   // and each engine normalizes it against its own vocabulary.
   const foldImageBlock = Number(value.schemaVersion) < 2 && isPlainObject(legacyImageToImage);
+  // A map written before schema 3 kept the text-to-image prompt beside it, shared by every engine.
+  // That one prompt (and the preset switches composed onto it) is copied into each engine exactly
+  // once; the schema number written back is what stops a second copy on the next read.
+  const foldPrompts = Number(value.schemaVersion) < 3 && isPlainObject(legacyPrompts);
+  const promptFields = foldPrompts ? {
+    ...(typeof legacyPrompts.positive === "string" ? { positive: legacyPrompts.positive } : {}),
+    ...(typeof legacyPrompts.negative === "string" ? { negative: legacyPrompts.negative } : {}),
+    ...(isPlainObject(legacyPrompts.activePromptPresets) ? { activePromptPresets: legacyPrompts.activePromptPresets } : {}),
+  } : {};
   for (const engine of SETTINGS_ENGINES) {
     const record = saved[engine];
     if (record !== undefined && !isPlainObject(record)) rejected += 1;
     // A missing engine is an empty scope rather than a corrupt file: a map written before an engine
     // shipped cannot carry its record, and treating that as corruption would strand the rest.
     const base = isPlainObject(record) ? record : null;
-    container.byEngine[engine] = normalizeEngineSettings(engine, foldImageBlock ? { ...base, imageToImage: legacyImageToImage } : base);
+    container.byEngine[engine] = normalizeEngineSettings(engine, {
+      ...base,
+      ...(foldImageBlock ? { imageToImage: legacyImageToImage } : {}),
+      ...promptFields,
+    });
   }
   return {
     container,
     rejected,
-    migrated: foldImageBlock,
+    migrated: foldImageBlock || foldPrompts,
     warning: rejected ? `已重置 ${rejected} 个无效的引擎参数记录。` : "",
   };
 }

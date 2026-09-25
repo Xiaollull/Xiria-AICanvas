@@ -351,7 +351,7 @@ class UpscalerTests(unittest.TestCase):
         with patch.dict(inference_server.performance_settings, {"staged_vae_decode": True}), \
                 patch.object(inference_server, "upscale_image", return_value=(image, diagnostics)), \
                 patch.object(inference_server.AutoPipelineForImage2Image, "from_pipe", return_value=ImagePipeline()), \
-                patch.object(inference_server, "prepare_prompt_conditioning", return_value={}), \
+                patch.object(inference_server, "prepare_dynamic_prompt_conditioning", return_value={}), \
                 patch.object(inference_server, "decode_staged_latents", return_value=[image]) as decode:
             result, result_diagnostics = inference_server.apply_resample_unit(
                 image, object(), "sd", request, request.resample_units[0], "missing-job", Control(), 0,
@@ -403,7 +403,7 @@ class UpscalerTests(unittest.TestCase):
                 with patch.dict(inference_server.performance_settings, {"staged_vae_decode": True}), \
                         patch.object(inference_server, "upscale_image", return_value=(image, {"model": "model.pth"})), \
                         patch.object(inference_server.AutoPipelineForImage2Image, "from_pipe", return_value=ImagePipeline()), \
-                        patch.object(inference_server, "prepare_prompt_conditioning", return_value={}), \
+                        patch.object(inference_server, "prepare_dynamic_prompt_conditioning", return_value={}), \
                         patch.object(inference_server, "decode_staged_latents", return_value=[image]):
                     _, diagnostics = inference_server.apply_resample_unit(
                         image, object(), "sd", request, request.resample_units[0], "missing-job", Control(), 0,
@@ -525,7 +525,7 @@ class UpscalerTests(unittest.TestCase):
                 ),
                 patch.object(
                     inference_server,
-                    "prepare_prompt_conditioning",
+                    "prepare_dynamic_prompt_conditioning",
                     side_effect=AssertionError("CLIP conditioning used"),
                 ),
                 patch.object(

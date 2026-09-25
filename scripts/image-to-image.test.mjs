@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { HARD_CANVAS_MAX_EDGE } from "../src/canvas-limit.js";
 import {
   IMAGE_TO_IMAGE_DEFAULTS,
   IMAGE_TO_IMAGE_MODES,
@@ -77,7 +78,12 @@ test("every canvas edge is a multiple of 64 inside the server's own bounds", () 
   assert.equal(snapEdge(1), 64);
   assert.equal(snapEdge(0), 64);
   assert.equal(snapEdge(-800), 64);
-  assert.equal(snapEdge(99999), 2048);
+  // A stored edge is held to the server's hard ceiling only; the page passes the workspace's
+  // canvas bound (2048 by default) wherever it sizes a canvas.
+  assert.equal(HARD_CANVAS_MAX_EDGE, 8192);
+  assert.equal(snapEdge(99999), 8192);
+  assert.equal(snapEdge(99999, MAXIMUM_EDGE), 2048);
+  assert.equal(snapEdge(99999, 4096), 4096);
   assert.equal(snapEdge(1080), 1088);
   assert.equal(snapEdge("1920"), 1920);
 });

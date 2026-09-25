@@ -11,7 +11,10 @@ import {
   supportsUsduTiled,
 } from "../src/hires-settings.js";
 import {
+  normalizeResampleChain,
   normalizeResampleUnit,
+  resampleChainIssue,
+  resampleChainPayload,
   resampleUnitEffectiveSteps,
 } from "../src/resample-chain.js";
 
@@ -152,8 +155,14 @@ test("workspace and Gallery resample seeds freeze per job while the next queued 
   assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?postprocessChain,/);
   assert.match(generate, /postprocess_chain: resampleChainPayload\(postprocessChain, \{ engine: model \}\)/);
   assert.doesNotMatch(generate, /seed: Number\(|parseInt\(/);
-  // A fixed seed with nothing typed in it never reaches the service as an invalid number.
-  assert.match(chain, /const fixed = seedMode === "fixed" && normalizeUint64Seed\(seed\) !== null;/);
+  // A fixed seed with nothing typed in it never reaches the service as an invalid number. A
+  // disabled unit keeps what the user stored, because it is skipped and only described.
+  assert.match(chain, /const normalizedSeed = normalizeUint64Seed\(seed\);\s*const fixed = seedMode === "fixed" && normalizedSeed !== null;/);
+  const [emptyFixed] = resampleChainPayload([normalizeResampleUnit({ enabled: true, seedMode: "fixed", seed: "" })], { engine: "SD" });
+  assert.equal(emptyFixed.seed_mode, "inherit");
+  assert.equal("seed" in emptyFixed, false);
+  const [typedFixed] = resampleChainPayload([normalizeResampleUnit({ enabled: true, seedMode: "fixed", seed: "18446744073709551615" })], { engine: "SD" });
+  assert.deepEqual([typedFixed.seed_mode, typedFixed.seed], ["fixed", "18446744073709551615"]);
 
   // A running task owns its frozen payload; only a model-switch transaction locks the next draft.
   assert.match(app, /const hiresControlsLocked = modelSwitching;/);
@@ -171,17 +180,23 @@ test("workspace and Gallery resample seeds freeze per job while the next queued 
 test("a unit's redraw is counted the way the family actually runs it", () => {
   const native = ["Anima", "Flux", "Flux2", "Krea2"];
   const unit = (overrides) => normalizeResampleUnit({ enabled: true, ...overrides });
-  // Diffusers image-to-image runs int(steps x denoise) updates.
-  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 20, denoise: 0.35 }), 28, "SD", native), 7);
-  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 10, denoise: 0.05 }), 28, "iL", native), 0);
+  // Diffusers image-to-image truncates its schedule to int(total x denoise), so SD/iL are handed
+  // the smallest total whose truncation is the configured count: the configured steps execute.
+  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 20, denoise: 0.35 }), 28, "SD", native), 20);
+  assert.equal(resampleUnitEffectiveSteps(unit({ steps: 10, denoise: 0.05 }), 28, "iL", native), 10);
   // Native engines follow Comfy -- a longer schedule with the last `steps + 1` sigmas kept -- so
   // they run every requested step whatever the denoise.
   assert.equal(resampleUnitEffectiveSteps(unit({ steps: 10, denoise: 0.05 }), 28, "Anima", native), 10);
   // A unit that leaves its steps to inherit is counted against the request's own.
-  assert.equal(resampleUnitEffectiveSteps(unit({ denoise: 0.5 }), 28, "SD", native), 14);
+  assert.equal(resampleUnitEffectiveSteps(unit({ denoise: 0.5 }), 28, "SD", native), 28);
   assert.equal(resampleUnitEffectiveSteps(unit({ denoise: 0.5 }), 28, "Anima", native), 28);
   // A unit that does not redraw spends no steps at all.
   assert.equal(resampleUnitEffectiveSteps(unit({ scale: 2, denoise: 0 }), 28, "SD", native), 0);
+  // The expansion has a ceiling: a schedule past 1000 steps is refused on SD/iL before the job,
+  // and never on a native engine, which does not expand.
+  const faint = normalizeResampleChain([unit({ steps: 60, denoise: 0.05 })]);
+  assert.match(resampleChainIssue(faint, { baseSteps: 28, engine: "SD", nativeEngines: native }), /重绘强度过低：调度总步数不能超过 1000/);
+  assert.equal(resampleChainIssue(faint, { baseSteps: 28, engine: "Anima", nativeEngines: native }), "");
 });
 test("tiled Hires is offered by engine capability, not by naming one engine", () => {
   // Both engines prepare their conditioning and sigma schedule once and hand the same pair to

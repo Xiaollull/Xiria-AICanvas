@@ -420,6 +420,10 @@ class ResidencyController:
         free_bytes = self.observe()
         wanted = self.select(inference_bytes, free_bytes=free_bytes)
         if wanted == self.tier:
+            if self.parked:
+                self.reinstall(wanted)
+                self.cap_allocator()
+                return self.tier
             self._record(stage, self.tier, self.tier, free_bytes, "stage_plan_unchanged",
                          inference_bytes=inference_bytes, canvas=canvas)
             self.cap_allocator()

@@ -17,7 +17,8 @@ const PROMPT_FIELD_ANCHORS = [
   ["src/App.jsx", "ref={negativePromptRef}"],
   ["src/App.jsx", 'updateADetailerUnit(unit.id, { prompt: event.target.value })'],
   ["src/App.jsx", 'updateADetailerUnit(unit.id, { negativePrompt: event.target.value })'],
-  ["src/App.jsx", 'update("content", event.target.value)'],
+  // The preset card editor lives in the floating preset window.
+  ["src/PromptPresetWindow.jsx", 'update("content", event.target.value)'],
   ["src/ImageToImagePage.jsx", 'update({ positive: event.target.value })'],
   ["src/ImageToImagePage.jsx", 'update({ negative: event.target.value })'],
   ["src/ImageToImagePage.jsx", 'updateUnit(unit.id, { prompt: event.target.value })'],

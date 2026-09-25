@@ -196,8 +196,13 @@ test("matching consults the project directories before the shared ones", () => {
   assert.ok(body.match(/catch \{/g).length >= 3);
 
   const resolve = functionBody(viteConfig, "async function resolveImageInfoModels(");
-  assert.match(resolve, /checkpointMatch: info\.checkpoint \? matchModelName/);
-  assert.match(resolve, /loras: \(info\.loras \|\| \[\]\)\.map/);
+  // The checkpoint is matched within the producing engine, and a name the catalogue holds twice is
+  // settled by a recorded hash before anything is shown.
+  assert.match(resolve, /let checkpointMatch = info\.checkpoint \? matchModelName\(info\.checkpoint, catalogs\.checkpoints, \{ engine: info\.engine \|\| "" \}\) : null;/);
+  assert.match(resolve, /checkpointMatch = await settleByHash\(checkpointMatch, info\.checkpointHash\);/);
+  // Each LoRA: the exact recorded ID first, then its name, then hash, then the folder rule.
+  assert.match(resolve, /const first = \(info\.loras \|\| \[\]\)\.map\(\(item\) => \{/);
+  assert.match(resolve, /settleByFolder\(await settleByHash\(match, item\.hash, affinity\), affinity\)/);
 });
 
 test("a typed directory is read-only, bounded, and cannot be escaped", () => {

@@ -170,9 +170,13 @@ test("image controls use a fixed left rail with no resize or collapse interactio
   assert.doesNotMatch(layout, /IMAGE_WORKSPACE_LAYOUT|ImageControlsPanel|imageWorkspaceLayout/);
 });
 
-test("i2i custom dimensions use the shared 64..2048 grid and latest-wins source token", async () => {
+test("i2i custom dimensions use the shared 64-step grid up to the workspace canvas bound and latest-wins source token", async () => {
   const page = await read("src/ImageToImagePage.jsx");
-  assert.match(page, /<SizeGrid[\s\S]*?min=\{64\}[\s\S]*?max=\{2048\}[\s\S]*?step=\{64\}/);
+  // The ceiling is the configurable canvas bound (default 2048) held to the engine's own edge, and
+  // the output size is computed against the same number the picker offers.
+  assert.match(page, /const canvasPickerMax = effectiveCanvasMaxEdge\(canvasMaxEdge, engine\.name\);/);
+  assert.match(page, /const canvas = outputSize\(source, config, \{ maxEdge: canvasPickerMax \}\);/);
+  assert.match(page, /<SizeGrid[\s\S]*?min=\{64\}[\s\S]*?max=\{canvasPickerMax\}[\s\S]*?step=\{64\}/);
   assert.match(page, /sourceTokenRef/);
   assert.match(page, /const editingLocked = modelPicker\.switching;/);
   assert.match(page, /if \(editingLocked\) return/);
@@ -236,11 +240,14 @@ test("image prompts reuse the text-to-image cards and keep transparency below th
   assert.match(page, /\{positivePromptPresets\}/);
   assert.match(page, /\{negativePromptPresets\}/);
   assert.match(app, /<TransparentBackgroundControl[\s\S]*?onToggle=\{toggleTextToImageTransparentBackground\}/);
-  assert.match(app, /positivePromptPresets=\{<PresetBox title="预设正向 Prompt" type="positive"/);
-  assert.match(app, /negativePromptPresets=\{<PresetBox title="预设负向 Prompt" type="negative"/);
+  // Both pages show the same preset strips over the one library, opening the same floating window.
+  assert.match(app, /positivePromptPresets=\{<PromptPresetStrip type="positive" container=\{promptPresets\} activeIds=\{activePromptPresets\.positive\}/);
+  assert.match(app, /negativePromptPresets=\{<PromptPresetStrip type="negative" container=\{promptPresets\} activeIds=\{activePromptPresets\.negative\}/);
+  assert.equal(app.match(/<PromptPresetStrip type="positive"/g)?.length, 2);
   assert.match(control, /className=\{`transparent-tag-control/);
   assert.match(css, /\.i2i-prompt-column \{[^}]*display: grid/);
-  assert.match(css, /\.i2i-prompt-column > \.preset-box \{ min-width: 0; \}/);
+  // The strip may shrink inside the prompt column's grid track.
+  assert.match(css, /\.preset-strip \{ min-width: 0;/);
   assert.match(css, /\.i2i-prompt-deck > \.i2i-transparent-control \{ grid-column: 1 \/ -1; margin: 0; \}/);
   assert.match(css, /\.transparent-tag-control \{[^}]*position: relative;[^}]*z-index: 1;/,
     "the ordinary control stays below the sticky image-to-image run bar while scrolling");

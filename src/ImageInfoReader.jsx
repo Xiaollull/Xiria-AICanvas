@@ -69,7 +69,7 @@ async function readJsonResponse(response, operation) {
   return payload;
 }
 
-export default function ImageInfoReader({ onApplyParameters, savedState = null, onStateChange = null }) {
+export default function ImageInfoReader({ onApplyParameters, applyContext = null, savedState = null, onStateChange = null }) {
   // Seeded from the saved snapshot rather than restored into afterwards, so the first paint is
   // already the restored view and there is no empty flash to reconcile against.
   const restored = savedState || emptyImageInfoState();
@@ -305,6 +305,12 @@ export default function ImageInfoReader({ onApplyParameters, savedState = null, 
     info?.checkpointMatch?.status === "missing" ? 1 : 0,
     (info?.loras || []).filter((item) => item.match?.status === "missing").length,
   ].reduce((total, value) => total + value, 0);
+  // Same-named files are a different problem from absent ones: the model may well be here, but
+  // which file it is cannot be told, so it is reported and never mounted as a guess.
+  const ambiguousCount = [
+    info?.checkpointMatch?.status === "ambiguous" ? 1 : 0,
+    (info?.loras || []).filter((item) => item.match?.status === "ambiguous").length,
+  ].reduce((total, value) => total + value, 0);
 
   return <><section className="image-info-tool">
     <header className="image-info-head">
@@ -396,11 +402,15 @@ export default function ImageInfoReader({ onApplyParameters, savedState = null, 
                 {info.checkpointHash && <div><span>模型哈希</span><code>{info.checkpointHash.slice(0, 16)}</code></div>}
               </div>
 
-              {applyOpen && onApplyParameters && <ImageInfoApply info={info} onApply={onApplyParameters} onRefresh={() => resolveMatches(info)} onClose={() => setApplyOpen(false)} />}
+              {applyOpen && onApplyParameters && <ImageInfoApply info={info} context={applyContext} onApply={onApplyParameters} onRefresh={() => resolveMatches(info)} onClose={() => setApplyOpen(false)} />}
 
               {missingCount > 0 && <p className="info-missing-warning">
                 <AlertTriangle size={13} />
                 有 {missingCount} 个模型在本地模型目录和共享目录中都找不到，按此信息复现会失败。
+              </p>}
+              {ambiguousCount > 0 && <p className="info-missing-warning ambiguous">
+                <AlertTriangle size={13} />
+                有 {ambiguousCount} 个模型在本地有多个同名文件且无法用记录的哈希区分，应用时不会自动挂载。
               </p>}
 
               {info.animaAssets && <div className="info-section">
@@ -423,7 +433,7 @@ export default function ImageInfoReader({ onApplyParameters, savedState = null, 
                 <h3>LoRA<b>{info.loras?.length || 0}</b></h3>
                 {info.loras?.length ? <div className="info-lora-list">
                   {info.loras.map((item, position) => <div key={`${item.name}-${position}`}>
-                    <ModelName match={item.match} fallback={item.name} />
+                    <ModelName match={item.match} fallback={item.name} lora />
                     <b>{item.weight === null || item.weight === undefined || Number.isNaN(item.weight) ? "权重未记录" : item.weight}</b>
                   </div>)}
                 </div> : <p className="info-section-empty">未使用 LoRA</p>}

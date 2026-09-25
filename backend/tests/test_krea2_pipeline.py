@@ -841,6 +841,25 @@ class LoraConversionTests(unittest.TestCase):
         # alpha 1 over rank 2 halves the down matrix.
         self.assertTrue(torch.allclose(converted["blocks.0.mlp.down.lora_A.weight"], torch.full((2, BLOCK_MLP), 0.5)))
 
+    def test_a_musubi_flat_lora_lands_on_comfy_names(self):
+        # Musubi Tuner / kohya-ss write `lora_unet_` + the path flattened with underscores; the
+        # flat spelling has to reach the same targets as the dotted one, alpha and all.
+        lora = {
+            "lora_unet_blocks_0_attn_wq.lora_down.weight": torch.ones(2, FEATURES),
+            "lora_unet_blocks_0_attn_wq.lora_up.weight": torch.ones(FEATURES, 2),
+            "lora_unet_blocks_0_attn_wq.alpha": torch.tensor(1.0),
+            "lora_unet_tmlp_0.lora_down.weight": torch.ones(2, FEATURES),
+            "lora_unet_tmlp_0.lora_up.weight": torch.ones(FEATURES, 2),
+            "lora_unet_tmlp_0.alpha": torch.tensor(2.0),
+        }
+        converted = convert_krea2_lora_state_dict(lora, self._config(), "Krea2 LoRA test")
+        self.assertIn("blocks.0.attn.wq.lora_B.weight", converted)
+        self.assertIn("tmlp.0.lora_B.weight", converted)
+        # alpha 1 over rank 2 halves the down matrix; alpha 2 over rank 2 leaves it unchanged.
+        self.assertTrue(torch.allclose(converted["blocks.0.attn.wq.lora_A.weight"], torch.full((2, FEATURES), 0.5)))
+        self.assertTrue(torch.allclose(converted["tmlp.0.lora_A.weight"], torch.ones(2, FEATURES)))
+        self.assertFalse(any(key.endswith(".alpha") for key in converted))
+
     def test_a_lora_already_in_comfy_naming_maps_to_itself(self):
         lora = {
             "diffusion_model.blocks.1.attn.wv.lora_A.weight": torch.randn(4, FEATURES),

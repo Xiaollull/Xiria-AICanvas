@@ -23,10 +23,11 @@ test("the shared category renders the folder tree instead of a flat list", () =>
 });
 
 test("shared LoRAs use the same card as local ones so they mount identically", () => {
-  // One definition, two call sites: a shared card that diverged would silently
-  // lose mounting, preview, lookup or the details dialog.
+  // One definition, three call sites — the shared tree, the folder browser and a search's flat
+  // results: a card that diverged would silently lose mounting, preview, lookup or the details dialog.
   assert.equal(loraPage.match(/const renderLibraryCard = /g)?.length, 1);
-  assert.equal(loraPage.match(/renderLibraryCard\(item, /g)?.length, 2);
+  assert.equal(loraPage.match(/renderLibraryCard\(item, /g)?.length, 3);
+  assert.match(loraPage, /renderCard=\{\(item, fileLabel\) => renderLibraryCard\(item, /);
   assert.match(loraPage, /lora-library-card lora-page-library-card/);
 
   // Search filters both views through the same predicate.

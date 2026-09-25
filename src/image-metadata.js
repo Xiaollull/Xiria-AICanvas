@@ -86,6 +86,19 @@ function pushParameter(list, label, value) {
   list.push({ label, value: String(value) });
 }
 
+// `Lora hashes: "name: 0123456789ab, other: ..."` — the short hash each LoRA
+// was mounted with, keyed by the name the prompt tag used. Names can contain
+// spaces, brackets and even commas, so each entry is read from its end: the
+// hash is the trailing hex run after the last colon.
+export function parseLoraHashes(value) {
+  const hashes = new Map();
+  for (const entry of textOf(value).split(/,\s*(?=[^,]*:\s*[0-9a-fA-F]{8,64}\s*(?:,|$))/)) {
+    const match = /^(.*):\s*([0-9a-fA-F]{8,64})\s*$/.exec(entry.trim());
+    if (match && match[1].trim()) hashes.set(match[1].trim().toLowerCase(), match[2].toLowerCase());
+  }
+  return hashes;
+}
+
 // `<lora:name:0.8>` in a prompt is the only place A1111 records a LoRA weight;
 // `Lora hashes` carries names but never strengths.
 export function extractPromptLoras(prompt) {
@@ -168,11 +181,18 @@ export function parseA1111(text) {
   }
 
   const loras = extractPromptLoras(positive);
-  if (!loras.length && settings.has("Lora hashes")) {
-    for (const entry of settings.get("Lora hashes").split(",")) {
-      const name = entry.split(":")[0]?.trim();
+  const loraHashes = parseLoraHashes(settings.get("Lora hashes"));
+  if (!loras.length && loraHashes.size) {
+    for (const entry of settings.get("Lora hashes").split(/,\s*(?=[^,]*:\s*[0-9a-fA-F]{8,64}\s*(?:,|$))/)) {
+      const name = entry.replace(/:\s*[0-9a-fA-F]{8,64}\s*$/, "").trim();
       if (name) loras.push({ name, weight: null });
     }
+  }
+  // The recorded short hash is what lets a name shared by several local files be
+  // told apart later; it is attached to the entry it names and nothing else.
+  for (const item of loras) {
+    const hash = loraHashes.get(item.name.toLowerCase());
+    if (hash) item.hash = hash;
   }
   if (!loras.length && settings.has("Civitai resources")) {
     // Civitai's publish block lists every resource the image used, base model
@@ -495,6 +515,15 @@ export function parseComfyUi(graph) {
 
 // This project's own outputs. The key set is written by `inference_server.py`
 // alongside the image; see `08-DATA-PERSISTENCE.md`.
+// The relative ID an inline-LoRA audit recorded for a mounted file name, when exactly one entry has
+// that file name. Shared references (`shared:<root>/…`) are IDs too.
+function auditedLoraId(audit, name) {
+  const wanted = textOf(name).split(/[\\/]/).pop().toLowerCase();
+  if (!wanted || !Array.isArray(audit)) return "";
+  const ids = [...new Set(audit.map((entry) => textOf(entry?.id)).filter((id) => id && id.split(/[\\/]/).pop().toLowerCase() === wanted))];
+  return ids.length === 1 ? ids[0] : "";
+}
+
 export function parseXiria(parameters, chunks = {}) {
   const list = [];
   pushParameter(list, "Steps", parameters.steps);
@@ -508,11 +537,33 @@ export function parseXiria(parameters, chunks = {}) {
     pushParameter(list, "Requested size", parameters.width && parameters.height ? `${parameters.width}x${parameters.height}` : "");
   }
   pushParameter(list, "Denoise", parameters.denoise);
+  // Protocol 37 records the effective gate, not merely the persisted preference. Re-derive it for
+  // early protocol-37 development PNGs too: those could carry raw true on a native/post-process run
+  // but had no active schedule total. Older PNGs omit the field and remain omitted here.
+  if (parameters.img2img_fix_steps !== undefined) {
+    const scheduleSteps = Number(parameters.img2img_schedule_steps);
+    const effectiveFixSteps = parameters.img2img_fix_steps === true
+      && (parameters.engine === "SD" || parameters.engine === "iL")
+      && Boolean(parameters.source_image)
+      && parameters.postprocess_only !== true
+      && Number.isFinite(scheduleSteps)
+      && scheduleSteps > 0;
+    pushParameter(list, "Img2img fix steps", effectiveFixSteps);
+    if (effectiveFixSteps) pushParameter(list, "Img2img schedule steps", scheduleSteps);
+  }
   pushParameter(list, "Guidance", parameters.guidance?.mode || parameters.guidance?.label);
+  // Protocol 39 records the effective layer SD/iL read. An older record has none, which means
+  // the family default ran (SD 1, iL 2) — it is left unstated rather than invented here.
+  if (Number.isInteger(parameters.clip_skip)) pushParameter(list, "Clip skip", parameters.clip_skip);
   pushParameter(list, "Elapsed", parameters.elapsed_seconds ? `${parameters.elapsed_seconds}s` : "");
   pushParameter(list, "Job", parameters.job_id);
 
   const anima = parameters.engine === "Anima";
+  const resampleLabel = (unit) => {
+    if (unit?.latent_algorithm) return `潜空间 · ${unit.latent_algorithm}`;
+    if (unit?.resize_algorithm) return unit.resize_algorithm;
+    return "算法缩放";
+  };
   const flags = [
     // A file written since the chain carries `resample`, one written before carries a single
     // `hires` block. Both are read: an old picture still reports the pass it ran.
@@ -521,7 +572,7 @@ export function parseXiria(parameters, chunks = {}) {
       label: "重采样",
       enabled: Array.isArray(parameters.resample) ? parameters.resample.length > 0 : Boolean(parameters.hires),
       detail: Array.isArray(parameters.resample) && parameters.resample.length
-        ? parameters.resample.map((unit) => [`${unit.scale ?? 1}x`, unit.upscaler || "算法缩放"].join(" ")).join(" → ")
+        ? parameters.resample.map((unit) => [`${unit.scale ?? 1}x`, unit.upscaler || resampleLabel(unit)].join(" ")).join(" → ")
         : parameters.hires?.upscaler || parameters.hires?.model || parameters.hires?.mode || "",
     },
     { id: "adetailer", label: "ADetailer", enabled: Boolean(parameters.adetailer), detail: parameters.adetailer?.detector || "" },
@@ -538,9 +589,29 @@ export function parseXiria(parameters, chunks = {}) {
     positive: textOf(chunks.prompt),
     negative: textOf(chunks.negative_prompt),
     parameters: list,
-    loras: Array.isArray(parameters.loras) ? parameters.loras.map((item) => ({ name: textOf(item.name), weight: Number(item.weight) })) : [],
+    // Since protocol 39 a LoRA also carries the relative ID it was mounted by, which is what
+    // tells two same-named files in different folders apart. An older picture whose prompt had
+    // `<lora:…>` tags still names every LoRA's ID in its `inline_loras` audit (manual mounts
+    // included); that ID is taken when exactly one audit entry has the file's name. The bare name
+    // stays the label.
+    loras: Array.isArray(parameters.loras) ? parameters.loras.map((item) => {
+      const path = textOf(item.path) || auditedLoraId(parameters.inline_loras, item.name);
+      return {
+        name: textOf(item.name),
+        ...(path ? { path } : {}),
+        weight: Number(item.weight),
+      };
+    }) : [],
     flags,
     animaAssets: anima ? { text_encoder: textOf(parameters.text_encoder), vae: textOf(parameters.vae) } : null,
+    // The run's own post-processing record, kept whole so Apply can rebuild the chain from what
+    // ran rather than from the flags above. Old pictures carry `hires`/`adetailer` instead.
+    postprocess: {
+      chain: Array.isArray(parameters.postprocess_chain) ? parameters.postprocess_chain : null,
+      hires: parameters.hires && typeof parameters.hires === "object" ? parameters.hires : null,
+      adetailer: parameters.adetailer && typeof parameters.adetailer === "object" ? parameters.adetailer : null,
+      postprocessOnly: parameters.postprocess_only === true,
+    },
   };
 }
 
@@ -623,30 +694,226 @@ export function interpretImageMetadata(chunks) {
   };
 }
 
-// Model matching, shared by checkpoints and LoRAs. A producer records a bare
-// filename (`animagine.safetensors`) or a path relative to *its* root
-// (`SDXL/animagine.safetensors`), so matching walks from most to least exact
-// and reports which of those it managed.
-export function matchModelName(name, catalog) {
+// The label a resolved model is shown by: its last parent folder and its real
+// filename (`Style_九V6.0\matcha.safetensors`), or the filename alone for a file
+// at the root. Only the label: the relative `value` a job mounts is untouched.
+export function modelDisplayName(relative) {
+  const segments = textOf(relative).split("\\").join("/").split("/").filter(Boolean);
+  if (!segments.length) return "";
+  return segments.length > 1 ? `${segments.at(-2)}\\${segments.at(-1)}` : segments[0];
+}
+
+// How many candidates an ambiguous match lists. The rest are counted, not shown.
+export const MATCH_CANDIDATE_LIMIT = 8;
+const MODEL_EXTENSION = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$/i;
+
+function candidateSummary(entry) {
+  return {
+    value: entry.value,
+    engine: entry.engine || "",
+    origin: entry.origin,
+    label: entry.label,
+    display: entry.display || modelDisplayName(entry.relative || entry.path),
+  };
+}
+
+/**
+ * Which installed file a recorded model name refers to, if exactly one does.
+ *
+ * A producer records a bare filename (`matcha.safetensors`), a prompt-tag stem
+ * (`matcha`), a path relative to *its* root (`Style_九V6.0/matcha.safetensors`)
+ * or — for this project's own pictures — the relative ID it mounted. Matching
+ * walks from most to least exact: the exact relative path, then a unique path
+ * suffix on segment boundaries, then a unique filename, then a unique stem.
+ * The first level with any candidate decides; if it has more than one, the
+ * record's engine may narrow them, and otherwise the answer is `ambiguous` with
+ * the candidates listed. Nothing is ever picked by catalogue order — a first hit
+ * among same-named files was how a LoRA used to be reported as found under the
+ * wrong folder. A recorded hash is checked later, on demand, by the caller that
+ * can read files.
+ */
+export function matchModelName(name, catalog, { engine = "", exactBareNames = true } = {}) {
   const wanted = textOf(name).trim();
   if (!wanted) return { status: "unknown", name: "" };
-  const normalized = wanted.split("\\").join("/").toLowerCase();
+  const normalized = wanted.split("\\").join("/").replace(/^\/+/, "").toLowerCase();
   const base = normalized.split("/").pop();
-  const stem = base.replace(/\.[^.]+$/, "");
+  const stem = base.replace(MODEL_EXTENSION, "");
+  const withoutExtension = normalized.replace(MODEL_EXTENSION, "");
+  const hasFolder = normalized.includes("/");
+  const entries = Array.isArray(catalog) ? catalog : [];
 
-  for (const [predicate, precision] of [
-    [(entry) => entry.path === normalized, "exact"],
-    [(entry) => entry.base === base, "filename"],
-    [(entry) => entry.stem === stem, "name"],
-  ]) {
-    // Local before shared at every precision level: a file the project owns
-    // outranks the same filename borrowed from another tool.
-    const local = catalog.find((entry) => entry.origin === "local" && predicate(entry));
-    if (local) return { status: "local", name: wanted, precision, match: local };
-    const shared = catalog.find((entry) => entry.origin === "shared" && predicate(entry));
-    if (shared) return { status: "shared", name: wanted, precision, match: shared };
+  const levels = [
+    // A bare filename equals the relative path of a file at a root, which would let that one copy
+    // win outright over same-named files in folders. `exactBareNames: false` is for names a producer
+    // wrote as plain names rather than as IDs: those files then compete as filenames.
+    ["exact", (entry) => (hasFolder || exactBareNames) && (entry.path === normalized || textOf(entry.value).toLowerCase() === normalized)],
+    // Segment-boundary suffixes in both directions: a record naming `Style_九V6.0/matcha` finds
+    // `style/Style_九V6.0/matcha.safetensors`, and a record naming a longer path than this root's
+    // (another tool's root, or a project-relative one) finds the file it ends with.
+    ["suffix", (entry) => hasFolder && (
+      entry.path.endsWith(`/${normalized}`)
+      || entry.path.replace(MODEL_EXTENSION, "").endsWith(`/${withoutExtension}`)
+      || (entry.path.includes("/") && normalized.endsWith(`/${entry.path}`))
+    )],
+    ["filename", (entry) => entry.base === base],
+    ["name", (entry) => entry.stem === stem],
+  ];
+  for (const [precision, predicate] of levels) {
+    let candidates = entries.filter(predicate);
+    if (!candidates.length) continue;
+    let narrowed = false;
+    if (candidates.length > 1 && engine) {
+      // The picture says which engine produced it; a same-named file under another engine's root
+      // is a different model, not a second answer.
+      const sameEngine = candidates.filter((entry) => entry.engine === engine || (entry.origin === "shared" && (entry.engines || []).includes(engine)));
+      if (sameEngine.length && sameEngine.length < candidates.length) {
+        candidates = sameEngine;
+        narrowed = true;
+      }
+    }
+    if (candidates.length === 1) {
+      const match = candidates[0];
+      return {
+        status: match.origin === "shared" ? "shared" : "local",
+        name: wanted,
+        precision: narrowed ? `${precision}+engine` : precision,
+        display: match.display || modelDisplayName(match.relative || match.path),
+        match,
+      };
+    }
+    return {
+      status: "ambiguous",
+      name: wanted,
+      precision,
+      count: candidates.length,
+      candidates: candidates.slice(0, MATCH_CANDIDATE_LIMIT).map(candidateSummary),
+      // Kept whole for the caller that can read the files and settle it by hash.
+      pending: candidates,
+    };
   }
-  return { status: "missing", name: wanted };
+  return { status: "missing", name: wanted, reason: hasFolder ? "path" : MODEL_EXTENSION.test(wanted) ? "filename" : "name" };
+}
+
+/** Settle an ambiguous match once the caller has found which candidates carry the recorded hash. */
+export function settleAmbiguousMatch(match, hashMatches) {
+  if (match?.status !== "ambiguous") return match;
+  const { pending, ...rest } = match;
+  const winners = Array.isArray(hashMatches) ? hashMatches : [];
+  if (winners.length === 1) {
+    const chosen = winners[0];
+    return {
+      status: chosen.origin === "shared" ? "shared" : "local",
+      name: match.name,
+      precision: `${match.precision}+hash`,
+      display: chosen.display || modelDisplayName(chosen.relative || chosen.path),
+      match: chosen,
+    };
+  }
+  return { ...rest, hashChecked: hashMatches !== null && hashMatches !== undefined, hashMatches: winners.length };
+}
+
+// The folder a catalogue entry sits in, as path segments that start with the root it belongs to: an
+// engine's local LoRA root, or one registered shared root. Two folders under different roots share
+// no segment, so they are never "near" each other.
+function entryFolderSegments(entry) {
+  const value = textOf(entry?.value).split("\\").join("/");
+  const shared = /^shared:([^/]+)\/(.*)$/i.exec(value);
+  const relative = shared ? shared[2] : textOf(entry?.relative || entry?.path || value).split("\\").join("/");
+  const folders = relative.split("/").filter(Boolean).slice(0, -1);
+  const root = shared ? ["shared", shared[1]] : [entry?.origin === "shared" ? "shared" : "local", textOf(entry?.engine)];
+  return [...root, ...folders].map((part) => part.toLowerCase());
+}
+
+/** The folder of a catalogue entry, keyed by its root (`local/il/style/style_九v6.0`). */
+export function modelFolderKey(entry) {
+  return entryFolderSegments(entry).join("/");
+}
+
+/**
+ * Where a picture's models live: for each folder, how much of the picture's set it holds.
+ *
+ * A model resolved to one file counts fully for that file's folder; a name several files share
+ * spreads one count over its candidates' folders. So the folder a style pack was installed into
+ * outranks a folder it was partly copied to, and a definite match outweighs a guess, even when many
+ * names in the set are duplicated.
+ */
+export function modelFolderAffinity(matches) {
+  const affinity = new Map();
+  for (const match of Array.isArray(matches) ? matches : []) {
+    const entries = match?.status === "local" || match?.status === "shared" ? [match.match] : Array.isArray(match?.pending) ? match.pending : [];
+    const keys = [...new Set(entries.filter(Boolean).map(modelFolderKey))];
+    for (const key of keys) affinity.set(key, (affinity.get(key) || 0) + 1 / keys.length);
+  }
+  return affinity;
+}
+
+// The folder the picture's set lives in: the one holding most of it; a tie goes to local, then the
+// shorter, then the alphabetically first path, so the answer never depends on catalogue order.
+function homeFolder(affinity) {
+  let home = null;
+  for (const [key, count] of affinity) {
+    const better = !home
+      || count > home.count
+      || (count === home.count && (key.startsWith("local/") ? 0 : 1) < (home.key.startsWith("local/") ? 0 : 1))
+      || (count === home.count && key.startsWith("local/") === home.key.startsWith("local/") && (key.length < home.key.length || (key.length === home.key.length && key < home.key)));
+    if (better) home = { key, count };
+  }
+  return home?.key || "";
+}
+
+function sharedLeadingSegments(first, second) {
+  let shared = 0;
+  while (shared < first.length && shared < second.length && first[shared] === second[shared]) shared += 1;
+  return shared;
+}
+
+/** Same-named files ordered the way `settleByFolder` chooses among them: nearest the picture's set first. */
+export function rankByFolder(entries, affinity) {
+  const home = homeFolder(affinity instanceof Map ? affinity : new Map());
+  const homeSegments = home ? home.split("/") : [];
+  const facts = (entry) => {
+    const segments = entryFolderSegments(entry);
+    return { entry, key: segments.join("/"), closeness: sharedLeadingSegments(segments, homeSegments), count: affinity?.get?.(segments.join("/")) || 0 };
+  };
+  return (Array.isArray(entries) ? entries : []).map(facts).sort((first, second) => (second.key === home) - (first.key === home)
+    || second.closeness - first.closeness
+    || second.count - first.count
+    || (first.entry.origin === "local" ? 0 : 1) - (second.entry.origin === "local" ? 0 : 1)
+    || textOf(first.entry.relative).length - textOf(second.entry.relative).length
+    || textOf(first.entry.relative).localeCompare(textOf(second.entry.relative)))
+    .map((item) => ({ ...item, home }));
+}
+
+/**
+ * Choose among same-named files by where the picture's other models live.
+ *
+ * A file in the picture's home folder — the one holding most of its models — wins; otherwise the
+ * file whose folder shares the most leading path with the home folder, then the folder holding more
+ * of the set, then local over shared and the shorter path. The match says how it was chosen and how
+ * many same-named files there were, so the choice is never presented as a verified identity. Only a
+ * match that still has its candidates can be settled; anything else is returned unchanged.
+ */
+export function settleByFolder(match, affinity) {
+  if (match?.status !== "ambiguous" || !Array.isArray(match.pending) || !match.pending.length) return match;
+  const [best] = rankByFolder(match.pending, affinity);
+  const chosen = best.entry;
+  return {
+    status: chosen.origin === "shared" ? "shared" : "local",
+    name: match.name,
+    precision: `${match.precision}+${best.key === best.home ? "folder" : "nearest"}`,
+    display: chosen.display || modelDisplayName(chosen.relative || chosen.path),
+    match: chosen,
+    chosenBy: best.key === best.home ? "folder" : "nearest",
+    count: match.count || match.pending.length,
+    ...(match.hashChecked && !match.hashMatches ? { hashMismatch: true } : {}),
+  };
+}
+
+/** A match as it may be stored and sent to a browser: never the private working set. */
+export function publicMatch(match) {
+  if (!match || typeof match !== "object") return match;
+  const { pending: _pending, ...rest } = match;
+  return rest;
 }
 
 /**

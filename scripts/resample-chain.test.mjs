@@ -207,8 +207,19 @@ test("a unit with no model sends null rather than an empty string", () => {
 
 test("USDU tiling is only sent for the engines that can run it", () => {
   const tiled = [unit({ executionMode: "usdu_tiled" })];
+  const options = (engine) => ({ baseSteps: 20, engine, nativeEngines: ["Anima", "Flux", "Flux2", "Krea2"] });
   assert.equal(resampleChainPayload(tiled, { engine: "Anima" })[0].execution_mode, "usdu_tiled");
-  assert.equal(resampleChainPayload(tiled, { engine: "Flux" })[0].execution_mode, "full_frame");
+  assert.equal(resampleChainIssue(tiled, options("Anima")), "");
+  // An engine switch does not rewrite the user's choice behind their back: an enabled tiled unit on
+  // an engine that cannot tile is a run blocker, so it never reaches the service.
+  for (const engine of ["SD", "iL", "Flux", "Flux2"]) {
+    assert.match(resampleChainIssue(tiled, options(engine)), /重采样 1：USDU 分块重绘仅支持 Anima \/ Krea2 引擎/);
+  }
+  // A disabled unit is skipped by the server and only described, so it keeps its mode untouched.
+  const parked = [unit({ executionMode: "usdu_tiled", enabled: false })];
+  assert.equal(resampleChainIssue(parked, options("Flux")), "");
+  const [payload] = resampleChainPayload(parked, { engine: "Flux" });
+  assert.deepEqual([payload.enabled, payload.execution_mode], [false, "usdu_tiled"]);
 });
 
 test("an unfinished fixed seed falls back to inherit instead of reaching the service", () => {
@@ -227,14 +238,17 @@ test("the run blocker names the unit and the first thing to fix", () => {
   const options = { baseSteps: 20, engine: "SD", nativeEngines: ["Anima", "Flux", "Flux2", "Krea2"] };
   assert.equal(resampleChainIssue([unit()], options), "");
   assert.match(resampleChainIssue([unit(), unit({ seedMode: "fixed", seed: "" })], options), /重采样 2/);
-  assert.match(resampleChainIssue([unit({ denoise: 0.01, steps: 1 })], options), /有效步骤/);
+  // Diffusers is handed a longer schedule so the configured steps execute; one past 1000 steps is
+  // refused before the job.
+  assert.equal(resampleChainIssue([unit({ denoise: 0.01, steps: 1 })], options), "");
+  assert.match(resampleChainIssue([unit({ denoise: 0.01, steps: 20 })], options), /重采样 1 的重绘强度过低：调度总步数不能超过 1000/);
   assert.match(resampleChainIssue([unit({ tileSize: 32, tileOverlap: 17 })], options), /分块重叠/);
   assert.match(
     resampleChainIssue([unit({ upscaler: "missing.pth" })], { ...options, upscalers: [{ id: "other.pth", compatible: true }] }),
     /超分模型不可用/,
   );
-  // A native engine executes every requested step, so the multiplied count must not refuse it.
-  assert.equal(resampleChainIssue([unit({ denoise: 0.01, steps: 1 })], { ...options, engine: "Anima" }), "");
+  // A native engine never expands its schedule, so the ceiling must not refuse it.
+  assert.equal(resampleChainIssue([unit({ denoise: 0.01, steps: 20 })], { ...options, engine: "Anima" }), "");
 });
 
 test("banker rounding matches Python ties-to-even behaviour", () => {

@@ -357,7 +357,7 @@ class ADetailerTests(unittest.TestCase):
                 ),
                 patch.object(
                     inference_server,
-                    "prepare_prompt_conditioning",
+                    "prepare_dynamic_prompt_conditioning",
                     side_effect=AssertionError("CLIP conditioning used"),
                 ),
             ):
@@ -692,8 +692,11 @@ class ADetailerStepAccountingTests(unittest.TestCase):
 
     def test_a_pass_is_counted_the_way_the_family_actually_runs_it(self):
         unit = ADetailerUnitInput(detector="face_yolov8n.pt", denoise=0.1)
-        # Diffusers inpainting runs int(steps * strength) updates.
-        self.assertEqual(inference_server.adetailer_effective_steps(unit, self.request(), "sd"), 3)
+        # Diffusers inpainting truncates its schedule to int(total * strength), so SD/iL are handed
+        # the smallest total whose truncation is the configured count: the configured steps execute.
+        self.assertEqual(inference_server.adetailer_effective_steps(unit, self.request(), "sd"), 30)
+        total = inference_server.diffusers_schedule_total(30, 0.1)
+        self.assertEqual(int(total * 0.1), 30)
         # Native Anima refinement keeps the last `steps + 1` sigmas of a longer schedule, so it runs
         # every requested step whatever the denoise. Multiplying here is what let the counter pass
         # its own total: the pass reported 3 and then delivered 30 callbacks.
@@ -701,7 +704,7 @@ class ADetailerStepAccountingTests(unittest.TestCase):
 
     def test_an_independent_step_count_replaces_the_inherited_one_in_both_families(self):
         unit = ADetailerUnitInput(detector="face_yolov8n.pt", denoise=0.5, use_steps=True, steps=40)
-        self.assertEqual(inference_server.adetailer_effective_steps(unit, self.request(), "sd"), 20)
+        self.assertEqual(inference_server.adetailer_effective_steps(unit, self.request(), "sd"), 40)
         self.assertEqual(inference_server.adetailer_effective_steps(unit, self.anima_request(), "anima"), 40)
 
     def test_the_counter_can_never_exceed_the_total_it_reports(self):

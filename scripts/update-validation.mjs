@@ -17,7 +17,7 @@ const REQUIRED_MODEL_MANIFESTS = [
   "models/yolo-models.json",
   "models/background-removal-models.json",
 ];
-const INFERENCE_PROTOCOL = 36;
+const INFERENCE_PROTOCOL = 39;
 
 // The validation backend is reachable only on loopback, and the shutdown call carries a one-time
 // token in a header. Global fetch honours NODE_USE_ENV_PROXY, so both would be handed to whatever

@@ -117,6 +117,9 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS) {
     loraGroupPrompt: typeof source.loraGroupPrompt === "string"
       ? source.loraGroupPrompt.slice(0, 4000).trim()
       : typeof base.loraGroupPrompt === "string" ? base.loraGroupPrompt.slice(0, 4000).trim() : "",
+    // SD/iL only. A card without one ran the family default and keeps saying nothing (`null`), so
+    // applying it restores that default rather than whatever the workspace holds.
+    clipSkip: Number.isInteger(source.clipSkip) ? source.clipSkip : value && typeof value === "object" ? null : Number.isInteger(base.clipSkip) ? base.clipSkip : null,
     imageSeeds: Array.isArray(source.imageSeeds) ? [...source.imageSeeds] : Array.isArray(base.imageSeeds) ? [...base.imageSeeds] : [],
     imageHiresSeedModes: Array.isArray(source.imageHiresSeedModes) ? [...source.imageHiresSeedModes] : Array.isArray(base.imageHiresSeedModes) ? [...base.imageHiresSeedModes] : [],
     imageHiresSeeds: Array.isArray(source.imageHiresSeeds) ? [...source.imageHiresSeeds] : Array.isArray(base.imageHiresSeeds) ? [...base.imageHiresSeeds] : [],
@@ -131,6 +134,11 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS) {
   // Same again for the per-engine parameter library: a card records one run, and a card carrying
   // every engine's parameters could rewrite all of them when applied.
   delete normalized.engineSettingsByEngine;
+  // Workspace preferences and switches, not facts about a run: the canvas bound, the output
+  // template and which prompt presets happen to be on (a card records the composed prompt instead).
+  delete normalized.canvasMaxEdge;
+  delete normalized.outputTemplate;
+  delete normalized.activePromptPresets;
   // The latent process preview was withdrawn. Cards written before that still carry the flag
   // through the `...source` spread above, so it is dropped here rather than rejected: an old card
   // keeps every setting that still means something and simply loses this one.

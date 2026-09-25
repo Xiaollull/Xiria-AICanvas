@@ -380,8 +380,8 @@ test("the registry plugin is wired into the control plane behind the setup gate"
   // Discovery stays in the Node control plane; the FastAPI data plane is not involved.
   const backend = await readFile(path.join(projectDirectory, "backend", "inference_server.py"), "utf8");
   assert.equal(backend.includes("/api/plugins"), false);
-  assert.match(source, /const inferenceProtocol = 36;/);
-  assert.match(backend, /^INFERENCE_PROTOCOL = 36$/m);
+  assert.match(source, /const inferenceProtocol = 39;/);
+  assert.match(backend, /^INFERENCE_PROTOCOL = 39$/m);
 });
 
 test("the build never transpiles, copies, or bundles plugin content", async (context) => {

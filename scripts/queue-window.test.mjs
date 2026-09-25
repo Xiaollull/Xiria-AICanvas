@@ -69,7 +69,10 @@ test("the window is portalled out of the panel that was clipping it", async () =
   assert.match(app, /<\/div>,\s*document\.body,\s*\);/);
   assert.match(css, /\.queue-dropdown \{ position: fixed;/);
   assert.doesNotMatch(css, /\.queue-dropdown \{ position: absolute/);
-  assert.match(app, /style=\{\{ left: `\$\{position\?\.x \?\? 0\}px`, top: `\$\{position\?\.y \?\? 0\}px` \}\}/);
+  // Its stacking number comes from the shared floating-window stack, so the queue and the preset
+  // window come to the front in the order they were last used rather than by fixed values.
+  assert.match(app, /style=\{\{ left: `\$\{position\?\.x \?\? 0\}px`, top: `\$\{position\?\.y \?\? 0\}px`, zIndex: layer\.zIndex \}\}/);
+  assert.match(app, /const layer = useFloatingWindowLayer\("queue"\);/);
 });
 
 test("the window can be dragged anywhere, and stays where it was put", async () => {

@@ -9,9 +9,11 @@ import {
   extractPromptLoras,
   interpretImageMetadata,
   matchModelName,
+  modelFolderAffinity,
   parseA1111,
   parseComfyUi,
   parseLooseJson,
+  settleByFolder,
   splitSettingsLine,
 } from "../src/image-metadata.js";
 
@@ -324,22 +326,30 @@ test("detection is by shape, so ComfyUI and A1111 never collide on `parameters`"
   assert.equal(ours.source, "xiria");
 });
 
-test("model matching prefers local over shared at every precision level", () => {
+test("a name two roots share is ambiguous until something decides it; an exact path still resolves", () => {
   const catalog = [
     { origin: "shared", path: "sdxl/animagine.safetensors", base: "animagine.safetensors", stem: "animagine", label: "ComfyUI" },
     { origin: "local", path: "il/animagine.safetensors", base: "animagine.safetensors", stem: "animagine", label: "models/checkpoints/illustrious" },
     { origin: "shared", path: "loose.ckpt", base: "loose.ckpt", stem: "loose", label: "sd-webui" },
   ];
 
-  // A bare filename is the common case and must still resolve locally first.
+  // A bare filename that two roots hold used to resolve to the first (local) hit. Picking one of two
+  // equally named files silently is a guess, so the reader reports both instead.
   const byName = matchModelName("animagine.safetensors", catalog);
-  assert.equal(byName.status, "local");
+  assert.equal(byName.status, "ambiguous");
   assert.equal(byName.precision, "filename");
+  assert.equal(byName.candidates.length, 2);
+  // The folder rule decides between them when nothing better (a recorded hash) has: here the only
+  // folder evidence is the name itself, and the tie goes to the local file.
+  const settled = settleByFolder(byName, modelFolderAffinity([byName]));
+  assert.equal(settled.status, "local");
+  assert.equal(settled.match.path, "il/animagine.safetensors");
 
-  // An exact relative path that only the shared root has still resolves.
+  // An exact relative path names one file wherever it lives.
   const shared = matchModelName("SDXL\\animagine.safetensors", catalog);
   assert.equal(shared.status, "shared");
   assert.equal(shared.precision, "exact");
+  assert.equal(matchModelName("il/animagine.safetensors", catalog).status, "local");
 
   // Extension differences are the last resort, not the first.
   assert.equal(matchModelName("loose.safetensors", catalog).status, "shared");

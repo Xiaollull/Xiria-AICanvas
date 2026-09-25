@@ -3,11 +3,14 @@
 The resample chain resizes a picture in three places — after a model upscale, in place of one when a
 unit carries no model, and once more when a unit asks for its exact target back after the engine
 rounded it — and all three have to agree, both with each other and with the node a user would have
-built the same chain from in ComfyUI. So the five methods are implemented once, here, against
-`comfy/utils.py:common_upscale`:
+built the same chain from in ComfyUI. The original five methods stay matched to
+`comfy/utils.py:common_upscale`; Forge's pixel-space `Nearest` is additive and deliberately uses
+Pillow rather than Torch:
 
 - `nearest-exact`, `bilinear`, `area`, `bicubic` go through `torch.nn.functional.interpolate` with
   torch's own `align_corners` default, exactly as Comfy passes them.
+- `nearest` uses Pillow's nearest-neighbour resize, matching Forge's pixel upscaler entry. It is not
+  an alias for Torch's existing `nearest-exact` compatibility mode.
 - `lanczos` is not an interpolate mode at all. Comfy converts to 8-bit RGB, calls PIL's
   `Image.resize(LANCZOS)` and converts back, so the channel order and the quantisation to bytes are
   both part of the result — which is why it is done the same way rather than approximated.
@@ -27,7 +30,7 @@ from PIL import Image
 
 # `nodes.py:1883`. `bislerp` is deliberately absent: it is a latent-space method Comfy exposes on the
 # latent nodes, not on `ImageScale`, and nothing in the chain resizes latents.
-RESIZE_METHODS = ("nearest-exact", "bilinear", "area", "bicubic", "lanczos")
+RESIZE_METHODS = ("nearest", "nearest-exact", "bilinear", "area", "bicubic", "lanczos")
 DEFAULT_RESIZE_METHOD = "lanczos"
 
 
@@ -57,6 +60,11 @@ def _lanczos(image: Image.Image, width: int, height: int):
     return image.resize((width, height), resample=Image.Resampling.LANCZOS)
 
 
+def _nearest(image: Image.Image, width: int, height: int):
+    """Forge's pixel `Nearest`, kept distinct from Torch `nearest-exact`."""
+    return image.resize((width, height), resample=Image.Resampling.NEAREST)
+
+
 def _interpolate(image: Image.Image, width: int, height: int, method: str):
     pixels = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(np.ascontiguousarray(pixels)).permute(2, 0, 1).unsqueeze(0)
@@ -82,4 +90,6 @@ def resize_image(image: Image.Image, width: int, height: int, method: str = DEFA
         return source
     if method == "lanczos":
         return _lanczos(source, width, height)
+    if method == "nearest":
+        return _nearest(source, width, height)
     return _interpolate(source, width, height, method)

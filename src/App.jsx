@@ -202,25 +202,53 @@ import { groupCardFor, loraCardFor, loraCardPresentation } from "./lora-cards.js
 import { useLoraCards } from "./use-lora-cards.js";
 import {
   createPromptPreset,
+  createPromptPresetGroup,
   deletePromptPreset,
+  deletePromptPresetGroup,
   composeGenerationPrompt,
   normalizeActivePromptPresetIds,
+  promptPresetGroupCards,
+  renamePromptPresetGroup,
+  reorderPromptPreset,
+  reorderPromptPresetGroup,
   togglePromptPresetId,
   normalizePromptPresetContainer,
   seededPromptPresetContainer,
-  sortPromptPresetRecords,
   updatePromptPreset,
-  validatePromptPresetDraft,
 } from "./prompt-presets";
+import { PRESET_WINDOW_SIZE, PromptPresetConfirm, PromptPresetEditor, PromptPresetStrip, PromptPresetWindow } from "./PromptPresetWindow.jsx";
+import { useFloatingWindowLayer } from "./floating-windows.js";
 import { SAMPLER_NAMES as samplerNames, SCHEDULER_NAMES as schedulerNames } from "./sampling-options";
 import {
+  DEFAULT_NEGATIVE_PROMPT,
+  DEFAULT_POSITIVE_PROMPT,
+  MAX_CANVAS_EDGE,
   PAG_DEFAULTS,
   SETTINGS_ENGINES,
   emptyEngineSettingsMap,
   engineSettingsFor,
+  normalizeClipSkip,
   normalizeEngineSettingsMap,
   withEngineSettings,
 } from "./engine-settings";
+import { clipSkipPayload, clipSkipRange } from "./clip-skip.js";
+import {
+  CANVAS_BOUND_PRESETS,
+  CANVAS_BOUND_STEP,
+  DEFAULT_CANVAS_MAX_EDGE,
+  HARD_CANVAS_MAX_EDGE,
+  MIN_CANVAS_BOUND,
+  canvasBoundConflicts,
+  canvasEdgeIssue,
+  effectiveCanvasMaxEdge,
+  normalizeCanvasMaxEdge,
+  snapCanvasMaxEdge,
+} from "./canvas-limit.js";
+import { DEFAULT_OUTPUT_TEMPLATE, OUTPUT_TEMPLATE_MAX_LENGTH, normalizeStoredOutputTemplate, outputTemplatePayload } from "./output-template.js";
+import { buildPostprocessChainPlan } from "./image-info-postprocess.js";
+import { CanvasBoundSetting, OutputTemplateSetting } from "./WorkspacePreferences.jsx";
+import { LoraEngineBar, LoraFolderGrid } from "./LoraFolderBrowser.jsx";
+import { loraFolderView } from "./lora-folders.js";
 import {
   ADETAILER_UNIT_LIMIT,
   DISTILLED_GUIDANCE_ENGINES,
@@ -320,6 +348,8 @@ function QueueList({ jobs, counts, error, watching, onCancel, onClose, onSelect,
   const panelRef = useRef(null);
   const dragRef = useRef(null);
   const [dragging, setDragging] = useState(false);
+  // Shares a stack with the preset window: whichever was opened, clicked or dragged last is on top.
+  const layer = useFloatingWindowLayer("queue");
   const viewport = () => ({ width: window.innerWidth, height: window.innerHeight });
   const panelSize = () => {
     const panel = panelRef.current;
@@ -364,7 +394,8 @@ function QueueList({ jobs, counts, error, watching, onCancel, onClose, onSelect,
       className={`queue-dropdown ${dragging ? "dragging" : ""}`}
       role="dialog"
       aria-label="任务队列"
-      style={{ left: `${position?.x ?? 0}px`, top: `${position?.y ?? 0}px` }}
+      style={{ left: `${position?.x ?? 0}px`, top: `${position?.y ?? 0}px`, zIndex: layer.zIndex }}
+      {...layer.bind}
     >
       <header
         onPointerDown={startDrag}
@@ -904,10 +935,18 @@ function loadWorkspaceState(saved) {
       // Before schema 2 the image page held one shared set for every engine. It seeds all of them,
       // so upgrading does not silently reset the parameters someone was working with.
       legacyImageToImage: saved.imageToImage,
+      // Before schema 3 the text-to-image prompt (and the preset switches on it) was one shared
+      // value. It is copied into every engine once; afterwards each engine keeps its own.
+      legacyPrompts: { positive: saved.positive, negative: saved.negative, activePromptPresets: saved.activePromptPresets },
     });
+    const canvasBound = normalizeCanvasMaxEdge(saved.canvasMaxEdge);
+    const template = normalizeStoredOutputTemplate(saved.outputTemplate);
     return {
       engineSettingsByEngine: engineSettingsMap.container,
       engineSettingsWarning: engineSettingsMap.warning,
+      canvasMaxEdge: canvasBound.value,
+      outputTemplate: template.value,
+      preferenceWarning: [canvasBound.warning, template.warning].filter(Boolean).join("；"),
       model: savedModel,
       checkpoint: modelIdentity.checkpoint,
       diffusionModel: modelIdentity.diffusionModel,
@@ -942,9 +981,10 @@ function loadWorkspaceState(saved) {
         appliedLayers: ["mid", "all"].includes(savedPag.appliedLayers) ? savedPag.appliedLayers : PAG_DEFAULTS.appliedLayers,
       },
       size: {
-        width: Math.round(numberInRange(saved.size?.width, 1024, 0, 2048) / 64) * 64,
-        height: Math.round(numberInRange(saved.size?.height, 1024, 0, 2048) / 64) * 64,
+        width: Math.round(numberInRange(saved.size?.width, 1024, 0, MAX_CANVAS_EDGE) / 64) * 64,
+        height: Math.round(numberInRange(saved.size?.height, 1024, 0, MAX_CANVAS_EDGE) / 64) * 64,
       },
+      clipSkip: Number.isInteger(saved.clipSkip) ? saved.clipSkip : null,
       backgroundRemovalModel: typeof saved.backgroundRemovalModel === "string" ? saved.backgroundRemovalModel : "",
       samplingExpanded: saved.samplingExpanded !== false,
       runInfoVisible: saved.runInfoVisible !== false,
@@ -1003,7 +1043,8 @@ function gallerySettingsWithoutPromptPresets(settings) {
   // one run; carrying every engine's parameters in it would let applying the card rewrite them all.
   // Which presets happen to be switched on belongs to the workspace too: a card records the
   // words that ran, in `composedPrompt`, not the switches that produced them.
-  const { promptPresets: _promptPresets, activePromptPresets: _activePromptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, ...gallerySettings } = settings;
+  // The canvas bound and the output template are preferences of this workspace, not of a run.
+  const { canvasMaxEdge: _canvasMaxEdge, outputTemplate: _outputTemplate, promptPresets: _promptPresets, activePromptPresets: _activePromptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, ...gallerySettings } = settings;
   return gallerySettings;
 }
 
@@ -1144,117 +1185,6 @@ function PostprocessStageHeader({ title, detail, enabled, expanded, onToggleExpa
   </div>;
 }
 
-const promptPresetPositionLabels = { start: "开头", middle: "中间", end: "结尾" };
-
-function PresetBox({ title, type, records, activeIds, disabled, libraryError, libraryWarning, onSelect, onCreate, onEdit, onDelete }) {
-  const [open, setOpen] = useState(false);
-  const [menuId, setMenuId] = useState("");
-  const listId = `prompt-preset-${type}-list`;
-  const menuRef = useRef(null);
-  useEffect(() => {
-    if (!menuId) return undefined;
-    const closeMenu = (event) => {
-      if (!menuRef.current?.contains(event.target)) setMenuId("");
-    };
-    const closeOnEscape = (event) => {
-      if (event.key === "Escape") {
-        event.stopPropagation();
-        setMenuId("");
-      }
-    };
-    window.addEventListener("pointerdown", closeMenu);
-    window.addEventListener("keydown", closeOnEscape);
-    return () => {
-      window.removeEventListener("pointerdown", closeMenu);
-      window.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [menuId]);
-  useEffect(() => {
-    if (libraryError) setOpen(true);
-  }, [libraryError]);
-  return (
-    <div className={`preset-box ${open ? "open" : ""}`}>
-      <div className="preset-head">
-        <button type="button" aria-expanded={open} aria-controls={listId} onClick={() => { setOpen((current) => !current); setMenuId(""); }}>
-          <span>{title}</span>
-          <span className="preset-meta">{activeIds.length ? `${activeIds.length}/${records.length} 已启用` : `${records.length} 个预设`} <ChevronDown size={15} /></span>
-        </button>
-        <button type="button" className="prompt-preset-add" data-prompt-preset-focus-fallback={type} aria-label={`新增${type === "positive" ? "正向" : "负向"} Prompt 预设`} disabled={disabled || Boolean(libraryError)} onClick={onCreate}><Plus size={14} />新增</button>
-      </div>
-      {open && (
-        <div className="preset-list" id={listId}>
-          {libraryError && <p className="prompt-preset-error" role="alert">{libraryError}</p>}
-          {!libraryError && libraryWarning && <p className="prompt-preset-warning" role="status">{libraryWarning}</p>}
-          {!libraryError && records.length === 0 && <div className="prompt-preset-empty"><strong>暂无{type === "positive" ? "正向" : "负向"}预设</strong><p>可以新增一个常用 Prompt，点击即可启用，生成时自动拼接。</p><button type="button" disabled={disabled} onClick={onCreate}><Plus size={14} />新增预设</button></div>}
-          {!libraryError && records.length > 0 && <div className="prompt-preset-grid">
-            {records.map((record) => {
-              const menuOpen = menuId === record.id;
-              const menuControlId = `prompt-preset-menu-${type}-${record.id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-              const active = activeIds.includes(record.id);
-              return <article className={`prompt-preset-card ${active ? "active" : ""}`} key={record.id}>
-                <button type="button" className="prompt-preset-main" aria-pressed={active} aria-label={`${active ? "停用" : "启用"}${type === "positive" ? "正向" : "负向"}预设“${record.name}”（生成时置于${promptPresetPositionLabels[record.position]}）`} disabled={disabled} onClick={() => onSelect(record)}>
-                  <span><strong>{record.name}</strong><b>{promptPresetPositionLabels[record.position]}</b></span>
-                  <small>{record.content.replace(/\s+/g, " ")}</small>
-                </button>
-                <div className="prompt-preset-more-wrap" ref={menuOpen ? menuRef : undefined}>
-                  <button type="button" className="prompt-preset-more" aria-label={`更多操作：${record.name}`} aria-haspopup="menu" aria-expanded={menuOpen} aria-controls={menuControlId} disabled={disabled} onClick={() => setMenuId((current) => current === record.id ? "" : record.id)}><span aria-hidden="true">•••</span></button>
-                  {menuOpen && <div className="prompt-preset-menu" id={menuControlId} role="menu" aria-label={`${record.name}预设操作`}>
-                    <button type="button" role="menuitem" disabled={disabled} onClick={(event) => { event.currentTarget.closest("article")?.querySelector(".prompt-preset-more")?.focus(); setMenuId(""); onEdit(record); }}><Pencil size={13} />编辑</button>
-                    <button type="button" role="menuitem" className="danger" disabled={disabled} onClick={(event) => { event.currentTarget.closest("article")?.querySelector(".prompt-preset-more")?.focus(); setMenuId(""); onDelete(record); }}><Trash2 size={13} />删除</button>
-                  </div>}
-                </div>
-              </article>;
-            })}
-          </div>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PromptPresetDialog({ dialog, records, onSave, onRequestClose }) {
-  const original = dialog.record ? {
-    name: dialog.record.name,
-    content: dialog.record.content,
-    type: dialog.record.type,
-    position: dialog.record.position,
-  } : { name: "", content: "", type: dialog.type, position: "end" };
-  const [draft, setDraft] = useState(original);
-  const [operationError, setOperationError] = useState("");
-  const validation = validatePromptPresetDraft(draft, records, dialog.record?.id || null);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(original);
-  const requestClose = () => {
-    if (dirty && !window.confirm("草稿尚未保存，确定要放弃更改吗？")) return;
-    onRequestClose();
-  };
-  const dialogRef = useDialogLifecycle(true, requestClose, "[data-prompt-preset-focus-fallback]");
-  const titleId = `prompt-preset-dialog-title-${dialog.record ? "edit" : "new"}`;
-  const update = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
-  return <div className="prompt-preset-backdrop" onMouseDown={(event) => event.target === event.currentTarget && requestClose()}>
-    <form ref={dialogRef} className="prompt-preset-dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex="-1" onSubmit={(event) => { event.preventDefault(); if (validation.valid) setOperationError(onSave(draft) || ""); }}>
-      <header><div><span>PROMPT PRESET LIBRARY</span><h2 id={titleId}>{dialog.record ? "编辑 Prompt 预设" : "新增 Prompt 预设"}</h2><p>{dialog.record ? `保留固定 ID · 保存后版本 ${dialog.record.version + 1}` : "保存常用内容并指定点击卡片时的插入位置"}</p></div><button type="button" aria-label="关闭 Prompt 预设窗口" onClick={requestClose}><X size={18} /></button></header>
-      <div className="prompt-preset-dialog-body">
-        {operationError && <p className="prompt-preset-error" role="alert">{operationError}</p>}
-        <label className={validation.errors.name ? "invalid" : ""}><span>预设名称 <small>{draft.name.length} / 48</small></span><input autoFocus data-dialog-autofocus value={draft.name} maxLength={48} aria-invalid={Boolean(validation.errors.name)} onChange={(event) => update("name", event.target.value)} />{validation.errors.name && <em>{validation.errors.name}</em>}</label>
-        <label className={`prompt-preset-content-field ${validation.errors.content ? "invalid" : ""}`}><span>Prompt 内容 <small>{draft.content.length} 字符</small></span><textarea value={draft.content} aria-invalid={Boolean(validation.errors.content)} onChange={(event) => update("content", event.target.value)} placeholder="保留权重、括号与内部换行" />{validation.errors.content && <em>{validation.errors.content}</em>}</label>
-        <fieldset><legend>Prompt 类型</legend><div className="prompt-preset-segmented two">{[["positive", "正向"], ["negative", "负向"]].map(([value, label]) => <button type="button" className={draft.type === value ? "active" : ""} aria-pressed={draft.type === value} key={value} onClick={() => update("type", value)}>{label}</button>)}</div><small>切换类型后，预设会移动到目标分区末尾。</small></fieldset>
-        <fieldset><legend>生成时的拼接位置</legend><div className="prompt-preset-segmented three">{[["start", "开头"], ["middle", "中间"], ["end", "结尾"]].map(([value, label]) => <button type="button" className={draft.position === value ? "active" : ""} aria-pressed={draft.position === value} key={value} onClick={() => update("position", value)}>{label}</button>)}</div><small>启用后不会写入输入框，生成时才拼接：开头与中间排在输入框内容之前，结尾排在其后，各段之间空一行。</small></fieldset>
-      </div>
-      <footer><span>{dialog.record ? `ID ${dialog.record.id}` : "ID 将由安全随机源生成"}</span><div><button type="button" onClick={requestClose}>取消</button><button type="submit" className="primary" disabled={!validation.valid}><Save size={14} />保存预设</button></div></footer>
-    </form>
-  </div>;
-}
-
-function PromptPresetDeleteDialog({ record, onConfirm, onClose }) {
-  const dialogRef = useDialogLifecycle(true, onClose, `[data-prompt-preset-focus-fallback="${record.type}"]`);
-  return <div className="prompt-preset-backdrop prompt-preset-delete-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <section ref={dialogRef} className="prompt-preset-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="prompt-preset-delete-title" tabIndex="-1">
-      <Trash2 size={25} /><h2 id="prompt-preset-delete-title">删除“{record.name}”？</h2><p>预设删除后不会自动恢复，包括原有内置预设。此操作不会改写当前 Prompt 文本。</p>
-      <div><button type="button" autoFocus onClick={onClose}>取消</button><button type="button" className="danger" onClick={onConfirm}>确认删除</button></div>
-    </section>
-  </div>;
-}
-
 function ThemeColorField({ label, detail, value, onChange }) {
   const [text, setText] = useState(value);
 
@@ -1350,8 +1280,17 @@ function App() {
   const [mountedLorasRaw, setMountedLorasRaw] = useState(null);
   const [shouldPersistMountedLoras, setShouldPersistMountedLoras] = useState(true);
   const [loraWorkspaceLocked, setLoraWorkspaceLocked] = useState(false);
-  const [positive, setPositive] = useState("a quiet observatory above the clouds, lone astronomer, warm light, cinematic composition");
-  const [negative, setNegative] = useState("low quality, blurry, malformed hands, oversaturated, watermark");
+  // The selected engine's own prompt pair (schema 3): switching engines puts these down into the
+  // engine being left and picks up the next engine's, like every other engine parameter.
+  const [positive, setPositive] = useState(DEFAULT_POSITIVE_PROMPT);
+  const [negative, setNegative] = useState(DEFAULT_NEGATIVE_PROMPT);
+  // SD/iL only; `null` on the engines that have no CLIP stack.
+  const [clipSkip, setClipSkip] = useState(() => normalizeClipSkip("SD", null));
+  // Global preferences from Settings → General. The canvas bound is what the pickers offer; the
+  // server still admits or refuses each canvas against the machine. The template is frozen into
+  // every job at submission.
+  const [canvasMaxEdge, setCanvasMaxEdge] = useState(DEFAULT_CANVAS_MAX_EDGE);
+  const [outputTemplate, setOutputTemplate] = useState(DEFAULT_OUTPUT_TEMPLATE);
   const [promptPresets, setPromptPresets] = useState(seededPromptPresetContainer);
   // Which presets are switched on, per prompt. Clicking one no longer writes it into the box: it
   // is joined onto the prompt when the job is submitted, so the box keeps only what was typed and
@@ -1362,7 +1301,14 @@ function App() {
   const [shouldPersistPromptPresets, setShouldPersistPromptPresets] = useState(true);
   const [promptPresetLibraryRaw, setPromptPresetLibraryRaw] = useState(null);
   const [promptPresetDialog, setPromptPresetDialog] = useState(null);
+  // `{ kind: "card", record }` or `{ kind: "group", group, count }` while a deletion awaits confirmation.
   const [promptPresetDelete, setPromptPresetDelete] = useState(null);
+  // The floating preset window: session-only, like the queue window, including which group each
+  // module last showed.
+  const [presetWindowOpen, setPresetWindowOpen] = useState(false);
+  const [presetWindowModule, setPresetWindowModule] = useState("positive");
+  const [presetWindowPosition, setPresetWindowPosition] = useState(null);
+  const [presetWindowGroups, setPresetWindowGroups] = useState({});
   const [steps, setSteps] = useState(28);
   const [cfg, setCfg] = useState(6.5);
   const [denoise, setDenoise] = useState(1);
@@ -1480,6 +1426,14 @@ function App() {
   const [loraManagerMaximized, setLoraManagerMaximized] = useState(false);
   const [loraCategory, setLoraCategory] = useState("character");
   const [loraSearch, setLoraSearch] = useState("");
+  // Which folder inside the selected local category the manager is showing, and the engine whose
+  // listing `loraLibrary` currently holds. Navigation only: nothing here reaches a request.
+  const [loraFolderPath, setLoraFolderPath] = useState("");
+  const [loraLibraryEngine, setLoraLibraryEngine] = useState("");
+  const [loraPathInput, setLoraPathInput] = useState("");
+  const [loraPathBusy, setLoraPathBusy] = useState(false);
+  // A folder located under another engine waits here until that engine's listing has arrived.
+  const [loraNavigation, setLoraNavigation] = useState(null);
   const [collapsedModalSharedFolders, setCollapsedModalSharedFolders] = useState({});
   const [loraLookups, setLoraLookups] = useState({});
   const [loraDetail, setLoraDetail] = useState(null);
@@ -1527,6 +1481,10 @@ function App() {
   // up and pure noise once it is settled, so it is the user's call whether to keep it on screen.
   const [runInfoVisible, setRunInfoVisible] = useState(true);
   const [upscalersRefreshing, setUpscalersRefreshing] = useState(false);
+  const [modelDownloadJob, setModelDownloadJob] = useState(null);
+  const [modelDownloadPollRevision, setModelDownloadPollRevision] = useState(0);
+  const [upscalerDownloadBusy, setUpscalerDownloadBusy] = useState(false);
+  const [upscalerDownloadError, setUpscalerDownloadError] = useState("");
   // The whole post-processing chain, in execution order: resample units, the ADetailer stage and
   // the RTX stage, as one list. ADetailer and RTX are still single-instance, so they are read back
   // out by name; everything that used to hold them separately reads these instead, and every write
@@ -1676,6 +1634,12 @@ function App() {
   const loraLookupControllers = useRef(new Set());
   const loraSyncChannel = useRef(null);
   const loraSyncReceiving = useRef(false);
+  // The latest render's engine-switch guard and swap, for the channel handler, which outlives
+  // renders: calling a stale `selectModel` would put down a stale record for the engine it leaves.
+  const loraEngineSwitchRef = useRef({ blocker: () => "主工作区尚未就绪", switch: () => false });
+  // The shared preset library the stored per-engine switches are checked against. Kept current each
+  // render; the restore path sets it to the library it has just read, before state catches up.
+  const promptPresetRecordsRef = useRef(null);
   const lorasRef = useRef(loras);
   const loraDragGateRef = useRef(null);
   const mountedLorasMapRef = useRef(mountedLorasByEngine);
@@ -1707,6 +1671,7 @@ function App() {
   const workspaceSnapshot = useRef(null);
   const uiStateSnapshot = useRef(null);
   inferenceHealthRef.current = inferenceHealth;
+  promptPresetRecordsRef.current = promptPresets.records;
   currentModel.current = model;
   currentCheckpoint.current = checkpoint;
   currentDiffusionModel.current = diffusionModel;
@@ -1747,6 +1712,7 @@ function App() {
   // The selected engine's live values, as one record. Read when leaving an engine so that what is
   // on screen is what gets stored for it.
   const captureEngineSettings = () => ({
+    positive, negative, activePromptPresets, clipSkip,
     checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
     steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     sampler, scheduler, guidance, pag, size,
@@ -1758,8 +1724,17 @@ function App() {
 
   // The reverse: an engine's stored record becomes the working copy. Every field is written, with
   // no "keep what was there" branch anywhere -- that branch is precisely how a value used to leak
-  // from the engine being left into the engine being opened.
+  // from the engine being left into the engine being opened. `presetRecords` is the shared preset
+  // library the stored switches are checked against, so a deleted preset cannot come back on.
   const applyEngineSettings = (settings) => {
+    const presetRecords = promptPresetRecordsRef.current || promptPresets.records;
+    setPositive(settings.positive);
+    setNegative(settings.negative);
+    setActivePromptPresets({
+      positive: normalizeActivePromptPresetIds(settings.activePromptPresets?.positive, presetRecords),
+      negative: normalizeActivePromptPresetIds(settings.activePromptPresets?.negative, presetRecords),
+    });
+    setClipSkip(settings.clipSkip);
     setCheckpoint(settings.checkpoint);
     setDiffusionModel(settings.diffusionModel);
     setTextEncoder(settings.textEncoder);
@@ -1796,14 +1771,19 @@ function App() {
   };
 
   workspaceSnapshot.current = {
-    model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
+    // `positive`, `negative` and `activePromptPresets` here mirror the selected engine for readers
+    // of the flat document; the per-engine map below is what a workspace is restored from.
+    model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, clipSkip, steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
     promptPresets: persistedPromptPresets,
     activePromptPresets,
     sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, postprocessChain, loraCategory, loraSearch,
+    canvasMaxEdge,
+    outputTemplate,
     // The selected engine's record is the live hooks, which have not been written back to the map
     // yet -- that happens on the way out of an engine. Folding them in here is what makes a reload
     // in the middle of a session come back to what was on screen rather than to the last switch.
     engineSettingsByEngine: withEngineSettings(engineSettingsByEngine, model, {
+      positive, negative, activePromptPresets, clipSkip,
       checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
       steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
       sampler, scheduler, guidance, pag, size,
@@ -1956,7 +1936,13 @@ function App() {
           engineSettingsMapRef.current = workspace.engineSettingsByEngine;
           setEngineSettingsByEngine(workspace.engineSettingsByEngine);
           if (workspace.engineSettingsWarning) setAppNotice({ message: workspace.engineSettingsWarning, error: true });
+          // The prompt pair, its preset switches and CLIP skip come from the engine's own record too
+          // (schema 3); the flat fields read above are only the mirror an older build wrote.
+          promptPresetRecordsRef.current = workspace.promptPresets.records;
           applyEngineSettings(engineSettingsFor(workspace.engineSettingsByEngine, workspace.model));
+          setCanvasMaxEdge(workspace.canvasMaxEdge);
+          setOutputTemplate(workspace.outputTemplate);
+          if (workspace.preferenceWarning) setAppNotice({ message: workspace.preferenceWarning, error: true });
           setLoraCategory(workspace.loraCategory);
           setLoraSearch(workspace.loraSearch);
           setSamplingExpanded(workspace.samplingExpanded);
@@ -2024,7 +2010,7 @@ function App() {
     if (!uiStateReady) return undefined;
     const timer = window.setTimeout(persistUiState, 300);
     return () => window.clearTimeout(timer);
-  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, promptPresets, activePromptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, postprocessChain, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
+  }, [theme, model, checkpoint, diffusionModel, textEncoder, textEncoder2, vae, positive, negative, clipSkip, canvasMaxEdge, outputTemplate, promptPresets, activePromptPresets, promptPresetLibraryError, shouldPersistPromptPresets, mountedLorasByEngine, shouldPersistMountedLoras, engineSettingsByEngine, steps, cfg, denoise, imagesPerBatch, batchCount, seed, seedMode, sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, postprocessChain, loraCategory, loraSearch, loras, backgroundRemovalModel, imageToImage, uiStateReady]);
 
   useEffect(() => {
     const saveBeforeExit = () => persistUiState(true);
@@ -2162,6 +2148,7 @@ function App() {
         setLoraCategory("character");
         setLoraSearch("");
       }
+      setLoraFolderPath("");
       setLoraLookups({});
     }
     const controller = new AbortController();
@@ -2189,6 +2176,7 @@ function App() {
         });
         if (!scan.applied) return;
         setLoraLibrary(payload.categories);
+        setLoraLibraryEngine(payload.engine || model);
         setLoraDirectory(payload.directory);
         const selectedExists = payload.categories.some((category) => category.id === restoredWorkspace?.loraCategory);
         if (restoringLoras && !selectedExists) {
@@ -2217,6 +2205,26 @@ function App() {
 
     return () => controller.abort();
   }, [model, activeLoraScopeKey, mountedLoraRescanGeneration, uiStateReady, activeJobRecoveryPending, status, modelSwitching, loraWorkspaceLocked, shouldPersistMountedLoras]);
+
+  // A located folder is opened once the listing of its engine is the one on screen — immediately
+  // for the selected engine, after the rescan for one the location just switched to.
+  useEffect(() => {
+    if (!loraNavigation || loraNavigation.engine !== model || loraLibraryEngine !== model || loraLoading) return;
+    const target = loraNavigation;
+    setLoraNavigation(null);
+    if (target.origin === "shared") {
+      setLoraCategory("shared");
+      setLoraFolderPath("");
+      setCollapsedModalSharedFolders((current) => ({ ...current, [`${target.rootId}/${target.folder}`]: false }));
+      return;
+    }
+    if (!loraLibrary.some((category) => category.id === target.categoryId)) {
+      setAppNotice({ message: `${target.display || "该文件夹"} 中没有可挂载的 LoRA 文件`, error: true });
+      return;
+    }
+    setLoraCategory(target.categoryId);
+    setLoraFolderPath(target.folder || "");
+  }, [loraNavigation, model, loraLibraryEngine, loraLoading, loraLibrary]);
 
   const refreshADetailerModels = async (signal) => {
     setADetailerInfo((current) => ({ ...current, loading: true, error: "" }));
@@ -2278,6 +2286,55 @@ function App() {
     }
   };
 
+  // The trusted recommended-download route accepts only catalogue identifiers. The browser never
+  // forwards a provider URL, local path, filename, or an id invented from the visible label.
+  const downloadUpscalerArtifact = async (artifact) => {
+    const familyId = artifact?.download?.family_id;
+    const artifactId = artifact?.download?.artifact_id;
+    if (!familyId || !artifactId || upscalerDownloadBusy || modelDownloadJob?.active) return;
+    setUpscalerDownloadBusy(true);
+    setUpscalerDownloadError("");
+    try {
+      const response = await fetch("/api/recommended-download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ family_id: familyId, artifact_id: artifactId, connections: 8 }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || payload.detail || "无法加入超分模型下载队列");
+      if (!payload.job) throw new Error("下载服务没有返回任务状态");
+      setModelDownloadJob(payload.job);
+      setModelDownloadPollRevision((current) => current + 1);
+      if (!payload.job.active) void refreshUpscalers();
+    } catch (error) {
+      setUpscalerDownloadError(error.message || "无法加入超分模型下载队列");
+    } finally {
+      setUpscalerDownloadBusy(false);
+    }
+  };
+
+  const retryUpscalerDownload = async () => {
+    if (upscalerDownloadBusy || modelDownloadJob?.active || !modelDownloadJob?.retryAvailable) return;
+    setUpscalerDownloadBusy(true);
+    setUpscalerDownloadError("");
+    try {
+      const response = await fetch("/api/model-download/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connections: 8 }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || payload.detail || "无法重试超分模型下载");
+      if (!payload.job) throw new Error("下载服务没有返回任务状态");
+      setModelDownloadJob(payload.job);
+      setModelDownloadPollRevision((current) => current + 1);
+    } catch (error) {
+      setUpscalerDownloadError(error.message || "无法重试超分模型下载");
+    } finally {
+      setUpscalerDownloadBusy(false);
+    }
+  };
+
   useEffect(() => {
     if (inferenceHealth?.status !== "ready") return undefined;
     const controller = new AbortController();
@@ -2315,6 +2372,16 @@ function App() {
       if (payload?.type === "request-workspace-loras") {
         const scopeKey = activeLoraScopeRef.current;
         channel.postMessage({ type: "workspace-loras", engine: scopeKey, loras: mountedLorasForScope(mountedLorasMapRef.current, scopeKey), locked: modelSwitching });
+        channel.postMessage({ type: "workspace-engine", engine: currentModel.current });
+        return;
+      }
+      if (payload?.type === "request-engine-switch") {
+        // This window owns the workspace, so a switch asked for by the standalone page is made
+        // here, through the same guard and the same swap as the manager's own engine bar.
+        const engine = payload.engine;
+        const reason = !READY_ENGINES.includes(engine) ? "未知引擎" : engine === currentModel.current ? "" : loraEngineSwitchRef.current.blocker();
+        const accepted = !reason && (engine === currentModel.current || loraEngineSwitchRef.current.switch(engine));
+        channel.postMessage({ type: "engine-switch-result", requestId: payload.requestId, engine, accepted, reason });
         return;
       }
       if (payload?.type === "workspace-lora-lock") {
@@ -2364,6 +2431,12 @@ function App() {
     if (!uiStateReady || !loraSyncChannel.current) return;
     loraSyncChannel.current.postMessage({ type: "workspace-lora-lock", locked: modelSwitching });
   }, [uiStateReady, status, modelSwitching]);
+
+  // The standalone LoRA page follows the generation engine, whichever surface changed it.
+  useEffect(() => {
+    if (!uiStateReady || !loraSyncChannel.current) return;
+    loraSyncChannel.current.postMessage({ type: "workspace-engine", engine: model });
+  }, [uiStateReady, model]);
 
   useEffect(() => {
     if (!appNotice) return undefined;
@@ -2498,15 +2571,6 @@ function App() {
   }, [uiStateReady, model, inferenceHealth?.performance_settings?.memory_mode]);
 
   useEffect(() => {
-    const models = inferenceHealth?.upscalers?.models || [];
-    const compatible = models.filter((item) => item.compatible);
-    if (!compatible.length) return;
-    setPostprocessChain((chain) => chain.map((stage) => (stage.type === "resample" && stage.upscaler && !compatible.some((item) => item.id === stage.upscaler)
-      ? { ...stage, upscaler: compatible[0].id }
-      : stage)));
-  }, [inferenceHealth?.upscalers?.models]);
-
-  useEffect(() => {
     const models = (inferenceHealth?.background_removal?.models || []).filter((item) => item.selectable !== false);
     if (!models.length) return;
     setBackgroundRemovalModel((current) => models.some((item) => item.id === current)
@@ -2574,6 +2638,7 @@ function App() {
         if (!response.ok) throw new Error(payload.error || "无法读取模型下载状态");
         if (stopped) return;
         const job = payload.job;
+        setModelDownloadJob(job || null);
         if (job?.active) {
           timer = window.setTimeout(poll, 1500);
           return;
@@ -2593,7 +2658,7 @@ function App() {
     };
     void poll();
     return () => { stopped = true; window.clearTimeout(timer); };
-  }, [activePage, model]);
+  }, [activePage, model, modelDownloadPollRevision]);
 
   useEffect(() => {
     if (!activeJobRecoveryPending || inferenceHealth?.status !== "ready" || generationJob || status === "running") return undefined;
@@ -3016,10 +3081,14 @@ function App() {
           guidance: distilledGeneration ? "none" : guidance,
           pag: { scale: pag.scale, applied_layers: pag.appliedLayers },
           background_removal_model: transparentPromptEnabled ? backgroundRemovalModel : null,
-          // The chain in execution order, stage by stage. Protocol 36 carries strict per-unit
+          // The chain in execution order, stage by stage. Protocol 38 carries strict per-unit
           // execution and lossless per-unit seed contracts.
           postprocess_chain: resampleChainPayload(postprocessChain, { engine: model }),
           loras: generationLoras.filter((lora) => lora.enabled !== false).map((lora) => ({ path: lora.value, weight: lora.weight })),
+          // Protocol 39: SD/iL send the effective CLIP skip, the other engines nothing; the output
+          // template is frozen into this job, so editing it mid-batch cannot move later images.
+          ...clipSkipPayload(model, clipSkip),
+          ...(outputTemplatePayload(outputTemplate) ? { output_template: outputTemplatePayload(outputTemplate) } : {}),
           gallery_settings: gallerySettings,
         }),
       });
@@ -3094,7 +3163,8 @@ function App() {
       sampler: settings.sampler,
       scheduler: settings.scheduler,
       guidance: "none",
-      size: outputSize(runSource, settings),
+      size: outputSize(runSource, settings, { maxEdge: effectiveCanvasMaxEdge(canvasMaxEdge, model) }),
+      clipSkip: settings.clipSkip,
       imagesPerBatch: settings.imagesPerBatch,
       batchCount: settings.batchCount,
       imageToImage: settings,
@@ -3139,6 +3209,8 @@ function App() {
           schedulers: activeSchedulerNames,
           loras: runLoras,
           backgroundRemovalModel,
+          canvasMaxEdge: effectiveCanvasMaxEdge(canvasMaxEdge, model),
+          outputTemplate: outputTemplatePayload(outputTemplate),
         })),
       });
       const job = await response.json();
@@ -3208,9 +3280,20 @@ function App() {
     setModelSwitching(false);
   };
 
-  const applyGallerySettings = async (savedSettings, groups, { page = "generate", label = "精选参数", fillMissingAssets = false } = {}) => {
+  /**
+   * Write a saved record's selected groups into a generate page.
+   *
+   * `target` is the page whose own parameters receive prompts, sampling, canvas and the chain:
+   * "t2i" writes the text-to-image fields, "i2i" the image page's `imageToImage` block — never its
+   * source picture. The model and the LoRA mount are shared by both pages and land in the same
+   * place either way. `imageToImagePatch` is an explicit image-page patch (the image reader's),
+   * written at the same commit point. Everything that can fail is checked before the first write,
+   * so a refusal leaves both pages exactly as they were.
+   */
+  const applyGallerySettings = async (savedSettings, groups, { page = "generate", label = "精选参数", fillMissingAssets = false, target = "t2i", imageToImagePatch = null } = {}) => {
     if (modelSwitching || modelLoading) throw new Error(`模型切换期间不能应用${label}`);
     const selectedGroups = new Set(groups);
+    const toImagePage = target === "i2i";
     const current = workspaceSnapshot.current;
     const source = savedSettings && typeof savedSettings === "object" ? { ...savedSettings } : {};
     delete source.promptPresets;
@@ -3244,11 +3327,84 @@ function App() {
     }
     const engineChanged = selectedGroups.has("model") && normalized.model !== model;
     // Applying a card that names a different engine leaves the current one, so its parameters are
-    // put down first, exactly as a manual switch does. This reads the values of the render this
-    // handler was called in, so it captures what the outgoing engine had rather than what the card
-    // is about to write. Everything below sets the incoming engine's values into the live hooks,
-    // and the workspace snapshot folds those into the incoming engine's record.
-    if (engineChanged) commitEngineSettings(model, captureEngineSettings());
+    // put down, exactly as a manual switch does — captured now, from the render this handler was
+    // called in, and committed only once every check below has passed. At that point the incoming
+    // engine's own record is picked up first and the selected groups are written over it, so a
+    // group the user did not select keeps the incoming engine's value rather than inheriting the
+    // outgoing engine's (a prompt written for one engine used to leak into the next this way).
+    const outgoingRecord = engineChanged ? captureEngineSettings() : null;
+    const incomingRecord = engineChanged
+      ? engineSettingsFor(withEngineSettings(engineSettingsMapRef.current, model, outgoingRecord), normalized.model)
+      : null;
+    // The image page values the selected groups are merged over: the incoming engine's block on an
+    // engine switch, otherwise the live one.
+    const baseImageToImage = incomingRecord ? incomingRecord.imageToImage : imageToImage;
+    const cardImageBlock = source.page === "image" && source.imageToImage && typeof source.imageToImage === "object" ? source.imageToImage : null;
+    const imagePatch = {};
+    if (toImagePage && imageToImagePatch) {
+      // The image reader states exactly what the picture recorded, in the image page's own field
+      // names; nothing else of this page is touched.
+      Object.assign(imagePatch, imageToImagePatch);
+    } else if (toImagePage) {
+      if (selectedGroups.has("prompts")) Object.assign(imagePatch, { positive: cardImageBlock?.positive ?? normalized.positive, negative: cardImageBlock?.negative ?? normalized.negative });
+      if (selectedGroups.has("sampling")) {
+        Object.assign(imagePatch, {
+          steps: cardImageBlock?.steps ?? normalized.steps,
+          cfg: cardImageBlock?.cfg ?? normalized.cfg,
+          seed: cardImageBlock?.seed ?? normalized.seed,
+          seedMode: cardImageBlock?.seedMode ?? normalized.seedMode,
+          sampler: cardImageBlock?.sampler ?? normalized.sampler,
+          scheduler: cardImageBlock?.scheduler ?? normalized.scheduler,
+          imagesPerBatch: cardImageBlock?.imagesPerBatch ?? normalized.imagesPerBatch,
+          batchCount: cardImageBlock?.batchCount ?? normalized.batchCount,
+          // A record without a CLIP skip ran the family default, so it applies as `null` (= default).
+          clipSkip: Number.isInteger((cardImageBlock ?? source).clipSkip) ? (cardImageBlock ?? source).clipSkip : null,
+          // A text-to-image card has no image-page strength: its `denoise` is the unused 1.0.
+          ...(cardImageBlock ? { denoise: cardImageBlock.denoise, fixSteps: cardImageBlock.fixSteps } : {}),
+        });
+      }
+      if (selectedGroups.has("canvas")) {
+        Object.assign(imagePatch, cardImageBlock
+          ? { sizeMode: cardImageBlock.sizeMode, scale: cardImageBlock.scale, width: cardImageBlock.width, height: cardImageBlock.height, resizeMode: cardImageBlock.resizeMode }
+          : { sizeMode: "custom", width: normalized.size.width, height: normalized.size.height });
+      }
+      if (selectedGroups.has("chain")) imagePatch.postprocessChain = cardImageBlock?.postprocessChain ?? normalized.postprocessChain;
+    }
+    let nextImageToImage = toImagePage && Object.keys(imagePatch).length
+      ? normalizeImageToImageSettings({ ...baseImageToImage, ...imagePatch })
+      : null;
+    if (nextImageToImage && (selectedGroups.has("chain") || selectedGroups.has("prompts"))) {
+      // ADetailer unit prompts belong to the Prompts group on this page as on the other: a chain
+      // taken without Prompts keeps the units' current prompts, and Prompts taken without the
+      // chain still writes the record's unit prompts into the units already here.
+      const promptSource = chainStage(selectedGroups.has("prompts")
+        ? (imagePatch.postprocessChain ?? cardImageBlock?.postprocessChain ?? normalized.postprocessChain)
+        : baseImageToImage.postprocessChain, "adetailer");
+      nextImageToImage = {
+        ...nextImageToImage,
+        postprocessChain: nextImageToImage.postprocessChain.map((stage) => (stage.type === "adetailer"
+          ? {
+            // `normalizeADetailerStage` returns the stage body only; the chain entry keeps its type and id.
+            ...stage,
+            ...normalizeADetailerStage({
+              ...stage,
+              units: stage.units.map((unit, index) => ({
+                ...unit,
+                prompt: promptSource?.units?.[index]?.prompt ?? (selectedGroups.has("prompts") ? unit.prompt : ""),
+                negativePrompt: promptSource?.units?.[index]?.negativePrompt ?? (selectedGroups.has("prompts") ? unit.negativePrompt : ""),
+              })),
+            }),
+          }
+          : stage)),
+      };
+    }
+    // The canvas bound is a preference the page enforces; a record asking for more is refused here
+    // rather than written and then blocked, or cut down without saying so.
+    if (selectedGroups.has("canvas")) {
+      const requested = toImagePage ? (nextImageToImage?.sizeMode === "custom" ? { width: nextImageToImage.width, height: nextImageToImage.height } : null) : normalized.size;
+      const issue = requested && (requested.width >= 64 && requested.height >= 64) ? canvasEdgeIssue(requested, { maxEdge: canvasMaxEdge, engine: normalized.model }) : "";
+      if (issue) throw new Error(`${label}的${issue}`);
+    }
     const checkpointChanged = selectedGroups.has("model") && normalized.checkpoint !== checkpoint;
     const splitAssetsChanged = selectedGroups.has("model") && (
       normalized.diffusionModel !== diffusionModel
@@ -3308,11 +3464,37 @@ function App() {
       applyLoras: selectedGroups.has("loras"),
     });
     const galleryTargetLoras = galleryTarget.loras;
+    // The chain, steps and canvas the target page will hold once this is applied — the page's own
+    // (or, on an engine switch, the incoming engine's) wherever a group was not selected.
+    const effectiveChain = toImagePage
+      ? (nextImageToImage || baseImageToImage).postprocessChain
+      : selectedGroups.has("chain") ? normalized.postprocessChain : (incomingRecord ? incomingRecord.postprocessChain : current.postprocessChain);
+    const effectiveSteps = toImagePage
+      ? (nextImageToImage || baseImageToImage).steps
+      : selectedGroups.has("sampling") ? normalized.steps : (incomingRecord ? incomingRecord.steps : current.steps);
+    const effectiveUnits = resampleUnits(effectiveChain).filter((unit) => unit.enabled);
+    // resampleChainIssue deliberately ignores disabled units; still run it for every chain/model
+    // apply so an engine switch cannot bypass validation when the chain currently has no active unit.
+    if (engineChanged || selectedGroups.has("chain")) {
+      const upscalers = targetHealthPayload?.upscalers || inferenceHealth?.upscalers || {};
+      const issue = resampleChainIssue(effectiveChain, {
+        baseSteps: effectiveSteps,
+        engine: targetModel,
+        nativeEngines: NATIVE_STEP_ENGINES,
+        upscalers: upscalers.runtime_available ? upscalers.models || [] : [],
+        // The image page's canvas depends on its source picture, which is checked at run time.
+        size: toImagePage ? null : selectedGroups.has("canvas") ? normalized.size : (incomingRecord ? incomingRecord.size : current.size),
+      });
+      if (issue) throw new Error(`${label}的${issue}`);
+      const detail = chainStage(effectiveChain, "adetailer");
+      if (selectedGroups.has("chain") && detail?.enabled) {
+        const detailIssue = adetailerStageIssue(detail, effectiveSteps, (detector) => adetailerInfo.available && adetailerModels.some((item) => item.value === detector), targetModel);
+        if (detailIssue) throw new Error(`${label}的 ${detailIssue}`);
+      }
+    }
     if (SPLIT_MODEL_ENGINES.includes(targetModel)) {
       const features = targetHealthPayload?.engines?.[targetModel]?.features || {};
       const effectiveLoras = selectedGroups.has("loras") ? galleryTargetLoras : (engineChanged || checkpointChanged || splitAssetsChanged) ? galleryTargetLoras : current.loras;
-      const effectiveChain = selectedGroups.has("chain") ? normalized.postprocessChain : current.postprocessChain;
-      const effectiveUnits = resampleUnits(effectiveChain).filter((unit) => unit.enabled);
       const effectiveADetailer = chainStage(effectiveChain, "adetailer") || { enabled: false, units: [] };
       const effectiveRtx = chainStage(effectiveChain, "rtx") || { enabled: false };
       const requestedFeatures = [
@@ -3331,19 +3513,8 @@ function App() {
         const available = new Set((loraPayload.categories || []).flatMap((category) => category.models || []).map((item) => item.value));
         if (enabledLoras.some((item) => !available.has(item.value))) throw new Error(`${label}的 ${targetModel} LoRA 文件未安装或已移动`);
       }
-      if ((engineChanged || selectedGroups.has("chain")) && effectiveUnits.length) {
-        const upscalers = targetHealthPayload?.upscalers || {};
-        const issue = resampleChainIssue(effectiveChain, {
-          baseSteps: selectedGroups.has("sampling") ? normalized.steps : current.steps,
-          engine: targetModel,
-          nativeEngines: NATIVE_STEP_ENGINES,
-          upscalers: upscalers.runtime_available ? upscalers.models || [] : [],
-        });
-        if (issue) throw new Error(`${label}的${issue}`);
-      }
       if ((engineChanged || selectedGroups.has("chain")) && effectiveADetailer.enabled) {
-        const baseSteps = selectedGroups.has("sampling") ? normalized.steps : current.steps;
-        const issue = adetailerStageIssue(effectiveADetailer, baseSteps, (detector) => adetailerInfo.available && adetailerModels.some((item) => item.value === detector), targetModel);
+        const issue = adetailerStageIssue(effectiveADetailer, effectiveSteps, (detector) => adetailerInfo.available && adetailerModels.some((item) => item.value === detector), targetModel);
         if (issue) throw new Error(`${label}的 ${issue}`);
       }
       if ((engineChanged || selectedGroups.has("chain")) && effectiveRtx.enabled && targetHealthPayload?.rtx_vsr?.available !== true) {
@@ -3360,6 +3531,15 @@ function App() {
       }
     }
 
+    // Every check has passed; from here on everything is a write.
+    if (engineChanged) {
+      commitEngineSettings(model, outgoingRecord);
+      applyEngineSettings(incomingRecord);
+    }
+    if (toImagePage) {
+      // The image page's own block, merged above; its source picture is never touched.
+      if (nextImageToImage) setImageToImage(nextImageToImage);
+    } else {
     if (selectedGroups.has("prompts")) {
       setPositive(normalized.positive);
       setNegative(normalized.negative);
@@ -3383,6 +3563,8 @@ function App() {
       setScheduler(normalized.scheduler);
       setGuidance(normalized.guidance);
       setPag(normalized.pag);
+      // A record without a CLIP skip ran the family default, so that is what it applies.
+      setClipSkip(normalizeClipSkip(normalized.model, Number.isInteger(source.clipSkip) ? source.clipSkip : null));
     }
     if (selectedGroups.has("canvas")) setSize(normalized.size);
     if (selectedGroups.has("chain")) {
@@ -3391,16 +3573,22 @@ function App() {
         // Prompts are their own group: taking the card's chain without its prompts keeps whatever
         // the user has typed here, unit by unit.
         return normalized.postprocessChain.map((stage) => (stage.type === "adetailer" && !selectedGroups.has("prompts")
-          ? normalizeADetailerStage({
+          ? {
+            // The chain entry keeps its type and id; `normalizeADetailerStage` returns the body only,
+            // and without them the stage stopped being found as the ADetailer stage.
             ...stage,
-            units: stage.units.map((unit, index) => ({
-              ...unit,
-              prompt: currentDetail?.units?.[index]?.prompt ?? "",
-              negativePrompt: currentDetail?.units?.[index]?.negativePrompt ?? "",
-            })),
-          })
+            ...normalizeADetailerStage({
+              ...stage,
+              units: stage.units.map((unit, index) => ({
+                ...unit,
+                prompt: currentDetail?.units?.[index]?.prompt ?? "",
+                negativePrompt: currentDetail?.units?.[index]?.negativePrompt ?? "",
+              })),
+            }),
+          }
           : stage));
       });
+    }
     }
     if (selectedGroups.has("auxiliary")) {
       setBackgroundRemovalModel(normalized.backgroundRemovalModel);
@@ -3478,11 +3666,44 @@ function App() {
    * and the missing-checkpoint mark stay in one implementation.
    */
   const applyImageInfoParameters = async (plan) => {
-    const shared = new Set(["model", "loras"]);
-    const workspaceGroups = plan.target === "i2i" ? plan.groups.filter((id) => shared.has(id)) : [...plan.groups];
-    if (plan.target === "i2i" && Object.keys(plan.imageToImage).length) {
-      setImageToImage((current) => normalizeImageToImageSettings({ ...current, ...plan.imageToImage }));
+    const toImagePage = plan.target === "i2i";
+    const engine = plan.targetEngine || model;
+    const imageToImagePatch = { ...plan.imageToImage };
+    const overlayChain = {};
+    if (plan.groups.includes("sampling")) {
+      // A picture that records no CLIP skip ran the family default, so its sampling applies that
+      // default rather than leaving whatever this workspace had selected.
+      if (toImagePage && !("clipSkip" in imageToImagePatch)) imageToImagePatch.clipSkip = null;
+      if (!toImagePage && !("clipSkip" in plan.overlay)) plan.overlay.clipSkip = null;
     }
+    if (plan.postprocess) {
+      // The recorded chain meets this machine here: installed upscalers and detectors, the engine's
+      // declared stages, and the same chain checks a run makes. Only a chain that can run as a
+      // whole is written; everything left out is listed on the result.
+      const health = inferenceHealthRef.current;
+      const upscalers = health?.upscalers || {};
+      const chainPlan = buildPostprocessChainPlan(plan.postprocess, {
+        engine,
+        upscalers: upscalers.models || [],
+        upscalerRuntimeReady: upscalers.runtime_available === true,
+        detectors: adetailerModels,
+        detectorRuntimeReady: adetailerInfo.available === true,
+        baseSteps: toImagePage ? (imageToImagePatch.steps ?? imageToImage.steps) : (plan.overlay.steps ?? steps),
+        size: toImagePage ? null : (plan.overlay.size ?? size),
+        order: plan.postprocessOrder || "hires-first",
+        features: SPLIT_MODEL_ENGINES.includes(engine) ? (health?.engines?.[engine]?.features || {}) : null,
+      });
+      plan.unapplied = chainPlan.unapplied;
+      plan.notes = [...(plan.notes || []), ...chainPlan.notes];
+      plan.chainApplied = chainPlan.applied;
+      if (chainPlan.ready) {
+        if (toImagePage) imageToImagePatch.postprocessChain = chainPlan.chain;
+        else overlayChain.postprocessChain = chainPlan.chain;
+      } else {
+        plan.groups = plan.groups.filter((id) => id !== "chain");
+      }
+    }
+    const workspaceGroups = [...plan.groups];
     if (!workspaceGroups.length) return;
     const snapshot = gallerySettingsWithoutPromptPresets(workspaceSnapshot.current);
     const overlay = { ...plan.overlay };
@@ -3493,14 +3714,33 @@ function App() {
       // engine that happens to be selected, whose encoder is the wrong model outright (Anima's Qwen3
       // 0.6B under a Krea 2 diffusion model, say).
       const record = engineSettingsFor(workspaceSnapshot.current.engineSettingsByEngine, targetEngine);
+      // Everything the picture did not record comes from that engine's record too, so a value the
+      // picture is silent about is the incoming engine's own rather than the outgoing engine's.
       Object.assign(snapshot, {
         checkpoint: record.checkpoint,
         diffusionModel: record.diffusionModel,
         textEncoder: record.textEncoder,
         textEncoder2: record.textEncoder2,
         vae: record.vae,
+        positive: record.positive,
+        negative: record.negative,
+        clipSkip: record.clipSkip,
+        steps: record.steps,
+        cfg: record.cfg,
+        denoise: record.denoise,
+        imagesPerBatch: record.imagesPerBatch,
+        batchCount: record.batchCount,
+        seed: record.seed,
+        seedMode: record.seedMode,
+        sampler: record.sampler,
+        scheduler: record.scheduler,
+        guidance: record.guidance,
+        pag: record.pag,
+        size: record.size,
+        postprocessChain: record.postprocessChain,
       });
     }
+    Object.assign(overlay, overlayChain);
     if (Array.isArray(overlay.loras)) {
       // A LoRA found under another engine's root cannot be mounted here: the
       // catalogue scan would prune it moments later. Dropping the whole group
@@ -3514,7 +3754,13 @@ function App() {
       }
     }
     if (!workspaceGroups.length) return;
-    await applyGallerySettings({ ...snapshot, ...overlay }, workspaceGroups, { page: null, label: "图片参数", fillMissingAssets: true });
+    await applyGallerySettings({ ...snapshot, ...overlay }, workspaceGroups, {
+      page: null,
+      label: "图片参数",
+      fillMissingAssets: true,
+      target: toImagePage ? "i2i" : "t2i",
+      imageToImagePatch: toImagePage ? imageToImagePatch : null,
+    });
   };
 
   // Choosing a different engine, checkpoint or component is a change of *selection*. It used to tear
@@ -3540,6 +3786,59 @@ function App() {
     // the installed runtime reports rather than on the engine alone.
     if (restored.guidance === "pag" && !pagAvailableForEngine(inferenceHealthRef.current, nextModel)) setGuidance("none");
     setModel(nextModel);
+  };
+
+  // Why the LoRA manager may not switch the generation engine right now, or "". Choosing an engine
+  // there is the same swap as the engine buttons (no model is unloaded for it), but it happens away
+  // from the generate page, so a running or not-yet-recovered job refuses it with a reason instead
+  // of changing what the next submission targets behind the user's back.
+  const loraEngineSwitchBlocker = () => {
+    if (modelSwitching) return "模型切换中，请稍候再切换引擎";
+    if (activeJobRecoveryPending) return "正在恢复进行中的任务状态，恢复完成后才能切换引擎";
+    if (queueBusy) return "当前有任务正在运行或排队，完成后才能切换生图引擎";
+    return "";
+  };
+  const switchEngineFromLoraManager = (engine) => {
+    if (engine === model) return true;
+    if (!READY_ENGINES.includes(engine)) return false;
+    const reason = loraEngineSwitchBlocker();
+    if (reason) {
+      setAppNotice({ message: reason, error: true });
+      return false;
+    }
+    selectModel(engine);
+    return true;
+  };
+  loraEngineSwitchRef.current = { blocker: loraEngineSwitchBlocker, switch: switchEngineFromLoraManager };
+  const selectLoraCategory = (categoryId) => {
+    setLoraCategory(categoryId);
+    setLoraFolderPath("");
+  };
+  // The path field: a project-relative, engine-relative or host-absolute folder becomes a relative
+  // navigation reference on the server (never a mount ID), and landing in another engine's folder
+  // switches the generation engine exactly as choosing it would.
+  const locateLoraFolder = async (typed = loraPathInput) => {
+    const text = String(typed || "").trim();
+    if (!text || loraPathBusy) return;
+    setLoraPathBusy(true);
+    try {
+      const response = await fetch("/api/lora-folder", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: text, engine: model }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.folder) throw new Error(payload.error || "无法定位该 LoRA 文件夹");
+      const target = payload.folder;
+      if (target.engine !== model && !switchEngineFromLoraManager(target.engine)) return;
+      setLoraNavigation({ ...target, requestedAt: Date.now() });
+      setLoraPathInput(target.display || text);
+      setLoraSearch("");
+    } catch (error) {
+      setAppNotice({ message: error.message || "无法定位该 LoRA 文件夹", error: true });
+    } finally {
+      setLoraPathBusy(false);
+    }
   };
 
   const selectCheckpoint = (nextCheckpoint) => {
@@ -5530,9 +5829,38 @@ function App() {
     setActivePromptPresets((current) => ({ ...current, [record.type]: togglePromptPresetId(current[record.type], record.id) }));
   };
 
-  const openPromptPresetDialog = (type, record = null) => {
+  // Every library write goes through one place: the new container is stored and marked for saving,
+  // and an operation the model refuses comes back as its message rather than a thrown error.
+  const commitPromptPresets = (next) => {
+    setPromptPresets(next);
+    setShouldPersistPromptPresets(true);
+  };
+  // Cards that no longer exist stop contributing their words on the engine in use, rather than
+  // staying switched on as ids nothing on screen can show or turn off again.
+  const dropActivePromptPresets = (ids) => {
+    const gone = new Set(ids);
+    if (!gone.size) return;
+    setActivePromptPresets((current) => ({
+      positive: current.positive.filter((id) => !gone.has(id)),
+      negative: current.negative.filter((id) => !gone.has(id)),
+    }));
+  };
+
+  const togglePromptPresetWindow = (type, anchor = null) => {
+    if (presetWindowOpen && presetWindowModule === type) {
+      setPresetWindowOpen(false);
+      return;
+    }
+    setPresetWindowModule(type);
+    if (!presetWindowOpen && !presetWindowPosition) {
+      setPresetWindowPosition(queueWindowPlacement(anchor?.getBoundingClientRect?.() || null, PRESET_WINDOW_SIZE, { width: window.innerWidth, height: window.innerHeight }));
+    }
+    setPresetWindowOpen(true);
+  };
+
+  const openPromptPresetDialog = (type, groupId = "", record = null) => {
     if (promptPresetLibraryError) return;
-    setPromptPresetDialog({ type, record });
+    setPromptPresetDialog({ type, groupId, record });
   };
 
   const savePromptPreset = (draft) => {
@@ -5542,8 +5870,10 @@ function App() {
         ? updatePromptPreset(promptPresets, promptPresetDialog.record.id, draft)
         : createPromptPreset(promptPresets, draft);
       if (!result.validation.valid) return Object.values(result.validation.errors)[0] || "Prompt 预设格式无效";
-      setPromptPresets(result.container);
-      setShouldPersistPromptPresets(true);
+      commitPromptPresets(result.container);
+      // A card moved into the other module cannot stay switched on under its old one.
+      if (promptPresetDialog?.record && promptPresetDialog.record.type !== result.record.type) dropActivePromptPresets([result.record.id]);
+      setPresetWindowGroups((current) => ({ ...current, [result.record.type]: result.record.groupId }));
       setPromptPresetDialog(null);
       return "";
     } catch (error) {
@@ -5551,21 +5881,74 @@ function App() {
     }
   };
 
+  const createPresetGroup = (type, name) => {
+    if (promptPresetLibraryError) return { error: "Prompt 预设库暂时不可写" };
+    try {
+      const result = createPromptPresetGroup(promptPresets, { type, name });
+      if (result.error) return { error: result.error };
+      commitPromptPresets(result.container);
+      return { group: result.group };
+    } catch (error) {
+      return { error: error.message || "无法新建分组" };
+    }
+  };
+
+  const renamePresetGroup = (id, name) => {
+    if (promptPresetLibraryError) return "Prompt 预设库暂时不可写";
+    try {
+      const result = renamePromptPresetGroup(promptPresets, id, name);
+      if (result.error) return result.error;
+      commitPromptPresets(result.container);
+      return "";
+    } catch (error) {
+      return error.message || "无法重命名分组";
+    }
+  };
+
+  const reorderPresetGroup = (id, index) => {
+    if (promptPresetLibraryError) return "Prompt 预设库暂时不可写";
+    try {
+      commitPromptPresets(reorderPromptPresetGroup(promptPresets, id, index));
+      return "";
+    } catch (error) {
+      return error.message || "无法调整分组顺序";
+    }
+  };
+
+  const reorderPresetCard = (id, index, groupId) => {
+    if (promptPresetLibraryError) return "Prompt 预设库暂时不可写";
+    try {
+      const before = promptPresets.records.find((record) => record.id === id);
+      const next = reorderPromptPreset(promptPresets, id, index, groupId);
+      commitPromptPresets(next);
+      const after = next.records.find((record) => record.id === id);
+      if (before && after && before.type !== after.type) dropActivePromptPresets([id]);
+      return "";
+    } catch (error) {
+      return error.message || "无法调整卡片顺序";
+    }
+  };
+
   const requestDeletePromptPreset = (record) => {
     if (promptPresetLibraryError) return;
-    setPromptPresetDelete(record);
+    setPromptPresetDelete({ kind: "card", record });
+  };
+
+  const requestDeletePresetGroup = (group) => {
+    if (promptPresetLibraryError) return;
+    setPromptPresetDelete({ kind: "group", group, count: promptPresetGroupCards(promptPresets, group.id).length });
   };
 
   const confirmDeletePromptPreset = () => {
     if (promptPresetLibraryError || !promptPresetDelete) return;
-    setPromptPresets((current) => deletePromptPreset(current, promptPresetDelete.id));
-    // A deleted preset stops contributing its words, rather than staying switched on as an id
-    // nothing on screen can show or turn off again.
-    setActivePromptPresets((current) => ({
-      positive: current.positive.filter((id) => id !== promptPresetDelete.id),
-      negative: current.negative.filter((id) => id !== promptPresetDelete.id),
-    }));
-    setShouldPersistPromptPresets(true);
+    if (promptPresetDelete.kind === "group") {
+      const result = deletePromptPresetGroup(promptPresets, promptPresetDelete.group.id);
+      commitPromptPresets(result.container);
+      dropActivePromptPresets(result.removedRecordIds);
+    } else {
+      commitPromptPresets(deletePromptPreset(promptPresets, promptPresetDelete.record.id));
+      dropActivePromptPresets([promptPresetDelete.record.id]);
+    }
     setPromptPresetDelete(null);
   };
 
@@ -6039,6 +6422,10 @@ function App() {
   };
   const matchesLoraSearch = (item) => item.name.toLowerCase().includes(loraSearch.trim().toLowerCase());
   const visibleLoras = loraCategory === "mounted" ? [] : activeLoraCategory?.models.filter(matchesLoraSearch) ?? [];
+  // A local category is walked folder by folder; the shared category keeps its own root view.
+  const loraFolder = activeLoraCategory && !activeLoraCategory.shared && loraCategory !== "mounted" && loraCategory !== "groups"
+    ? loraFolderView(activeLoraCategory, loraFolderPath, loraSearch)
+    : null;
   const displayedGenerationProgress = progress;
   const selectedOutput = generatedOutputs[selectedOutputIndex] || null;
   const transparentPromptEnabled = transparentBackgroundEnabled(positive);
@@ -6098,9 +6485,11 @@ function App() {
                   : generationStage === "model_restore"
                     ? "MODEL RESTORE"
                     : generationStage.toUpperCase();
-  const canvasSizeValid = size.width >= 64 && size.height >= 64
-    && size.width <= 2048 && size.height <= 2048
-    && size.width % 64 === 0 && size.height % 64 === 0;
+  // The bound the pickers offer for this engine: the Settings bound, capped by the engine's own edge.
+  const canvasPickerMax = effectiveCanvasMaxEdge(canvasMaxEdge, model);
+  const canvasIssue = canvasEdgeIssue(size, { maxEdge: canvasMaxEdge, engine: model });
+  const canvasSizeValid = !canvasIssue;
+  const clipSkipLimits = clipSkipRange(model);
   const isAnima = model === "Anima";
   const tilesHires = supportsUsduTiled(model);
   const isFlux = model === "Flux";
@@ -6160,7 +6549,6 @@ function App() {
   const adetailerReady = !adetailer.enabled || (adetailerInfo.available && !adetailerIssue);
   const adetailerLocked = modelSwitching;
   const upscalerModels = inferenceHealth?.upscalers?.models || [];
-  const compatibleUpscalers = upscalerModels.filter((item) => item.compatible);
   const chainResampleUnits = resampleUnits(postprocessChain);
   const activeResampleUnits = chainResampleUnits.filter((unit) => unit.enabled);
   const chainUsesUpscaler = activeResampleUnits.some((unit) => unit.upscaler);
@@ -6242,7 +6630,7 @@ function App() {
           : transparentPromptEnabled && !selectedBackgroundRemovalModel ? "请选择透明背景模型"
           : transparentPromptEnabled && !selectedBackgroundRemovalModel?.installed ? "所选透明背景模型尚未下载"
           : transparentPromptEnabled && !inferenceHealth?.background_removal?.runtime_available ? "ONNX Runtime 尚未就绪，请重新运行环境配置器"
-          : !canvasSizeValid ? "画布尺寸必须为 64 的倍数且不超过 2048"
+          : !canvasSizeValid ? canvasIssue
             : ultraLowMode && enabledChainStages(postprocessChain).length ? "极限省存模式正在关闭附加后处理阶段"
               : ultraLowMode && guidance !== "none" ? "极限省存模式不支持引导增强"
                 : !guidanceReady ? `当前 ${model} 推理运行时未声明 ${guidance === "pag" ? "PAG" : "CFG-Zero*"} 可用`
@@ -6310,11 +6698,14 @@ function App() {
   const runtimeMemoryMode = actualPerformanceValue(performanceActive.memory_mode, inferenceHealth?.memory_mode);
   const runtimeAttentionBackend = actualPerformanceValue(performanceActive.attention_backend, inferenceHealth?.attention_backend);
   const runtimeComputeDtype = actualPerformanceValue(performanceActive.compute_dtype, inferenceHealth?.compute_dtype);
-  const renderModalLoraCard = (item, categoryLabel) => {
+  const renderModalLoraCard = (item, categoryLabel, displayName = "") => {
     const mounted = loras.some((lora) => lora.value === item.value);
     const lookup = loraLookups[item.value];
     const metadata = item.metadata;
-    const presentation = loraPresentationFor(item);
+    const basePresentation = loraPresentationFor(item);
+    // Inside a folder the card names the file, not the whole path below the category; a custom
+    // card title still wins. The item itself (and the mount entry built from it) is unchanged.
+    const presentation = displayName && !basePresentation.renamed ? { ...basePresentation, title: displayName } : basePresentation;
     return <article
       aria-disabled={modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras}
       className={`lora-library-card ${mounted ? "mounted" : ""} ${presentation.customized ? "customized" : ""} ${modelSwitching || loraWorkspaceLocked || !shouldPersistMountedLoras ? "locked" : ""}`}
@@ -6472,7 +6863,9 @@ function App() {
                 <Slider label="采样步数" value={steps} min={1} max={60} integer onChange={setSteps} />
                 <Slider label={isDistilledGuidance ? "蒸馏引导（Guidance）" : "CFG 引导"} value={cfg} min={1} max={15} step={0.5} inputStep={0.1} onChange={setCfg} />
                 <Slider label="降噪强度" value={denoise} min={0} max={1} step={0.05} inputStep={0.01} onChange={setDenoise} />
+                {clipSkipLimits && <Slider label="CLIP skip" value={clipSkip ?? clipSkipLimits.default} min={clipSkipLimits.minimum} max={clipSkipLimits.maximum} integer onChange={(value) => setClipSkip(normalizeClipSkip(model, value))} />}
               </div>
+              {clipSkipLimits && <p className="clip-skip-note">生效值 <b>{normalizeClipSkip(model, clipSkip)}</b>{model === "iL" ? " · SDXL/iL 的 CLIP-L/G 两塔最小有效值为 2（与 Forge 一致），默认 2 即当前编码" : " · 默认 1 即最终层（当前编码）"}</p>}
               <div className="generation-count-grid">
                 <CountField label="单批图片数" detail="一次批量推理同时生成" value={imagesPerBatch} max={10} disabled={modelSwitching} onChange={setImagesPerBatch} />
                 <CountField label="生成批次数" detail="批次之间按顺序排队" value={batchCount} max={20} disabled={modelSwitching} onChange={setBatchCount} />
@@ -6496,17 +6889,23 @@ function App() {
                 baseSize={size}
                 baseSteps={steps}
                 baseCfg={cfg}
-                upscalers={upscalerModels}
+                upscalers={inferenceHealth?.upscalers || { models: upscalerModels, builtins: [] }}
                 upscalerRuntimeReady={upscalerRuntimeReady}
                 upscalersRefreshing={upscalersRefreshing}
                 onRefreshUpscalers={() => void refreshUpscalers()}
+                upscalerDownloadJob={modelDownloadJob}
+                upscalerDownloadBusy={upscalerDownloadBusy}
+                upscalerDownloadError={upscalerDownloadError}
+                onDownloadUpscaler={downloadUpscalerArtifact}
+                onRetryUpscaler={retryUpscalerDownload}
                 locked={hiresControlsLocked}
                 addDisabled={ultraLowMode}
                 unitUnavailableReason={!engineAllowsHires ? `当前推理服务未声明 ${model} 重采样能力。` : ultraLowMode ? "极限省存模式会关闭全部附加后处理阶段。" : ""}
                 Slider={Slider}
-                NumberInput={ChainNumberInput}
-                randomSeed={randomSeed}
-                renderCard={({ title, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
+                 NumberInput={ChainNumberInput}
+                 randomSeed={randomSeed}
+                 chainIssue={chainIssue}
+                 renderCard={({ title, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
                   <section className={`postprocess-stage-card ${enabled ? "enabled" : ""} ${expanded ? "expanded" : ""}`}>
                     <PostprocessStageHeader
                       title={title}
@@ -6705,7 +7104,7 @@ function App() {
             onDownload={downloadBackgroundRemovalModel}
             onToggle={toggleTextToImageTransparentBackground}
           />
-          <PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} activeIds={activePromptPresets.positive} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />
+          <PromptPresetStrip type="positive" container={promptPresets} activeIds={activePromptPresets.positive} open={presetWindowOpen && presetWindowModule === "positive"} disabled={modelSwitching} libraryError={promptPresetLibraryError} onOpen={togglePromptPresetWindow} onToggle={applyPreset} />
 
           <label className="prompt-field negative-field">
             <div><span>负向提示词</span><small>{engineAllowsNegativePrompt ? `${negative.length} 字符` : "当前引擎不使用"}</small></div>
@@ -6713,18 +7112,19 @@ function App() {
           </label>
           {/* The text is kept, not cleared: switching back to another engine should find it intact. */}
           {!engineAllowsNegativePrompt && negative.trim() && <p className="guidance-unavailable" role="status">已保留负向提示词，但本次 FLUX.1 生成不会使用它。</p>}
-          <PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} activeIds={activePromptPresets.negative} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />
+          <PromptPresetStrip type="negative" container={promptPresets} activeIds={activePromptPresets.negative} open={presetWindowOpen && presetWindowModule === "negative"} disabled={modelSwitching} libraryError={promptPresetLibraryError} onOpen={togglePromptPresetWindow} onToggle={applyPreset} />
 
           <div className="canvas-settings">
-            <div className="section-heading"><span>08</span><h2>画布尺寸</h2><div className="dimension"><BoundedNumberInput value={size.width} min={0} max={2048} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(width) => setSize((current) => ({ ...current, width }))} ariaLabel="画布宽度" /><i>×</i><BoundedNumberInput value={size.height} min={0} max={2048} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(height) => setSize((current) => ({ ...current, height }))} ariaLabel="画布高度" /><b>PX</b></div></div>
-            <SizeGrid width={size.width} height={size.height} onChange={(width, height) => setSize({ width, height })} />
+            <div className="section-heading"><span>08</span><h2>画布尺寸</h2><div className="dimension"><BoundedNumberInput value={size.width} min={0} max={canvasPickerMax} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(width) => setSize((current) => ({ ...current, width }))} ariaLabel="画布宽度" /><i>×</i><BoundedNumberInput value={size.height} min={0} max={canvasPickerMax} integer normalize={(value) => Math.round(value / 64) * 64} onCommit={(height) => setSize((current) => ({ ...current, height }))} ariaLabel="画布高度" /><b>PX</b></div></div>
+            <SizeGrid width={size.width} height={size.height} max={canvasPickerMax} onChange={(width, height) => setSize({ width, height })} />
             <div className="size-presets">
               {[{ label: "512", w: 512, h: 512 }, { label: "1:1", w: 1024, h: 1024 }, { label: "4:3", w: 1152, h: 896 }, { label: "3:4", w: 896, h: 1152 }, { label: "16:9", w: 1344, h: 768 }, { label: "9:16", w: 768, h: 1344 }].map((item) => (
                 <button key={item.label} className={size.width === item.w && size.height === item.h ? "active" : ""} onClick={() => setSize({ width: item.w, height: item.h })}>{item.label}</button>
               ))}
-              <span>范围 0 × 0 ～ 2048 × 2048</span>
+              <span title="画布上限在“设置 → 常规设置”中调整">范围 0 × 0 ～ {canvasPickerMax} × {canvasPickerMax}</span>
             </div>
-            {!canvasSizeValid && <p className="canvas-size-warning">0 × 0 可用于网格定位；生成尺寸至少为 64 × 64</p>}
+            {!canvasSizeValid && <p className="canvas-size-warning">{size.width < 64 || size.height < 64 ? "0 × 0 可用于网格定位；生成尺寸至少为 64 × 64" : canvasIssue}</p>}
+            {canvasSizeValid && Math.max(size.width, size.height) > DEFAULT_CANVAS_MAX_EDGE && <p className="canvas-size-note">超过 2048 的画布会在提交时按本机显存与内存预先检查，放不下的任务会在入队前被拒绝，不会自动降低分辨率。</p>}
           </div>
         </section>
 
@@ -6841,6 +7241,7 @@ function App() {
         }}
         stagePreviews={stagePreviews}
         onEnlargeStage={setEnlargedStage}
+        canvasMaxEdge={canvasMaxEdge}
         job={{
           status,
           progress: displayedGenerationProgress,
@@ -6894,11 +7295,19 @@ function App() {
           onModelChange: setBackgroundRemovalModel,
           onDownload: downloadBackgroundRemovalModel,
         }}
-        positivePromptPresets={<PresetBox title="预设正向 Prompt" type="positive" records={sortPromptPresetRecords(promptPresets.records, "positive")} activeIds={activePromptPresets.positive} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("positive")} onEdit={(record) => openPromptPresetDialog("positive", record)} onDelete={requestDeletePromptPreset} />}
-        negativePromptPresets={<PresetBox title="预设负向 Prompt" type="negative" records={sortPromptPresetRecords(promptPresets.records, "negative")} activeIds={activePromptPresets.negative} disabled={modelSwitching} libraryError={promptPresetLibraryError} libraryWarning={promptPresetLibraryWarning} onSelect={applyPreset} onCreate={() => openPromptPresetDialog("negative")} onEdit={(record) => openPromptPresetDialog("negative", record)} onDelete={requestDeletePromptPreset} />}
+        positivePromptPresets={<PromptPresetStrip type="positive" container={promptPresets} activeIds={activePromptPresets.positive} open={presetWindowOpen && presetWindowModule === "positive"} disabled={modelSwitching} libraryError={promptPresetLibraryError} onOpen={togglePromptPresetWindow} onToggle={applyPreset} />}
+        negativePromptPresets={<PromptPresetStrip type="negative" container={promptPresets} activeIds={activePromptPresets.negative} open={presetWindowOpen && presetWindowModule === "negative"} disabled={modelSwitching} libraryError={promptPresetLibraryError} onOpen={togglePromptPresetWindow} onToggle={applyPreset} />}
         postprocess={{
-          upscalers: compatibleUpscalers,
+          upscalers: upscalerModels,
+          upscalerCatalog: inferenceHealth?.upscalers || { models: upscalerModels, builtins: [] },
           upscalerRuntime: inferenceHealth?.upscalers?.runtime_available === true,
+          upscalersRefreshing,
+          onRefreshUpscalers: () => void refreshUpscalers(),
+          upscalerDownloadJob: modelDownloadJob,
+          upscalerDownloadBusy,
+          upscalerDownloadError,
+          onDownloadUpscaler: downloadUpscalerArtifact,
+          onRetryUpscaler: retryUpscalerDownload,
           adetailerModels,
           adetailerInfo,
           rtxHealth,
@@ -6906,17 +7315,27 @@ function App() {
         }}
         /></Suspense> : activePage === "gallery" ? <Suspense fallback={<PageLoading label="正在加载画廊" />}><GalleryPage
         currentSettings={galleryCardSettings(workspaceSnapshot.current)}
+        canvasMaxEdge={canvasMaxEdge}
         focus={galleryFocus}
          onApplySettings={applyGallerySettings}
          onApplyPrompt={applyPromptLibraryEntry}
-        onNotice={(message, error = false) => setAppNotice({ message, error })}
+         upscalerCatalog={inferenceHealth?.upscalers || { models: upscalerModels, builtins: [] }}
+         upscalerRuntimeReady={inferenceHealth?.upscalers?.runtime_available === true}
+         upscalersRefreshing={upscalersRefreshing}
+         onRefreshUpscalers={() => void refreshUpscalers()}
+         upscalerDownloadJob={modelDownloadJob}
+         upscalerDownloadBusy={upscalerDownloadBusy}
+         upscalerDownloadError={upscalerDownloadError}
+         onDownloadUpscaler={downloadUpscalerArtifact}
+         onRetryUpscaler={retryUpscalerDownload}
+         onNotice={(message, error = false) => setAppNotice({ message, error })}
       /></Suspense> : <Suspense fallback={<PageLoading label="正在加载工具箱" />}><ToolboxPage onApplyImageParameters={applyImageInfoParameters} onDownloaded={({ kind, engine, targets: completedTargets }) => {
         const targets = completedTargets?.length ? completedTargets : [{ kind, engine }];
         if (targets.some((target) => (target.kind === "checkpoint" && target.engine === model) || (SPLIT_MODEL_ENGINES.includes(model) && (target.engine === model || ["diffusion_model", "text_encoder", "vae", "config"].includes(target.kind))))) void refreshCheckpoints();
         if (targets.some((target) => target.kind === "lora" && target.engine === model)) void refreshLoras();
         if (targets.some((target) => target.kind === "yolo")) void refreshADetailerModels();
         if (targets.some((target) => target.kind === "upscaler")) void refreshUpscalers();
-      }} /></Suspense>}
+      }} imageApplyContext={{ engine: model, maximumEdge: canvasMaxEdge }} /></Suspense>}
       {enlargedStage && <div className="stage-enlarge" role="dialog" aria-modal="true" aria-label={`${enlargedStage.label} 阶段结果`} onClick={() => setEnlargedStage(null)}>
         <figure onClick={(event) => event.stopPropagation()}>
           <img src={enlargedStage.url} alt={`${enlargedStage.label} 阶段结果`} />
@@ -6934,8 +7353,40 @@ function App() {
           setAppNotice({ message: `已将 ${imageCount} 张图片加入精选集${count > 1 ? `，创建 ${count} 张卡片` : ""}`, error: false });
         }}
       />}
-      {promptPresetDialog && <PromptPresetDialog dialog={promptPresetDialog} records={promptPresets.records} onSave={savePromptPreset} onRequestClose={() => setPromptPresetDialog(null)} />}
-      {promptPresetDelete && <PromptPresetDeleteDialog record={promptPresetDelete} onConfirm={confirmDeletePromptPreset} onClose={() => setPromptPresetDelete(null)} />}
+      {/* One window serves both generate pages; it floats over whichever of them is showing. */}
+      {presetWindowOpen && (activePage === "generate" || activePage === "image") && <PromptPresetWindow
+        container={promptPresets}
+        activeIds={activePromptPresets}
+        module={presetWindowModule}
+        selectedGroups={presetWindowGroups}
+        position={presetWindowPosition}
+        disabled={modelSwitching}
+        libraryError={promptPresetLibraryError}
+        libraryWarning={promptPresetLibraryWarning}
+        onModule={setPresetWindowModule}
+        onSelectGroup={(type, groupId) => setPresetWindowGroups((current) => ({ ...current, [type]: groupId }))}
+        onMove={setPresetWindowPosition}
+        onClose={() => setPresetWindowOpen(false)}
+        onToggle={applyPreset}
+        onCreateGroup={createPresetGroup}
+        onRenameGroup={renamePresetGroup}
+        onDeleteGroup={requestDeletePresetGroup}
+        onReorderGroup={reorderPresetGroup}
+        onCreateCard={(type, groupId) => openPromptPresetDialog(type, groupId)}
+        onEditCard={(record) => openPromptPresetDialog(record.type, record.groupId, record)}
+        onDeleteCard={requestDeletePromptPreset}
+        onReorderCard={reorderPresetCard}
+      />}
+      {promptPresetDialog && <PromptPresetEditor dialog={promptPresetDialog} container={promptPresets} disabled={modelSwitching} onSave={savePromptPreset} onRequestClose={() => setPromptPresetDialog(null)} />}
+      {promptPresetDelete && <PromptPresetConfirm
+        title={promptPresetDelete.kind === "group" ? `删除分组“${promptPresetDelete.group.name}”？` : `删除卡片“${promptPresetDelete.record.name}”？`}
+        detail={promptPresetDelete.kind === "group"
+          ? `分组中的 ${promptPresetDelete.count} 张卡片会一起删除，删除后不会自动恢复。此操作不会改写当前 Prompt 文本。`
+          : "卡片删除后不会自动恢复，包括原有内置预设。此操作不会改写当前 Prompt 文本。"}
+        confirmLabel={promptPresetDelete.kind === "group" ? "删除分组与卡片" : "确认删除"}
+        onConfirm={confirmDeletePromptPreset}
+        onClose={() => setPromptPresetDelete(null)}
+      />}
       {loraManagerOpen && (
         <div className="lora-modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setLoraManagerOpen(false)}>
           <section className={`lora-modal ${loraManagerMaximized ? "maximized" : ""}`} ref={loraManagerDialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="lora-manager-title">
@@ -6948,17 +7399,27 @@ function App() {
                 <button type="button" className="modal-close" aria-label="关闭 LoRA 管理器" onClick={() => setLoraManagerOpen(false)}><X size={20} /></button>
               </div>
             </header>
+            <LoraEngineBar
+              engines={READY_ENGINES}
+              engine={model}
+              blockedReason={loraEngineSwitchBlocker()}
+              onSelectEngine={switchEngineFromLoraManager}
+              pathValue={loraPathInput}
+              onPathChange={setLoraPathInput}
+              onLocate={() => void locateLoraFolder()}
+              busy={loraPathBusy}
+            />
             <div className="lora-modal-body">
               <nav className="lora-categories" aria-label="LoRA 分类">
-                <button className={`lora-mounted-nav ${loraCategory === "mounted" ? "active" : ""}`} onClick={() => setLoraCategory("mounted")}>
+                <button className={`lora-mounted-nav ${loraCategory === "mounted" ? "active" : ""}`} onClick={() => selectLoraCategory("mounted")}>
                   <span>已挂载</span><b>{loras.length}</b>
                 </button>
-                <button className={`lora-mounted-nav ${loraCategory === "groups" ? "active" : ""}`} onClick={() => setLoraCategory("groups")}>
+                <button className={`lora-mounted-nav ${loraCategory === "groups" ? "active" : ""}`} onClick={() => selectLoraCategory("groups")}>
                   <span>组合</span><b>{activeLoraGroups.length}</b>
                 </button>
                 <span>分类</span>
                 {loraLibrary.map((category) => (
-                  <button className={loraCategory === category.id ? "active" : ""} key={category.id} onClick={() => setLoraCategory(category.id)}>
+                  <button className={loraCategory === category.id ? "active" : ""} key={category.id} onClick={() => selectLoraCategory(category.id)}>
                     <span>{category.label}</span><b>{category.models.length}</b>
                   </button>
                 ))}
@@ -6992,8 +7453,8 @@ function App() {
                     />
                 </div> : <>
                 <div className="lora-browser-head">
-                  <div><h3>{activeLoraCategory?.label || "LoRA"}</h3><p>{activeLoraCategory?.directory || loraError || "选择分类浏览模型"}</p></div>
-                  <label className="lora-search"><Search size={15} /><input value={loraSearch} onChange={(event) => setLoraSearch(event.target.value)} placeholder="搜索 LoRA" /></label>
+                  <div><h3>{activeLoraCategory?.label || "LoRA"}</h3><p>{activeLoraCategory?.directory ? `${activeLoraCategory.directory}${loraFolder?.path ? `/${loraFolder.path}` : ""}` : loraError || "选择分类浏览模型"}</p></div>
+                  <label className="lora-search"><Search size={15} /><input value={loraSearch} onChange={(event) => setLoraSearch(event.target.value)} placeholder={loraFolder?.path ? "在当前文件夹中搜索" : "搜索 LoRA"} /></label>
                 </div>
                 {activeLoraCategory?.shared ? <div className="lora-modal-shared-view">
                   {(activeLoraCategory.roots || []).map((root) => {
@@ -7010,8 +7471,16 @@ function App() {
                       }) : <p className="lora-modal-shared-empty">{loraSearch ? "该共享目录中没有匹配的文件" : "该共享目录为空"}</p>}
                     </section>;
                   })}
-                </div> : <div className="lora-library-grid">
-                  {visibleLoras.map((item) => renderModalLoraCard(item, activeLoraCategory.label))}
+                </div> : loraFolder ? <LoraFolderGrid
+                  view={loraFolder}
+                  categoryLabel={activeLoraCategory.label}
+                  search={loraSearch}
+                  onOpenFolder={setLoraFolderPath}
+                  renderCard={(item, fileLabel) => renderModalLoraCard(item, loraFolder.path ? `${activeLoraCategory.label}/${loraFolder.path}` : activeLoraCategory.label, fileLabel)}
+                  emptyHint={`将模型文件放入 ${activeLoraCategory?.directory || "对应分类目录"}`}
+                  error={loraError}
+                /> : <div className="lora-library-grid">
+                  {visibleLoras.map((item) => renderModalLoraCard(item, activeLoraCategory?.label || ""))}
                   {!visibleLoras.length && <div className="lora-library-empty"><Layers3 size={30} /><strong>{loraSearch ? "没有匹配的 LoRA" : "该分类暂无 LoRA"}</strong><p>{loraSearch ? "尝试其他关键词" : `将模型文件放入 ${activeLoraCategory?.directory || "对应分类目录"}`}</p></div>}
                   {loraError && <div className="lora-library-empty error"><X size={30} /><strong>LoRA 目录读取失败</strong><p>{loraError}</p></div>}
                 </div>}
@@ -7072,6 +7541,15 @@ function App() {
                 <div className="settings-option"><div><strong>工作区自动保存</strong><p>保存 Prompt、底模、采样参数、ADetailer、画布和全部 LoRA 挂载状态。</p></div><span className="settings-status enabled">始终启用</span></div>
                 <div className="settings-option"><div><strong>界面布局</strong><p>左侧配置面板的宽度与折叠状态，保存在当前浏览器。恢复默认只会还原面板布局，不会改动任何创作参数或其他设置。</p></div><button type="button" className="settings-layout-reset" disabled={isDefaultWorkspaceLayout(workspaceLayout)} onClick={resetWorkspaceLayout}><PanelLeft size={13} />{isDefaultWorkspaceLayout(workspaceLayout) ? "已是默认布局" : "恢复默认布局"}</button></div>
                 <div className="settings-option"><div><strong>界面动态效果</strong><p>控制画廊卡片入场、弹窗、提示条以及界面过渡。偏好保存在当前浏览器，关闭后仍保留功能反馈。</p></div><button type="button" role="switch" aria-label="启用界面动态效果" aria-checked={motionEnabled} className={`settings-switch ${motionEnabled ? "active" : ""}`} onClick={() => setMotionEnabled((current) => !current)}><i /></button></div>
+                <CanvasBoundSetting
+                  value={canvasMaxEdge}
+                  canvases={[
+                    { label: `文生图 · ${model}`, width: size.width, height: size.height },
+                    ...(imageToImage.sizeMode === "custom" ? [{ label: `图生图 · ${model}`, width: imageToImage.width, height: imageToImage.height }] : []),
+                  ]}
+                  onChange={setCanvasMaxEdge}
+                />
+                <OutputTemplateSetting value={outputTemplate} engine={model} onChange={setOutputTemplate} />
                 </div>
                 <div className="settings-workspace-summary"><span>当前创作状态</span><div><b>{model}</b><b>{isSplitModel ? diffusionModel || "未选择扩散模型" : checkpoint || "未选择底模"}</b><b>{loras.length} 个 LoRA</b><b>{size.width} × {size.height}</b></div></div>
               </section>}

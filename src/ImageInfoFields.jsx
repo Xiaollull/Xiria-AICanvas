@@ -6,20 +6,53 @@ import { groupParameters } from "./metadata-explorer";
 // The two presentational pieces the facts panel and the details dialog both use.
 // They live here so neither file has to import the other.
 
-// Where a model was found decides how its name reads. "Missing" is the only
-// one the user has to act on, so it is the only one that shouts.
-export function ModelName({ match, fallback = "", className = "" }) {
+// Where a model was found decides how its name reads. "Missing" and "ambiguous"
+// are the two the user has to act on, so they are the ones that shout.
+//
+// A resolved model is shown by its last folder and real filename
+// (`Style_九V6.0\matcha.safetensors`), with the name the picture recorded kept
+// beside it when the two differ — the label changes, the mounted ID does not.
+export function ModelName({ match, fallback = "", className = "", lora = false }) {
   const name = match?.name || fallback;
   if (!name) return <span className="model-name-unset">未记录</span>;
   if (!match || match.status === "unknown") return <span className={className}>{name}</span>;
   if (match.status === "missing") {
+    // A LoRA with no file of its name here has nothing to select: it reads as 无选择, with the
+    // recorded name beside it, rather than as a warning on every row of a borrowed picture.
+    if (lora) {
+      return <span className={`model-name-unselected ${className}`} title={`本地模型目录与共享目录中都没有这个 LoRA：${name}`}>
+        无选择<small className="model-name-recorded">{name}</small>
+      </span>;
+    }
     return <span className={`model-name-missing ${className}`} title="本地模型目录与共享目录中都没有这个模型">
       <AlertTriangle size={12} />{name}
     </span>;
   }
-  return <span className={`model-name-found ${match.status} ${className}`}>
-    {name}
-    <i title={match.match?.label || ""}>{match.status === "shared" ? <><Share2 size={10} />共享</> : <><Check size={10} />本地</>}</i>
+  if (match.status === "ambiguous") {
+    const candidates = (match.candidates || []).map((item) => `${item.display}${item.engine ? ` · ${item.engine}` : ""}${item.origin === "shared" ? " · 共享" : ""}`);
+    const more = (match.count || candidates.length) > candidates.length ? `\n另有 ${(match.count || 0) - candidates.length} 个` : "";
+    return <span className={`model-name-ambiguous ${className}`} title={`有歧义：本地有 ${match.count || candidates.length} 个同名文件，无法确定是哪一个${match.hashChecked ? "（记录的哈希也无法区分）" : ""}\n${candidates.join("\n")}${more}`}>
+      <AlertTriangle size={12} />{name}<i>有歧义 · {match.count || candidates.length} 个同名</i>
+    </span>;
+  }
+  const display = match.display || match.match?.display || name;
+  const detail = [
+    match.match?.label || "",
+    match.precision ? `匹配方式 ${match.precision}` : "",
+    match.duplicates ? `另有 ${match.duplicates} 个内容相同的副本` : "",
+  ].filter(Boolean).join(" · ");
+  // Chosen among same-named files by where the picture's other models live — said, not hidden.
+  const choice = match.chosenBy
+    ? {
+      label: `${match.chosenBy === "folder" ? "同目录" : "就近"} · ${match.count} 个同名`,
+      title: `${match.count} 个同名文件，${match.chosenBy === "folder" ? "按图片中其他模型所在的文件夹选择了这一个" : "图片其他模型所在的文件夹里没有，选择了位置最接近的一个"}${match.hashMismatch ? "；图片记录的哈希与这些文件都不一致" : ""}`,
+    }
+    : null;
+  return <span className={`model-name-found ${match.status} ${className}`} title={display !== name ? `图片记录：${name}` : undefined}>
+    {display}
+    {display !== name && <small className="model-name-recorded">{name}</small>}
+    {choice && <em className="model-name-choice" title={choice.title}>{choice.label}</em>}
+    <i title={detail}>{match.status === "shared" ? <><Share2 size={10} />共享</> : <><Check size={10} />本地</>}</i>
   </span>;
 }
 

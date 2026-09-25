@@ -76,6 +76,7 @@ jobs:
       artifact: ${{ steps.version.outputs.artifact }}
       full_package: ${{ steps.version.outputs.full_package }}
       full_package_notice: ${{ steps.version.outputs.full_package_notice }}
+      release_notes: ${{ steps.version.outputs.release_notes }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -101,6 +102,7 @@ jobs:
           node --input-type=module <<'NODE'
           import { appendFile, readFile } from "node:fs/promises";
           import { FULL_PACKAGE_NOTICE, isFullPackageRelease } from "./scripts/full-package-release.mjs";
+          import { RELEASE_NOTES_DELIMITER, readReleaseNotes } from "./scripts/release-notes.mjs";
 
           const tag = process.env.GITHUB_REF_NAME;
           const stableTag = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
@@ -141,6 +143,13 @@ jobs:
             // travels to it instead of the code that composes it.
             await appendFile(process.env.GITHUB_OUTPUT, `full_package_notice<<XIRAI_FULL_PACKAGE_NOTICE\n${FULL_PACKAGE_NOTICE}\nXIRAI_FULL_PACKAGE_NOTICE\n`);
             console.log(`${version} is declared a full-package release: existing installations cannot apply it in place.`);
+          }
+          // Hand-written notes travel to the publish job the same way, and are validated here so a
+          // malformed file fails before anything is built.
+          const releaseNotes = await readReleaseNotes(process.cwd(), tag);
+          if (releaseNotes) {
+            await appendFile(process.env.GITHUB_OUTPUT, `release_notes<<${RELEASE_NOTES_DELIMITER}\n${releaseNotes}\n${RELEASE_NOTES_DELIMITER}\n`);
+            console.log(`Release notes for ${tag}: ${releaseNotes.length} characters.`);
           }
           NODE
 
@@ -764,6 +773,7 @@ jobs:
           ARCHIVE: ${{ needs.verify-and-package.outputs.archive }}
           FULL_PACKAGE: ${{ needs.verify-and-package.outputs.full_package }}
           FULL_PACKAGE_NOTICE: ${{ needs.verify-and-package.outputs.full_package_notice }}
+          RELEASE_NOTES: ${{ needs.verify-and-package.outputs.release_notes }}
           TARGET_SHA: ${{ github.sha }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release_id }}
@@ -928,7 +938,9 @@ jobs:
           if ((process.env.FULL_PACKAGE === "true") !== Boolean(notice)) {
             throw new Error("The full-package declaration and its release notice disagree; refusing to publish");
           }
-          const releaseBody = notice ? `${notice}\n\n${notes.body}` : notes.body;
+          // Then the release's own notes, when it has them, and the generated compare list last.
+          const releaseNotes = (process.env.RELEASE_NOTES || "").trim();
+          const releaseBody = [notice, releaseNotes, notes.body].filter(Boolean).join("\n\n");
 
           // Keep the marker until every fallible preparation and upload operation succeeds. This
           // final mutation replaces it with generated notes and publishes the draft. The safety

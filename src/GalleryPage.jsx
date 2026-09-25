@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
   BookOpen,
   Check,
+  ChevronDown,
   ChevronRight,
+  FileSearch,
   Copy,
   FolderPlus,
   FolderOpen,
@@ -36,13 +39,16 @@ import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
 import { copyText } from "./clipboard";
 import { engineGuidance, isSplitEngine } from "./engine-settings.js";
+import { NATIVE_STEP_ENGINES, adetailerSummary, normalizeADetailerUnits } from "./adetailer-units.js";
+import ResampleChainPanel from "./ResampleChainPanel.jsx";
+import GalleryOutputDrawer from "./GalleryOutputDrawer.jsx";
+import { GALLERY_IMAGE_INFO_READ_LIMIT, galleryCardFromImageInfo, imageInfoHasGenerationData, imageInfoRecordedSeed } from "./gallery-image-info.js";
+import { extractPromptLoras, modelDisplayName } from "./image-metadata.js";
+import { clipSkipRange, normalizeClipSkip } from "./clip-skip.js";
+import { DEFAULT_CANVAS_MAX_EDGE, effectiveCanvasMaxEdge } from "./canvas-limit.js";
 import {
-  RESAMPLE_UNIT_LIMIT,
-  RESIZE_ALGORITHMS,
-  addResampleUnit,
   chainSizeLine,
-  moveChainStage,
-  removeChainStage,
+  resampleChainIssue,
   resampleUnitSummary,
   resampleUnitTitle,
   resampleUnits,
@@ -108,6 +114,14 @@ function fileToDataUrl(file) {
   });
 }
 
+// A picture added in this editor session has no id yet; this key is what a read that finishes later
+// uses to find it again after the strip has been reordered or trimmed. Never saved.
+let imageLocalSequence = 0;
+function imageLocalKey() {
+  imageLocalSequence += 1;
+  return `local-${imageLocalSequence}`;
+}
+
 async function filesToNewImages(fileList) {
   const files = [...fileList];
   if (!files.length) throw new Error("没有检测到可添加的图片文件");
@@ -116,7 +130,50 @@ async function filesToNewImages(fileList) {
   }
   const imported = [];
   for (const file of files) imported.push(await fileToDataUrl(file));
-  return imported.map((item) => ({ kind: "new", dataUrl: item.dataUrl, name: item.name, url: item.dataUrl }));
+  return imported.map((item) => ({ kind: "new", localKey: imageLocalKey(), dataUrl: item.dataUrl, name: item.name, url: item.dataUrl }));
+}
+
+// Only PNG carries the text chunks the reader understands, so nothing else is uploaded to be read.
+function carriesPngRecord(image) {
+  if (image.kind === "new") return /^data:image\/png[;,]/i.test(image.dataUrl || "");
+  return image.kind === "output" && /\.png$/i.test(image.name || "");
+}
+
+async function imageDataUrl(image) {
+  if (image.dataUrl) return image.dataUrl;
+  const response = await fetch(image.url, { cache: "no-store" });
+  if (!response.ok) throw new Error(`无法读取 ${image.name}`);
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result || "")));
+    reader.addEventListener("error", () => reject(new Error(`无法读取 ${image.name}`)));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function readImageRecord(image) {
+  const response = await fetch("/api/image-info/read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image: await imageDataUrl(image), name: image.name }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `读取 ${image.name} 的生成参数失败（HTTP ${response.status}）`);
+  return payload.info || null;
+}
+
+// The installed ADetailer detectors: a recorded detector is only written when it names one of them,
+// exactly as the image reader decides. An unreachable service means none, never a guess.
+async function readDetectorCatalog() {
+  try {
+    const response = await fetch("/api/inference/adetailer/models", { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) return { models: [], ready: false };
+    return { models: Array.isArray(payload.models) ? payload.models : [], ready: payload.available === true };
+  } catch {
+    return { models: [], ready: false };
+  }
 }
 
 function NumericField({ label, value, onChange, min, max, step = 1, disabled = false }) {
@@ -126,9 +183,116 @@ function NumericField({ label, value, onChange, min, max, step = 1, disabled = f
   }} /></label>;
 }
 
+function GalleryChainSlider({ label, value, min, max, step = 1, inputStep = step, fixed, suffix = "", disabled = false, onChange }) {
+  const numeric = Number(value);
+  const display = Number.isFinite(numeric) ? (Number.isInteger(fixed) ? numeric.toFixed(fixed) : numeric) : "--";
+  const commit = (next) => {
+    const parsed = Number(next);
+    if (!Number.isFinite(parsed)) return;
+    onChange(Math.max(min, Math.min(max, parsed)));
+  };
+  return <label className="gallery-chain-slider">
+    <span><b>{label}</b><em>{display}{suffix}</em></span>
+    <input type="range" value={Number.isFinite(numeric) ? numeric : min} min={min} max={max} step={step} disabled={disabled} aria-label={label} onChange={(event) => commit(event.target.value)} />
+    <input type="number" value={Number.isFinite(numeric) ? numeric : min} min={min} max={max} step={inputStep} disabled={disabled} aria-label={`${label}数值`} onChange={(event) => commit(event.target.value)} />
+  </label>;
+}
+
+function GalleryChainNumberInput({ ariaLabel, value, min, max, step = 1, integer = false, disabled = false, onChange }) {
+  return <input
+    type="number"
+    className="bounded-number"
+    aria-label={ariaLabel}
+    value={value ?? ""}
+    min={min}
+    max={max}
+    step={integer ? 1 : step}
+    disabled={disabled}
+    onChange={(event) => {
+      const next = Number(event.target.value);
+      if (!Number.isFinite(next)) return;
+      onChange(Math.max(min, Math.min(max, integer ? Math.round(next) : next)));
+    }}
+  />;
+}
+
 function ToggleField({ label, detail, checked, onChange, disabled = false }) {
   const locked = disabled && !checked;
   return <label className={`gallery-toggle-field ${checked ? "active" : ""} ${disabled ? "disabled" : ""}`}><span><strong>{label}</strong><small>{detail}</small></span><input type="checkbox" checked={checked} disabled={locked} onChange={(event) => { if (!disabled || !event.target.checked) onChange(event.target.checked); }} /><i /></label>;
+}
+
+// How many left-out items the notice lists before it counts the rest.
+const RECORD_NOTICE_ITEMS = 6;
+
+/** What reading an added picture's record did to the card, and a way back. */
+function GalleryRecordNotice({ record, onUndo, onDismiss }) {
+  const noticeRef = useRef(null);
+  // A picture can be added while the parameters are scrolled down to the chain; the outcome is
+  // brought into view once it is known, and left where it is when it is already visible.
+  useEffect(() => {
+    if (record.state !== "reading") noticeRef.current?.scrollIntoView({ block: "nearest" });
+  }, [record]);
+  const dismiss = <button type="button" className="gallery-editor-record-dismiss" aria-label="关闭图片参数提示" title="关闭" onClick={onDismiss}><X size={12} /></button>;
+  if (record.state === "reading") {
+    return <div ref={noticeRef} className="gallery-editor-record reading" role="status" aria-live="polite">
+      <RefreshCw className="spin" size={13} />
+      <div><strong>正在读取图片中的生成参数</strong><small>{record.count > 1 ? `${record.name} 等 ${record.count} 张` : record.name}</small></div>
+    </div>;
+  }
+  if (record.state === "none" || record.state === "error") {
+    return <div ref={noticeRef} className={`gallery-editor-record ${record.state}`} role="status" aria-live="polite">
+      {record.state === "error" ? <AlertTriangle size={13} /> : <FileSearch size={13} />}
+      <div>
+        <strong>{record.state === "error" ? "无法读取图片中的生成参数" : "图片中没有可读取的生成参数"}</strong>
+        <small>{record.state === "error" ? record.message : `${record.count > 1 ? `${record.name} 等 ${record.count} 张` : record.name}：参数保持不变`}</small>
+      </div>
+      {dismiss}
+    </div>;
+  }
+  // Everything the picture recorded that the card could not take, each with its reason.
+  const left = [
+    ...record.missing.map((item) => `${item.kind === "checkpoint" ? "底模" : "LoRA"} ${item.label || item.name}：${item.reason}`),
+    ...record.unapplied,
+    ...record.skipped.map((item) => `${item}：本工作区不支持`),
+  ];
+  const shown = left.slice(0, RECORD_NOTICE_ITEMS);
+  return <div ref={noticeRef} className="gallery-editor-record filled" role="status" aria-live="polite">
+    <Check size={13} />
+    <div>
+      <strong>已从 {record.name} 读取生成参数{record.source ? ` · ${record.source}` : ""}</strong>
+      <small>已填入：{record.filled.length ? record.filled.join("、") : "无"}{record.engineChanged ? `；引擎切换为 ${record.engine}` : ""}</small>
+      {record.notes.length > 0 && <small>{record.notes.join("；")}</small>}
+      {shown.length > 0 && <ul aria-label="未填入的项目">
+        {shown.map((item) => <li key={item}>{item}</li>)}
+        {left.length > shown.length && <li>另有 {left.length - shown.length} 项未填入</li>}
+      </ul>}
+    </div>
+    <button type="button" className="gallery-editor-record-undo" title="恢复读取图片之前的参数" onClick={onUndo}>撤销</button>
+    {dismiss}
+  </div>;
+}
+
+/**
+ * One post-processing stage in the card editor: resample units, ADetailer and RTX VSR all fold the
+ * same way. Collapsed, the header still says what the stage will do; the header itself folds the
+ * card, while its switch, order arrows and delete keep their own clicks.
+ */
+function GalleryChainCard({ kind, title, detail, enabled, expanded, disabled = false, onToggleEnabled, onToggleExpanded, actions, children }) {
+  const foldFromHeader = (event) => {
+    if (event.target.closest("button, input, label, select, textarea, a")) return;
+    onToggleExpanded();
+  };
+  return <section className={`postprocess-stage-card gallery-resample-card ${enabled ? "enabled" : ""} ${expanded ? "expanded" : ""}`}>
+    <header className="gallery-resample-card-header" onClick={foldFromHeader}>
+      <span>{kind}</span>
+      <strong title={title}>{title}</strong>
+      <small>{detail}</small>
+      <ToggleField label="启用" detail="" checked={enabled} disabled={disabled} onChange={onToggleEnabled} />
+      <button type="button" className="gallery-chain-card-fold" aria-label={`${expanded ? "收起" : "展开"}${title}`} title={expanded ? "收起" : "展开"} aria-expanded={expanded} onClick={onToggleExpanded}><ChevronDown size={13} /></button>
+      {actions}
+    </header>
+    {expanded && children}
+  </section>;
 }
 
 /**
@@ -610,7 +774,25 @@ function GalleryLoraManager({ engine, value, onClose, onApply }) {
   </div>;
 }
 
-function GalleryCardEditor({ card, collectionId, collections, initialSettings, initialImages = [], onClose, onSaved }) {
+function GalleryCardEditor({
+  card,
+  collectionId,
+  collections,
+  initialSettings,
+  initialImages = [],
+  canvasMaxEdge = DEFAULT_CANVAS_MAX_EDGE,
+  upscalers = null,
+  upscalerRuntimeReady = true,
+  upscalersRefreshing = false,
+  onRefreshUpscalers = null,
+  upscalerDownloadJob = null,
+  upscalerDownloadBusy = false,
+  upscalerDownloadError = "",
+  onDownloadUpscaler = null,
+  onRetryUpscaler = null,
+  onClose,
+  onSaved,
+}) {
   const [selectedCollection, setSelectedCollection] = useState(card?.collection_id || collectionId || collections[0]?.id || "");
   const [title, setTitle] = useState(card?.title || "");
   const [settings, setSettings] = useState(() => card
@@ -627,11 +809,30 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
   const [checkpoints, setCheckpoints] = useState([]);
   const [splitAssets, setSplitAssets] = useState({ diffusion_model: [], text_encoder: [], text_encoder_2: [], vae: [] });
   const [loraOpen, setLoraOpen] = useState(false);
+  const [outputOpen, setOutputOpen] = useState(false);
+  const [activeImage, setActiveImage] = useState(0);
+  const [imageDrag, setImageDrag] = useState(false);
+  const [imageReading, setImageReading] = useState(false);
+  const [imageError, setImageError] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [modelCatalogError, setModelCatalogError] = useState("");
+  // What reading the added pictures' generation records did: reading, filled (with an undo), found
+  // nothing, or failed. The card's settings are only ever changed through this, never silently.
+  const [record, setRecord] = useState(null);
   const dialogRef = useDialogLifecycle(!loraOpen, onClose, "", !busy);
   const fileInput = useRef(null);
+  const imageDragDepth = useRef(0);
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const recordToken = useRef(0);
+  const shownIndex = Math.min(activeImage, Math.max(0, images.length - 1));
+  const shownImage = images[shownIndex] || null;
+  const promptTagLoras = [...extractPromptLoras(settings.positive), ...extractPromptLoras(settings.negative)];
   const setField = (key, value) => setSettings((current) => busy ? current : ({ ...current, [key]: value }));
   const setNested = (group, key, value) => setSettings((current) => busy ? current : ({ ...current, [group]: { ...current[group], [key]: value } }));
   // Every engine that mounts separate component files -- Anima, both Flux generations and Krea 2 --
@@ -641,7 +842,6 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
   // Guidance the selected engine refuses: distilled Flux takes none, CFG-Zero* needs a
   // flow-matching engine, Krea 2 has no PAG. One rule set, shared with the workspace.
   const guidanceBlocked = engineGuidance(settings.model, settings.guidance) !== settings.guidance;
-  const tilesHires = supportsUsduTiled(settings.model);
   const visibleSamplers = SAMPLERS;
   const visibleSchedulers = SCHEDULERS;
   const changeEngine = (nextModel) => setSettings((current) => ({
@@ -684,29 +884,144 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
       });
     return () => controller.abort();
   }, [settings.model]);
-  const addFiles = async (fileList) => {
-    if (busy) return;
-    setError("");
-    try {
-      const imported = await filesToNewImages(fileList);
-      setImages((current) => [...current, ...imported]);
-    } catch (readError) {
-      setError(readError.message);
+  const chainIssue = resampleChainIssue(settings.postprocessChain, {
+    baseSteps: settings.steps,
+    engine: settings.model,
+    nativeEngines: NATIVE_STEP_ENGINES,
+    upscalers: upscalerRuntimeReady ? upscalers : [],
+    size: settings.size,
+  });
+  // A picture made by this program, SD-WebUI/Forge or ComfyUI says how it was made. The first added
+  // picture with a readable record fills the card; every read picture keeps its own recorded seed.
+  // The newest addition wins: a read still running for an earlier one stops writing.
+  const readImageRecords = async (added) => {
+    const readable = added.filter(carriesPngRecord).slice(0, GALLERY_IMAGE_INFO_READ_LIMIT);
+    if (!readable.length) return;
+    const token = ++recordToken.current;
+    setRecord({ state: "reading", name: readable[0].name, count: readable.length });
+    const seeds = new Map();
+    let filled = false;
+    let failure = "";
+    let detectors = null;
+    for (const image of readable) {
+      let info = null;
+      try {
+        info = await readImageRecord(image);
+      } catch (readError) {
+        failure ||= readError.message;
+      }
+      if (token !== recordToken.current) return;
+      if (!imageInfoHasGenerationData(info)) continue;
+      const seed = imageInfoRecordedSeed(info);
+      if (seed) seeds.set(image.localKey, seed);
+      if (filled || busyRef.current) continue;
+      detectors ||= await readDetectorCatalog();
+      if (token !== recordToken.current) return;
+      const previous = settingsRef.current;
+      const result = galleryCardFromImageInfo(previous, info, {
+        canvasMaxEdge,
+        upscalers: upscalers?.models || [],
+        upscalerRuntimeReady,
+        detectors: detectors.models,
+        detectorRuntimeReady: detectors.ready,
+      });
+      if (!result) continue;
+      filled = true;
+      setSettings(result.settings);
+      setRecord({ ...result, state: "filled", name: image.name, previous });
+    }
+    if (seeds.size) {
+      setImages((current) => current.map((image) => (image.localKey && seeds.has(image.localKey) && !image.seed ? { ...image, seed: seeds.get(image.localKey) } : image)));
+    }
+    if (!filled) {
+      setRecord(failure
+        ? { state: "error", message: failure }
+        : { state: "none", name: readable[0].name, count: readable.length });
     }
   };
-  const moveImage = (index, direction) => setImages((current) => {
-    if (busy) return current;
+  const undoRecord = () => {
+    if (busy || !record?.previous) return;
+    setSettings(record.previous);
+    setRecord(null);
+  };
+  // Pictures dropped on the add-card tile arrive with the editor; they are read like any other.
+  useEffect(() => {
+    if (!card && initialImages.length) void readImageRecords(initialImages);
+    return () => { recordToken.current += 1; };
+    // Once per editor: `initialImages` is the drop that opened it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const addFiles = async (fileList) => {
+    if (busy || imageReading) return;
+    setImageError("");
+    setImageReading(true);
+    let imported = [];
+    try {
+      // The same import the add-card tile uses: PNG/JPEG/WebP/GIF, 20 MiB each, 100 MiB per batch.
+      imported = await filesToNewImages(fileList);
+      setActiveImage(imagesRef.current.length);
+      setImages((current) => [...current, ...imported]);
+    } catch (readError) {
+      setImageError(`图片未加入：${readError.message}`);
+    } finally {
+      setImageReading(false);
+    }
+    if (imported.length) void readImageRecords(imported);
+  };
+  // Only a drag that carries files is an image drop. Text dragged over a prompt box, or a link
+  // dragged in from a page, is left to the browser and never read as a picture.
+  const carriesFiles = (event) => [...(event.dataTransfer?.types || [])].includes("Files");
+  const imageDragEnter = (event) => {
+    if (!carriesFiles(event) || busy) return;
+    event.preventDefault();
+    imageDragDepth.current += 1;
+    setImageDrag(true);
+  };
+  const imageDragOver = (event) => {
+    if (!carriesFiles(event) || busy) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  };
+  const imageDragLeave = (event) => {
+    if (!carriesFiles(event)) return;
+    imageDragDepth.current = Math.max(0, imageDragDepth.current - 1);
+    if (!imageDragDepth.current) setImageDrag(false);
+  };
+  const imageDrop = (event) => {
+    if (!carriesFiles(event) || busy) return;
+    event.preventDefault();
+    event.stopPropagation();
+    imageDragDepth.current = 0;
+    setImageDrag(false);
+    void addFiles(event.dataTransfer.files);
+  };
+  const addOutputImages = (files) => {
+    setOutputOpen(false);
+    setImageError("");
+    const current = imagesRef.current;
+    const known = new Set(current.filter((image) => image.kind === "output").map((image) => image.assetId));
+    const additions = files.filter((file) => !known.has(file.id)).map((file) => ({ kind: "output", localKey: imageLocalKey(), assetId: file.id, name: file.name, url: file.url }));
+    if (!additions.length) return;
+    setActiveImage(current.length);
+    setImages([...current, ...additions]);
+    void readImageRecords(additions);
+  };
+  const moveImage = (index, direction) => {
+    const current = imagesRef.current;
     const target = index + direction;
-    if (target < 0 || target >= current.length) return current;
+    if (busy || target < 0 || target >= current.length) return;
     const next = [...current];
     [next[index], next[target]] = [next[target], next[index]];
-    return next;
-  });
+    setImages(next);
+    setActiveImage((selected) => (selected === index ? target : selected === target ? index : selected));
+  };
+  const removeImage = (index) => {
+    const current = imagesRef.current;
+    if (busy || index < 0 || index >= current.length) return;
+    setImages(current.filter((_, itemIndex) => itemIndex !== index));
+    setActiveImage((selected) => Math.max(0, Math.min(current.length - 2, selected > index ? selected - 1 : selected)));
+  };
   const setStage = (id, updates) => setSettings((current) => (busy ? current : { ...current, postprocessChain: updateChainStage(current.postprocessChain, id, updates) }));
-  const moveStage = (id, direction) => setSettings((current) => {
-    if (busy) return current;
-    return { ...current, postprocessChain: moveChainStage(current.postprocessChain, id, direction) };
-  });
   const save = async (event) => {
     event.preventDefault();
     if (!selectedCollection || busy) return;
@@ -729,6 +1044,10 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
     }
     if (guidanceBlocked) {
       setError(`${settings.model} 不支持${GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "当前引导增强"}，请切换为可用选项`);
+      return;
+    }
+    if (chainIssue) {
+      setError(`后处理链不可保存：${chainIssue}`);
       return;
     }
     setBusy(true);
@@ -765,7 +1084,10 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
         imageHiresSeedModes: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? firstRedrawUnit?.seedMode, image.hiresSeed ?? firstRedrawUnit?.seed).seedMode),
         imageHiresSeeds: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? firstRedrawUnit?.seedMode, image.hiresSeed ?? firstRedrawUnit?.seed).seed),
       },
-      images: images.map((image) => image.kind === "existing" ? { gallery_image_id: image.id } : { data_url: image.dataUrl, name: image.name }),
+      // An output picture travels as its `asset_id` only; the server copies the file it names.
+      images: images.map((image) => image.kind === "existing"
+        ? { gallery_image_id: image.id }
+        : image.kind === "output" ? { asset_id: image.assetId, name: image.name } : { data_url: image.dataUrl, name: image.name }),
     };
     try {
       const result = await galleryRequest(card ? `/cards/${card.id}` : "/cards", { method: card ? "PATCH" : "POST", body: JSON.stringify(payload) });
@@ -777,16 +1099,56 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
     }
   };
   return <div className="gallery-editor-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
-    <form ref={dialogRef} className="gallery-card-editor" role="dialog" aria-modal="true" aria-labelledby="gallery-card-editor-title" tabIndex="-1" onSubmit={save}>
+    <form ref={dialogRef} className="gallery-card-editor gallery-card-editor-split" role="dialog" aria-modal="true" aria-labelledby="gallery-card-editor-title" tabIndex="-1" onSubmit={save}>
       <header><div><span>CURATED CARD EDITOR</span><h2 id="gallery-card-editor-title">{card ? "编辑精选卡片" : "添加精选卡片"}</h2><p>图片可选，参数可独立于当前生图工作区保存</p></div><button type="button" aria-label="关闭卡片编辑器" disabled={busy} onClick={onClose}><X size={20} /></button></header>
-      <fieldset className="gallery-editor-body" disabled={busy}>
-        <section className="gallery-editor-media">
-          <div className="gallery-editor-section-head"><div><span>01</span><strong>卡片与图片</strong></div><button type="button" onClick={() => fileInput.current?.click()}><Upload size={13} />添加图片</button><input ref={fileInput} type="file" hidden multiple accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} /></div>
-          <div className="gallery-editor-grid two"><label className="gallery-field"><span>收藏夹</span><select value={selectedCollection} onChange={(event) => setSelectedCollection(event.target.value)}>{collections.map((item) => <option value={item.id} key={item.id}>{item.id}</option>)}</select></label><label className="gallery-field"><span>概括标题（可选）</span><input value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)} placeholder="留空时使用正向 Prompt 概括" /></label></div>
-          <div className="gallery-editor-images">
-            {images.map((image, index) => <article key={image.id || `${image.name}-${index}`}><img src={image.kind === "existing" ? thumbUrl(image) : image.url} alt="" loading="lazy" decoding="async" /><span>{image.name}<small>{index + 1} / {images.length}</small></span><div><button type="button" aria-label={`上移图片 ${index + 1}`} disabled={index === 0} onClick={() => moveImage(index, -1)}><ArrowUp size={12} /></button><button type="button" aria-label={`下移图片 ${index + 1}`} disabled={index === images.length - 1} onClick={() => moveImage(index, 1)}><ArrowDown size={12} /></button><button type="button" aria-label={`删除图片 ${index + 1}`} onClick={() => setImages((current) => current.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={12} /></button></div></article>)}
-            {images.length === 0 && <button type="button" className="gallery-editor-drop" onClick={() => fileInput.current?.click()}><ImageIcon size={26} /><span>图片可不添加</span><small>{title.trim() || settings.positive.trim() ? "卡片会显示文字概括" : "未填写标题和 Prompt 时显示 No image"}</small></button>}
+      <div className="gallery-editor-split">
+        {/* The picture is the card, so it gets the fixed left half: whole, at any aspect ratio,
+            with the configuration scrolling beside it rather than pushing it off screen. */}
+        <section className="gallery-editor-stage" aria-label="卡片图片">
+          <div
+            className={`gallery-editor-preview ${imageDrag ? "drop-active" : ""} ${imageReading ? "drop-reading" : ""} ${shownImage ? "" : "empty"}`}
+            role="button"
+            tabIndex={busy ? -1 : 0}
+            aria-label={shownImage ? `当前图片 ${shownImage.name}；点击添加图片，或拖入本地图片` : "点击选择本地图片，或把图片拖到这里"}
+            aria-busy={imageReading}
+            onClick={() => !busy && fileInput.current?.click()}
+            onKeyDown={(event) => { if (!busy && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); fileInput.current?.click(); } }}
+            onDragEnter={imageDragEnter}
+            onDragOver={imageDragOver}
+            onDragLeave={imageDragLeave}
+            onDrop={imageDrop}
+          >
+            {shownImage
+              ? <img src={shownImage.kind === "new" || shownImage.kind === "output" ? shownImage.url : shownImage.url || thumbUrl(shownImage)} alt={shownImage.name || "卡片图片"} decoding="async" />
+              : <div className="gallery-editor-preview-empty"><ImageIcon size={30} /><strong>拖入或点击添加图片</strong><small>{title.trim() || settings.positive.trim() ? "不添加图片时，卡片显示文字概括" : "图片可不添加；未填写标题和 Prompt 时显示 No image"}</small></div>}
+            {(imageDrag || imageReading) && <div className="gallery-editor-drop-overlay">{imageReading ? <RefreshCw className="spin" size={24} /> : <Upload size={24} />}<strong>{imageReading ? "正在读取图片" : "释放以加入卡片"}</strong><small>PNG · JPEG · WebP · GIF · 单张 20 MiB · 单次 100 MiB</small></div>}
+            {shownImage && images.length > 1 && <span className="gallery-editor-preview-count">{shownIndex + 1} / {images.length}</span>}
           </div>
+          <input ref={fileInput} type="file" hidden multiple accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} />
+          <div className="gallery-editor-stage-actions">
+            <button type="button" disabled={busy || imageReading} onClick={() => fileInput.current?.click()}><Upload size={13} />添加本地图片</button>
+            <button type="button" disabled={busy} onClick={() => setOutputOpen(true)}><FolderOpen size={13} />从 output 选择</button>
+          </div>
+          {imageError && <p className="gallery-form-error" role="alert">{imageError}</p>}
+          {images.length > 0 && <ol className="gallery-editor-strip" aria-label="卡片图片顺序">
+            {images.map((image, index) => <li key={image.id || image.assetId || `${image.name}-${index}`} className={index === shownIndex ? "active" : ""}>
+              <button type="button" className="gallery-editor-strip-thumb" aria-label={`查看第 ${index + 1} 张：${image.name}`} aria-current={index === shownIndex} onClick={() => setActiveImage(index)}>
+                <img src={image.kind === "existing" ? thumbUrl(image) : image.url} alt="" loading="lazy" decoding="async" />
+                {image.kind === "output" && <i>output</i>}
+              </button>
+              <div>
+                <button type="button" aria-label={`前移图片 ${index + 1}`} disabled={busy || index === 0} onClick={() => moveImage(index, -1)}><ArrowLeft size={12} /></button>
+                <button type="button" aria-label={`后移图片 ${index + 1}`} disabled={busy || index === images.length - 1} onClick={() => moveImage(index, 1)}><ArrowRight size={12} /></button>
+                <button type="button" aria-label={`删除图片 ${index + 1}`} disabled={busy} onClick={() => removeImage(index)}><Trash2 size={12} /></button>
+              </div>
+            </li>)}
+          </ol>}
+        </section>
+      <fieldset className="gallery-editor-body" disabled={busy}>
+        {record && <GalleryRecordNotice record={record} onUndo={undoRecord} onDismiss={() => setRecord(null)} />}
+        <section className="gallery-editor-media">
+          <div className="gallery-editor-section-head"><div><span>01</span><strong>卡片信息</strong></div></div>
+          <div className="gallery-editor-grid two"><label className="gallery-field"><span>收藏夹</span><select value={selectedCollection} onChange={(event) => setSelectedCollection(event.target.value)}>{collections.map((item) => <option value={item.id} key={item.id}>{item.id}</option>)}</select></label><label className="gallery-field"><span>概括标题（可选）</span><input value={title} maxLength={160} onChange={(event) => setTitle(event.target.value)} placeholder="留空时使用正向 Prompt 概括" /></label></div>
         </section>
 
         <section>
@@ -796,7 +1158,13 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
             {isSplit ? [["diffusionModel", "扩散模型", splitAssets.diffusion_model], ["textEncoder", isFlux ? "CLIP-L 文本编码器" : "文本编码器", splitAssets.text_encoder], ...(isFlux ? [["textEncoder2", "T5-XXL 文本编码器", splitAssets.text_encoder_2]] : []), ["vae", "VAE", splitAssets.vae]].map(([key, label, catalog]) => <label className="gallery-field" key={key}><span>{label}</span><select value={settings[key]} onChange={(event) => setField(key, event.target.value)}><option value="">未指定</option>{settings[key] && !catalog.some((item) => item.value === settings[key]) && <option value={settings[key]}>{settings[key]}（未在当前目录发现）</option>}{catalog.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>) : <label className="gallery-field wide"><span>底模选择</span><select value={settings.checkpoint} onChange={(event) => setField("checkpoint", event.target.value)}><option value="">未指定</option>{settings.checkpoint && !checkpoints.some((item) => item.value === settings.checkpoint) && <option value={settings.checkpoint}>{settings.checkpoint}（未在当前目录发现）</option>}{checkpoints.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>}
           </div>
           {modelCatalogError && <p className="gallery-form-error">模型目录扫描失败：{modelCatalogError}</p>}
-          <div className="gallery-editor-lora-summary">{settings.loras.length ? settings.loras.map((item, index) => <span className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><b>{item.name || compactName(item.value)}</b><small>{formatWeight(item.weight ?? 1)}</small></span>) : <p>未挂载 LoRA</p>}</div>
+          <div className="gallery-editor-lora-summary">
+            {settings.loras.map((item, index) => <span className={item.enabled === false ? "disabled" : ""} key={`${item.value}-${index}`}><b>{item.name || compactName(item.value)}</b><small>{formatWeight(item.weight ?? 1)}</small></span>)}
+            {/* A `<lora:…>` tag in the prompt loads its LoRA when the card runs; it is shown here so the
+                card's LoRAs read in one place, and never mounted as well, which the server refuses. */}
+            {promptTagLoras.map((item, index) => <span className="prompt-tag" key={`tag-${item.name}-${index}`} title={`由提示词中的 <lora:${item.name}> 标签加载`}><b>{modelDisplayName(item.name)}</b><small>标签 {formatWeight(item.weight)}</small></span>)}
+            {!settings.loras.length && !promptTagLoras.length && <p>未挂载 LoRA</p>}
+          </div>
         </section>
 
         <section>
@@ -814,57 +1182,93 @@ function GalleryCardEditor({ card, collectionId, collections, initialSettings, i
             {settings.guidance === "pag" && <><div className="gallery-editor-grid two"><NumericField label="PAG 强度" value={settings.pag.scale} min={0} max={5} step={0.01} onChange={(value) => setNested("pag", "scale", value)} /><label className="gallery-field"><span>PAG 作用层</span><select value={settings.pag.appliedLayers} onChange={(event) => setNested("pag", "appliedLayers", event.target.value)}><option value="mid">Mid（推荐）</option><option value="all">全部自注意力层（高风险）</option></select></label></div>{settings.pag.appliedLayers === "all" && <p className="gallery-guidance-note">全部层会明显放大对比、描边和色彩。动漫模型建议使用 Mid，并从强度 0.3 开始。</p>}</>}
             {guidanceBlocked && <p id="gallery-guidance-note" className="gallery-guidance-note" role="status">{settings.model} 不支持{GUIDANCE.find(([id]) => id === settings.guidance)?.[1] || "当前引导增强"}：FLUX 两代为蒸馏引导，只能选“无”；CFG-Zero* 需要 Anima 或 Krea 2 的 Flow Matching；Krea 2 不支持 PAG。</p>}
             <div className="gallery-editor-grid two"><NumericField label="单批图片数" value={settings.imagesPerBatch} min={1} max={10} onChange={(value) => setField("imagesPerBatch", Math.round(value))} /><NumericField label="批次数" value={settings.batchCount} min={1} max={20} onChange={(value) => setField("batchCount", Math.round(value))} /></div>
-            <div className="gallery-editor-grid three"><NumericField label="画布宽度" value={settings.size.width} min={64} max={2048} onChange={(value) => setField("size", { ...settings.size, width: Math.round(value / 64) * 64 })} /><NumericField label="画布高度" value={settings.size.height} min={64} max={2048} onChange={(value) => setField("size", { ...settings.size, height: Math.round(value / 64) * 64 })} /><label className="gallery-field"><span>Seed 模式</span><select value={settings.seedMode} onChange={(event) => setField("seedMode", event.target.value)}><option value="fixed">固定</option><option value="random">随机</option><option value="increment">递增</option><option value="decrement">递减</option></select></label></div>
+            {clipSkipRange(settings.model) && <div className="gallery-editor-grid two"><NumericField label={`CLIP skip（${clipSkipRange(settings.model).minimum}～${clipSkipRange(settings.model).maximum}）`} value={normalizeClipSkip(settings.model, settings.clipSkip)} min={clipSkipRange(settings.model).minimum} max={clipSkipRange(settings.model).maximum} onChange={(value) => setField("clipSkip", normalizeClipSkip(settings.model, value))} /></div>}
+            <div className="gallery-editor-grid three"><NumericField label="画布宽度" value={settings.size.width} min={64} max={effectiveCanvasMaxEdge(canvasMaxEdge, settings.model)} onChange={(value) => setField("size", { ...settings.size, width: Math.round(value / 64) * 64 })} /><NumericField label="画布高度" value={settings.size.height} min={64} max={effectiveCanvasMaxEdge(canvasMaxEdge, settings.model)} onChange={(value) => setField("size", { ...settings.size, height: Math.round(value / 64) * 64 })} /><label className="gallery-field"><span>Seed 模式</span><select value={settings.seedMode} onChange={(event) => setField("seedMode", event.target.value)}><option value="fixed">固定</option><option value="random">随机</option><option value="increment">递增</option><option value="decrement">递减</option></select></label></div>
           </div>
         </details>
 
         <details>
           <summary><Zap size={14} />后处理链</summary>
           <div className="gallery-details-content">
-            <p className="gallery-field-detail">按执行顺序排列。重采样单元可增删与调序；ADetailer 与 RTX VSR 各只有一个，只能调序与开关。</p>
-            <div className="gallery-chain-list">
-              {settings.postprocessChain.map((stage, index) => <div key={stage.id} className={stage.enabled ? "enabled" : "disabled"}>
-                <header>
-                  <span>{index + 1}</span>
-                  <strong>{stage.type === "resample" ? resampleUnitTitle(settings.postprocessChain, stage) : stageLabels[stage.type]}</strong>
-                  <ToggleField label="启用" detail="" checked={stage.enabled} onChange={(value) => setStage(stage.id, { enabled: value })} />
-                  <button type="button" aria-label="上移" disabled={index === 0} onClick={() => moveStage(stage.id, -1)}><ArrowUp size={12} /></button>
-                  <button type="button" aria-label="下移" disabled={index === settings.postprocessChain.length - 1} onClick={() => moveStage(stage.id, 1)}><ArrowDown size={12} /></button>
-                  {stage.type === "resample" && <button type="button" aria-label="删除该单元" onClick={() => setSettings((current) => ({ ...current, postprocessChain: removeChainStage(current.postprocessChain, stage.id) }))}><X size={12} /></button>}
-                </header>
-                {stage.type === "resample" && <div className="gallery-editor-grid four">
-                  <label className="gallery-field"><span>超分模型</span><input value={stage.upscaler} placeholder="留空 = 仅算法缩放" onChange={(event) => setStage(stage.id, { upscaler: event.target.value })} /></label>
-                  <label className="gallery-field"><span>缩放算法</span><select value={stage.resizeAlgorithm} onChange={(event) => setStage(stage.id, { resizeAlgorithm: event.target.value })}>{RESIZE_ALGORITHMS.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}</select></label>
-                  <NumericField label="倍率" value={stage.scale} min={1} max={4} step={0.1} onChange={(value) => setStage(stage.id, { scale: value })} />
-                  <NumericField label="重绘强度" value={stage.denoise} min={0} max={1} step={0.01} onChange={(value) => setStage(stage.id, { denoise: value })} />
-                  <NumericField label="步数（0 = 跟随首轮）" value={stage.steps ?? 0} min={0} max={100} onChange={(value) => setStage(stage.id, { steps: value > 0 ? Math.round(value) : null })} />
-                  <NumericField label="CFG（-1 = 跟随首轮）" value={stage.cfg ?? -1} min={-1} max={30} step={0.1} onChange={(value) => setStage(stage.id, { cfg: value >= 0 ? value : null })} />
-                  <NumericField label="像素放大分块" value={stage.tileSize} min={32} max={2048} onChange={(value) => setStage(stage.id, { tileSize: Math.round(value) })} />
-                  <NumericField label="像素放大分块重叠" value={stage.tileOverlap} min={0} max={512} onChange={(value) => setStage(stage.id, { tileOverlap: Math.round(value) })} />
-                  {tilesHires && <label className="gallery-field"><span>重绘方式</span><select value={stage.executionMode} onChange={(event) => setStage(stage.id, { executionMode: event.target.value })}><option value="usdu_tiled">USDU 分块重绘（推荐）</option><option value="full_frame">整图重绘（兼容）</option></select></label>}
-                  <label className="gallery-field"><span>采样器</span><select value={stage.sampler || ""} onChange={(event) => setStage(stage.id, { sampler: event.target.value || null })}><option value="">跟随首轮</option>{SAMPLERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
-                  <label className="gallery-field"><span>调度器</span><select value={stage.scheduler || ""} onChange={(event) => setStage(stage.id, { scheduler: event.target.value || null })}><option value="">跟随首轮</option>{SCHEDULERS.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
-                </div>}
-                {stage.type === "adetailer" && <div className="gallery-editor-grid two"><label className="gallery-field wide"><span>检测模型</span><input value={stage.units?.[0]?.detector || ""} onChange={(event) => setStage(stage.id, { units: (stage.units || []).map((unit, position) => (position === 0 ? { ...unit, detector: event.target.value } : unit)) })} /></label><NumericField label="单元数" value={(stage.units || []).length} min={1} max={6} onChange={() => {}} /></div>}
-                {stage.type === "rtx" && <div className="gallery-editor-grid two"><NumericField label="RTX 倍率" value={stage.scale} min={1} max={4} step={0.01} onChange={(value) => setStage(stage.id, { scale: value })} /><label className="gallery-field"><span>RTX 质量</span><select value={stage.quality} onChange={(event) => setStage(stage.id, { quality: event.target.value })}><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option><option value="ultra">ULTRA</option></select></label></div>}
-              </div>)}
-            </div>
-            <button type="button" className="gallery-chain-add" disabled={resampleUnits(settings.postprocessChain).length >= RESAMPLE_UNIT_LIMIT} onClick={() => setSettings((current) => ({ ...current, postprocessChain: addResampleUnit(current.postprocessChain) }))}><Plus size={12} />添加重采样单元</button>
+            <ResampleChainPanel
+              chain={settings.postprocessChain}
+              onChange={(nextChain) => setSettings((current) => busy ? current : { ...current, postprocessChain: nextChain })}
+              engine={settings.model}
+              samplers={visibleSamplers}
+              schedulers={visibleSchedulers}
+              baseSize={settings.size}
+              baseSteps={settings.steps}
+              baseCfg={settings.cfg}
+              upscalers={upscalers || { models: [], builtins: [] }}
+              upscalerRuntimeReady={upscalerRuntimeReady}
+              upscalersRefreshing={upscalersRefreshing}
+              onRefreshUpscalers={onRefreshUpscalers}
+              upscalerDownloadJob={upscalerDownloadJob}
+              upscalerDownloadBusy={upscalerDownloadBusy}
+              upscalerDownloadError={upscalerDownloadError}
+              onDownloadUpscaler={onDownloadUpscaler}
+              onRetryUpscaler={onRetryUpscaler}
+              locked={busy}
+              Slider={GalleryChainSlider}
+               NumberInput={GalleryChainNumberInput}
+               randomSeed={secureRandomUint64Seed}
+               chainIssue={chainIssue}
+               renderCard={({ title: stageTitle, detail, enabled, expanded, onToggleEnabled, onToggleExpanded, actions, children }) => (
+                <GalleryChainCard kind="重采样" title={stageTitle} detail={detail} enabled={enabled} expanded={expanded} disabled={busy} onToggleEnabled={() => onToggleEnabled()} onToggleExpanded={onToggleExpanded} actions={actions}>{children}</GalleryChainCard>
+              )}
+              renderStage={(stage, index, actions) => {
+                const toggleExpanded = () => setStage(stage.id, { expanded: !stage.expanded });
+                if (stage.type === "adetailer") {
+                  // Every slot exists; the ones switched on are the passes that run, in this order.
+                  const units = normalizeADetailerUnits(stage);
+                  const active = units.filter((unit) => unit.enabled);
+                  const setUnit = (id, updates) => setStage(stage.id, { units: units.map((unit) => (unit.id === id ? { ...unit, ...updates } : unit)) });
+                  return <GalleryChainCard kind="细节修复" title="ADetailer" detail={stage.enabled ? adetailerSummary(stage) : "关闭"} enabled={stage.enabled} expanded={stage.expanded} disabled={busy} onToggleEnabled={(value) => setStage(stage.id, { enabled: value })} onToggleExpanded={toggleExpanded} actions={actions}>
+                    <div className="gallery-chain-card-body">
+                      {active.length === 0 && <p className="gallery-field-detail">没有启用的检测单元</p>}
+                      {active.map((unit, position) => <div className="gallery-ade-unit" key={unit.id}>
+                        <span>{String(position + 1).padStart(2, "0")}</span>
+                        <label className="gallery-field"><span>检测模型</span><input value={unit.detector} placeholder="如 face_yolov8n.pt" onChange={(event) => setUnit(unit.id, { detector: event.target.value })} /></label>
+                        <NumericField label="置信度" value={unit.confidence} min={0.05} max={1} step={0.01} onChange={(value) => setUnit(unit.id, { confidence: value })} />
+                        <NumericField label="重绘强度" value={unit.denoise} min={0.05} max={1} step={0.01} onChange={(value) => setUnit(unit.id, { denoise: value })} />
+                      </div>)}
+                    </div>
+                  </GalleryChainCard>;
+                }
+                return <GalleryChainCard kind="RTX 放大" title="RTX VSR" detail={stage.enabled ? `${stage.scale}× · ${String(stage.quality).toUpperCase()}` : "关闭"} enabled={stage.enabled} expanded={stage.expanded} disabled={busy} onToggleEnabled={(value) => setStage(stage.id, { enabled: value })} onToggleExpanded={toggleExpanded} actions={actions}>
+                  <div className="gallery-chain-card-body gallery-editor-grid two">
+                    <NumericField label="RTX 倍率" value={stage.scale} min={1} max={4} step={0.01} onChange={(value) => setStage(stage.id, { scale: value })} />
+                    <label className="gallery-field"><span>RTX 质量</span><select value={stage.quality} onChange={(event) => setStage(stage.id, { quality: event.target.value })}><option value="low">LOW</option><option value="medium">MEDIUM</option><option value="high">HIGH</option><option value="ultra">ULTRA</option></select></label>
+                  </div>
+                </GalleryChainCard>;
+              }}
+            />
           </div>
         </details>
         {error && <p className="gallery-form-error">{error}</p>}
       </fieldset>
+      </div>
       <footer><span>{images.length ? `${images.length} 张图片` : "无图片卡片"} · {settings.loras.length} 个 LoRA · {settings.size.width} × {settings.size.height}</span><div><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary" disabled={busy || !selectedCollection}>{busy ? <RefreshCw className="spin" size={14} /> : <Save size={14} />}保存卡片</button></div></footer>
     </form>
     {loraOpen && <GalleryLoraManager engine={settings.model} value={settings.loras} onClose={() => setLoraOpen(false)} onApply={(next) => { setField("loras", next); setLoraOpen(false); }} />}
+    {outputOpen && createPortal(<GalleryOutputDrawer onClose={() => setOutputOpen(false)} onPick={addOutputImages} />, document.body)}
   </div>;
 }
+
+// Where a card's parameters land. Prompts, sampling, canvas and the chain belong to the chosen
+// page; the model and the LoRA mount are shared by both, and image-to-image keeps its source.
+const APPLY_TARGETS = [
+  ["t2i", "文生图", "写入文生图页"],
+  ["i2i", "图生图", "写入图生图页，来源图保持不变"],
+];
 
 function ApplySettingsDialog({ card, onClose, onApply }) {
   // Defaults to Prompt only. Applying everything replaces the model, the whole
   // LoRA mount and every sampling parameter, which is a much larger action than
   // "I want this card's prompt" — the reason people open this dialog.
   const [selected, setSelected] = useState(() => new Set(APPLY_DEFAULT_GROUPS));
+  // A card saved from the image page opens on the image page; any other on text-to-image.
+  const [target, setTarget] = useState(() => (card.settings?.page === "image" ? "i2i" : "t2i"));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const dialogRef = useDialogLifecycle(true, onClose, "", !busy);
@@ -873,7 +1277,7 @@ function ApplySettingsDialog({ card, onClose, onApply }) {
     setBusy(true);
     setError("");
     try {
-      await onApply(card.settings, groups);
+      await onApply(card.settings, groups, { target, page: target === "i2i" ? "image" : "generate" });
       onClose();
     } catch (applyError) {
       setError(applyError.message);
@@ -884,6 +1288,9 @@ function ApplySettingsDialog({ card, onClose, onApply }) {
   return <div className="gallery-dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}>
     <section ref={dialogRef} className="gallery-apply-dialog" role="dialog" aria-modal="true" aria-labelledby="gallery-apply-dialog-title" tabIndex="-1">
       <header><div><span>APPLY PARAMETERS</span><h2 id="gallery-apply-dialog-title">应用到生图区域</h2><p title={card.title || card.settings?.positive}>{displayTitle(card)}</p></div><button type="button" aria-label="关闭参数应用窗口" disabled={busy} onClick={onClose}><X size={18} /></button></header>
+      <div className="gallery-apply-target" role="radiogroup" aria-label="应用目标页面">
+        {APPLY_TARGETS.map(([id, label, detail]) => <button type="button" key={id} role="radio" aria-checked={target === id} className={target === id ? "selected" : ""} disabled={busy} title={detail} onClick={() => setTarget(id)}><strong>{label}</strong><small>{detail}</small></button>)}
+      </div>
       <div className="gallery-apply-grid">{APPLY_GROUPS.map(([id, label, detail]) => <button type="button" className={selected.has(id) ? "selected" : ""} aria-pressed={selected.has(id)} disabled={busy} key={id} onClick={() => toggle(id)}><i>{selected.has(id) && <Check size={12} />}</i><span><strong>{label}</strong><small>{detail}</small></span></button>)}</div>
       {card.settings?.loraGroupPrompt && selected.has("prompts") && (
         // Applied prompts are the handwritten part only. The prefix came from
@@ -1055,7 +1462,23 @@ function GalleryDetail({ card, cards, onBack, onNavigate, onEdit, onDelete, onAp
   </div>;
 }
 
-export default function GalleryPage({ currentSettings, focus, onApplySettings, onApplyPrompt, onNotice }) {
+export default function GalleryPage({
+  currentSettings,
+  canvasMaxEdge = DEFAULT_CANVAS_MAX_EDGE,
+  focus,
+  onApplySettings,
+  onApplyPrompt,
+  onNotice,
+  upscalerCatalog = null,
+  upscalerRuntimeReady = true,
+  upscalersRefreshing = false,
+  onRefreshUpscalers = null,
+  upscalerDownloadJob = null,
+  upscalerDownloadBusy = false,
+  upscalerDownloadError = "",
+  onDownloadUpscaler = null,
+  onRetryUpscaler = null,
+}) {
   const [data, setData] = useState({ collections: [], cards: [] });
   const [activeSection, setActiveSection] = useState("gallery");
   const [selectedCollection, setSelectedCollection] = useState(null);
@@ -1422,7 +1845,9 @@ export default function GalleryPage({ currentSettings, focus, onApplySettings, o
     {dragState && createPortal(<div ref={dragGhostRef} className="gallery-drag-ghost"><Images size={14} /><span><strong>正在排序</strong><small>{displayTitle(data.cards.find((card) => card.id === dragState.cardId), 42)}</small></span></div>, document.body)}
     {cardMenu && <GalleryCardMenu menu={cardMenu} onClose={() => setCardMenu(null)} onEdit={editFromCardMenu} onDelete={deleteFromCardMenu} />}
     {collectionDialog && <CollectionDialog collection={collectionDialog.collection} onClose={() => setCollectionDialog(null)} onSaved={saveCollection} onDeleted={collectionDeleted} />}
-    {editor && <GalleryCardEditor card={editor.card} collectionId={editor.collectionId} collections={data.collections} initialSettings={currentSettings} initialImages={editor.initialImages} onClose={() => setEditor(null)} onSaved={saveCard} />}
+    {/* Portalled like the detail viewer: the page is a stacking context under the sticky header,
+        which otherwise covered the editor's top edge. */}
+    {editor && createPortal(<GalleryCardEditor card={editor.card} collectionId={editor.collectionId} collections={data.collections} initialSettings={currentSettings} initialImages={editor.initialImages} canvasMaxEdge={canvasMaxEdge} upscalers={upscalerCatalog} upscalerRuntimeReady={upscalerRuntimeReady} upscalersRefreshing={upscalersRefreshing} onRefreshUpscalers={onRefreshUpscalers} upscalerDownloadJob={upscalerDownloadJob} upscalerDownloadBusy={upscalerDownloadBusy} upscalerDownloadError={upscalerDownloadError} onDownloadUpscaler={onDownloadUpscaler} onRetryUpscaler={onRetryUpscaler} onClose={() => setEditor(null)} onSaved={saveCard} />, document.body)}
     {promptDialog && <PromptLibraryDialog entry={promptDialog.entry} onClose={() => setPromptDialog(null)} onSaved={() => void savePromptEntry()} />}
   </section>;
 }

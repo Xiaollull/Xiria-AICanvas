@@ -17,11 +17,14 @@ test("the reader's catalogue tags a diffusion model with the engine that owns it
   for (const discover of ["discoverAnimaModels", "discoverFluxModels", "discoverFlux2Models", "discoverKrea2Models"]) {
     assert.match(catalogs, new RegExp(`\\["\\w+", ${discover}\\]`), `${discover} is not consulted`);
   }
-  assert.match(catalogs, /catalogEntry\("local", model\.value, `\$\{relative\} · \$\{engine\}`, \{ engine \}\)/);
+  assert.match(catalogs, /catalogEntry\("local", model\.value, `\$\{relative\} · \$\{engine\}`, \{ engine, file: path\.join\(directory, model\.value\) \}\)/);
   // Claimed in a fixed order, so a file two engines accept always lands on the same one.
   assert.match(catalogs, /if \(claimed\.has\(model\.value\)\) continue;/);
   // A file no engine recognises is still reported as found, but names no engine.
-  assert.match(catalogs, /if \(!claimed\.has\(model\.value\)\) checkpoints\.push\(catalogEntry\("local", model\.value, relative\)\);/);
+  assert.match(catalogs, /if \(!claimed\.has\(model\.value\)\) checkpoints\.push\(catalogEntry\("local", model\.value, relative, \{ file: path\.join\(directory, model\.value\) \}\)\);/);
+  // The file on this machine settles an ambiguous name by hash, and never reaches a browser.
+  const entry = vite.slice(vite.indexOf("function catalogEntry("), vite.indexOf("const modelHashCache"));
+  assert.match(entry, /if \(file\) Object\.defineProperty\(entry, "file", \{ value: file, enumerable: false \}\);/);
 });
 
 test("applying another engine's picture takes that engine's encoder and VAE", async () => {
@@ -61,7 +64,7 @@ test("copying an image outside a secure context says why instead of throwing a T
 test("a picture's borrowed encoder or VAE can be replaced; its diffusion model and a card's files cannot", async () => {
   const app = await readSource("src/App.jsx");
   // Only the image reader asks for this; a Gallery card's recorded files are still checked as-is.
-  assert.match(app, /label: "图片参数", fillMissingAssets: true \}\);/);
+  assert.match(app, /label: "图片参数",\s*fillMissingAssets: true,\s*target: toImagePage \? "i2i" : "t2i",/);
   assert.equal((app.match(/fillMissingAssets: true/g) || []).length, 1, "only the picture path may opt in");
   assert.match(app, /else if \(fillMissingAssets && field !== "diffusionModel" && catalog\.length === 1 && !catalog\.some\(\(item\) => item\.value === normalized\[field\]\)\) normalized\[field\] = catalog\[0\]\.value;/);
 });

@@ -11,6 +11,8 @@
 // Both generate surfaces and the gallery read this one shape, so the
 // text-to-image page and the image-to-image page cannot drift apart.
 
+import { DIFFUSERS_SCHEDULE_STEP_LIMIT, diffusersScheduleTotal } from "./diffusers-schedule.js";
+
 export const ADETAILER_UNIT_LIMIT = 6;
 
 export const ADETAILER_UNIT_DEFAULTS = Object.freeze({
@@ -126,21 +128,17 @@ export function activeADetailerUnits(stage) {
   return normalizeADetailerUnits(stage).filter((unit) => unit.enabled);
 }
 
-// Diffusers runs `int(steps × denoise)` updates on an inpaint pass, so a low
-// denoise with the inherited step count can round to nothing.
-//
-// The native engines do not. Their refinement follows Comfy — build a longer schedule,
-// keep the last `steps + 1` sigmas — so it executes **every** requested step
-// whatever the denoise. Multiplying there understated the pass, which is what let
-// the job's step counter climb past its own total. The backend makes the same
-// split in `adetailer_effective_steps`; the two must agree, because this number is
-// both what the page promises and what the run blocker is decided on.
+// Every engine executes the requested detail count. Native refinement already follows Comfy's
+// suffix semantics; SD/iL receive a longer Diffusers schedule so denoise selects the starting noise
+// without shrinking the retained updates. This helper keeps the engine argument because it is part
+// of the stable call shape shared by both pages, while the schedule cap remains engine-specific in
+// `adetailerStageIssue` below.
 export const NATIVE_STEP_ENGINES = ["Anima", "Flux", "Flux2", "Krea2"];
 
 export function adetailerUnitSteps(unit, baseSteps, engine) {
+  if (!(unit?.denoise > 0)) return 0;
   const steps = Number((unit?.useSteps ? unit.steps : baseSteps) || 0);
-  if (NATIVE_STEP_ENGINES.includes(engine)) return Math.floor(steps);
-  return Math.floor(steps * Number(unit?.denoise || 0));
+  return Number.isFinite(steps) ? Math.floor(steps) : 0;
 }
 
 export function adetailerUnitLabel(index, total) {
@@ -180,7 +178,12 @@ export function adetailerStageIssue(stage, baseSteps, isDetectorAvailable, engin
     const label = adetailerUnitLabel(index, units.length);
     if (!unit.detector) return `${label} 尚未选择检测模型`;
     if (typeof isDetectorAvailable === "function" && !isDetectorAvailable(unit.detector)) return `${label} 的检测模型不可用`;
-    if (adetailerUnitSteps(unit, baseSteps, engine) < 1) return `${label} 的有效步数至少需要 1 步`;
+    const effectiveSteps = adetailerUnitSteps(unit, baseSteps, engine);
+    if (effectiveSteps < 1) return `${label} 的有效步数至少需要 1 步`;
+    if (!NATIVE_STEP_ENGINES.includes(engine)
+      && diffusersScheduleTotal(effectiveSteps, unit.denoise) === null) {
+      return `${label} 的重绘强度过低：调度总步数不能超过 ${DIFFUSERS_SCHEDULE_STEP_LIMIT}，请提高重绘强度或降低步数`;
+    }
   }
   return "";
 }

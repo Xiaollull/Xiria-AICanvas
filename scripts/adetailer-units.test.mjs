@@ -159,19 +159,28 @@ test("a stage that cannot run says which unit is at fault", () => {
     adetailerStageIssue(stage([{ detector: "face.pt" }, { detector: "gone.pt" }]), steps, (detector) => detector === "face.pt"),
     /ADetailer 2 的检测模型不可用/,
   );
-  // Diffusers runs `int(steps × denoise)` updates, so a low denoise can round to
-  // nothing and the pass would fail where it would have started working.
-  assert.match(adetailerStageIssue(stage([{ detector: "face.pt", denoise: 0.05 }]), 10), /有效步数至少需要 1 步/);
+  // A pass inheriting no steps has nothing to run.
+  assert.match(adetailerStageIssue(stage([{ detector: "face.pt" }]), 0), /有效步数至少需要 1 步/);
+  // Diffusers is handed a longer schedule so the configured steps all execute; a denoise so low that
+  // schedule would pass 1000 steps is refused before the job instead of failing inside it.
+  assert.equal(adetailerStageIssue(stage([{ detector: "face.pt", denoise: 0.05 }]), 10), "");
+  assert.match(
+    adetailerStageIssue(stage([{ detector: "face.pt", denoise: 0.05, useSteps: true, steps: 60 }]), 10),
+    /ADetailer 1 的重绘强度过低：调度总步数不能超过 1000/,
+  );
   assert.match(adetailerStageIssue(stage([{ detector: "face.pt", enabled: false }]), steps), /至少需要启用一个/);
 });
 
 test("step arithmetic and the labels a user reads", () => {
-  assert.equal(adetailerUnitSteps({ denoise: 0.4 }, 20), 8);
-  assert.equal(adetailerUnitSteps({ denoise: 0.4, useSteps: true, steps: 30 }, 20), 12);
-  assert.equal(adetailerUnitSteps({ denoise: 0.05 }, 10), 0);
+  // Every family executes the configured steps; denoise only chooses where the schedule starts.
+  // (SD/iL used to run `int(steps × denoise)`, so 25 steps at 0.35 ran eight updates.)
+  assert.equal(adetailerUnitSteps({ denoise: 0.4 }, 20), 20);
+  assert.equal(adetailerUnitSteps({ denoise: 0.4, useSteps: true, steps: 30 }, 20), 30);
+  assert.equal(adetailerUnitSteps({ denoise: 0.05 }, 10), 10);
+  assert.equal(adetailerUnitSteps({ denoise: 0 }, 20), 0);
 
   const stage = normalizeADetailerStage({ enabled: true, units: [{ detector: "a.pt", denoise: 0.5 }, { detector: "b.pt", denoise: 0.25 }] });
-  assert.equal(adetailerTotalSteps(stage, 20), 15);
+  assert.equal(adetailerTotalSteps(stage, 20), 40);
 
   // Native Anima refinement keeps the last `steps + 1` sigmas of a longer schedule, so it executes
   // every requested step whatever the denoise. Multiplying there promised 2 steps and delivered 20 —
@@ -179,10 +188,10 @@ test("step arithmetic and the labels a user reads", () => {
   assert.equal(adetailerUnitSteps({ denoise: 0.1 }, 20, "Anima"), 20);
   assert.equal(adetailerUnitSteps({ denoise: 0.1, useSteps: true, steps: 30 }, 20, "Anima"), 30);
   assert.equal(adetailerTotalSteps(stage, 20, "Anima"), 40);
-  // A denoise that rounds to nothing is a blocker on Diffusers and a non-issue on Anima, because
-  // there the pass would have run its 10 steps.
-  const faint = normalizeADetailerStage({ enabled: true, units: [{ detector: "face.pt", denoise: 0.05 }] });
-  assert.match(adetailerStageIssue(faint, 10), /有效步数至少需要 1 步/);
+  // A schedule longer than Diffusers accepts is a blocker there and a non-issue on Anima, which
+  // never expands its schedule.
+  const faint = normalizeADetailerStage({ enabled: true, units: [{ detector: "face.pt", denoise: 0.05, useSteps: true, steps: 60 }] });
+  assert.match(adetailerStageIssue(faint, 10), /重绘强度过低/);
   assert.equal(adetailerStageIssue(faint, 10, undefined, "Anima"), "");
 
   assert.equal(adetailerUnitLabel(0, 1), "ADetailer");

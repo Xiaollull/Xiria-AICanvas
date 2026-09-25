@@ -17,6 +17,9 @@
 
 import { formatFileSize } from "./format-size.js";
 import { DISTILLED_GUIDANCE_ENGINES, NATIVE_STEP_ENGINES, adetailerStageIssue } from "./adetailer-units.js";
+import { clipSkipPayload } from "./clip-skip.js";
+import { canvasEdgeIssue, DEFAULT_CANVAS_MAX_EDGE, HARD_CANVAS_MAX_EDGE } from "./canvas-limit.js";
+import { DIFFUSERS_SCHEDULE_STEP_LIMIT, diffusersScheduleTotal } from "./diffusers-schedule.js";
 import {
   chainStage,
   enabledChainStages,
@@ -54,9 +57,12 @@ export const SOURCE_IMAGE_TYPES = Object.freeze(["image/png", "image/jpeg", "ima
 export const SOURCE_IMAGE_ACCEPT = SOURCE_IMAGE_TYPES.join(",");
 
 // The same bounds `GenerateInput` enforces. Duplicated here so a request is shaped correctly before
-// it is sent rather than rejected after; the server remains the authority.
+// it is sent rather than rejected after; the server remains the authority. `MAXIMUM_EDGE` is the
+// default canvas bound — what fitting a source uses unless the user raised the bound in Settings;
+// a stored custom canvas may be anything up to the hard ceiling, and is checked against the bound
+// in force rather than cut down to it.
 export const MINIMUM_EDGE = 64;
-export const MAXIMUM_EDGE = 2048;
+export const MAXIMUM_EDGE = DEFAULT_CANVAS_MAX_EDGE;
 export const EDGE_STEP = 64;
 
 export const MINIMUM_DENOISE = 0.05;
@@ -84,6 +90,7 @@ export const IMAGE_TO_IMAGE_DEFAULTS = Object.freeze({
   // 0.6 keeps the composition of the source while giving the prompt real room. 1.0 would discard
   // the picture entirely, which is text-to-image and already has a page.
   denoise: 0.6,
+  fixSteps: false,
   steps: 28,
   cfg: 6.5,
   sampler: "",
@@ -131,6 +138,9 @@ export function normalizeImageToImageSettings(value, { samplers = [], schedulers
     positive: typeof source.positive === "string" ? source.positive : IMAGE_TO_IMAGE_DEFAULTS.positive,
     negative: typeof source.negative === "string" ? source.negative : IMAGE_TO_IMAGE_DEFAULTS.negative,
     denoise: Math.round(numberInRange(source.denoise, IMAGE_TO_IMAGE_DEFAULTS.denoise, MINIMUM_DENOISE, 1) * 100) / 100,
+    // Missing means the pre-protocol-37 behavior. Only a literal true opts into the more expensive
+    // expanded schedule, so old persisted records remain byte-for-behavior compatible.
+    fixSteps: source.fixSteps === true,
     steps: Math.round(numberInRange(source.steps, IMAGE_TO_IMAGE_DEFAULTS.steps, 1, 60)),
     cfg: Math.round(numberInRange(source.cfg, IMAGE_TO_IMAGE_DEFAULTS.cfg, 0, 30) * 10) / 10,
     sampler: pickFromCatalog(source.sampler, samplers, defaultSampler),
@@ -149,29 +159,32 @@ export function normalizeImageToImageSettings(value, { samplers = [], schedulers
     postprocessChain: Array.isArray(source.postprocessChain)
       ? normalizeResampleChain(source.postprocessChain, { samplers, schedulers })
       : migrateResampleChain(source, { samplers, schedulers }),
+    // Engine-specific, so kept as stored here and resolved by `clipSkipPayload` for the engine that
+    // submits; the per-engine store normalises it against its own engine.
+    clipSkip: Number.isInteger(source.clipSkip) ? source.clipSkip : null,
   };
 }
 
-export function snapEdge(value) {
+export function snapEdge(value, maximum = HARD_CANVAS_MAX_EDGE) {
   const numeric = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
   if (!Number.isFinite(numeric) || numeric <= 0) return MINIMUM_EDGE;
   const snapped = Math.round(numeric / EDGE_STEP) * EDGE_STEP;
-  return Math.min(MAXIMUM_EDGE, Math.max(MINIMUM_EDGE, snapped));
+  return Math.min(maximum, Math.max(MINIMUM_EDGE, snapped));
 }
 
 // Scale to fit, then snap — in that order. Clamping a 4000 px edge straight down to 2048 while
 // leaving a 3000 px edge to be snapped on its own would silently reframe an oversized picture;
 // fitting the long edge first keeps the aspect ratio, and the 64 px rounding stays the only
-// distortion the geometry introduces.
-export function fitSourceSize(width, height) {
+// distortion the geometry introduces. `maxEdge` is the canvas bound in force (2048 by default).
+export function fitSourceSize(width, height, maxEdge = MAXIMUM_EDGE) {
   const sourceWidth = Number.isFinite(width) && width > 0 ? width : 0;
   const sourceHeight = Number.isFinite(height) && height > 0 ? height : 0;
-  if (!sourceWidth || !sourceHeight) return { width: snapEdge(IMAGE_TO_IMAGE_DEFAULTS.width), height: snapEdge(IMAGE_TO_IMAGE_DEFAULTS.height) };
-  const ratio = Math.min(1, MAXIMUM_EDGE / Math.max(sourceWidth, sourceHeight));
-  return { width: snapEdge(sourceWidth * ratio), height: snapEdge(sourceHeight * ratio) };
+  if (!sourceWidth || !sourceHeight) return { width: snapEdge(IMAGE_TO_IMAGE_DEFAULTS.width, maxEdge), height: snapEdge(IMAGE_TO_IMAGE_DEFAULTS.height, maxEdge) };
+  const ratio = Math.min(1, maxEdge / Math.max(sourceWidth, sourceHeight));
+  return { width: snapEdge(sourceWidth * ratio, maxEdge), height: snapEdge(sourceHeight * ratio, maxEdge) };
 }
 
-export function outputSize(source, settings) {
+export function outputSize(source, settings, { maxEdge = MAXIMUM_EDGE } = {}) {
   const config = normalizeImageToImageSettings(settings);
   // Post-processing never resamples, so the canvas is not a choice: it is whatever the file is. The
   // stage chain then grows it from there, which is what `resampleChainPlan` reports.
@@ -183,7 +196,7 @@ export function outputSize(source, settings) {
     return { width: config.width, height: config.height };
   }
   const scale = config.sizeMode === "scale" ? config.scale : 1;
-  return fitSourceSize(source.width * scale, source.height * scale);
+  return fitSourceSize(source.width * scale, source.height * scale, maxEdge);
 }
 
 // Why a picture cannot be post-processed as-is, or "" when it can.
@@ -224,12 +237,41 @@ export function sourceImageSummary(source) {
   return parts.join(" · ");
 }
 
+// Consume a normalized settings object and the actual session source. The page, blocker and request
+// builder all call this gate, so native/post-process/source-less requests cannot submit a persisted
+// preference that the backend would ignore.
+export function imageToImageFixStepsPlan(config, engine, source) {
+  const active = Boolean(
+    source?.dataUrl
+    && config?.mode !== "postprocess"
+    && config?.fixSteps
+    && (engine === "SD" || engine === "iL"),
+  );
+  if (!active) return { active: false, executedSteps: null, scheduleSteps: null, issue: "" };
+  const scheduleSteps = diffusersScheduleTotal(config.steps, config.denoise);
+  return {
+    active: true,
+    executedSteps: config.steps,
+    scheduleSteps,
+    issue: scheduleSteps === null
+      ? `重绘强度过低：按滑条步数精确执行所需的调度总步数超过 ${DIFFUSERS_SCHEDULE_STEP_LIMIT}，请提高重绘强度或降低采样步数`
+      : "",
+  };
+}
+
 // Why the run button is off, in the order the user can act on: no picture, then no model, then a
 // service that is not up, then a run already in flight.
-export function imageToImageBlockers({ source, settings, engine, engineReady = true, serviceReady = true, postprocess = {}, backgroundRemoval = {} }) {
+export function imageToImageBlockers({ source, settings, engine, engineReady = true, serviceReady = true, postprocess = {}, backgroundRemoval = {}, canvasMaxEdge = MAXIMUM_EDGE }) {
   const config = normalizeImageToImageSettings(settings);
   const postprocessOnly = config.mode === "postprocess";
-  if (!source) return "请先选择一张来源图片";
+  const fixStepsPlan = imageToImageFixStepsPlan(config, engine, source);
+  if (!source?.dataUrl) return "请先选择一张来源图片";
+  if (!postprocessOnly) {
+    // A custom canvas saved under a higher bound is kept, not cut down; it just cannot run until the
+    // bound allows it again (or a smaller canvas is chosen).
+    const edgeIssue = canvasEdgeIssue(outputSize(source, config, { maxEdge: canvasMaxEdge }), { maxEdge: canvasMaxEdge, engine });
+    if (edgeIssue) return edgeIssue;
+  }
   // The prompt is required in both modes: Hires and ADetailer redraw through the mounted model and
   // the server refuses an empty prompt, so post-processing without one is not a shortcut available
   // here — even a run whose only stage is RTX carries it.
@@ -247,6 +289,7 @@ export function imageToImageBlockers({ source, settings, engine, engineReady = t
       return "后处理模式需要至少启用一个重采样单元、ADetailer 或 RTX VSR";
     }
   }
+  if (fixStepsPlan.issue) return fixStepsPlan.issue;
   // The server refuses every post-processing stage in ultra-low memory mode, so this is a 422 the
   // page can explain instead of submitting into.
   if (postprocess.ultraLow && enabledChainStages(config.postprocessChain).length) {
@@ -267,9 +310,8 @@ export function imageToImageBlockers({ source, settings, engine, engineReady = t
   // Which unit is at fault matters once there are several: "ADetailer is not
   // ready" does not say which card to open.
   if (adetailerStage?.enabled) {
-    // The engine decides what a pass executes: native Anima runs every requested
-    // step whatever the denoise, so the multiplied count would refuse a run the
-    // server would have accepted.
+    // Every engine executes the requested detail count. The shared helper also mirrors the
+    // backend's SD/iL schedule cap, while native refinement remains exempt from that Diffusers limit.
     const issue = adetailerStageIssue(adetailerStage, config.steps, undefined, engine);
     if (issue) return issue;
   }
@@ -296,9 +338,11 @@ export function imageToImageRequestBody({
   backgroundRemovalModel = null,
   samplers = [],
   schedulers = [],
+  canvasMaxEdge = MAXIMUM_EDGE,
+  outputTemplate = null,
 }) {
   const config = normalizeImageToImageSettings(settings, { samplers, schedulers });
-  const size = outputSize(source, config);
+  const size = outputSize(source, config, { maxEdge: canvasMaxEdge });
   const anima = engine === "Anima";
   const flux = engine === "Flux";
   const flux2 = engine === "Flux2";
@@ -309,8 +353,10 @@ export function imageToImageRequestBody({
   const splitModel = anima || flux || flux2 || krea2;
   const distilled = DISTILLED_GUIDANCE_ENGINES.includes(engine);
   const postprocessOnly = config.mode === "postprocess";
+  const fixStepsPlan = imageToImageFixStepsPlan(config, engine, source);
   return {
     postprocess_only: postprocessOnly,
+    img2img_fix_steps: fixStepsPlan.active,
     engine,
     ...(flux
       ? { diffusion_model: diffusionModel, text_encoder: textEncoder, text_encoder_2: textEncoder2, vae }
@@ -341,6 +387,9 @@ export function imageToImageRequestBody({
     },
     postprocess_chain: resampleChainPayload(config.postprocessChain, { engine, seedOverrides }),
     loras: loras.filter((lora) => lora.enabled !== false).map((lora) => ({ path: lora.value, weight: lora.weight })),
+    // SD/iL send the effective layer; the native engines send nothing, because they have none.
+    ...clipSkipPayload(engine, config.clipSkip),
+    ...(outputTemplate ? { output_template: outputTemplate } : {}),
     gallery_settings: gallerySettings,
   };
 }

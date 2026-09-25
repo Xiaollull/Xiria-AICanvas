@@ -44,6 +44,9 @@ import {
 import { pageLoraDragLocked } from "./lora-drag-handle";
 import { createLoraPersistenceEpochGuard, runLoraPersistenceEpoch } from "./lora-persistence-epoch";
 import { applyThemeToDocument, loadThemeState } from "./theme.js";
+import { LoraEngineBar, LoraFolderGrid } from "./LoraFolderBrowser.jsx";
+import { loraFolderView } from "./lora-folders.js";
+import { engineSettingsFor, normalizeEngineSettingsMap } from "./engine-settings.js";
 
 const ENGINES = READY_LORA_ENGINES;
 const CHART_COLORS = ["var(--lime)", "#62d0ff", "#ffb55e", "#ff7548", "#8f9389"];
@@ -122,6 +125,15 @@ export default function LoraManagerPage() {
   const [collapsedSharedFolders, setCollapsedSharedFolders] = useState({});
   const [detail, setDetail] = useState(null);
   const [cardEdit, setCardEdit] = useState(null);
+  // Folder navigation inside a local category, and the path field. Navigation only.
+  const [folderPath, setFolderPath] = useState("");
+  const [pathInput, setPathInput] = useState("");
+  const [pathBusy, setPathBusy] = useState(false);
+  const [engineBusy, setEngineBusy] = useState(false);
+  // Whether a main workspace tab has spoken on the channel. It owns the workspace, so an engine
+  // switch is asked of it; without one this page makes the switch in the saved workspace itself.
+  const parentSeenRef = useRef(false);
+  const pendingEngineSwitchRef = useRef(new Map());
   const loraCards = useLoraCards();
   modelRef.current = model;
   lorasRef.current = loras;
@@ -228,7 +240,21 @@ export default function LoraManagerPage() {
     channelRef.current = channel;
     channel.onmessage = (event) => {
       const payload = event.data;
+      if (payload?.type === "workspace-engine") {
+        parentSeenRef.current = true;
+        adoptEngineRef.current(payload.engine);
+        return;
+      }
+      if (payload?.type === "engine-switch-result") {
+        const resolve = pendingEngineSwitchRef.current.get(payload.requestId);
+        if (resolve) {
+          pendingEngineSwitchRef.current.delete(payload.requestId);
+          resolve(payload);
+        }
+        return;
+      }
       if (payload?.type === "workspace-lora-lock") {
+        parentSeenRef.current = true;
         persistenceEpochRef.current.invalidate();
         applyWorkspaceLock(payload.locked === true);
         syncReadyRef.current = true;
@@ -236,6 +262,7 @@ export default function LoraManagerPage() {
         return;
       }
       if (payload?.type !== "workspace-loras") return;
+      parentSeenRef.current = true;
       persistenceEpochRef.current.invalidate();
       applyWorkspaceLock(payload.locked === true);
       syncReadyRef.current = true;
@@ -327,6 +354,131 @@ export default function LoraManagerPage() {
     return () => { window.clearTimeout(timer); persistenceEpochRef.current.invalidate(); };
   }, [loras, mountedLorasByEngine, loraGroupsByEngine, workspaceLocked, syncReady]);
 
+  // This page follows the generation engine: the list, the groups and the category grid all switch
+  // to that engine's scope. The map already holds every engine's list, so nothing is fetched.
+  const adoptEngine = (engine) => {
+    if (!ENGINES.includes(engine) || engine === modelRef.current) return;
+    const scopeKey = engineScopeKey(engine);
+    scopeKeyRef.current = scopeKey;
+    const next = mountedLorasForScope(mountedLorasMapRef.current, scopeKey);
+    localChangeRef.current = false;
+    lorasRef.current = next;
+    modelRef.current = engine;
+    setLoras(next);
+    setModel(engine);
+    setCategory((current) => (current === "mounted" || current === "groups" ? current : "mounted"));
+    setFolderPath("");
+    setSearch("");
+  };
+  const adoptEngineRef = useRef(adoptEngine);
+  adoptEngineRef.current = adoptEngine;
+
+  /**
+   * Switch the generation engine from this page.
+   *
+   * With a main workspace open, it is asked to switch — it owns every engine's saved record and the
+   * running-job guard — and this page follows its answer. With none open, this page is the only
+   * writer: a queued or running job refuses the switch, and otherwise the saved workspace moves to
+   * the engine's own record (selection, prompts and all), which is what the main page restores.
+   */
+  const requestEngine = async (engine) => {
+    if (engine === modelRef.current) return true;
+    if (!ENGINES.includes(engine) || engineBusy) return false;
+    if (workspaceLockedRef.current) {
+      setNotice("生成或模型切换期间不能切换引擎");
+      return false;
+    }
+    setEngineBusy(true);
+    try {
+      if (parentSeenRef.current && channelRef.current) {
+        const requestId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+        const result = await new Promise((resolve) => {
+          pendingEngineSwitchRef.current.set(requestId, resolve);
+          channelRef.current.postMessage({ type: "request-engine-switch", engine, requestId });
+          window.setTimeout(() => {
+            if (pendingEngineSwitchRef.current.delete(requestId)) resolve({ accepted: false, reason: "主工作区没有响应，请在主工作区切换引擎" });
+          }, 2500);
+        });
+        if (!result.accepted) {
+          setNotice(result.reason || "主工作区拒绝了引擎切换");
+          return false;
+        }
+        adoptEngine(engine);
+        return true;
+      }
+      const active = await fetch("/api/inference/jobs/active", { cache: "no-store" }).then((response) => response.json()).catch(() => ({}));
+      if (["queued", "running", "pausing", "paused", "cancelling"].includes(active?.job?.status)) {
+        setNotice("当前有任务正在运行或排队，完成后才能切换生图引擎");
+        return false;
+      }
+      const response = await fetch("/api/ui-state", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "无法读取工作区状态");
+      const state = payload.state || {};
+      const workspace = state.workspace && typeof state.workspace === "object" ? state.workspace : {};
+      const map = normalizeEngineSettingsMap(workspace.engineSettingsByEngine, {
+        fieldMissing: !Object.prototype.hasOwnProperty.call(workspace, "engineSettingsByEngine"),
+        legacy: workspace,
+        legacyImageToImage: workspace.imageToImage,
+        legacyPrompts: { positive: workspace.positive, negative: workspace.negative, activePromptPresets: workspace.activePromptPresets },
+      }).container;
+      const record = engineSettingsFor(map, engine);
+      // The flat fields mirror the selected engine for the main page's restore; they move with it.
+      const nextWorkspace = {
+        ...workspace,
+        model: engine,
+        engineSettingsByEngine: map,
+        checkpoint: record.checkpoint,
+        diffusionModel: record.diffusionModel,
+        textEncoder: record.textEncoder,
+        textEncoder2: record.textEncoder2,
+        vae: record.vae,
+        positive: record.positive,
+        negative: record.negative,
+        activePromptPresets: record.activePromptPresets,
+        clipSkip: record.clipSkip,
+        loras: mountedLorasForScope(mountedLorasMapRef.current, engineScopeKey(engine)),
+      };
+      const saved = await fetch("/api/ui-state", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...state, workspace: nextWorkspace }) });
+      if (!saved.ok) throw new Error("无法保存引擎切换");
+      adoptEngine(engine);
+      return true;
+    } catch (switchError) {
+      setNotice(switchError.message || "引擎切换失败");
+      return false;
+    } finally {
+      setEngineBusy(false);
+    }
+  };
+
+  const locateFolder = async () => {
+    const text = pathInput.trim();
+    if (!text || pathBusy) return;
+    setPathBusy(true);
+    try {
+      const response = await fetch("/api/lora-folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: text, engine: modelRef.current }) });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.folder) throw new Error(payload.error || "无法定位该 LoRA 文件夹");
+      const target = payload.folder;
+      if (target.engine !== modelRef.current && !(await requestEngine(target.engine))) return;
+      setActiveView("manager");
+      setSearch("");
+      setPathInput(target.display || text);
+      if (target.origin === "shared") {
+        setCategory("shared");
+        setFolderPath("");
+        setCollapsedSharedFolders((current) => ({ ...current, [`${target.rootId}/${target.folder}`]: false }));
+      } else {
+        setCategory(target.categoryId);
+        setFolderPath(target.folder || "");
+      }
+    } catch (locateError) {
+      setNotice(locateError.message || "无法定位该 LoRA 文件夹");
+    } finally {
+      setPathBusy(false);
+    }
+  };
+
   const updateMountedLoras = (updater) => {
     if (currentLoraDragLocked()) {
       setNotice(workspaceLockedRef.current ? "生成或模型切换期间不能修改 LoRA" : "正在确认工作区锁定状态");
@@ -362,6 +514,7 @@ export default function LoraManagerPage() {
   const activeCategory = currentLibrary?.categories.find((item) => item.id === category);
   const matchesSearch = (item) => item.name.toLowerCase().includes(search.trim().toLowerCase());
   const visibleFiles = (activeCategory?.models || []).filter(matchesSearch);
+  const folderView = activeCategory && !activeCategory.shared ? loraFolderView(activeCategory, folderPath, search) : null;
   const mountedValues = new Set(loras.map((item) => item.value));
   const activeLoraGroups = loraGroupsForScope(loraGroupsByEngine, scopeKeyRef.current || model);
   activeLoraGroupsRef.current = activeLoraGroups;
@@ -488,11 +641,13 @@ export default function LoraManagerPage() {
 
   // One card definition for both the flat categories and the shared tree, so a
   // shared LoRA mounts, previews and opens details exactly like a local one.
-  const renderLibraryCard = (item, categoryLabel) => {
+  const renderLibraryCard = (item, categoryLabel, displayName = "") => {
     const mounted = mountedValues.has(item.value);
     const metadata = item.metadata;
     const lookup = lookups[item.value];
-    const presentation = loraPresentationFor(item);
+    const basePresentation = loraPresentationFor(item);
+    // Inside a folder the card names the file; a custom card title still wins.
+    const presentation = displayName && !basePresentation.renamed ? { ...basePresentation, title: displayName } : basePresentation;
     return <article aria-disabled={loraDragLocked} className={`lora-library-card lora-page-library-card ${mounted ? "mounted" : ""} ${presentation.customized ? "customized" : ""} ${loraDragLocked ? "locked" : ""}`} key={item.value} role="button" tabIndex="0" onClick={() => toggleLora(item, activeCategory)} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); toggleLora(item, activeCategory); } }}>
       <div className="lora-card-preview"><span>NO PREVIEW</span>{presentation.coverUrl && <img src={presentation.coverUrl} alt="" onError={(event) => event.currentTarget.remove()} />}<button type="button" className="lora-card-query" disabled={lookup?.loading} onClick={(event) => { event.stopPropagation(); void lookupLora(item, false, activeCategory?.id); }}>{lookup?.loading ? <RefreshCw className="spin" size={13} /> : <Search size={13} />}{lookup?.loading ? "查询中" : "查询"}</button><button type="button" className="lora-card-customize" title="自定义封面、提示词和显示信息" aria-label={`自定义 ${item.name} 的卡片`} onClick={(event) => { event.stopPropagation(); setCardEdit({ value: item.value, name: item.name, categoryId: activeCategory?.id }); }}><Palette size={13} />自定义</button><span className="lora-card-state">{mounted ? <><Check size={13} />已挂载</> : <><Plus size={13} />挂载</>}</span></div>
       <div className="lora-card-copy"><strong title={presentation.renamed ? `${presentation.title}（${item.name}）` : item.name}>{presentation.title}</strong><small>{formatBytes(item.size)} · {categoryLabel}</small>{presentation.tags.length > 0 && <div className="lora-card-tags">{presentation.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>}{metadata?.status === "found" && <div className="lora-card-metadata"><span>{metadata.modelName || metadata.versionName || "已识别模型"}</span><small>{metadata.baseModel || "来源元数据已载入"}</small></div>}{lookup?.error && <span className="lora-card-error">{lookup.error}</span>}<button type="button" className="lora-card-detail" onClick={(event) => { event.stopPropagation(); openDetails(item, activeCategory?.id); }}><FileText size={12} />查看详细信息</button></div>
@@ -517,6 +672,16 @@ export default function LoraManagerPage() {
       </header>
 
       <div className="lora-page-stage">
+        <LoraEngineBar
+          engines={ENGINES}
+          engine={model}
+          blockedReason={workspaceLocked ? "生成或模型切换期间不能切换引擎" : ""}
+          onSelectEngine={(engine) => void requestEngine(engine)}
+          pathValue={pathInput}
+          onPathChange={setPathInput}
+          onLocate={() => void locateFolder()}
+          busy={pathBusy || engineBusy}
+        />
         {error && <div className="lora-page-error"><X size={18} />{error}</div>}
         {pageLoading ? <div className="lora-page-loading"><RefreshCw className="spin" size={28} /><span>正在扫描全部 LoRA 目录</span></div> : activeView === "overview" ? <section className="lora-page-view lora-overview-view">
           <section className="lora-metric-grid">
@@ -541,7 +706,7 @@ export default function LoraManagerPage() {
             <nav className="lora-page-categories">
               <button type="button" className={category === "mounted" ? "active" : ""} onClick={() => setCategory("mounted")}><span>已挂载</span><b>{loras.length}</b></button>
               <button type="button" className={category === "groups" ? "active" : ""} onClick={() => setCategory("groups")}><span>组合</span><b>{activeLoraGroups.length}</b></button>
-              {(currentLibrary?.categories || []).map((item) => <button type="button" className={category === item.id ? "active" : ""} key={item.id} onClick={() => setCategory(item.id)}><span>{item.label}</span><b>{item.models.length}</b></button>)}
+              {(currentLibrary?.categories || []).map((item) => <button type="button" className={category === item.id ? "active" : ""} key={item.id} onClick={() => { setCategory(item.id); setFolderPath(""); }}><span>{item.label}</span><b>{item.models.length}</b></button>)}
             </nav>
             <div className="lora-page-browser">
               {category === "mounted" ? <>
@@ -568,7 +733,7 @@ export default function LoraManagerPage() {
                   onNotice={setNotice}
                 />
               </> : <>
-                <header><div><strong>{activeCategory?.label || "LoRA 分类"}</strong><span>{activeCategory?.directory || "选择分类浏览"}</span></div><label><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索文件名" /></label></header>
+                <header><div><strong>{activeCategory?.label || "LoRA 分类"}</strong><span>{activeCategory?.directory ? `${activeCategory.directory}${folderView?.path ? `/${folderView.path}` : ""}` : "选择分类浏览"}</span></div><label><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={folderView?.path ? "在当前文件夹中搜索" : "搜索文件名"} /></label></header>
                 {activeCategory?.shared ? <div className="lora-shared-view">
                   {(activeCategory.roots || []).map((root) => {
                     const folders = (root.folders || []).map((folder) => ({ ...folder, models: folder.models.filter(matchesSearch) })).filter((folder) => folder.models.length);
@@ -590,7 +755,15 @@ export default function LoraManagerPage() {
                       }) : <p className="lora-shared-empty">{search ? "该共享目录中没有匹配的文件" : "该共享目录为空"}</p>}
                     </section>;
                   })}
-                </div> : <div className="lora-page-library-grid">
+                </div> : folderView ? <LoraFolderGrid
+                  view={folderView}
+                  categoryLabel={activeCategory.label}
+                  gridClassName="lora-page-library-grid"
+                  search={search}
+                  onOpenFolder={setFolderPath}
+                  renderCard={(item, fileLabel) => renderLibraryCard(item, folderView.path ? `${activeCategory.label}/${folderView.path}` : activeCategory.label, fileLabel)}
+                  emptyHint="当前分类目录为空"
+                /> : <div className="lora-page-library-grid">
                   {visibleFiles.map((item) => renderLibraryCard(item, activeCategory?.label))}
                   {!visibleFiles.length && <div className="lora-page-empty"><FolderOpen size={30} /><strong>没有匹配的 LoRA</strong><span>{search ? "尝试其他关键词" : "当前分类目录为空"}</span></div>}
                 </div>}

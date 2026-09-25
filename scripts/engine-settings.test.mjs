@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   ENGINE_SETTINGS_SCHEMA_VERSION,
+  MAX_CANVAS_EDGE,
   SETTINGS_ENGINES,
   emptyEngineSettingsMap,
   engineSettingsDefaults,
@@ -146,7 +147,12 @@ test("out-of-range values are clamped rather than passed to the service", () => 
   assert.equal(record.denoise, 1);
   assert.equal(record.imagesPerBatch, 10);
   assert.equal(record.batchCount, 1);
-  assert.equal(record.size.width, 2048);
+  // The stored canvas is held to the hard sampling ceiling only. The user's configurable canvas
+  // bound (2048 by default) is checked by the page against the canvas it has, so raising or
+  // lowering that bound never silently cuts a saved canvas down.
+  assert.equal(MAX_CANVAS_EDGE, 8192);
+  assert.equal(record.size.width, 8192);
+  assert.equal(record.size.height, 64);
   const rtx = record.postprocessChain.find((stage) => stage.type === "rtx");
   assert.equal(rtx.scale, 4);
   assert.equal(rtx.quality, "ultra");
@@ -191,8 +197,10 @@ test("the workspace swaps records on an engine change instead of editing one set
   assert.doesNotMatch(select, /setCheckpoint\(""\)/);
   assert.doesNotMatch(select, /ANIMA_SAMPLERS\.includes\(current\)/);
 
-  // Applying a Gallery card that names another engine is also a departure from the current one.
-  assert.match(app, /if \(engineChanged\) commitEngineSettings\(model, captureEngineSettings\(\)\)/);
+  // Applying a Gallery card that names another engine is also a departure from the current one:
+  // the outgoing record is captured up front and both records are swapped only after every check.
+  assert.match(app, /const outgoingRecord = engineChanged \? captureEngineSettings\(\) : null;/);
+  assert.match(app, /if \(engineChanged\) \{\s*commitEngineSettings\(model, outgoingRecord\);\s*applyEngineSettings\(incomingRecord\);/);
 });
 
 test("the map is persisted with the workspace and restored from it", async () => {
@@ -227,7 +235,8 @@ test("a pre-split workspace's model files seed only the engine they were chosen 
 });
 
 test("each engine owns its image-to-image parameters, and a change under one cannot reach another", () => {
-  assert.equal(ENGINE_SETTINGS_SCHEMA_VERSION, 2, "the per-engine image block is schema 2");
+  // The per-engine image block arrived with schema 2; schema 3 added per-engine prompts on top.
+  assert.equal(ENGINE_SETTINGS_SCHEMA_VERSION, 3);
   const map = emptyEngineSettingsMap();
   for (const engine of SETTINGS_ENGINES) {
     const record = map.byEngine[engine];

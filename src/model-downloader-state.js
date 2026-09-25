@@ -1,3 +1,14 @@
+export const COMPLETED_DOWNLOAD_NOTICE_MS = 5000;
+export const DISMISSED_DOWNLOAD_NOTICE_KEY = "xirai_dismissed_download_notice";
+
+// Identify a successful queue completion, not a polling response. updatedAt may change on
+// service restart, while an appended batch under the same job ID is a new completion.
+export function completedDownloadNoticeKey(job) {
+  if (!job?.jobId || job.active || job.status !== "complete" || Number(job.failedModels) > 0) return "";
+  if ((job.items || []).some((item) => item.status !== "complete")) return "";
+  return JSON.stringify([job.jobId, job.totalModels ?? job.items?.length ?? 0, job.completedModels ?? job.items?.length ?? 0]);
+}
+
 export function normalizedDownloadCredentials({ civitai = "", huggingface = "", modelscope = "" } = {}) {
   return {
     civitai: typeof civitai === "string" ? civitai.trim() : "",

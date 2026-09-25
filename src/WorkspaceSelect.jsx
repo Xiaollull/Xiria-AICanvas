@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { Fragment, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown } from "lucide-react";
 
@@ -13,6 +13,7 @@ export default function WorkspaceSelect({
   ariaDescribedBy,
   className = "",
 }) {
+  const isGroupHeading = (option) => option?.type === "group" || option?.groupHeading === true;
   const id = useId();
   const rootRef = useRef(null);
   const menuRef = useRef(null);
@@ -20,9 +21,9 @@ export default function WorkspaceSelect({
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [menuStyle, setMenuStyle] = useState(null);
-  const selectedIndex = options.findIndex((option) => option.value === value);
+  const selectedIndex = options.findIndex((option) => !isGroupHeading(option) && option.value === value);
   const selected = options[selectedIndex];
-  const enabledIndexes = options.reduce((indexes, option, index) => option.disabled ? indexes : [...indexes, index], []);
+  const enabledIndexes = options.reduce((indexes, option, index) => isGroupHeading(option) || option.disabled ? indexes : [...indexes, index], []);
 
   const openMenu = (preferLast = false) => {
     if (disabled || !enabledIndexes.length) return;
@@ -37,7 +38,7 @@ export default function WorkspaceSelect({
   };
   const selectAt = (index) => {
     const option = options[index];
-    if (disabled || !option || option.disabled) return;
+    if (disabled || !option || isGroupHeading(option) || option.disabled) return;
     onChange(option.value);
     closeMenu(true);
   };
@@ -114,7 +115,20 @@ export default function WorkspaceSelect({
       <span title={selected?.label || placeholder}>{selected?.label || placeholder}</span><ChevronDown size={14} />
     </button>
     {open && createPortal(<div ref={menuRef} id={`${id}-menu`} className="workspace-select-menu" role="listbox" aria-label={ariaLabel} style={menuStyle || { visibility: "hidden" }}>
-      {options.map((option, index) => <button key={`${option.value}-${index}`} id={`${id}-option-${index}`} type="button" role="option" aria-selected={option.value === value} disabled={option.disabled} data-option-index={index} className={index === activeIndex ? "active" : ""} onPointerMove={() => !option.disabled && setActiveIndex(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => selectAt(index)}><span>{option.label}</span>{option.value === value && <i />}</button>)}
-    </div>, document.body)}
+       {(() => {
+         let lastGroup = null;
+         return options.map((option, index) => {
+           if (isGroupHeading(option)) return <div key={`${option.label}-${index}`} className="workspace-select-group-heading" role="group" aria-label={option.label}>{option.label}</div>;
+           const group = typeof option.group === "string" && option.group.trim() ? option.group : "";
+           const heading = group && group !== lastGroup;
+           lastGroup = group;
+           const reason = option.disabledReason || option.reason || "";
+           return <Fragment key={`${option.value}-${index}`}>
+             {heading && <div className="workspace-select-group-heading" role="group" aria-label={group}>{group}</div>}
+             <button id={`${id}-option-${index}`} type="button" role="option" aria-selected={option.value === value} aria-label={reason ? `${option.label}：${reason}` : undefined} title={reason || undefined} disabled={option.disabled} data-option-index={index} className={`${index === activeIndex ? "active" : ""}${reason ? " has-reason" : ""}`} onPointerMove={() => !option.disabled && setActiveIndex(index)} onMouseDown={(event) => event.preventDefault()} onClick={() => selectAt(index)}><span>{option.label}</span>{reason && <small>{reason}</small>}{option.value === value && <i />}</button>
+           </Fragment>;
+         });
+       })()}
+     </div>, document.body)}
   </div>;
 }

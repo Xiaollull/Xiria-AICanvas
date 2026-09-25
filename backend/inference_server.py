@@ -21,7 +21,8 @@ import uuid
 import warnings
 import re
 import secrets
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as package_version
 from importlib.util import find_spec
@@ -29,7 +30,7 @@ from math import ceil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Annotated, Literal, Union
+from typing import Annotated, Callable, Literal, Union
 try:
     from .benchmark_lease import HIRES_ARTIFACT_PURPOSE, validate_lease
     from .hires_artifacts import NULL_CAPTURE, StageArtifactCapture, canonical_parameter_digest, capture_gate, prompt_facts
@@ -164,7 +165,7 @@ from diffusers import (
 )
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from PIL import Image, ImageDraw
 from PIL.PngImagePlugin import PngInfo
 from safetensors import safe_open
@@ -253,7 +254,29 @@ try:
         require_model as require_background_removal_model,
         transparent_conditioning_prompt,
     )
-    from .prompt_encoding import parse_prompt_weights, prepare_prompt_conditioning, prompt_diagnostics
+    from .prompt_encoding import parse_prompt_weights, prompt_diagnostics
+    from .forge_prompt import PreparedConditioning, forge_prompt_diagnostics
+    from .output_paths import (
+        DEFAULT_OUTPUT_TEMPLATE,
+        OUTPUT_TEMPLATE_PLACEHOLDERS,
+        OutputPathError,
+        normalize_output_template,
+        output_root_display,
+        output_target,
+        preview_output_name,
+        publish_exclusive,
+        temporary_output_path,
+    )
+    from .dynamic_prompt import (
+        PromptTimeline,
+        compile_conditioning_syntax,
+        prepare_dynamic_prompt_conditioning,
+        prompt_plan_audit,
+        sampling_timeline,
+        static_conditioning_lease,
+    )
+    from .inline_lora import InlineLoraError, discover_candidates, has_extra_network_tag, resolve_inline_loras
+    from .comfy_workflow import ResampleStage, WorkflowFacts, build_workflow
     from .guidance import (
         CFG_ZERO_STAR_ENGINES,
         PAG_APPLIED_LAYERS,
@@ -276,6 +299,21 @@ try:
     )
     from .pipeline_configs import PIPELINE_CONFIG_REPOSITORIES, find_pipeline_config, require_pipeline_config
     from .console_noise import mark_long_prompts_handled, quiet_lora_loading, quiet_pipeline_loading
+    from .lora_patch import (
+        MAX_GROUP_WORKSPACE_BYTES,
+        HostWeightPrefault,
+        LoraPatchError,
+        apply_lora_plan,
+        build_lora_groups,
+        build_target_index,
+        classify_lora_keys,
+        fold_peft_adapters,
+        lora_header_requires_direct_patch,
+        preflight_lora_patch,
+        read_lora_header,
+        readable_lora_error,
+        validate_lora_plan_materialized,
+    )
     from .residency import (
         RESIDENCY_TIER_MEMORY_MODES,
         RESIDENCY_TIER_OFFLOAD_MODES,
@@ -351,7 +389,29 @@ except ImportError:
         require_model as require_background_removal_model,
         transparent_conditioning_prompt,
     )
-    from prompt_encoding import parse_prompt_weights, prepare_prompt_conditioning, prompt_diagnostics
+    from prompt_encoding import parse_prompt_weights, prompt_diagnostics
+    from forge_prompt import PreparedConditioning, forge_prompt_diagnostics
+    from output_paths import (
+        DEFAULT_OUTPUT_TEMPLATE,
+        OUTPUT_TEMPLATE_PLACEHOLDERS,
+        OutputPathError,
+        normalize_output_template,
+        output_root_display,
+        output_target,
+        preview_output_name,
+        publish_exclusive,
+        temporary_output_path,
+    )
+    from dynamic_prompt import (
+        PromptTimeline,
+        compile_conditioning_syntax,
+        prepare_dynamic_prompt_conditioning,
+        prompt_plan_audit,
+        sampling_timeline,
+        static_conditioning_lease,
+    )
+    from inline_lora import InlineLoraError, discover_candidates, has_extra_network_tag, resolve_inline_loras
+    from comfy_workflow import ResampleStage, WorkflowFacts, build_workflow
     from guidance import (
         CFG_ZERO_STAR_ENGINES,
         PAG_APPLIED_LAYERS,
@@ -374,6 +434,21 @@ except ImportError:
     )
     from pipeline_configs import PIPELINE_CONFIG_REPOSITORIES, find_pipeline_config, require_pipeline_config
     from console_noise import mark_long_prompts_handled, quiet_lora_loading, quiet_pipeline_loading
+    from lora_patch import (
+        MAX_GROUP_WORKSPACE_BYTES,
+        HostWeightPrefault,
+        LoraPatchError,
+        apply_lora_plan,
+        build_lora_groups,
+        build_target_index,
+        classify_lora_keys,
+        fold_peft_adapters,
+        lora_header_requires_direct_patch,
+        preflight_lora_patch,
+        read_lora_header,
+        readable_lora_error,
+        validate_lora_plan_materialized,
+    )
     from residency import (
         RESIDENCY_TIER_MEMORY_MODES,
         RESIDENCY_TIER_OFFLOAD_MODES,
@@ -708,7 +783,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="XiriaCanvas AI Inference", docs_url=None, redoc_url=None, lifespan=lifespan)
-INFERENCE_PROTOCOL = 36
+INFERENCE_PROTOCOL = 39
 WORKSPACE_ID = os.environ.get("INFERENCE_WORKSPACE_ID")
 
 
@@ -896,6 +971,27 @@ class ADetailerInput(BaseModel):
 
 RESAMPLE_UNIT_LIMIT = 8
 
+LATENT_UPSCALE_MODES = {
+    "latent": {"label": "Latent", "mode": "bilinear", "antialias": False},
+    "latent-antialias": {"label": "Latent (antialiased)", "mode": "bilinear", "antialias": True},
+    "latent-bicubic": {"label": "Latent (bicubic)", "mode": "bicubic", "antialias": False},
+    "latent-bicubic-antialias": {
+        "label": "Latent (bicubic antialiased)", "mode": "bicubic", "antialias": True,
+    },
+    "latent-nearest": {"label": "Latent (nearest)", "mode": "nearest", "antialias": False},
+    "latent-nearest-exact": {
+        "label": "Latent (nearest-exact)", "mode": "nearest-exact", "antialias": False,
+    },
+}
+LatentUpscaleAlgorithm = Literal[
+    "latent",
+    "latent-antialias",
+    "latent-bicubic",
+    "latent-bicubic-antialias",
+    "latent-nearest",
+    "latent-nearest-exact",
+]
+
 
 class ResampleUnitInput(BaseModel):
     """One pass of the resample chain: upscale, resize, redraw — each part optional.
@@ -922,8 +1018,9 @@ class ResampleUnitInput(BaseModel):
     # `None` is "no model, resize only" and is the default: a unit is useful without one, and an
     # empty string would be indistinguishable from a model that has not been chosen yet.
     upscaler: str | None = Field(default=None, max_length=500)
+    latent_algorithm: LatentUpscaleAlgorithm | None = None
     scale: float = Field(default=1.0, ge=1, le=4)
-    resize_algorithm: Literal["nearest-exact", "bilinear", "area", "bicubic", "lanczos"] = "lanczos"
+    resize_algorithm: Literal["nearest", "nearest-exact", "bilinear", "area", "bicubic", "lanczos"] = "lanczos"
     # Zero is a real value here, not a disabled unit: it is what asks for the enlargement without
     # the redraw. The old field refused it because a Hires pass that did not redraw was a no-op.
     denoise: float = Field(default=0.35, ge=0, le=1)
@@ -969,6 +1066,10 @@ class ResampleUnitInput(BaseModel):
     def validate_configuration(self):
         if not math.isfinite(self.scale):
             raise ValueError("Resample scale must be finite")
+        if self.enabled and self.latent_algorithm is not None and self.upscaler is not None:
+            raise ValueError("Latent resampling cannot be combined with an upscaler model")
+        if self.enabled and self.latent_algorithm is not None and self.execution_mode != "full_frame":
+            raise ValueError("Latent resampling supports full_frame execution only; USDU tiled mode is unavailable")
         if self.enabled and self.tile_overlap > self.tile_size // 2:
             raise ValueError("Resample tile overlap cannot exceed half the tile size")
         if self.execution_mode == "usdu_tiled" and (not self.uniform_tiles or not self.tiled_decode):
@@ -1094,12 +1195,21 @@ POSTPROCESS_CHAIN_LIMIT = RESAMPLE_UNIT_LIMIT + 2
 # whether the entry exists before asking whether it is enabled.
 ABSENT_ADETAILER_STAGE = ADetailerInput()
 ABSENT_RTX_STAGE = RtxInput()
-# The sampler's canvas: a latent grid, so 64-aligned, and capped where the memory policy was
-# measured. Post-processing has no latent grid of its own — every stage works on pixels it is
-# handed — so a post-processing run is bounded by the RTX safety envelope instead and keeps the
-# picture at whatever size the user's file actually is.
-MAX_SAMPLING_EDGE = 2048
+# The sampler's canvas: a latent grid, so 64-aligned. 2048 is where the memory policy was measured
+# and what every record before protocol 39 was held to; a canvas past it is allowed up to the hard
+# 8192 safety ceiling (and each engine's own refinement edge), but only after
+# `validate_expanded_canvas_resources` has checked it against this device before the job is queued.
+# Post-processing has no latent grid of its own — every stage works on pixels it is handed — so a
+# post-processing run is bounded by the RTX safety envelope instead and keeps the picture at
+# whatever size the user's file actually is.
+LEGACY_MAX_SAMPLING_EDGE = 2048
+MAX_SAMPLING_EDGE = 8192
 SAMPLING_EDGE_STEP = 64
+# CLIP skip exists only where a CLIP tower encodes the prompt. SD reads its final layer by default;
+# SDXL/iL reads the penultimate layer of both towers, which is also Forge's floor for them, so a
+# requested 1 on iL would execute 2 — and is refused rather than displayed as 1 and run as 2.
+CLIP_SKIP_DEFAULTS = {"SD": 1, "iL": 2}
+CLIP_SKIP_MAXIMUM = 12
 MAX_POSTPROCESS_SOURCE_EDGE = rtx_vsr.MAX_OUTPUT_EDGE
 MAX_POSTPROCESS_SOURCE_PIXELS = rtx_vsr.MAX_OUTPUT_PIXELS
 ANIMA_TOKENIZER_ARTIFACTS = {
@@ -1219,8 +1329,15 @@ class GenerateInput(BaseModel):
     # worst possible way to tell someone their prompt is long.
     prompt: str = Field(min_length=1)
     negative_prompt: str = ""
-    # The ceiling here is the post-processing one. A sampling run is held to 2048 and to 64-pixel
-    # alignment by `validate_dimensions`, which is where the two contracts are told apart.
+    # SD/iL only, and strict: the layer the CLIP towers are read from, counted from the last. Absent
+    # means the family default (SD 1, iL 2), which is the encoding every earlier record ran with.
+    clip_skip: StrictInt | None = None
+    # A relative path template beneath the output root, frozen with the job. Absent (or the default
+    # template) keeps the historical date-folder naming and its `-02` collision suffixes.
+    output_template: str | None = Field(default=None, max_length=400)
+    # The ceiling here is the post-processing one. A sampling run is held to 64-pixel alignment, the
+    # 8192 safety ceiling and its engine's own edge by `validate_dimensions`, which is where the two
+    # contracts are told apart.
     width: int = Field(ge=64, le=MAX_POSTPROCESS_SOURCE_EDGE)
     height: int = Field(ge=64, le=MAX_POSTPROCESS_SOURCE_EDGE)
     steps: int = Field(ge=1, le=100)
@@ -1235,6 +1352,10 @@ class GenerateInput(BaseModel):
     pag: PagInput = Field(default_factory=PagInput)
     background_removal_model: str | None = Field(default=None, max_length=300)
     source_image: SourceImageInput = Field(default_factory=SourceImageInput)
+    # Forge-compatible opt-in semantics for the SD/iL base image-to-image pass. Off preserves the
+    # historical Diffusers `int(steps * strength)` update count; on expands only the internal
+    # schedule so the configured slider count is what actually executes.
+    img2img_fix_steps: bool = False
     # Post-processing mode: run the enabled stages on the source picture and nothing else. The base
     # sampling pass is skipped outright rather than run at a denoise low enough to be invisible, so
     # the pixels the user brought are the pixels the first stage receives. Everything the stages
@@ -1282,6 +1403,28 @@ class GenerateInput(BaseModel):
     def validate_gallery_settings(cls, value):
         return validated_gallery_settings_payload(value)
 
+    @field_validator("output_template")
+    @classmethod
+    def validate_output_template(cls, value):
+        try:
+            return normalize_output_template(value)
+        except OutputPathError as error:
+            raise ValueError(str(error)) from error
+
+    @model_validator(mode="after")
+    def validate_clip_skip(self):
+        if self.clip_skip is None:
+            return self
+        minimum = CLIP_SKIP_DEFAULTS.get(self.engine)
+        if minimum is None:
+            # The native engines encode with language models or T5, not a CLIP stack a layer can be
+            # skipped in. Accepting the field and ignoring it would be a control that does nothing.
+            raise ValueError(f"{self.engine} does not support CLIP skip; it applies to SD and iL only")
+        if not minimum <= self.clip_skip <= CLIP_SKIP_MAXIMUM:
+            detail = "; SDXL/iL CLIP-L/G towers have a minimum effective skip of 2" if self.engine == "iL" else ""
+            raise ValueError(f"{self.engine} CLIP skip must be between {minimum} and {CLIP_SKIP_MAXIMUM}{detail}")
+        return self
+
     @model_validator(mode="after")
     def validate_chain_shape(self):
         counts = {name: 0 for name in POSTPROCESS_STAGE_TYPES}
@@ -1303,8 +1446,9 @@ class GenerateInput(BaseModel):
         if not self.postprocess_only:
             if self.width % SAMPLING_EDGE_STEP != 0 or self.height % SAMPLING_EDGE_STEP != 0:
                 raise ValueError("Image dimensions must be divisible by 64")
-            if self.width > MAX_SAMPLING_EDGE or self.height > MAX_SAMPLING_EDGE:
-                raise ValueError(f"Image dimensions cannot exceed {MAX_SAMPLING_EDGE}")
+            ceiling = min(MAX_SAMPLING_EDGE, engine_max_refinement_edge(request_family(self.engine)))
+            if self.width > ceiling or self.height > ceiling:
+                raise ValueError(f"{self.engine} image dimensions cannot exceed {ceiling}")
         elif self.width * self.height > MAX_POSTPROCESS_SOURCE_PIXELS:
             raise ValueError("Post-processing source exceeds the safe 8192-edge / 32-megapixel limit")
         return self
@@ -1415,6 +1559,10 @@ class GenerateInput(BaseModel):
         for number, unit in enumerate(self.resample_units, start=1):
             if not unit.enabled:
                 continue
+            if unit.latent_algorithm is not None and self.engine not in {"SD", "iL"}:
+                raise ValueError(
+                    f"Resample unit {number}: 潜空间放大目前仅支持 SD/iL；{self.engine} 暂不支持"
+                )
             validate_resample_sampling_override(unit.sampler, unit.scheduler, family, number)
             if unit.execution_mode == "usdu_tiled" and not supports_usdu_tiled(family):
                 raise ValueError(f"USDU tiled resampling in resample unit {number} is supported only by Anima and Krea2")
@@ -1441,6 +1589,14 @@ class GenerateInput(BaseModel):
                 where = f"Resample unit {entry['unit_number']}" if entry["type"] == "resample" else f"The {entry['type']} stage"
                 raise ValueError(f"{where} exceeds the safe 8192-edge / 32-megapixel limit")
         return self
+
+
+def effective_clip_skip(request: GenerateInput) -> int | None:
+    """The CLIP layer this job's SD/iL passes read, frozen for base, image-to-image, Hires and ADetailer."""
+    default = CLIP_SKIP_DEFAULTS.get(request.engine)
+    if default is None:
+        return None
+    return default if request.clip_skip is None else request.clip_skip
 
 
 class PerformanceInput(BaseModel):
@@ -2055,6 +2211,7 @@ def job_output_summary(output: dict | None) -> dict | None:
     return {
         "index": output.get("index"),
         "output_name": output.get("output_name"),
+        "output_relative": output.get("output_relative"),
         "image_url": output.get("image_url"),
         "seed": output.get("seed"),
         "width": output.get("width"),
@@ -2281,7 +2438,11 @@ def list_history_cards(folder: Path | None = None, *, session_only=True):
             resolved = path.resolve()
             if output_root not in resolved.parents or is_internal_output_directory(resolved.parent):
                 continue
-            if session_only and resolved.stat().st_mtime < HISTORY_STARTED_AT:
+            file_stat = resolved.stat()
+            # An empty file is a name another writer has reserved but not yet published.
+            if file_stat.st_size == 0:
+                continue
+            if session_only and file_stat.st_mtime < HISTORY_STARTED_AT:
                 continue
             records.append(history_file_record(resolved))
         except (OSError, ValueError):
@@ -2676,6 +2837,118 @@ def resolve_model_path(requested_path: str, root: Path, extensions, label: str):
     if extensions and path.suffix.lower() not in extensions:
         raise ValueError(f"{label} must be one of {', '.join(sorted(extensions))}")
     return path
+
+
+def preflight_inline_lora_request(request: GenerateInput):
+    """Resolve and strip SD/iL inline tags before a job can be created."""
+
+    if request.engine not in {"SD", "iL"}:
+        return request, []
+    for index, unit in enumerate(request.adetailer.active_units, start=1):
+        # A detail pass shares the job's mounted adapters; a tag of its own would
+        # otherwise reach CLIP as literal text.
+        if has_extra_network_tag(unit.prompt) or has_extra_network_tag(unit.negative_prompt):
+            raise InlineLoraError(f"ADetailer unit {index}: inline <lora:…> tags are only read from the main prompt")
+    if not has_extra_network_tag(request.prompt) and not has_extra_network_tag(request.negative_prompt):
+        return request, []
+    _checkpoint_root, lora_root = model_roots(request.engine)
+    manual_paths = [
+        resolve_model_path(item.path, lora_root, LORA_EXTENSIONS, "LoRA")
+        for item in request.loras
+    ]
+    audit = []
+    for order, (item, path) in enumerate(zip(request.loras, manual_paths)):
+        reference = (
+            shared_model_reference(item.path)
+            if is_shared_ref(item.path)
+            else path.relative_to(lora_root.resolve()).as_posix()
+        )
+        if not reference:
+            raise InlineLoraError("explicit LoRA shared reference is invalid")
+        audit.append({
+            "id": reference,
+            "weight": float(item.weight),
+            "source": "manual",
+            "match": "manual",
+            "order": order,
+        })
+    candidates = discover_candidates(
+        lora_root,
+        load_shared_roots(PROJECT_ROOT),
+        request.engine,
+        LORA_EXTENSIONS,
+    )
+    result = resolve_inline_loras(
+        request.prompt,
+        request.negative_prompt,
+        manual_paths,
+        candidates,
+    )
+    merged = list(request.loras) + [
+        LoraInput(path=match.reference, weight=match.weight)
+        for match in result.matches
+    ]
+    runtime_request = request.model_copy(update={
+        "prompt": result.prompt,
+        "negative_prompt": result.negative_prompt,
+        "loras": merged,
+    })
+    audit.extend(match.audit() for match in result.matches)
+    return runtime_request, audit
+
+
+SECOND_ORDER_SAMPLERS = frozenset({"heun", "dpm_2", "dpm_2_ancestral"})
+
+
+def sampler_calls_per_step(sampler: str) -> int:
+    """Denoiser calls per step of the scheduler `configure_scheduler` builds for `sampler`."""
+    return 2 if str(sampler).lower() in SECOND_ORDER_SAMPLERS else 1
+
+
+def request_prompt_timelines(request: GenerateInput):
+    """The prompt-schedule timeline of every SD/iL sampling pass a request will run.
+
+    Forge counts a schedule against the requested steps of a pass. A redraw after a base
+    pass continues the base timeline, as Hires fix does; ADetailer passes start their own.
+    """
+    base = None
+    if not request.postprocess_only:
+        base = PromptTimeline(request.steps * sampler_calls_per_step(request.sampler))
+    resample = []
+    for settings in request.active_resample_units:
+        if not settings.redraws:
+            continue
+        horizon = settings.resolved_steps(request.steps) * sampler_calls_per_step(settings.sampler or request.sampler)
+        resample.append(PromptTimeline(horizon, base.steps, 1.0) if base else PromptTimeline(horizon))
+    adetailer = [
+        PromptTimeline((unit.steps if unit.use_steps else request.steps) * sampler_calls_per_step(request.sampler))
+        for unit in request.adetailer.active_units
+    ]
+    return base, resample, adetailer
+
+
+def preflight_dynamic_prompt_request(request: GenerateInput):
+    """Compile every SD/iL prompt shape, for every pass that encodes it, before a job exists."""
+
+    if request.engine not in {"SD", "iL"}:
+        return None
+    base_timeline, resample_timelines, adetailer_timelines = request_prompt_timelines(request)
+    main_passes = [timeline for timeline in (base_timeline, *resample_timelines) if timeline is not None]
+    base = compile_conditioning_syntax(request.prompt, request.negative_prompt, main_passes)
+    detail_plans = []
+    for index, (unit, timeline) in enumerate(zip(request.adetailer.active_units, adetailer_timelines), start=1):
+        detail_prompt = expand_prompt(unit.prompt, request.prompt)
+        detail_negative = expand_prompt(unit.negative_prompt, request.negative_prompt)
+        detail_plans.append({
+            "unit": index,
+            **prompt_plan_audit(compile_conditioning_syntax(detail_prompt, detail_negative, (timeline,)), timeline),
+        })
+    return {
+        "compiler": "forge_dynamic_v2",
+        "base": prompt_plan_audit(base, base_timeline),
+        "resample": [prompt_plan_audit(base, timeline) for timeline in resample_timelines],
+        "adetailer": detail_plans,
+    }
 
 
 def shared_reference_for_path(absolute_path):
@@ -3915,6 +4188,10 @@ def plan_residency_for_stage(stage, family, canvas, guidance_scale, images_per_b
     here each sampling stage is placed by what *it* needs against the memory free at that moment.
     Only the Diffusers families have a controller — the native engines schedule their own.
     """
+    if torch.cuda.is_available() and pipeline_cpu_parked and not is_native_family(family):
+        restore_parked_pipeline()
+        if pipeline_cpu_parked:
+            raise RuntimeError("扩散模型无法从 CPU 停放状态恢复，重绘不能在 GPU 上运行；请重启推理服务")
     if active_residency is None or family not in SD_COMPONENT_FAMILIES or loaded_pipeline is None:
         return None
     copies = int((active_memory_strategy or {}).get("physical_forward_copies", 1))
@@ -4009,6 +4286,316 @@ def prepare_vae_latents(pipeline, latents, family):
     return latents, needs_upcasting
 
 
+def pipeline_execution_device(pipeline):
+    """Resolve Diffusers' onload device without moving a component or installing another hook."""
+    device = getattr(pipeline, "_execution_device", None)
+    if device is not None:
+        return torch.device(device)
+    for component_name in ("unet", "vae"):
+        component = getattr(pipeline, component_name, None)
+        if component is None:
+            continue
+        tensor = next(component.parameters(), None)
+        if tensor is None:
+            tensor = next(component.buffers(), None)
+        if tensor is not None:
+            return tensor.device
+    return torch.device("cpu")
+
+
+def module_dtype(module, fallback=torch.float32):
+    dtype = getattr(module, "dtype", None)
+    if dtype is not None:
+        return dtype
+    tensor = next(module.parameters(), None)
+    if tensor is None:
+        tensor = next(module.buffers(), None)
+    return tensor.dtype if tensor is not None else fallback
+
+
+def pipeline_sampling_dtype(pipeline):
+    unet = getattr(pipeline, "unet", None)
+    dtype = getattr(unet, "dtype", None)
+    if dtype is not None:
+        return dtype
+    if unet is not None:
+        tensor = next(unet.parameters(), None)
+        if tensor is not None:
+            return tensor.dtype
+    return module_dtype(pipeline.vae)
+
+
+def pipeline_vae_scale_factor(pipeline) -> int:
+    """Read the pipeline's real VAE stride; latent geometry must never assume eight."""
+    raw = getattr(pipeline, "vae_scale_factor", None)
+    if isinstance(raw, bool):
+        raw = None
+    try:
+        factor = int(raw)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("The image pipeline does not expose a valid VAE scale factor") from error
+    if factor < 1 or factor != raw:
+        raise RuntimeError(f"Invalid VAE scale factor for latent resampling: {raw!r}")
+    return factor
+
+
+def encode_image_to_latents(image_pipeline, image: Image.Image, generator: torch.Generator):
+    """Encode one picture exactly as Diffusers 0.38 img2img prepares its initial latents.
+
+    The caller reuses ``generator`` for the subsequent img2img call. Sampling the VAE distribution
+    here therefore consumes the same random stream that Diffusers would have consumed before drawing
+    the sampler noise; creating a second generator would change the fixed-seed trajectory.
+    """
+    if not isinstance(image, Image.Image):
+        raise TypeError("Latent resampling requires a PIL image to encode")
+    if not isinstance(generator, torch.Generator):
+        raise TypeError("Latent resampling requires a torch.Generator")
+    if torch.cuda.is_available() and image_pipeline is loaded_pipeline and pipeline_cpu_parked:
+        raise RuntimeError("扩散模型仍停放在 CPU，无法执行潜空间编码；请重启推理服务")
+
+    vae = image_pipeline.vae
+    original_dtype = module_dtype(vae)
+    sampling_dtype = pipeline_sampling_dtype(image_pipeline)
+    device = pipeline_execution_device(image_pipeline)
+    pixels = image_pipeline.image_processor.preprocess(image)
+    if not torch.isfinite(pixels).all():
+        raise ValueError("Latent resampling input contains non-finite pixels")
+    pixels = pixels.to(device=device, dtype=sampling_dtype)
+    needs_upcasting = bool(
+        original_dtype == torch.float16 and getattr(vae.config, "force_upcast", False)
+    )
+    try:
+        if needs_upcasting:
+            pixels = pixels.float()
+            vae.to(dtype=torch.float32)
+        with torch.inference_mode():
+            encoder_output = vae.encode(pixels)
+            if hasattr(encoder_output, "latent_dist"):
+                latents = encoder_output.latent_dist.sample(generator)
+            elif hasattr(encoder_output, "latents"):
+                latents = encoder_output.latents
+            else:
+                raise AttributeError("VAE encoder output does not expose latents")
+        latents = latents.to(dtype=sampling_dtype)
+        mean_values = getattr(vae.config, "latents_mean", None)
+        std_values = getattr(vae.config, "latents_std", None)
+        if mean_values is not None and std_values is not None:
+            mean = torch.as_tensor(mean_values, device=latents.device, dtype=latents.dtype).view(1, 4, 1, 1)
+            std = torch.as_tensor(std_values, device=latents.device, dtype=latents.dtype).view(1, 4, 1, 1)
+            latents = (latents - mean) * vae.config.scaling_factor / std
+        else:
+            latents = latents * vae.config.scaling_factor
+        if latents.ndim != 4 or latents.shape[0] != 1 or latents.shape[1] != 4:
+            raise RuntimeError(f"VAE encoding returned an invalid latent shape: {tuple(latents.shape)}")
+        if not torch.isfinite(latents).all():
+            raise RuntimeError("VAE encoding produced non-finite latents")
+        return latents
+    finally:
+        if needs_upcasting:
+            vae.to(dtype=original_dtype)
+
+
+def interpolate_image_latents(image_pipeline, latents, target_size, latent_algorithm: str):
+    """Apply a Forge latent mode on the largest VAE grid contained by the pixel target."""
+    mode = LATENT_UPSCALE_MODES.get(latent_algorithm)
+    if mode is None:
+        raise ValueError(f"Unsupported latent resampling algorithm: {latent_algorithm}")
+    target_width, target_height = (int(target_size[0]), int(target_size[1]))
+    factor = pipeline_vae_scale_factor(image_pipeline)
+    latent_width = max(1, target_width // factor)
+    latent_height = max(1, target_height // factor)
+    if not isinstance(latents, torch.Tensor) or latents.ndim != 4 or latents.shape[1] != 4:
+        raise ValueError("Latent resampling requires a four-channel BCHW tensor")
+    target_device = pipeline_execution_device(image_pipeline)
+    target_dtype = pipeline_sampling_dtype(image_pipeline)
+    latents = latents.to(device=target_device, dtype=target_dtype)
+    if not torch.isfinite(latents).all():
+        raise RuntimeError("Latent resampling received non-finite latents")
+    # CPU is a probe/fallback device for this CUDA-only service. Torch does not implement every
+    # antialiased half-precision CPU kernel, so compute there in float32 and project back to the
+    # sampler dtype; CUDA keeps the exact model dtype used by Forge and by the following sampler.
+    interpolation_input = (
+        latents.float()
+        if target_device.type == "cpu" and target_dtype in {torch.float16, torch.bfloat16}
+        else latents
+    )
+    resized = torch.nn.functional.interpolate(
+        interpolation_input,
+        size=(latent_height, latent_width),
+        mode=mode["mode"],
+        antialias=mode["antialias"],
+    ).to(dtype=target_dtype)
+    if not torch.isfinite(resized).all():
+        raise RuntimeError("Latent interpolation produced non-finite latents")
+    return resized, factor
+
+
+def decode_resident_latents(
+    pipeline, latents, family, job_id, control, *, start_progress, final_progress, phase_prefix,
+):
+    """Decode scaled SD/SDXL latents without changing the configured residency mechanism."""
+    if torch.cuda.is_available() and pipeline is loaded_pipeline and pipeline_cpu_parked:
+        restore_parked_pipeline()
+        if pipeline_cpu_parked:
+            raise RuntimeError("扩散模型无法从 CPU 停放状态恢复，潜空间结果无法解码；请重启推理服务")
+    control.checkpoint(job_id, f"{phase_prefix} latent decode")
+    update_job(
+        job_id,
+        phase=f"{phase_prefix} · VAE decode",
+        stage="resample_latent_decode",
+        stage_step=0,
+        stage_total=1,
+        progress=start_progress,
+    )
+    vae = pipeline.vae
+    original_dtype = module_dtype(vae)
+    decoded = None
+    prepared = None
+    try:
+        prepared, _needs_upcasting = prepare_vae_latents(pipeline, latents, family)
+        prepared = prepared.to(pipeline_execution_device(pipeline))
+        with torch.inference_mode():
+            decoded = vae.decode(prepared, return_dict=False)[0]
+        if not torch.isfinite(decoded).all():
+            raise RuntimeError("VAE decode produced non-finite pixels")
+        watermark = getattr(pipeline, "watermark", None)
+        if family == "sdxl" and watermark is not None:
+            decoded = watermark.apply_watermark(decoded)
+        images = pipeline.image_processor.postprocess(decoded, output_type="pil")
+        control.checkpoint(job_id, f"{phase_prefix} latent decode")
+        update_job(job_id, stage_step=1, stage_total=1, progress=final_progress)
+        return images
+    finally:
+        if getattr(vae, "dtype", original_dtype) != original_dtype:
+            vae.to(dtype=original_dtype)
+        del decoded, prepared
+
+
+@dataclass
+class LatentImageArtifact:
+    """A scaled four-channel latent with a logical size and memoized PIL materialization."""
+
+    latents: torch.Tensor
+    pixel_size: tuple[int, int]
+    family: str
+    vae_scale_factor: int
+    decoder: Callable[[torch.Tensor], Image.Image] = field(repr=False)
+    _image: Image.Image | None = field(default=None, init=False, repr=False)
+
+    @property
+    def size(self):
+        return self.pixel_size
+
+    def materialize(self) -> Image.Image:
+        if self._image is None:
+            image = self.decoder(self.latents)
+            if not isinstance(image, Image.Image):
+                raise RuntimeError("Latent materialization did not return a PIL image")
+            if image.size != self.pixel_size:
+                raise RuntimeError(
+                    f"Latent materialization returned {image.size[0]}x{image.size[1]}, "
+                    f"expected {self.pixel_size[0]}x{self.pixel_size[1]}"
+                )
+            self._image = image
+        return self._image
+
+
+def materialize_image(image):
+    if isinstance(image, LatentImageArtifact):
+        return image.materialize()
+    if not isinstance(image, Image.Image):
+        raise TypeError(f"Expected a PIL image or latent artifact, got {type(image).__name__}")
+    return image
+
+
+def make_latent_image_artifact(
+    latents,
+    decoded_pixel_size,
+    pipeline,
+    family,
+    job_id,
+    control,
+    *,
+    staged_decode,
+    start_progress,
+    final_progress,
+    phase_prefix,
+    output_size=None,
+    output_resize_algorithm=None,
+):
+    factor = pipeline_vae_scale_factor(pipeline)
+    decoded_pixel_size = (int(decoded_pixel_size[0]), int(decoded_pixel_size[1]))
+    output_size = (
+        decoded_pixel_size
+        if output_size is None
+        else (int(output_size[0]), int(output_size[1]))
+    )
+    if not isinstance(latents, torch.Tensor) or latents.ndim != 4 or latents.shape[:2] != (1, 4):
+        shape = tuple(latents.shape) if isinstance(latents, torch.Tensor) else type(latents).__name__
+        raise RuntimeError(f"Latent resampling produced an invalid output shape: {shape}")
+    expected = (latents.shape[-1] * factor, latents.shape[-2] * factor)
+    if expected != decoded_pixel_size:
+        raise RuntimeError(
+            f"Latent output grid {latents.shape[-1]}x{latents.shape[-2]} with VAE factor {factor} "
+            f"does not match {decoded_pixel_size[0]}x{decoded_pixel_size[1]}"
+        )
+    if output_size != decoded_pixel_size and output_resize_algorithm is None:
+        raise ValueError("A latent artifact with a non-grid output size requires a pixel resize algorithm")
+    if not torch.isfinite(latents).all():
+        raise RuntimeError("Latent resampling produced non-finite output")
+    stored_latents = latents.to("cpu") if staged_decode else latents
+
+    def decode(current):
+        if staged_decode:
+            images = decode_staged_latents(
+                pipeline,
+                current,
+                family,
+                job_id,
+                control,
+                active_vae_mode == "tiled",
+                start_progress=start_progress,
+                final_progress=final_progress,
+                phase_prefix=phase_prefix,
+            )
+        else:
+            images = decode_resident_latents(
+                pipeline,
+                current,
+                family,
+                job_id,
+                control,
+                start_progress=start_progress,
+                final_progress=final_progress,
+                phase_prefix=phase_prefix,
+            )
+        if len(images) != 1:
+            raise RuntimeError(f"Latent materialization returned {len(images)} images instead of 1")
+        result = images[0].convert("RGB")
+        if result.size != decoded_pixel_size:
+            raise RuntimeError(
+                f"VAE decoded {result.size[0]}x{result.size[1]}, expected "
+                f"{decoded_pixel_size[0]}x{decoded_pixel_size[1]}"
+            )
+        if output_size != decoded_pixel_size:
+            control.checkpoint(job_id, f"{phase_prefix} latent output resize")
+            update_job(
+                job_id,
+                phase=f"{phase_prefix} · Restoring exact output {output_size[0]} x {output_size[1]}",
+                stage="resample_resize",
+                stage_step=0,
+                stage_total=1,
+                progress=final_progress,
+            )
+            result = resize_image(
+                result, output_size[0], output_size[1], output_resize_algorithm
+            )
+            update_job(job_id, stage_step=1, stage_total=1, progress=final_progress)
+        return result
+
+    return LatentImageArtifact(stored_latents, output_size, family, factor, decode)
+
+
 def whole_image_decode_fits(latents, vae):
     """Whether this decode can run on the card in one piece, now that the sampler has been parked.
 
@@ -4044,7 +4631,17 @@ def whole_image_decode_fits(latents, vae):
     return required_bytes * 1.10 <= max(0, free_bytes - reserved_bytes)
 
 
-def decode_staged_latents(pipeline, latents, family, job_id, control, use_tiling, start_progress=94, final_progress=98):
+def decode_staged_latents(
+    pipeline,
+    latents,
+    family,
+    job_id,
+    control,
+    use_tiling,
+    start_progress=94,
+    final_progress=98,
+    phase_prefix=None,
+):
     global active_vae_mode
     latents = latents.to("cpu")
     control.checkpoint(job_id, "Unloading sampler")
@@ -4091,7 +4688,12 @@ def decode_staged_latents(pipeline, latents, family, job_id, control, use_tiling
         control.checkpoint(job_id, "VAE decoding")
         update_job(
             job_id,
-            phase="VAE tiled decode" if tiling_active else "VAE decode",
+            phase=(
+                f"{phase_prefix} · VAE tiled decode" if phase_prefix and tiling_active
+                else f"{phase_prefix} · VAE decode" if phase_prefix
+                else "VAE tiled decode" if tiling_active
+                else "VAE decode"
+            ),
             stage="vae_decode",
             stage_step=0,
             stage_total=tile_total,
@@ -4100,6 +4702,8 @@ def decode_staged_latents(pipeline, latents, family, job_id, control, use_tiling
         )
         with torch.inference_mode():
             decoded = vae.decode(latents, return_dict=False)[0]
+        if not torch.isfinite(decoded).all():
+            raise RuntimeError("VAE decode produced non-finite pixels")
         control.checkpoint(job_id, "VAE decoding")
         update_job(job_id, stage_step=tile_total, stage_total=tile_total, progress=final_progress)
         watermark = getattr(pipeline, "watermark", None)
@@ -4118,6 +4722,11 @@ def decode_staged_latents(pipeline, latents, family, job_id, control, use_tiling
 def restore_cached_pipeline_state(job_id=None, request=None):
     if loaded_pipeline is None or active_memory_strategy is None:
         return True
+    lora_state = getattr(loaded_pipeline, "_xiriai_lora_fusion_state", None)
+    if isinstance(lora_state, dict) and lora_state.get("state") == "dirty":
+        # A failed irreversible fold/patch may have changed only a prefix of the
+        # requested groups.  No hook or parking operation can restore that base.
+        return False
     try:
         if is_native_family(loaded_family):
             loaded_pipeline.to_cpu()
@@ -4292,6 +4901,19 @@ def build_residency_controller(pipeline, strategy):
     )
 
 
+def pipeline_lora_cache_compatible(pipeline, signature):
+    if pipeline is None:
+        return False
+    state = getattr(pipeline, "_xiriai_lora_fusion_state", None)
+    if isinstance(state, dict):
+        return state.get("state") == "clean" and state.get("signature") == tuple(signature or ())
+    # Compatibility with a pipeline created earlier in this process before the
+    # structured state existed.  An absent legacy marker is a clean base only
+    # for an empty request; it can never authorize reuse for a requested set.
+    fused = getattr(pipeline, "_xiriai_fused_loras", None)
+    return (not signature and fused is None) or fused == tuple(signature or ())
+
+
 def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height: int, guidance_scale: float, lora_bytes: int, job_id: str, images_per_batch=1, guidance="none", loras=()):
     global loaded_pipeline, loaded_checkpoint, loaded_checkpoint_hash, loaded_family, loaded_engine
     global pipeline_cpu_parked, active_memory_strategy, active_attention_backend, active_compute_dtype
@@ -4311,8 +4933,7 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
         # A fused adapter set cannot be taken off again by `unload_lora_weights`, so a job that
         # wants different adapters cannot reuse this pipeline — it has to be built from the
         # checkpoint again. Same set, and both the load and the fuse are skipped entirely.
-        fused = getattr(loaded_pipeline, "_xiriai_fused_loras", None)
-        adapters_compatible = fused is None or fused == tuple(loras or ())
+        adapters_compatible = pipeline_lora_cache_compatible(loaded_pipeline, tuple(loras or ()))
         if (loaded_pipeline is not None and loaded_checkpoint == str(checkpoint)
                 and loaded_family == family and loaded_engine == engine and adapters_compatible):
             strategy = choose_memory_strategy(
@@ -4340,7 +4961,6 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
                 update_job(job_id, phase=f"Adjusting VRAM policy · {strategy['label']}", progress=8)
                 previous_strategy = active_memory_strategy
                 try:
-                    loaded_pipeline.unload_lora_weights()
                     reconfigure_memory_strategy(loaded_pipeline, strategy)
                     pipeline_cpu_parked = False
                 except Exception:
@@ -5639,15 +6259,276 @@ def report_mounted_loras(job_id: str, entries):
 
 
 def lora_signature(loras, lora_root: Path):
-    """What identifies a mounted adapter set: the resolved files and the weights applied to them."""
+    """Lossless ordered identity for an irreversible adapter combination.
+
+    Paths are first resolved through the trusted model-root boundary, then stored
+    only as their relative wire reference.  File replacement invalidates reuse
+    through size and nanosecond mtime without putting a local absolute path in a
+    job, PNG or pipeline signature. Creation time and the platform's stable file
+    identity close the same-size/mtime-restored replacement hole without hashing
+    a potentially multi-hundred-megabyte adapter on every task.
+    """
     signature = []
     for lora in loras or ():
+        path = resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA")
         try:
-            path = resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA")
-        except Exception:
-            path = Path(lora.path)
-        signature.append((str(path), round(float(lora.weight), 6)))
+            stat = path.stat()
+        except Exception as error:
+            raise readable_lora_error(path, "文件修订", error) from None
+        if is_shared_ref(lora.path):
+            reference = shared_model_reference(lora.path)
+            if not reference:
+                raise ValueError("LoRA shared reference is invalid")
+        else:
+            reference = path.relative_to(lora_root.resolve()).as_posix()
+        signature.append((
+            reference,
+            float(lora.weight).hex(),
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            int(getattr(stat, "st_dev", 0)),
+            int(getattr(stat, "st_ino", 0)),
+        ))
     return tuple(signature)
+
+
+def lora_signature_summary(signature):
+    encoded = json.dumps(tuple(signature or ()), ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def mark_pipeline_lora_state(pipeline, state, signature, report=None):
+    pipeline._xiriai_lora_fusion_state = {
+        "schema": 1,
+        "state": state,
+        "signature": tuple(signature or ()),
+    }
+    pipeline._xiriai_fused_loras = tuple(signature or ()) if state == "clean" else None
+    if report is not None:
+        pipeline._xiriai_lora_fusion_report = dict(report)
+
+
+def pipeline_lora_modules(pipeline):
+    return {
+        "unet": getattr(pipeline, "unet", None),
+        "text_encoder": getattr(pipeline, "text_encoder", None),
+        "text_encoder_2": getattr(pipeline, "text_encoder_2", None),
+    }
+
+
+def _lora_file_report(classification, groups, path):
+    return {
+        "name": Path(path).name,
+        "format": classification.family,
+        "advanced": classification.advanced,
+        "targets": len(groups),
+        "dora": classification.dora,
+    }
+
+
+def _pipeline_has_unmanaged_offload(pipeline):
+    for component in pipeline_lora_modules(pipeline).values():
+        if not isinstance(component, torch.nn.Module):
+            continue
+        for module in component.modules():
+            if getattr(module, "_hf_hook", None) is not None:
+                return True
+            registry = getattr(module, "_diffusers_hook", None)
+            if registry is not None:
+                return True
+    return False
+
+
+def prepare_pipeline_for_direct_lora_patch(pipeline):
+    """Materialize advanced-patch targets through the residency owner.
+
+    Standard Diffusers adapters never enter this boundary. A production pipeline
+    with offload installed must have its matching ``ResidencyController``; this
+    function never tears hooks down behind that owner's back.
+    """
+
+    if loaded_pipeline is not None and pipeline is not loaded_pipeline:
+        raise LoraPatchError("LoRA 应用失败（驻留状态）：拒绝补丁非当前或已停放的旧 pipeline")
+    controller = (
+        active_residency
+        if active_residency is not None and active_residency.pipeline is pipeline
+        else None
+    )
+    if pipeline is loaded_pipeline and pipeline_cpu_parked:
+        try:
+            restore_parked_pipeline()
+        except Exception as error:
+            raise readable_lora_error("LoRA", "驻留恢复", error) from None
+        if pipeline_cpu_parked:
+            raise LoraPatchError("LoRA 应用失败（驻留状态）：pipeline 仍处于 CPU 停放状态，必须重建")
+    if controller is not None and controller.parked:
+        try:
+            controller.reinstall(controller.tier)
+        except Exception as error:
+            raise readable_lora_error("LoRA", "驻留恢复", error) from None
+        if controller.parked:
+            raise LoraPatchError("LoRA 应用失败（驻留状态）：ResidencyController 未能恢复停放 pipeline")
+    if controller is None:
+        if _pipeline_has_unmanaged_offload(pipeline):
+            raise LoraPatchError("LoRA 应用失败（驻留状态）：检测到无 ResidencyController 管理的 offload hook")
+        return None
+    tier = controller.tier
+    if tier is None:
+        raise LoraPatchError("LoRA 应用失败（驻留状态）：ResidencyController 没有可恢复的驻留层级")
+    try:
+        disable_sequential_batch_forward(getattr(pipeline, "unet", None))
+        controller.release(empty_cache=False)
+    except Exception as error:
+        raise readable_lora_error("LoRA", "驻留准备", error) from None
+    return controller, tier
+
+
+# The rungs that hold real weights where Diffusers folds a standard adapter: resident on the card, or
+# whole components on the host behind `CpuOffload`. Anything below them streams or offloads per
+# submodule and has to be released through the residency owner before a standard fold.
+LORA_FOLD_IN_PLACE_TIERS = frozenset({"T0", "T1"})
+
+
+def standard_lora_fold_needs_release(pipeline):
+    """Whether a standard-only fold must go through the residency owner's release.
+
+    `load_lora_weights` removes accelerate's hooks and installs them again for every component of
+    every file. On the per-submodule rung (the LOW_VRAM admission for SD/iL) that reinstall moves
+    every weight to the meta device, so the `fuse_lora` that follows folds into placeholders and is
+    lost while the record says it was fused — and the three strips and reinstalls per file are most
+    of what a standard-only mount cost there (QPlan P5 Phase A). The streaming rungs re-pin every
+    group per load instead. Only a pipeline this process's controller owns is ever released.
+    """
+    controller = (
+        active_residency
+        if active_residency is not None and active_residency.pipeline is pipeline
+        else None
+    )
+    if controller is None or controller.tier is None:
+        return False
+    return controller.parked or controller.tier not in LORA_FOLD_IN_PLACE_TIERS
+
+
+def restore_pipeline_after_direct_lora_patch(pipeline, placement, job_id=None):
+    if placement is None:
+        return
+    controller, tier = placement
+    try:
+        if not controller.reinstall(tier):
+            raise RuntimeError("ResidencyController did not reinstall the saved tier")
+        if pipeline is loaded_pipeline and active_memory_strategy is not None:
+            apply_cfg_execution_mode(pipeline, active_memory_strategy)
+            publish_residency(job_id)
+    except Exception as error:
+        raise readable_lora_error("LoRA", "驻留恢复", error) from None
+
+
+def planned_target_weights(plan, modules):
+    """The live weights one advanced plan will write."""
+    weights = []
+    for planned in plan.groups:
+        component = modules.get(planned.target.component)
+        if isinstance(component, torch.nn.Module):
+            weights.append(component.get_parameter(planned.target.parameter))
+    return weights
+
+
+def peft_base_weights(modules):
+    """The base weights under every PEFT adapter layer mounted so far — what a standard fold writes."""
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    weights = []
+    for component in modules.values():
+        if not isinstance(component, torch.nn.Module):
+            continue
+        for module in component.modules():
+            if isinstance(module, BaseTunerLayer):
+                weight = getattr(module.get_base_layer(), "weight", None)
+                if isinstance(weight, torch.Tensor):
+                    weights.append(weight)
+    return weights
+
+
+# What an accelerator must have free, beyond the largest single workspace a mount may hold on it at
+# once (one advanced group, capped at MAX_GROUP_WORKSPACE_BYTES; one standard layer is far smaller),
+# before it is used for the dense part of a host-resident mount.
+LORA_COMPUTE_RESERVE_BYTES = 512 * 1024**2
+
+
+def lora_compute_device():
+    """The accelerator that takes the dense, element-wise part of a host-resident LoRA mount.
+
+    Measured on the reference seven-LoRA job (QPlan P5 Phase A), the host spent about 44 s folding
+    six standard adapters and patching 788 LoKr groups — memory-bound FP16/FP32 passes over
+    billions of weights. The weights stay where the residency owner put them; only each layer's
+    arithmetic visits the card and comes back. None — the established host path — when there is no
+    CUDA device or it has too little free for one workspace.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info()
+    except Exception:
+        return None
+    if free_bytes < MAX_GROUP_WORKSPACE_BYTES + LORA_COMPUTE_RESERVE_BYTES:
+        return None
+    return torch.device("cuda")
+
+
+# An isolated benchmark may ask for one device synchronisation per mount stage, so that queued CUDA
+# work is not billed to whichever stage happens to read a result first. Never per target, and never
+# in production, where the stage clocks below cost nothing but `perf_counter` calls.
+LORA_BENCHMARK_SYNC = os.environ.get("XIRAI_LORA_BENCHMARK_SYNC") == "1"
+
+
+class LoraMountClock:
+    """Stage clocks for one `configure_loras` call (QPlan P5 Phase A).
+
+    Holds stage names, seconds, basenames and counts only — never a path, a key list or a tensor —
+    so the result can ride on the job record, the PNG and a failure record alike. A stage that
+    raises is still billed, which is what a dirty report needs to say where the time went.
+    """
+
+    def __init__(self):
+        self.started = time.perf_counter()
+        self.seconds = {}
+        self.counts = {}
+        self.standard_files = []
+        self.advanced_files = []
+
+    def _synchronize(self):
+        if LORA_BENCHMARK_SYNC and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def add(self, name, seconds):
+        self.seconds[name] = self.seconds.get(name, 0.0) + seconds
+
+    @contextmanager
+    def stage(self, name):
+        self._synchronize()
+        begin = time.perf_counter()
+        failed = True
+        try:
+            yield
+            failed = False
+        finally:
+            if not failed:
+                self._synchronize()
+            self.add(name, time.perf_counter() - begin)
+
+    def total_seconds(self):
+        return round(time.perf_counter() - self.started, 3)
+
+    def report(self):
+        timings = {name: round(value, 3) for name, value in self.seconds.items()}
+        timings.update(self.counts)
+        if self.standard_files:
+            timings["standard_files"] = [dict(item) for item in self.standard_files]
+        if self.advanced_files:
+            timings["advanced_files"] = [dict(item) for item in self.advanced_files]
+        timings["total_seconds"] = self.total_seconds()
+        return timings
 
 
 def configure_loras(pipeline, loras: list[LoraInput], lora_root: Path, job_id: str):
@@ -5673,48 +6554,349 @@ def configure_loras(pipeline, loras: list[LoraInput], lora_root: Path, job_id: s
     stack a second set on top of the first. A later job with the *same* set skips both the load and
     the fuse, which is most of what a cached model is worth.
     """
-    requested = lora_signature(loras, lora_root)
-    if getattr(pipeline, "_xiriai_fused_loras", None) == requested:
-        update_job(job_id, lora_fusion={"fused": bool(requested), "reused": True, "count": len(requested)})
-        report_mounted_loras(job_id, [(Path(path), weight) for path, weight in requested])
-        return
-    pipeline.unload_lora_weights()
-    pipeline._xiriai_fused_loras = None
+    clock = LoraMountClock()
+    with clock.stage("signature_seconds"):
+        requested = lora_signature(loras, lora_root)
+        resolved = [
+            (resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA"), float(lora.weight))
+            for lora in (loras or ())
+        ]
+    with clock.stage("reuse_lookup_seconds"):
+        reusable = pipeline_lora_cache_compatible(pipeline, requested)
+    if reusable:
+        previous = getattr(pipeline, "_xiriai_lora_fusion_report", None)
+        report = dict(previous) if isinstance(previous, dict) else {
+            "schema": 1,
+            "state": "clean",
+            "signature": lora_signature_summary(requested),
+            "standard": len(requested),
+            "lycoris": 0,
+            "files": [],
+            "targets": 0,
+            "dora": False,
+        }
+        report.update({"state": "clean", "reused": True, "count": len(requested), "fused": bool(requested)})
+        # The reused record keeps the cold fold's `elapsed_seconds` (its established meaning), but
+        # the clocks describe this call: a hot reuse reads no header and folds nothing.
+        report["timings"] = clock.report()
+        report["total_seconds"] = report["timings"]["total_seconds"]
+        pipeline._xiriai_lora_fusion_report = report
+        update_job(job_id, lora_fusion=report)
+        report_mounted_loras(job_id, resolved)
+        return report
+
+    prior_state = getattr(pipeline, "_xiriai_lora_fusion_state", None)
+    if isinstance(prior_state, dict):
+        if prior_state.get("state") == "dirty":
+            raise LoraPatchError("LoRA 应用失败（事务）：当前 pipeline 已标记为 dirty，必须先重建")
+        if prior_state.get("state") == "clean" and prior_state.get("signature") != requested:
+            # Normally load_pipeline has already rebuilt.  Reaching this branch
+            # means a file revision changed between load admission and fusion;
+            # patching the newly observed set over the old fused set is unsafe.
+            mark_pipeline_lora_state(pipeline, "dirty", requested)
+            changed_name = resolved[0][0].name if resolved else "LoRA"
+            raise LoraPatchError(
+                f"LoRA 应用失败（文件修订）：{changed_name} 在加载期间发生变化，请重试以重建模型"
+            )
+
+    # Only advanced markers opt a Safetensors file into strict Kohya/LyCORIS
+    # parsing. Diffusers owns its native standard namespace (including PEFT
+    # unet/text_encoder/text_encoder_2 keys), so pure standard files must never
+    # be rejected by our narrower parser before load_lora_weights sees them.
+    standard_files = []
+    advanced_files = []
+    file_reports = []
+    modules = pipeline_lora_modules(pipeline)
+    target_index = None
+    for index, ((path, weight), lora) in enumerate(zip(resolved, loras or ())):
+        if path.suffix.lower() != ".safetensors":
+            # Preserve the established Diffusers path for legacy standard LoRA
+            # containers.  They cannot be safely header-inspected without
+            # deserializing pickle, so they are never admitted to direct patching.
+            file_reports.append({
+                "name": path.name,
+                "format": "standard-legacy",
+                "advanced": False,
+                "targets": None,
+                "dora": False,
+            })
+            standard_files.append({
+                "index": index, "path": path, "weight": weight, "groups": (),
+            })
+            continue
+        with clock.stage("header_seconds"):
+            header = read_lora_header(path)
+            direct = lora_header_requires_direct_patch(header)
+        if not direct:
+            file_reports.append({
+                "name": path.name,
+                "format": "standard-native",
+                "advanced": False,
+                "targets": None,
+                "dora": False,
+            })
+            standard_files.append({
+                "index": index, "path": path, "weight": weight, "groups": (),
+            })
+            continue
+        with clock.stage("header_seconds"):
+            classification = classify_lora_keys(header)
+            groups = build_lora_groups(header)
+        # Structural mapping (including every advanced file) completes against
+        # the live parameter table before any hook, adapter, or base is changed.
+        # One target index serves every advanced file of this transaction.
+        if target_index is None:
+            with clock.stage("target_index_seconds"):
+                target_index = build_target_index(modules)
+        preflight_started = time.perf_counter()
+        with clock.stage("advanced_preflight_seconds"):
+            plan = preflight_lora_patch(
+                path,
+                modules,
+                loaded_family or ("sdxl" if getattr(pipeline, "text_encoder_2", None) is not None else "sd"),
+                header=header,
+                groups=groups,
+                require_materialized=False,
+                index=target_index,
+            )
+        file_reports.append(_lora_file_report(classification, groups, path))
+        advanced_files.append({
+            "index": index,
+            "path": path,
+            "weight": weight,
+            "groups": groups,
+            "plan": plan,
+            "clock": {
+                "name": path.name,
+                "targets": len(groups),
+                "preflight_seconds": round(time.perf_counter() - preflight_started, 3),
+            },
+        })
+
+    if target_index is not None:
+        clock.counts.update(target_index.counts())
+        # Transaction-local by construction: nothing may resolve against it once the adapters and
+        # the residency hooks start changing what the components hold.
+        target_index = None
+
+    base_report = {
+        "schema": 1,
+        "state": "clean",
+        "signature": lora_signature_summary(requested),
+        "reused": False,
+        "standard": len(standard_files),
+        "lycoris": len(advanced_files),
+        "files": file_reports,
+        "targets": sum(len(item["groups"]) for item in advanced_files),
+        "dora": any(item["plan"].dora for item in advanced_files),
+        "count": len(requested),
+    }
+    started = time.time()
+
+    def clocked(report):
+        report["timings"] = clock.report()
+        report["total_seconds"] = report["timings"]["total_seconds"]
+        return report
+
+    def publish_dirty():
+        dirty_report = clocked({
+            **base_report,
+            "state": "dirty",
+            "fused": False,
+            "elapsed_seconds": round(time.time() - started, 2),
+        })
+        mark_pipeline_lora_state(pipeline, "dirty", requested, dirty_report)
+        update_job(job_id, lora_fusion=dirty_report)
+        return dirty_report
+
+    # unload/load/set/fuse and direct-patch residency preparation can all leave
+    # mutable adapter/base state. Dirty precedes the first one, never follows it.
+    publish_dirty()
+    placement = None
+    prefault = None
+
+    def finish_prefault():
+        # Joined before the first write to any base weight, and on every failure exit.
+        if prefault is not None:
+            clock.counts["host_prefault_busy_seconds"] = prefault.finish()
+            clock.counts["host_prefault_bytes"] = prefault.bytes
+
+    def restore_after_failure():
+        # Every exit restores the rung this transaction released. The pipeline is already dirty and
+        # will be rebuilt, so a restore that fails too must not replace the error that brought us here.
+        finish_prefault()
+        if placement is not None:
+            try:
+                restore_pipeline_after_direct_lora_patch(pipeline, placement, job_id)
+            except Exception:
+                clock.counts["residency_restore_failed"] = True
+
+    # The residency owner releases the pipeline once for the whole transaction whenever a direct
+    # patch needs materialized weights, or whenever Diffusers' own per-load offload handling would
+    # otherwise run: on a streaming or per-submodule rung it strips and reinstalls the hooks for
+    # every component of every file, and on the per-submodule rung the reinstall leaves every weight
+    # on the meta device, where the fold that follows would be silently lost.
+    if advanced_files or (standard_files and standard_lora_fold_needs_release(pipeline)):
+        try:
+            with clock.stage("residency_prepare_seconds"):
+                placement = prepare_pipeline_for_direct_lora_patch(pipeline)
+                for entry in advanced_files:
+                    validate_lora_plan_materialized(entry["plan"], modules)
+        except Exception:
+            restore_after_failure()
+            publish_dirty()
+            raise
+    if loras:
+        # Take the copy-on-write faults of every weight this mount will write while Diffusers maps
+        # the standard files: the advanced targets now, each standard file's layers as it lands.
+        prefault = HostWeightPrefault()
+        for entry in advanced_files:
+            if entry["weight"] != 0.0:
+                prefault.add(planned_target_weights(entry["plan"], modules))
+    try:
+        with clock.stage("standard_unload_seconds"):
+            pipeline.unload_lora_weights()
+    except Exception as error:
+        restore_after_failure()
+        publish_dirty()
+        source = resolved[0][0] if resolved else "LoRA"
+        raise readable_lora_error(source, "适配器清理", error) from None
     if not loras:
-        return
+        base_report["fused"] = False
+        clocked(base_report)
+        mark_pipeline_lora_state(pipeline, "clean", requested, base_report)
+        update_job(job_id, lora_fusion=base_report)
+        return base_report
 
     update_job(job_id, phase="Loading LoRA adapters", progress=21)
     adapter_names = []
     adapter_weights = []
-    mounted = []
-    for index, lora in enumerate(loras):
-        path = resolve_model_path(lora.path, lora_root, LORA_EXTENSIONS, "LoRA")
-        adapter_name = f"lora_{index}"
-        with quiet_lora_loading(path):
-            pipeline.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter_name)
+    for entry in standard_files:
+        path = entry["path"]
+        adapter_name = f"lora_{entry['index']}"
+        load_started = time.perf_counter()
+        try:
+            with clock.stage("standard_load_seconds"), quiet_lora_loading(path):
+                pipeline.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter_name)
+        except Exception as error:
+            restore_after_failure()
+            publish_dirty()
+            raise readable_lora_error(path, "标准 LoRA", error) from None
+        finally:
+            clock.standard_files.append({
+                "name": path.name, "load_seconds": round(time.perf_counter() - load_started, 3),
+            })
+        if prefault is not None:
+            prefault.add(peft_base_weights(modules))
         adapter_names.append(adapter_name)
-        adapter_weights.append(lora.weight)
-        mounted.append((path, lora.weight))
-    pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
-    fused = False
-    started = time.time()
-    try:
+        adapter_weights.append(entry["weight"])
+    if adapter_names:
+        try:
+            with clock.stage("standard_set_seconds"):
+                pipeline.set_adapters(adapter_names, adapter_weights=adapter_weights)
+        except Exception as error:
+            restore_after_failure()
+            publish_dirty()
+            raise readable_lora_error(standard_files[0]["path"], "标准 LoRA 组合", error) from None
+
+    # Nothing below may run while the prefault thread still rewrites a queued weight.
+    with clock.stage("host_prefault_wait_seconds"):
+        finish_prefault()
+    # Chosen after the residency release, when the card holds none of this pipeline's weights.
+    compute_device = lora_compute_device()
+    clock.counts["lora_compute"] = "cuda" if compute_device is not None else "host"
+    fused = not adapter_names
+    if adapter_names:
         update_job(job_id, phase="Folding LoRA into weights", progress=22)
-        pipeline.fuse_lora(adapter_names=adapter_names)
-        pipeline.unload_lora_weights()
-        pipeline._xiriai_fused_loras = requested
-        fused = True
-    except Exception:
-        # A set that will not fuse still runs: the adapters stay mounted and the job pays the
-        # per-step cost rather than failing. `set_adapters` has already been applied, so the only
-        # thing lost is the speed.
-        traceback.print_exc()
-        pipeline._xiriai_fused_loras = None
-    update_job(job_id, lora_fusion={
-        "fused": fused, "reused": False, "count": len(adapter_names),
+        try:
+            with clock.stage("standard_fuse_seconds"):
+                if compute_device is None:
+                    pipeline.fuse_lora(adapter_names=adapter_names)
+                else:
+                    # Diffusers has already mapped, injected and scaled every adapter; only the fold
+                    # moves, and PEFT's own `merge` still folds every layer this does not replicate.
+                    folded = fold_peft_adapters(modules, adapter_names, compute_device)
+                    clock.counts["standard_fold_layers"] = folded["folded_layers"]
+                    clock.counts["standard_fold_delegated"] = folded["delegated_layers"]
+                    if folded["device_fallbacks"]:
+                        # The card ran out part-way; the rest of this transaction stays on the host.
+                        clock.counts["lora_compute_fallbacks"] = folded["device_fallbacks"]
+                        compute_device = None
+                    pipeline._merged_adapters = set(getattr(pipeline, "_merged_adapters", ())) | folded["merged_adapters"]
+            with clock.stage("standard_unload_seconds"):
+                pipeline.unload_lora_weights()
+            fused = True
+        except Exception as error:
+            fused = False
+            # The mounted fallback samples this job with the adapters still attached, so the rung
+            # has to be back on the pipeline before it returns, not only before it raises.
+            restore_after_failure()
+            dirty_report = publish_dirty()
+            report_mounted_loras(job_id, resolved)
+            if advanced_files:
+                raise readable_lora_error(standard_files[0]["path"], "标准+LyCORIS", error) from None
+            # Preserve the established standard-only fallback: adapters remain
+            # mounted for this job, but the dirty pipeline is never reusable.
+            return dirty_report
+
+    if advanced_files:
+        update_job(job_id, phase="Applying LyCORIS patches", progress=23)
+        try:
+            for entry in advanced_files:
+                apply_started = time.perf_counter()
+                try:
+                    with clock.stage("advanced_apply_seconds"):
+                        apply_stats = {}
+                        apply_lora_plan(
+                            entry["path"], entry["plan"], modules, entry["weight"],
+                            compute_device=compute_device, stats=apply_stats,
+                        )
+                        if apply_stats.get("device_fallbacks"):
+                            clock.counts["lora_compute_fallbacks"] = (
+                                clock.counts.get("lora_compute_fallbacks", 0) + apply_stats["device_fallbacks"]
+                            )
+                            compute_device = None
+                finally:
+                    clock.advanced_files.append({
+                        **entry["clock"], "apply_seconds": round(time.perf_counter() - apply_started, 3),
+                    })
+        except Exception:
+            restore_after_failure()
+            publish_dirty()
+            raise
+    if clock.counts.get("lora_compute") == "cuda":
+        # Hand the mount's workspaces back before the rung is reinstalled and the controller next
+        # reads free memory to place the base stage.
+        torch.cuda.empty_cache()
+    if placement is not None:
+        try:
+            with clock.stage("residency_restore_seconds"):
+                restore_pipeline_after_direct_lora_patch(pipeline, placement, job_id)
+        except Exception:
+            publish_dirty()
+            raise
+
+    # A replacement racing this task must poison the irreversible result rather
+    # than publish a clean cache identity for bytes that were not one revision.
+    with clock.stage("revision_recheck_seconds"):
+        revision_changed = lora_signature(loras, lora_root) != requested
+    if revision_changed:
+        publish_dirty()
+        changed_name = resolved[0][0].name if resolved else "LoRA"
+        raise LoraPatchError(
+            f"LoRA 应用失败（文件修订）：{changed_name} 在应用期间发生变化，请重试以重建模型"
+        )
+
+    report = clocked({
+        **base_report,
+        "state": "clean",
+        "fused": bool(requested) and (fused or bool(advanced_files)),
         "elapsed_seconds": round(time.time() - started, 2),
     })
-    report_mounted_loras(job_id, mounted)
+    mark_pipeline_lora_state(pipeline, "clean", requested, report)
+    update_job(job_id, lora_fusion=report)
+    report_mounted_loras(job_id, resolved)
+    return report
 
 
 def append_warning(current: str | None, message: str):
@@ -5849,17 +7031,57 @@ def run_with_offload_escalation(pipeline, pipeline_kwargs, call):
         return call()
 
 
-def run_guided_pipeline(pipeline, active_pipeline, pipeline_kwargs, guidance_kwargs=None):
+def keep_prompt_lease_seated(callback, prompt_lease):
+    """Re-seat the prompt lease after every step, once the job's own callback has run.
+
+    Residency work between steps (a pause, a park, a hook rebuild) can hand the UNet a new
+    `forward`; the lease has to be back on top before Diffusers makes the next call, or its
+    sentinel refuses that call. Diffusers' callback objects carry their own tensor list and are
+    left alone — the lease still re-seats itself after each of its own calls.
+    """
+    if callback is not None and hasattr(callback, "tensor_inputs"):
+        return callback
+
+    def step_end(active, step, timestep, callback_kwargs):
+        result = callback(active, step, timestep, callback_kwargs) if callback is not None else callback_kwargs
+        prompt_lease.ensure_bound()
+        return result
+
+    return step_end
+
+
+def run_guided_pipeline(
+    pipeline,
+    active_pipeline,
+    pipeline_kwargs,
+    guidance_kwargs=None,
+    prompt_conditioning: PreparedConditioning | None = None,
+):
     original_attn_processors = (
         dict(pipeline.unet.attn_processors)
         if guidance_kwargs and hasattr(pipeline, "unet") else None
     )
     try:
-        return run_with_offload_escalation(
+        with static_conditioning_lease(
             pipeline,
-            pipeline_kwargs,
-            lambda: active_pipeline(**{**pipeline_kwargs, **(guidance_kwargs or {})}),
-        )
+            prompt_conditioning,
+            pipeline_kwargs.get("guidance_scale", 1.0),
+            (guidance_kwargs or {}).get("pag_scale", 0.0),
+        ) as prompt_lease:
+            def invoke():
+                # An OOM escalation can rebuild an Accelerate hook and replace
+                # UNet.forward between attempts. Rebind only to the new live
+                # layer, under the same pipeline-local lease token.
+                call_kwargs = {**pipeline_kwargs, **(guidance_kwargs or {})}
+                if prompt_lease is not None:
+                    prompt_lease.begin_invocation(active_pipeline)
+                    prompt_lease.ensure_bound()
+                    call_kwargs["callback_on_step_end"] = keep_prompt_lease_seated(
+                        call_kwargs.get("callback_on_step_end"), prompt_lease
+                    )
+                return active_pipeline(**call_kwargs)
+
+            return run_with_offload_escalation(pipeline, pipeline_kwargs, invoke)
     finally:
         if original_attn_processors is not None:
             pipeline.unet.set_attn_processor(original_attn_processors)
@@ -5963,6 +7185,23 @@ def adopt_postprocess_canvas(request: GenerateInput, image: Image.Image) -> bool
     return True
 
 
+def uses_diffusers_img2img_fix_steps(request: GenerateInput) -> bool:
+    """Whether this request has a real SD/iL base image-to-image pass to expand."""
+    return (
+        request.img2img_fix_steps
+        and request.engine in {"SD", "iL"}
+        and request.source_image.enabled
+        and not request.postprocess_only
+    )
+
+
+def img2img_schedule_steps(request: GenerateInput) -> int | None:
+    """The expanded base schedule when fixed-step image-to-image is active."""
+    if not uses_diffusers_img2img_fix_steps(request):
+        return None
+    return diffusers_schedule_total(request.steps, request.denoise)
+
+
 def source_image_pipeline_kwargs(request: GenerateInput, source_image, generators, on_step_end, conditioning):
     """Diffusers image-to-image kwargs.
 
@@ -5974,7 +7213,7 @@ def source_image_pipeline_kwargs(request: GenerateInput, source_image, generator
     return {
         "image": source_image,
         "strength": request.denoise,
-        "num_inference_steps": request.steps,
+        "num_inference_steps": img2img_schedule_steps(request) or request.steps,
         "num_images_per_prompt": request.images_per_batch,
         "guidance_scale": request.cfg,
         "generator": generators,
@@ -5994,19 +7233,34 @@ def base_sampling_steps(request: GenerateInput, family: str) -> int:
     """
     if request.postprocess_only:
         return 0
+    if uses_diffusers_img2img_fix_steps(request):
+        return request.steps
     if not request.source_image.enabled or is_native_family(family):
         return request.steps
     return max(1, int(request.steps * request.denoise))
 
 
-def run_guided_pipeline_batch(pipeline, guidance: str, pipeline_kwargs, pag: PagInput | None = None, factory=None):
+def run_guided_pipeline_batch(
+    pipeline,
+    guidance: str,
+    pipeline_kwargs,
+    pag: PagInput | None = None,
+    factory=None,
+    prompt_conditioning: PreparedConditioning | None = None,
+):
     active_pipeline, guidance_kwargs = (
         derived_sampling_pipeline(pipeline, factory, guidance, pag)
         if factory is not None
         else sampling_pipeline(pipeline, guidance, pag)
     )
     try:
-        outputs = run_guided_pipeline(pipeline, active_pipeline, pipeline_kwargs, guidance_kwargs).images
+        outputs = run_guided_pipeline(
+            pipeline,
+            active_pipeline,
+            pipeline_kwargs,
+            guidance_kwargs,
+            prompt_conditioning,
+        ).images
         expected = pipeline_kwargs["num_images_per_prompt"]
         if len(outputs) != expected:
             raise RuntimeError(f"Pipeline returned {len(outputs)} images for a requested batch of {expected}")
@@ -6040,6 +7294,100 @@ def resample_unit_sizes(size, unit: ResampleUnitInput, family: str):
         return {"target": target, "redraw": target, "output": target}
     redraw = redraw_canvas_size(target, family)
     return {"target": target, "redraw": redraw, "output": target if unit.exact_output else redraw}
+
+
+DIFFUSERS_SCHEDULE_STEP_LIMIT = 1000
+
+
+def diffusers_schedule_total(steps: int, denoise: float) -> int:
+    """Return the smallest Diffusers schedule whose strength suffix runs ``steps`` updates.
+
+    Diffusers truncates image-to-image and inpaint schedules with
+    ``int(num_inference_steps * strength)``. Resample and ADetailer expose executed updates instead,
+    so SD/iL expand the schedule while leaving ``strength`` unchanged. The narrow search around the
+    mathematical quotient also uses Diffusers' exact floating-point operation, avoiding an off-by-one
+    at a representational boundary.
+    """
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("Diffusers schedule steps must be a positive integer")
+    if steps > DIFFUSERS_SCHEDULE_STEP_LIMIT:
+        raise ValueError(
+            f"Diffusers schedule cannot exceed {DIFFUSERS_SCHEDULE_STEP_LIMIT} steps; lower the steps"
+        )
+    if isinstance(denoise, bool):
+        raise ValueError("重绘强度必须是大于 0 的有限数值")
+    try:
+        strength = float(denoise)
+    except (TypeError, ValueError) as error:
+        raise ValueError("重绘强度必须是大于 0 的有限数值") from error
+    if not math.isfinite(strength) or strength <= 0:
+        raise ValueError("重绘强度必须是大于 0 的有限数值")
+    if strength >= 1:
+        return steps
+
+    try:
+        estimated_total = math.ceil(steps / strength)
+    except (OverflowError, ValueError, ZeroDivisionError) as error:
+        raise ValueError(
+            f"重绘强度过低：调度总步数不能超过 {DIFFUSERS_SCHEDULE_STEP_LIMIT}，请提高重绘强度或降低步数"
+        ) from error
+    first = max(steps, estimated_total - 2)
+    last = min(DIFFUSERS_SCHEDULE_STEP_LIMIT, estimated_total + 2)
+    for total in range(first, last + 1):
+        if int(total * strength) == steps:
+            return total
+    if estimated_total > DIFFUSERS_SCHEDULE_STEP_LIMIT:
+        raise ValueError(
+            f"重绘强度过低：调度总步数不能超过 {DIFFUSERS_SCHEDULE_STEP_LIMIT}，请提高重绘强度或降低步数"
+        )
+    raise ValueError("无法为当前步数与重绘强度构造 Diffusers 调度，请调整后重试")
+
+
+def validate_diffusers_postprocess_schedules(request: GenerateInput) -> None:
+    """Reject expanded SD/iL schedules before a job is queued or loads a model."""
+    if uses_diffusers_img2img_fix_steps(request):
+        try:
+            diffusers_schedule_total(request.steps, request.denoise)
+        except ValueError as error:
+            raise ValueError(f"图生图基础采样：{error}") from error
+    if is_native_family(request_family(request.engine)):
+        return
+    for stage in postprocessing_stages(request):
+        if stage.type == "resample":
+            if stage.denoise <= 0:
+                continue
+            label = f"重采样 {request.resample_unit_number(stage)}"
+            steps = stage.resolved_steps(request.steps)
+            schedules = ((label, steps, stage.denoise),)
+        elif stage.type == "adetailer":
+            schedules = tuple(
+                (
+                    f"ADetailer {index}" if len(stage.active_units) > 1 else "ADetailer",
+                    unit.steps if unit.use_steps else request.steps,
+                    unit.denoise,
+                )
+                for index, unit in enumerate(stage.active_units, start=1)
+            )
+        else:
+            continue
+        for label, steps, denoise in schedules:
+            try:
+                diffusers_schedule_total(steps, denoise)
+            except ValueError as error:
+                raise ValueError(f"{label}：{error}") from error
+
+
+def validate_latent_resample_request(request: GenerateInput) -> None:
+    """Defensive admission gate, including callers that bypass normal Pydantic construction."""
+    for number, unit in enumerate(request.resample_units, start=1):
+        if not unit.enabled or unit.latent_algorithm is None:
+            continue
+        if unit.upscaler is not None:
+            raise ValueError(f"Resample unit {number}: latent resampling cannot use an upscaler model")
+        if unit.execution_mode != "full_frame":
+            raise ValueError(f"Resample unit {number}: latent resampling supports full_frame only; USDU is unavailable")
+        if request.engine not in {"SD", "iL"}:
+            raise ValueError(f"Resample unit {number}: 潜空间放大目前仅支持 SD/iL；{request.engine} 暂不支持")
 
 
 def resample_chain_plan(request: GenerateInput, base_size=None):
@@ -6220,9 +7568,90 @@ def generation_memory_workload_diagnostics(request: GenerateInput, family: str):
                 workloads.append((1024, 1024, detail_cfg, 1, detail_copies, "adetailer"))
     selected = max(workloads or [base_workload], key=lambda item: estimate_inference_bytes(family, *item[:5]))
     diagnostics["admission"] = selected[:4]
+    diagnostics["admission_copies"] = selected[4]
     if selected[5] != "usdu_tile_processing_target_excluded":
         diagnostics["stage"] = selected[5]
     return diagnostics
+
+
+# What streaming a sampler one submodule at a time still keeps on the card beside its activations:
+# the block in flight, its hooks and the allocator's granularity. It is the floor of the lowest
+# rung, which is the rung an oversized canvas would be pushed onto.
+EXPANDED_CANVAS_STREAMED_MODULE_BYTES = 768 * 1024**2
+# A tiled autoencoder decode: one tile's working set (measured at ~3.1 GiB for an SDXL tile, see
+# `estimate_vae_decode_bytes`) plus the full-resolution float picture it assembles and blends.
+EXPANDED_CANVAS_TILED_DECODE_BYTES = int(3.2 * GIB)
+EXPANDED_CANVAS_DECODE_BYTES_PER_PIXEL = 24
+# Host memory that grows with the picture rather than the model: the decoded float copies, the
+# 8-bit picture, post-processing copies and the PNG encoder, per image held in one batch.
+EXPANDED_CANVAS_HOST_BYTES_PER_PIXEL = 32
+EXPANDED_CANVAS_HOST_FRACTION = 0.5
+
+
+def expanded_canvas_resource_issue(request: GenerateInput) -> str | None:
+    """Why a canvas past the historical 2048 cannot run on this machine, or `None`.
+
+    Asked before a job exists. A canvas inside 2048 keeps the admission it always had — the
+    runtime's own rungs and offload escalation — so nothing about an old request changes. Past it,
+    the lowest rung still needs the sampler's activations on the card at once, and on Windows an
+    allocation that does not fit is served out of host memory instead of failing, so the job would
+    crawl or die long after it was accepted. The estimates are the same functions the runtime
+    admission uses; nothing is reduced to make a request fit.
+    """
+    if request.postprocess_only or max(request.width, request.height) <= LEGACY_MAX_SAMPLING_EDGE:
+        return None
+    family = request_family(request.engine)
+    if family == "sd":
+        # iL is always SDXL. An SD checkpoint is only known to be SD 1.x once it is loaded, so until
+        # then it is sized as SDXL, the more demanding of the two, rather than read from disk here.
+        family = loaded_family if request.engine == "SD" and loaded_family in {"sd", "sdxl"} and loaded_checkpoint and Path(loaded_checkpoint).name == Path(request.checkpoint or "").name else "sdxl"
+    diagnostics = generation_memory_workload_diagnostics(request, family)
+    width, height, cfg, batch = diagnostics["admission"]
+    inference_bytes = estimate_inference_bytes(family, width, height, cfg, batch, diagnostics["admission_copies"])
+    canvas = f"{request.width}×{request.height}"
+    if diagnostics["stage"] != "base":
+        canvas += f"（后处理阶段 {width}×{height}）"
+    if request.images_per_batch > 1:
+        canvas += f"，单批 {request.images_per_batch} 张"
+    if torch.cuda.is_available():
+        physical_total = installed_vram_bytes()
+        fixed_wall = performance_settings.get("vram_limit_gb", 0.0) > 0
+        limit = effective_vram_limit_bytes(
+            physical_total,
+            performance_settings.get("vram_limit_gb", 0.0),
+            allow_shared_memory=performance_settings["allow_shared_memory"],
+        )
+        budget = limit if fixed_wall else physical_total
+        reserve = 0 if fixed_wall else int(RESERVED_VRAM_GB * GIB) if RESERVED_VRAM_GB is not None else reserved_vram_bytes(
+            physical_total, allow_shared_memory=performance_settings["allow_shared_memory"],
+        )
+        sampling_bytes = inference_bytes + EXPANDED_CANVAS_STREAMED_MODULE_BYTES + reserve
+        largest_output = max([request.width * request.height] + [
+            entry["output_size"][0] * entry["output_size"][1] for entry in resample_chain_plan(request)
+        ])
+        decode_bytes = (
+            EXPANDED_CANVAS_TILED_DECODE_BYTES + EXPANDED_CANVAS_DECODE_BYTES_PER_PIXEL * request.width * request.height + reserve
+            if family in {"sd", "sdxl"} else 0
+        )
+        required = max(sampling_bytes, decode_bytes)
+        if required > budget:
+            stage = "采样" if sampling_bytes >= decode_bytes else "VAE 分块解码"
+            return (
+                f"画布 {canvas} 在本机预计需要约 {required / GIB:.1f} GiB 显存（{stage}），"
+                f"超过可用上限 {budget / GIB:.1f} GiB；请降低画布、批量或后处理尺寸后重试。任务未入队，也不会自动降低分辨率。"
+            )
+    else:
+        largest_output = request.width * request.height
+    psutil = psutil_module()
+    if psutil is not None:
+        host_total = int(psutil.virtual_memory().total)
+        host_bytes = EXPANDED_CANVAS_HOST_BYTES_PER_PIXEL * largest_output * request.images_per_batch
+        if host_bytes > host_total * EXPANDED_CANVAS_HOST_FRACTION:
+            return (
+                f"画布 {canvas} 的图像缓冲预计需要约 {host_bytes / GIB:.1f} GiB 内存，"
+                f"超过本机内存 {host_total / GIB:.1f} GiB 的一半；请降低画布或批量后重试。任务未入队。"
+            )
+    return None
 
 
 def apply_rtx_vsr(
@@ -6315,6 +7744,7 @@ def resample_stage_facts(
         "unit": unit_number,
         "name": settings.name or None,
         "upscaler": settings.upscaler,
+        "latent_algorithm": settings.latent_algorithm,
         "scale": settings.scale,
         "resize_algorithm": settings.resize_algorithm,
         "exact_output": settings.exact_output,
@@ -6342,7 +7772,7 @@ def resample_stage_facts(
     return facts
 
 
-def exact_resample_output(image: Image.Image, settings: ResampleUnitInput, target_size, diagnostics, control, job_id, label):
+def exact_resample_output(image, settings: ResampleUnitInput, target_size, diagnostics, control, job_id, label):
     """Put the picture back on the unit's exact target when it asked for that, and say so either way."""
     executed = tuple(image.size)
     target = tuple(target_size)
@@ -6351,7 +7781,7 @@ def exact_resample_output(image: Image.Image, settings: ResampleUnitInput, targe
     if not settings.exact_output or executed == target:
         return image
     control.checkpoint(job_id, f"{label} exact resize")
-    corrected = resize_image(image, target[0], target[1], settings.resize_algorithm)
+    corrected = resize_image(materialize_image(image), target[0], target[1], settings.resize_algorithm)
     diagnostics.update({
         "exact_output_applied": True,
         "pre_exact_size": list(executed),
@@ -6362,7 +7792,7 @@ def exact_resample_output(image: Image.Image, settings: ResampleUnitInput, targe
 
 
 def apply_resample_unit(
-    image: Image.Image,
+    image: Image.Image | LatentImageArtifact,
     pipeline,
     family: str,
     request: GenerateInput,
@@ -6392,7 +7822,7 @@ def apply_resample_unit(
         return stages()
     try:
         result, diagnostics = stages()
-        capture.stage("final", result)
+        capture.stage("final", materialize_image(result))
         capture.finish(
             status="complete",
             protocol=INFERENCE_PROTOCOL,
@@ -6418,7 +7848,9 @@ def apply_resample_unit(
                     "unit": unit_number,
                     "scale": settings.scale, "steps": diagnostics.get("steps"), "cfg": diagnostics.get("cfg"),
                     "denoise": settings.denoise, "execution_mode": settings.execution_mode,
-                    "resize_algorithm": settings.resize_algorithm, "exact_output": settings.exact_output,
+                    "resize_algorithm": settings.resize_algorithm,
+                    "latent_algorithm": settings.latent_algorithm,
+                    "exact_output": settings.exact_output,
                     "sampler": diagnostics.get("sampler_resolved"), "scheduler": diagnostics.get("scheduler_resolved"),
                     "padding": settings.padding, "mask_blur": settings.mask_blur,
                     "uniform_tiles": settings.uniform_tiles, "tiled_decode": settings.tiled_decode,
@@ -6436,7 +7868,7 @@ def apply_resample_unit(
 
 
 def _apply_resample_unit_stages(
-    image: Image.Image,
+    image: Image.Image | LatentImageArtifact,
     pipeline,
     family: str,
     request: GenerateInput,
@@ -6455,27 +7887,53 @@ def _apply_resample_unit_stages(
         return image, None
     if settings.redraws and effective_seed is None:
         raise ValueError("A resample unit's effective seed must be resolved before the unit runs")
+    if settings.latent_algorithm is not None:
+        if family not in SD_COMPONENT_FAMILIES:
+            raise ValueError(
+                f"潜空间放大运行时仅支持 SD/SDXL family；当前 family 为 {family}"
+            )
+        if settings.upscaler is not None:
+            raise ValueError("Latent resampling cannot be combined with an upscaler model")
+        if settings.execution_mode != "full_frame":
+            raise ValueError("Latent resampling supports full_frame execution only; USDU is unavailable")
+    # A latent artifact is an internal chain value, not a public image boundary. Its logical size is
+    # sufficient for planning and compatible latent units reuse the scaled tensor directly. Only a
+    # pixel/model/callback boundary below is allowed to materialize it.
     base_seed = request.seed if image_seed is None else image_seed
     label = resample_unit_label(settings, unit_number)
     # USDU Auto follows the pre-SR image, even though planning happens after
     # pixel SR has produced the diffusion canvas.
-    resample_source_size = image.size
+    resample_source_size = tuple(image.size)
     unit_steps = settings.resolved_steps(request.steps)
     unit_cfg = settings.resolved_cfg(request.cfg)
-    # SD/iL retain Diffusers' effective callback count. The native engines follow Comfy's
-    # expanded-schedule suffix and always execute every requested step.
-    effective_steps = unit_steps if is_native_family(family) else max(1, int(unit_steps * settings.denoise))
-    sizes = resample_unit_sizes(image.size, settings, family)
-    # `target` is the exact size the chain asked for; `destination` is where the pixels actually
-    # land, which is the engine's grid when a redraw follows and the target itself when none does.
+    # Every refinement reports and executes the requested updates. Native engines build their own
+    # Comfy-style suffix; SD/iL expand Diffusers' schedule below so strength only selects its start.
+    effective_steps = unit_steps
+    schedule_steps = (
+        unit_steps
+        if is_native_family(family) or not settings.redraws
+        else diffusers_schedule_total(unit_steps, settings.denoise)
+    )
+    sizes = resample_unit_sizes(resample_source_size, settings, family)
+    # `target` is the exact logical size the chain asked for; `destination` is the sampler canvas
+    # when a redraw follows and otherwise the same logical target. A no-redraw latent may occupy the
+    # contained VAE grid and defer its few-pixel correction until a real PIL boundary.
     target_size = sizes["target"]
     destination = sizes["redraw"]
     if settings.redraws and max(destination) > engine_max_refinement_edge(family):
         raise ValueError(f"Refinement dimensions cannot exceed {engine_max_refinement_edge(family)}")
     staged_decode = performance_settings["staged_vae_decode"] and not is_native_family(family)
-    resizes = destination != image.size
-    upscale_end = progress_start + round((progress_end - progress_start) * 0.2) if resizes else progress_start
-    sampling_end = progress_end - round((progress_end - progress_start) * 0.15) if staged_decode else progress_end
+    resizes = destination != resample_source_size
+    latent_resample = settings.latent_algorithm is not None
+    upscale_end = (
+        progress_start + round((progress_end - progress_start) * 0.2)
+        if resizes or latent_resample else progress_start
+    )
+    deferred_decode = staged_decode or latent_resample
+    sampling_end = (
+        progress_end - round((progress_end - progress_start) * 0.15)
+        if deferred_decode else progress_end
+    )
     control.checkpoint(job_id, f"{label} upscaling")
     reported_upscale_tiles = [0]
 
@@ -6492,106 +7950,210 @@ def _apply_resample_unit_stages(
         )
         control.checkpoint(job_id, f"{label} upscaling")
 
-    use_cuda_upscaler = bool(settings.upscaler) and any(edge > source for edge, source in zip(destination, image.size)) and torch.cuda.is_available()
-    upscale_warning = None
-    def run_upscaler(device: str, running_label: str):
-        return upscale_image(
-            image,
-            UPSCALER_MODEL_DIRECTORY,
-            settings.upscaler,
-            settings.scale,
-            settings.tile_size,
-            settings.tile_overlap,
-            on_upscale_tile,
-            device=device,
-            checkpoint=lambda: control.checkpoint(job_id, running_label),
-            method=settings.resize_algorithm,
-            destination=destination,
+    latent_generator = None
+    if latent_resample:
+        latent_mode = LATENT_UPSCALE_MODES[settings.latent_algorithm]
+        latent_generator = torch.Generator(device="cpu").manual_seed(
+            effective_seed if effective_seed is not None else base_seed
         )
-
-    if settings.upscaler:
-        update_job(job_id, phase=f"{label} · Loading upscaler", stage="resample_upscale", stage_step=0, stage_total=0, progress=progress_start)
-        try:
-            try:
-                # The upscaler used to be given the card unconditionally, which meant parking the
-                # diffusion model before it and fetching it back for the refinement that follows —
-                # 10.1s out and 2.4s back on a 24 GB card, around an upscale that takes 2.0s. It never
-                # needed the room: the pass is tiled, so its footprint is bounded by one tile rather
-                # than by the picture, and an ESRGAN at a 192-pixel tile peaks far below what sampling
-                # just used with the model resident. So the parking is demand-driven now. Running out
-                # of memory is the signal, and it is answered the way it always was, one step later.
-                upscaled, diagnostics = run_upscaler(
-                    "cuda" if use_cuda_upscaler else "cpu", f"{label} upscaling")
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
-                if not use_cuda_upscaler or not is_oom_error(error):
-                    raise
-                torch.cuda.empty_cache()
-                if not pipeline_cpu_parked:
-                    # The room the tiled pass turned out to need is exactly what parking frees, and
-                    # the GPU pass is worth another attempt before falling back to the CPU one.
-                    update_job(job_id, phase=f"{label} · Parking diffusion model", stage="sampler_offload", progress=progress_start)
-                    park_pipeline_for_external_stage(pipeline, family)
-                    try:
-                        upscaled, diagnostics = run_upscaler("cuda", f"{label} upscaling")
-                    except (torch.cuda.OutOfMemoryError, RuntimeError) as retry_error:
-                        if not is_oom_error(retry_error):
-                            raise
-                        torch.cuda.empty_cache()
-                        upscale_warning = f"{label} upscaler exceeded GPU memory and used CPU fallback"
-                        update_job(job_id, phase=f"{label} · CPU fallback", stage="resample_upscale", warning=append_warning(None, upscale_warning))
-                        upscaled, diagnostics = run_upscaler("cpu", f"{label} CPU upscaling")
-                else:
-                    upscale_warning = f"{label} upscaler exceeded GPU memory and used CPU fallback"
-                    update_job(job_id, phase=f"{label} · CPU fallback", stage="resample_upscale", warning=append_warning(None, upscale_warning))
-                    upscaled, diagnostics = run_upscaler("cpu", f"{label} CPU upscaling")
-        finally:
-            if not is_native_family(family) and pipeline_cpu_parked and not control.cancelled:
-                update_job(job_id, phase=f"{label} · Restoring diffusion model", stage="model_restore")
-                restore_parked_pipeline()
-    else:
-        # No model means no model pass: the unit resizes and that is the whole pixel stage. It is
-        # the same call the model path finishes with, so a unit whose model would have had nothing
-        # to add lands on the same pixels either way.
+        factor = pipeline_vae_scale_factor(pipeline)
+        reuses_latents = (
+            isinstance(image, LatentImageArtifact)
+            and image.family == family
+            and image.vae_scale_factor == factor
+        )
+        if not reuses_latents:
+            plan_residency_for_stage(
+                "hires_latent_encode", family, tuple(destination), unit_cfg, 1, job_id
+            )
+        preparation = "Reusing scaled latents" if reuses_latents else "Encoding image to latents"
+        control.checkpoint(job_id, f"{label} latent {'reuse' if reuses_latents else 'encode'}")
         update_job(
             job_id,
-            phase=f"{label} · Resizing {destination[0]} x {destination[1]}",
-            stage="resample_resize", stage_step=0, stage_total=1, progress=progress_start,
+            phase=f"{label} · {preparation} for {latent_mode['label']}",
+            stage="resample_latent_encode",
+            stage_step=0,
+            stage_total=1,
+            progress=progress_start,
         )
-        control.checkpoint(job_id, f"{label} resizing")
-        upscaled = resize_image(image, destination[0], destination[1], settings.resize_algorithm)
+        if reuses_latents:
+            source_latents = image.latents
+        else:
+            source_latents = encode_image_to_latents(
+                pipeline, materialize_image(image).convert("RGB"), latent_generator
+            )
+        control.checkpoint(job_id, f"{label} latent interpolation")
+        update_job(
+            job_id,
+            phase=f"{label} · {latent_mode['label']} {destination[0]} x {destination[1]}",
+            stage="resample_latent_upscale",
+            stage_step=0,
+            stage_total=1,
+            progress=progress_start,
+        )
+        interpolated, factor = interpolate_image_latents(
+            pipeline, source_latents, destination, settings.latent_algorithm
+        )
+        latent_decode_size = (
+            int(interpolated.shape[-1]) * factor,
+            int(interpolated.shape[-2]) * factor,
+        )
+        upscaled = make_latent_image_artifact(
+            interpolated,
+            latent_decode_size,
+            pipeline,
+            family,
+            job_id,
+            control,
+            staged_decode=staged_decode,
+            start_progress=upscale_end,
+            final_progress=progress_end,
+            phase_prefix=label,
+            output_size=target_size if not settings.redraws else None,
+            output_resize_algorithm=settings.resize_algorithm if not settings.redraws else None,
+        )
         diagnostics = {
             "model": None,
             "scale": settings.scale,
-            "source_size": list(image.size),
+            "source_size": list(resample_source_size),
             "target_size": list(destination),
             "resize_algorithm": settings.resize_algorithm,
+            "latent_algorithm": settings.latent_algorithm,
+            "latent_mode": latent_mode["mode"],
+            "latent_antialias": latent_mode["antialias"],
+            "vae_scale_factor": factor,
+            "latent_decode_size": list(latent_decode_size),
             "upscaler_applied": False,
-            "device": "cpu",
+            "device": interpolated.device.type,
         }
         update_job(
             job_id,
-            phase=f"{label} · Resizing {destination[0]} x {destination[1]}",
-            stage="resample_resize", stage_step=1, stage_total=1, progress=upscale_end,
+            phase=f"{label} · {latent_mode['label']} {destination[0]} x {destination[1]}",
+            stage="resample_latent_upscale",
+            stage_step=1,
+            stage_total=1,
+            progress=upscale_end,
         )
+        upscale_warning = None
+    else:
+        image = materialize_image(image)
+        use_cuda_upscaler = bool(settings.upscaler) and any(
+            edge > source for edge, source in zip(destination, image.size)
+        ) and torch.cuda.is_available()
+        upscale_warning = None
+        def run_upscaler(device: str, running_label: str):
+            return upscale_image(
+                image,
+                UPSCALER_MODEL_DIRECTORY,
+                settings.upscaler,
+                settings.scale,
+                settings.tile_size,
+                settings.tile_overlap,
+                on_upscale_tile,
+                device=device,
+                checkpoint=lambda: control.checkpoint(job_id, running_label),
+                method=settings.resize_algorithm,
+                destination=destination,
+            )
+
+        if settings.upscaler:
+            update_job(job_id, phase=f"{label} · Loading upscaler", stage="resample_upscale", stage_step=0, stage_total=0, progress=progress_start)
+            try:
+                try:
+                    # The upscaler used to be given the card unconditionally, which meant parking the
+                    # diffusion model before it and fetching it back for the refinement that follows —
+                    # 10.1s out and 2.4s back on a 24 GB card, around an upscale that takes 2.0s. It never
+                    # needed the room: the pass is tiled, so its footprint is bounded by one tile rather
+                    # than by the picture, and an ESRGAN at a 192-pixel tile peaks far below what sampling
+                    # just used with the model resident. So the parking is demand-driven now. Running out
+                    # of memory is the signal, and it is answered the way it always was, one step later.
+                    upscaled, diagnostics = run_upscaler(
+                        "cuda" if use_cuda_upscaler else "cpu", f"{label} upscaling")
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+                    if not use_cuda_upscaler or not is_oom_error(error):
+                        raise
+                    torch.cuda.empty_cache()
+                    if not pipeline_cpu_parked:
+                        # The room the tiled pass turned out to need is exactly what parking frees, and
+                        # the GPU pass is worth another attempt before falling back to the CPU one.
+                        update_job(job_id, phase=f"{label} · Parking diffusion model", stage="sampler_offload", progress=progress_start)
+                        park_pipeline_for_external_stage(pipeline, family)
+                        try:
+                            upscaled, diagnostics = run_upscaler("cuda", f"{label} upscaling")
+                        except (torch.cuda.OutOfMemoryError, RuntimeError) as retry_error:
+                            if not is_oom_error(retry_error):
+                                raise
+                            torch.cuda.empty_cache()
+                            upscale_warning = f"{label} upscaler exceeded GPU memory and used CPU fallback"
+                            update_job(job_id, phase=f"{label} · CPU fallback", stage="resample_upscale", warning=append_warning(None, upscale_warning))
+                            upscaled, diagnostics = run_upscaler("cpu", f"{label} CPU upscaling")
+                    else:
+                        upscale_warning = f"{label} upscaler exceeded GPU memory and used CPU fallback"
+                        update_job(job_id, phase=f"{label} · CPU fallback", stage="resample_upscale", warning=append_warning(None, upscale_warning))
+                        upscaled, diagnostics = run_upscaler("cpu", f"{label} CPU upscaling")
+            finally:
+                if not is_native_family(family) and pipeline_cpu_parked and not control.cancelled:
+                    update_job(job_id, phase=f"{label} · Restoring diffusion model", stage="model_restore")
+                    restore_parked_pipeline()
+        else:
+            # No model means no model pass: the unit resizes and that is the whole pixel stage. It is
+            # the same call the model path finishes with, so a unit whose model would have had nothing
+            # to add lands on the same pixels either way.
+            update_job(
+                job_id,
+                phase=f"{label} · Resizing {destination[0]} x {destination[1]}",
+                stage="resample_resize", stage_step=0, stage_total=1, progress=progress_start,
+            )
+            control.checkpoint(job_id, f"{label} resizing")
+            upscaled = resize_image(image, destination[0], destination[1], settings.resize_algorithm)
+            diagnostics = {
+                "model": None,
+                "scale": settings.scale,
+                "source_size": list(image.size),
+                "target_size": list(destination),
+                "resize_algorithm": settings.resize_algorithm,
+                "upscaler_applied": False,
+                "device": "cpu",
+            }
+            update_job(
+                job_id,
+                phase=f"{label} · Resizing {destination[0]} x {destination[1]}",
+                stage="resample_resize", stage_step=1, stage_total=1, progress=upscale_end,
+            )
 
     if settings.redraws and is_native_family(family) and max(upscaled.size) > NATIVE_MAX_REFINEMENT_EDGE:
         raise ValueError(f"Native refinement dimensions cannot exceed {NATIVE_MAX_REFINEMENT_EDGE}")
-    capture.stage("base", image)
-    capture.stage("post_sr", upscaled)
     # Denoise 0 asks for the enlargement without the redraw, so the unit is finished here: there is
     # no sampler to configure, no seed to spend and no schedule to build.
     if not settings.redraws:
+        result = upscaled if latent_resample else materialize_image(upscaled).convert("RGB")
+        if latent_resample and latent_decode_size != target_size:
+            diagnostics.update({
+                "latent_output_resize_applied": True,
+                "pre_output_resize_size": list(latent_decode_size),
+            })
+        if capture.enabled:
+            capture.stage("base", materialize_image(image))
+            capture.stage("post_sr", materialize_image(result))
         diagnostics.update(resample_stage_facts(
             settings, unit_number, base_seed, None,
             source_size=resample_source_size, target_size=target_size,
-            executed_size=upscaled.size, steps=None, cfg=None,
+            executed_size=result.size, steps=None, cfg=None,
             sampler_resolved=None, scheduler_resolved=None, execution_mode="resize_only",
         ))
         if upscale_warning:
             diagnostics["warning"] = upscale_warning
-        return upscaled.convert("RGB"), diagnostics
+        return result, diagnostics
+    if capture.enabled:
+        capture.stage("base", materialize_image(image))
+        capture.stage("post_sr", materialize_image(upscaled))
     control.checkpoint(job_id, f"{label} diffusion refinement")
-    phase = f"{label} · Diffusion {destination[0]} x {destination[1]}"
+    phase = (
+        f"{label} · {LATENT_UPSCALE_MODES[settings.latent_algorithm]['label']} diffusion "
+        f"{destination[0]} x {destination[1]}"
+        if latent_resample
+        else f"{label} · Diffusion {destination[0]} x {destination[1]}"
+    )
     resolved_sampler = settings.sampler or request.sampler
     resolved_scheduler = settings.scheduler or request.scheduler
     if not is_native_family(family):
@@ -6797,13 +8359,20 @@ def _apply_resample_unit_stages(
     # back and the upscaler has been parked, so where the diffusion model should live is a different
     # question from the one the base pass answered — and on a 1152x1920 redraw it is the question
     # that used to be answered once, for the whole chain, by whichever stage needed the most.
-    plan_residency_for_stage("hires_sampling", family, tuple(target_size), unit_cfg, 1, job_id)
+    plan_residency_for_stage("hires_sampling", family, tuple(destination), unit_cfg, 1, job_id)
     image_pipeline, guidance_kwargs = derived_sampling_pipeline(
         pipeline, AutoPipelineForImage2Image, request.guidance, request.pag
     )
     if settings.sampler is not None or settings.scheduler is not None:
         configure_scheduler(image_pipeline, resolved_sampler, resolved_scheduler)
-    conditioning = prepare_prompt_conditioning(image_pipeline, family, request.prompt, request.negative_prompt)
+    # A redraw after a base pass continues the base pass's schedule timeline, as Forge's
+    # Hires fix does; `pipeline` still carries the base pass's scheduler.
+    base_timeline = None if request.postprocess_only else sampling_timeline(pipeline, request.steps)
+    conditioning = prepare_dynamic_prompt_conditioning(
+        image_pipeline, family, request.prompt, request.negative_prompt,
+        timeline=sampling_timeline(image_pipeline, unit_steps, continues=base_timeline),
+        clip_skip=effective_clip_skip(request),
+    )
     last_hires_step = [0]
 
     def on_hires_step(_pipeline, step_index, _timestep, callback_kwargs):
@@ -6827,23 +8396,39 @@ def _apply_resample_unit_stages(
 
     update_job(job_id, phase=phase, stage="resample_sampling", stage_step=0, stage_total=effective_steps, progress=upscale_end, step=0, total_steps=effective_steps)
     try:
+        pipeline_input = upscaled.latents if isinstance(upscaled, LatentImageArtifact) else upscaled
+        refinement_generator = latent_generator or torch.Generator(device="cpu").manual_seed(hires_seed)
         pipeline_output = run_guided_pipeline(
             pipeline,
             image_pipeline,
             {
-                "image": upscaled,
+                "image": pipeline_input,
                 "strength": settings.denoise,
-                "num_inference_steps": unit_steps,
+                "num_inference_steps": schedule_steps,
                 "guidance_scale": unit_cfg,
-                "generator": torch.Generator(device="cpu").manual_seed(hires_seed),
+                "generator": refinement_generator,
                 "callback_on_step_end": on_hires_step,
                 "callback_on_step_end_tensor_inputs": ["latents"],
-                "output_type": "latent" if staged_decode else "pil",
+                "output_type": "latent" if deferred_decode else "pil",
                 **conditioning,
             },
             guidance_kwargs,
+            conditioning,
         ).images
-        if staged_decode:
+        if latent_resample:
+            result = make_latent_image_artifact(
+                pipeline_output,
+                destination,
+                pipeline,
+                family,
+                job_id,
+                control,
+                staged_decode=staged_decode,
+                start_progress=sampling_end,
+                final_progress=progress_end,
+                phase_prefix=label,
+            )
+        elif staged_decode:
             pipeline_output = pipeline_output.to("cpu")
             decoded = decode_staged_latents(
                 pipeline,
@@ -6909,16 +8494,13 @@ def anima_detail_processing_size(crop_box):
 def adetailer_effective_steps(settings: ADetailerUnitInput, request: GenerateInput, family: str) -> int:
     """How many denoise updates one detail pass actually performs.
 
-    The same family split `base_sampling_steps` and `_apply_hires_fix_stages` already make. Diffusers
-    inpainting runs `int(steps * strength)` of them, so `steps` alone would overstate the pass. Native
-    refinement follows Comfy: it builds a longer schedule and keeps the last `steps + 1` sigmas,
-    so it executes **every** requested step whatever the denoise, and `int(steps * denoise)` would
-    understate it — which is what drove the job's step counter past its own total.
+    Every family now executes the requested count. Native refinement already builds a Comfy-style
+    suffix; SD/iL receive an expanded Diffusers schedule in `apply_adetailer_unit` so strength selects
+    the starting noise without shrinking this count. The family argument stays in the stable helper
+    signature used by the accounting call sites.
     """
     detail_steps = settings.steps if settings.use_steps else request.steps
-    if is_native_family(family):
-        return detail_steps
-    return int(detail_steps * settings.denoise)
+    return detail_steps
 
 
 def apply_adetailer_unit(
@@ -6942,8 +8524,11 @@ def apply_adetailer_unit(
     detail_steps = settings.steps if settings.use_steps else request.steps
     detail_cfg = settings.cfg if settings.use_cfg else request.cfg
     effective_steps = adetailer_effective_steps(settings, request, family)
-    if effective_steps < 1:
-        raise ValueError("ADetailer steps multiplied by denoise must be at least 1")
+    schedule_steps = (
+        detail_steps
+        if is_native_family(family)
+        else diffusers_schedule_total(detail_steps, settings.denoise)
+    )
     # Where the job-wide step counter starts. The base pass is behind us, so its steps are counted as
     # done — but only the ones it actually performed: post-processing mode runs none, and Diffusers
     # image-to-image runs `int(steps * strength)` rather than the requested count.
@@ -7139,7 +8724,11 @@ def apply_adetailer_unit(
     detail_pipeline, guidance_kwargs = derived_sampling_pipeline(
         pipeline, AutoPipelineForInpainting, request.guidance, request.pag
     )
-    conditioning = prepare_prompt_conditioning(detail_pipeline, family, detail_prompt, detail_negative_prompt)
+    conditioning = prepare_dynamic_prompt_conditioning(
+        detail_pipeline, family, detail_prompt, detail_negative_prompt,
+        timeline=sampling_timeline(detail_pipeline, detail_steps),
+        clip_skip=effective_clip_skip(request),
+    )
     sample_size = detail_pipeline.unet.config.sample_size
     vae_scale = detail_pipeline.vae_scale_factor
     if isinstance(sample_size, (tuple, list)):
@@ -7214,7 +8803,7 @@ def apply_adetailer_unit(
                 "image": current_image,
                 "mask_image": hard_mask,
                 "strength": settings.denoise,
-                "num_inference_steps": detail_steps,
+                "num_inference_steps": schedule_steps,
                 "guidance_scale": detail_cfg,
                 "generator": generator,
                 "callback_on_step_end": on_detail_step,
@@ -7223,7 +8812,7 @@ def apply_adetailer_unit(
             kwargs["padding_mask_crop"] = settings.padding
             kwargs.update(conditioning)
             detailed = run_guided_pipeline(
-                pipeline, detail_pipeline, kwargs, guidance_kwargs
+                pipeline, detail_pipeline, kwargs, guidance_kwargs, conditioning
             ).images[0].convert("RGB")
             current_image = Image.composite(detailed, current_image, soft_mask)
             detection_states[index]["status"] = "complete"
@@ -7355,17 +8944,12 @@ def cleanup_job_stage_previews(job_id: str):
             remove_preview(stage_path)
 
 
-def create_output_path():
-    now = datetime.now()
-    directory = OUTPUT_DIRECTORY / now.strftime("%Y-%m-%d")
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = f"XirAI-{now:%Y-%m-%d-%H-%M}"
-    output_path = directory / f"{stem}.png"
-    index = 2
-    while output_path.exists():
-        output_path = directory / f"{stem}-{index:02d}.png"
-        index += 1
-    return output_path
+def output_relative_path(path: Path) -> str:
+    """Where a picture sits beneath the output root, as the only location a record may carry."""
+    try:
+        return path.resolve().relative_to(OUTPUT_DIRECTORY.resolve()).as_posix()
+    except ValueError:
+        return path.name
 
 
 def output_seed(request: GenerateInput, batch_index: int, image_index: int):
@@ -7469,6 +9053,85 @@ def run_pipeline_batch(pipeline, pipeline_kwargs):
     return outputs
 
 
+# How much of a workflow failure reaches the job's warning line.
+WORKFLOW_WARNING_LIMIT = 200
+
+
+def comfy_workflow_facts(request: GenerateInput, *, seed, resample_results, identity, background_removal=False) -> WorkflowFacts:
+    """What one picture executed, in the shape `build_workflow` reads.
+
+    `request` is the runtime request: its prompt is the text the encoders were given and its LoRAs
+    include the ones inline tags resolved to. Each resample unit's seed, steps and sizes come from
+    the record the unit wrote while it ran, so a random seed is the one it actually drew.
+    """
+    family = request_family(request.engine)
+    executed = {
+        record["unit"]: record
+        for record in resample_results or []
+        if isinstance(record, dict) and isinstance(record.get("unit"), int)
+    }
+    stages = []
+    for stage in request.postprocess_chain:
+        if not stage.enabled:
+            continue
+        if stage.type != "resample":
+            stages.append(stage.type)
+            continue
+        number = request.resample_unit_number(stage)
+        record = executed.get(number)
+        if record is None:
+            raise RuntimeError(f"resample unit {number} left no execution record")
+        source = tuple(int(edge) for edge in record["source_size"])
+        sizes = resample_unit_sizes(source, stage, family)
+        recorded_seed = record.get("seed")
+        stages.append(ResampleStage(
+            number=number,
+            redraws=stage.redraws,
+            tiled=stage.execution_mode == "usdu_tiled" and supports_usdu_tiled(family),
+            upscaler=stage.upscaler,
+            latent_algorithm=stage.latent_algorithm,
+            resize_algorithm=stage.resize_algorithm,
+            denoise=stage.denoise,
+            steps=record.get("steps") if stage.redraws else None,
+            cfg=record.get("cfg") if stage.redraws else None,
+            sampler=record.get("sampler_resolved") or stage.sampler or request.sampler,
+            scheduler=record.get("scheduler_resolved") or stage.scheduler or request.scheduler,
+            seed=int(recorded_seed) if recorded_seed is not None else (int(seed) if stage.redraws else None),
+            source_size=source,
+            target_size=tuple(sizes["target"]),
+            redraw_size=tuple(sizes["redraw"]),
+            output_size=tuple(int(edge) for edge in (record.get("executed_size") or sizes["output"])),
+        ))
+    return WorkflowFacts(
+        identity=identity,
+        seed=int(seed),
+        positive=request.prompt,
+        negative=request.negative_prompt,
+        loras=tuple((item.path, float(item.weight)) for item in request.loras),
+        clip_skip=effective_clip_skip(request),
+        stages=tuple(stages),
+        background_removal=bool(background_removal),
+    )
+
+
+def embedded_workflow_text(request: GenerateInput, **facts):
+    """The `workflow` chunk for one picture, and a warning; at most one of them is set.
+
+    Never raises: a graph that cannot be built costs the chunk, never the picture.
+    """
+    try:
+        workflow = build_workflow(request, comfy_workflow_facts(request, **facts))
+    except Exception as error:
+        traceback.print_exc()
+        detail = f"{type(error).__name__}: {error}"
+        return None, f"ComfyUI 工作流未嵌入：{detail[:WORKFLOW_WARNING_LIMIT]}"
+    if workflow is None:
+        return None, None
+    # ASCII keeps the chunk a plain tEXt block that every ComfyUI frontend reads; JSON escapes carry
+    # non-Latin prompt text through unchanged.
+    return json.dumps(workflow, ensure_ascii=True, separators=(",", ":")), None
+
+
 def save_image(
     image,
     job_id: str,
@@ -7482,18 +9145,23 @@ def save_image(
     background_removal_result=None,
     *,
     conditioning_prompt=None,
+    inline_loras=None,
     seed=None,
     chain_seeds=None,
     batch_index=1,
     image_index=1,
     before_commit=None,
+    workflow_request=None,
+    workflow_warnings=None,
 ):
     base_seed = request.seed if seed is None else seed
     resample_results = list(resample_results or [])
     if any(unit.redraws for unit in request.active_resample_units) and not chain_seeds:
         raise ValueError("Resample seeds must be resolved before saving an output that redraws")
-    output_path = create_output_path()
-    temporary_path = output_path.with_name(f".{output_path.stem}-{uuid.uuid4().hex}.tmp")
+    # The job's frozen template (or the historical scheme) names the folder and stem now; the file
+    # name itself is only settled when the finished picture is published, exclusively.
+    target = output_target(OUTPUT_DIRECTORY, request.output_template, moment=datetime.now(), engine=request.engine, create=True)
+    temporary_path = temporary_output_path(target)
     metadata = PngInfo()
     metadata.add_text("prompt", request.prompt)
     metadata.add_text("negative_prompt", request.negative_prompt)
@@ -7508,6 +9176,8 @@ def save_image(
         "steps": request.steps,
         "cfg": request.cfg,
         "denoise": request.denoise,
+        "img2img_fix_steps": uses_diffusers_img2img_fix_steps(request),
+        "img2img_schedule_steps": img2img_schedule_steps(request),
         **output_seed_facts(request, base_seed, chain_seeds),
         "images_per_batch": request.images_per_batch,
         "batch_count": request.batch_count,
@@ -7545,11 +9215,25 @@ def save_image(
         "rtx": rtx_result if request.rtx.enabled else None,
         "postprocess_stages": postprocess_stage_types(request),
         "postprocess_only": request.postprocess_only,
-        "loras": [{"name": Path(item.path).name, "weight": item.weight} for item in request.loras],
+        # `path` is the relative ID the job mounted (inside its engine's LoRA root, or a
+        # `shared:<id>/...` reference), so a reader can match the exact file among same-named ones.
+        "loras": [{"name": Path(item.path).name, "path": public_model_reference(item.path), "weight": item.weight} for item in request.loras],
         "elapsed_seconds": round(elapsed, 3),
         "wall_elapsed_seconds": round(wall_elapsed, 3),
         "paused_seconds": round(paused_seconds, 3),
     }
+    clip_skip = effective_clip_skip(request)
+    if clip_skip is not None:
+        parameters["clip_skip"] = clip_skip
+    if request.output_template is not None:
+        parameters["output_template"] = request.output_template
+    if inline_loras:
+        parameters["inline_loras"] = copy.deepcopy(list(inline_loras))
+    lora_fusion = getattr(loaded_pipeline, "_xiriai_lora_fusion_report", None)
+    if request.engine in {"SD", "iL"} and isinstance(lora_fusion, dict):
+        # The report contains only basenames, counts and a digest of the trusted
+        # relative signature; never copy the private pipeline signature itself.
+        parameters["lora_fusion"] = dict(lora_fusion)
     if request.engine == "Anima":
         parameters.update({
             "diffusion_model": public_model_reference(request.diffusion_model),
@@ -7606,16 +9290,29 @@ def save_image(
     if conditioning_prompt and conditioning_prompt != request.prompt:
         parameters["conditioning_prompt"] = conditioning_prompt
     metadata.add_text("parameters", json.dumps(parameters, ensure_ascii=False))
+    # The runtime request, when the caller has it, is what ran: inline tags resolved into LoRAs and
+    # the prompt the encoders were given. The submitted one still describes the job above.
+    workflow_text, workflow_warning = embedded_workflow_text(
+        workflow_request or request,
+        seed=base_seed,
+        resample_results=resample_results,
+        identity=f"{job_id}/{batch_index}/{image_index}",
+        background_removal=bool(background_removal_result),
+    )
+    if workflow_text is not None:
+        metadata.add_text("workflow", workflow_text)
+    if workflow_warning and workflow_warnings is not None:
+        workflow_warnings.append(workflow_warning)
     if background_removal_result and image.mode != "RGBA":
         raise RuntimeError("透明背景处理未生成 RGBA 图像，已停止保存")
     try:
         image.save(temporary_path, format="PNG", pnginfo=metadata)
         if before_commit:
             before_commit()
-        os.replace(temporary_path, output_path)
-    except Exception:
+        # Exclusive publish: an existing picture is never replaced, even by a second process.
+        output_path = publish_exclusive(temporary_path, target)
+    except BaseException:
         temporary_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
         raise
     return output_path
 
@@ -7704,17 +9401,34 @@ def pipeline_component_diagnostics():
     return components
 
 
+def generation_failure_message(error: Exception) -> str:
+    if isinstance(error, LoraPatchError):
+        return " ".join(str(error).split())[:960]
+    return str(error)
+
+
+def generation_failure_trace(error: Exception) -> str:
+    if isinstance(error, LoraPatchError):
+        # The exception is already bounded and path-sanitized. Do not persist
+        # source frames or chained dependency errors for this dedicated class.
+        return "".join(traceback.format_exception_only(type(error), error)).strip()[:1100]
+    return traceback.format_exc()
+
+
 def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exception, failure_kind=None):
     try:
         with jobs_lock:
             job = jobs.get(job_id, {})
         out_of_memory = is_oom_error(error)
         failure_kind = failure_kind or ("generation-memory-failure" if out_of_memory else "generation-failure")
+        error_message = generation_failure_message(error)
+        submitted_prompt = str(job.get("prompt", request.prompt))
+        submitted_negative = str(job.get("negative_prompt", request.negative_prompt))
         details = {
             "job_id": job_id,
             "failure": {
                 "type": type(error).__name__,
-                "message": str(error),
+                "message": error_message,
                 "phase": job.get("phase"),
                 "stage": job.get("stage"),
                 "stage_step": job.get("stage_step"),
@@ -7734,6 +9448,8 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                 "steps": request.steps,
                 "cfg": request.cfg,
                 "denoise": request.denoise,
+                "img2img_fix_steps": uses_diffusers_img2img_fix_steps(request),
+                "img2img_schedule_steps": img2img_schedule_steps(request),
                 "seed": request.seed,
                 "images_per_batch": request.images_per_batch,
                 "batch_count": request.batch_count,
@@ -7741,11 +9457,20 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                 "scheduler": request.scheduler,
                 "guidance": request.guidance,
                 "pag": request.pag.model_dump(),
+                "prompt_sha256": hashlib.sha256(submitted_prompt.encode("utf-8")).hexdigest(),
+                "prompt_length": len(submitted_prompt),
+                "negative_prompt_sha256": hashlib.sha256(submitted_negative.encode("utf-8")).hexdigest(),
+                "negative_prompt_length": len(submitted_negative),
+                "prompt_encoding": copy.deepcopy(job.get("prompt_encoding")),
                 "source_image_enabled": request.source_image.enabled,
                 "source_image_resize_mode": request.source_image.resize_mode if request.source_image.enabled else None,
                 "postprocess_only": request.postprocess_only,
                 "lora_count": len(request.loras),
-                "loras": [{"path": item.path, "weight": item.weight} for item in request.loras],
+                "loras": [
+                    {"path": public_model_reference(item.path), "weight": item.weight}
+                    for item in request.loras
+                ],
+                "lora_resolution": copy.deepcopy(job.get("inline_loras") or []),
                 "adetailer_enabled": request.adetailer.enabled,
                 "adetailer_units": len(request.adetailer.active_units),
                 "adetailer_detector": " · ".join(unit.detector for unit in request.adetailer.active_units) or None,
@@ -7754,7 +9479,9 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                     {
                         "unit": request.resample_unit_number(unit), "upscaler": unit.upscaler,
                         "scale": unit.scale, "denoise": unit.denoise,
-                        "resize_algorithm": unit.resize_algorithm, "execution_mode": unit.execution_mode,
+                        "resize_algorithm": unit.resize_algorithm,
+                        "latent_algorithm": unit.latent_algorithm,
+                        "execution_mode": unit.execution_mode,
                     }
                     for unit in request.active_resample_units
                 ],
@@ -7790,6 +9517,7 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                 "loaded_family": loaded_family,
                 "loaded_engine": loaded_engine,
             },
+            "lora_fusion": job.get("lora_fusion") if isinstance(job.get("lora_fusion"), dict) else None,
             "cuda_memory": cuda_memory_diagnostics(),
             "system_memory": system_memory_diagnostics(),
             "pipeline_components": pipeline_component_diagnostics(),
@@ -7800,13 +9528,13 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
             "XiriaCanvas AI diagnostic log",
             f"Time: {created_at.isoformat()}",
             f"Type: {failure_kind}",
-            f"Message: {error}",
+            f"Message: {error_message}",
             "",
             "Details:",
             json.dumps(details, ensure_ascii=False, indent=2),
             "",
             "Traceback:",
-            traceback.format_exc(),
+            generation_failure_trace(error),
         ])
         LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
         (LOG_DIRECTORY / filename).write_text(content, encoding="utf-8")
@@ -7842,7 +9570,12 @@ def write_cpu_mode_log():
         pass
 
 
-def run_generation(job_id: str, request: GenerateInput):
+def run_generation(
+    job_id: str,
+    request: GenerateInput,
+    audit_request: GenerateInput | None = None,
+    inline_lora_audit=None,
+):
     global active_attention_backend, active_vae_mode
     control = job_controls.get(job_id)
     # A queued job can be cancelled before the worker ever reaches it. Checking here means it is
@@ -7854,7 +9587,7 @@ def run_generation(job_id: str, request: GenerateInput):
             progress=0, completed_at=time.time(),
         )
         return
-    original_request = request
+    original_request = audit_request or request
     cleaned_prompt, directives = parse_prompt_directives(request.prompt)
     transparent_background = directives["transparent_background"]
     conditioning_prompt = transparent_conditioning_prompt(cleaned_prompt) if transparent_background else cleaned_prompt
@@ -7878,7 +9611,7 @@ def run_generation(job_id: str, request: GenerateInput):
             except OSError:
                 pass
 
-    def publish_stage_preview(image: Image.Image, stage: str, image_index: int = 0, label: str | None = None):
+    def publish_stage_preview(image, stage: str, image_index: int = 0, label: str | None = None):
         """Record one finished stage's picture on the job.
 
         This is the settled result of a stage that has just finished, published while the next
@@ -7887,11 +9620,15 @@ def run_generation(job_id: str, request: GenerateInput):
         the whole of whatever follows it. With several resample units, `label` is what tells two of
         them apart on screen -- they share a stage type and differ only by their number.
         """
+        # A latent artifact's decode is part of generation, not a best-effort preview operation.
+        # Materialize outside the preview-only exception boundary so NaN/OOM/cancellation cannot be
+        # swallowed and retried later. The artifact memoizes this image for every downstream user.
+        preview_image = materialize_image(image)
         try:
             with jobs_lock:
                 job = jobs.get(job_id)
                 index = len(job.get("stage_previews") or []) if job else 0
-            stage_path = save_stage_preview(image, job_id, stage, index)
+            stage_path = save_stage_preview(preview_image, job_id, stage, index)
         except Exception:
             # A stage picture is a convenience. Losing one must never take the generation with it.
             traceback.print_exc()
@@ -7909,8 +9646,8 @@ def run_generation(job_id: str, request: GenerateInput):
                 "label": label or STAGE_PREVIEW_LABELS.get(stage, stage),
                 "image_index": image_index,
                 "url": f"/api/inference/jobs/{job_id}/stages/{index}",
-                "width": image.width,
-                "height": image.height,
+                "width": preview_image.width,
+                "height": preview_image.height,
                 "created_at": time.time(),
             })
             paths.append(str(stage_path))
@@ -8272,8 +10009,8 @@ def run_generation(job_id: str, request: GenerateInput):
             # which is the order the plan asks for (P1-6).
             if active_residency is not None:
                 active_residency.measure()
-            prompt_info = prompt_diagnostics(pipeline.tokenizer, request.prompt)
-            negative_prompt_info = prompt_diagnostics(pipeline.tokenizer, request.negative_prompt)
+            prompt_info = forge_prompt_diagnostics(pipeline.tokenizer, request.prompt)
+            negative_prompt_info = forge_prompt_diagnostics(pipeline.tokenizer, request.negative_prompt)
             prompt_weighted_tokens = prompt_info["weighted_tokens"]
             negative_prompt_weighted_tokens = negative_prompt_info["weighted_tokens"]
         update_job(
@@ -8290,8 +10027,10 @@ def run_generation(job_id: str, request: GenerateInput):
             negative_prompt_weighted_tokens=negative_prompt_weighted_tokens,
         )
 
-        conditioning = None if is_native_family(family) else prepare_prompt_conditioning(
-            pipeline, family, request.prompt, request.negative_prompt
+        conditioning = None if is_native_family(family) else prepare_dynamic_prompt_conditioning(
+            pipeline, family, request.prompt, request.negative_prompt,
+            timeline=sampling_timeline(pipeline, request.steps),
+            clip_skip=effective_clip_skip(request),
         )
         if ultra_low_memory:
             update_job(job_id, phase="Releasing prompt encoders", progress=24)
@@ -8566,7 +10305,9 @@ def run_generation(job_id: str, request: GenerateInput):
                 )
                 if performance_settings["staged_vae_decode"]:
                     pipeline_kwargs["output_type"] = "latent"
-                    latents = run_guided_pipeline_batch(pipeline, request.guidance, pipeline_kwargs, request.pag, sampling_factory)
+                    latents = run_guided_pipeline_batch(
+                        pipeline, request.guidance, pipeline_kwargs, request.pag, sampling_factory, conditioning
+                    )
                     latents = latents.to("cpu")
                     images = decode_staged_latents(
                         pipeline,
@@ -8580,7 +10321,9 @@ def run_generation(job_id: str, request: GenerateInput):
                     )
                     del latents
                 else:
-                    images = run_guided_pipeline_batch(pipeline, request.guidance, pipeline_kwargs, request.pag, sampling_factory)
+                    images = run_guided_pipeline_batch(
+                        pipeline, request.guidance, pipeline_kwargs, request.pag, sampling_factory, conditioning
+                    )
             if len(images) != request.images_per_batch:
                 raise RuntimeError(
                     f"Pipeline returned {len(images)} images for a requested batch of {request.images_per_batch}"
@@ -8611,6 +10354,10 @@ def run_generation(job_id: str, request: GenerateInput):
                         control.checkpoint(job_id, "Restoring sampler for ADetailer")
                         update_job(job_id, phase="Restoring model for ADetailer", stage="model_restore", progress=round(stage_start))
                         restore_parked_pipeline()
+                    if post_stage.type == "resample" and pipeline_cpu_parked:
+                        control.checkpoint(job_id, "Restoring sampler for resample")
+                        update_job(job_id, phase="Restoring model for resample", stage="model_restore", progress=round(stage_start))
+                        restore_parked_pipeline()
                     if post_stage.type == "resample":
                         unit_number = request.resample_unit_number(post_stage)
                         image, resample_result = apply_resample_unit(
@@ -8635,6 +10382,7 @@ def run_generation(job_id: str, request: GenerateInput):
                             warning = append_warning(warning, resample_warning)
                             update_job(job_id, warning=warning)
                     elif post_stage.type == "adetailer":
+                        image = materialize_image(image)
                         image, adetailer_result, adetailer_warning = apply_adetailer(
                             image,
                             pipeline,
@@ -8651,6 +10399,7 @@ def run_generation(job_id: str, request: GenerateInput):
                             warning = append_warning(warning, adetailer_warning)
                             update_job(job_id, warning=warning)
                     elif post_stage.type == "rtx":
+                        image = materialize_image(image)
                         image, rtx_result = apply_rtx_vsr(
                             image,
                             pipeline,
@@ -8670,6 +10419,10 @@ def run_generation(job_id: str, request: GenerateInput):
                         image, post_stage.type, image_index,
                         label=f"重采样 {request.resample_unit_number(post_stage)}" if post_stage.type == "resample" else None,
                     )
+                # The ordered chain is allowed to carry a latent internally, but every external
+                # consumer and the chain tail are PIL. This is a cache hit when the stage preview
+                # already materialized the same artifact; it never performs a second full decode.
+                image = materialize_image(image)
                 background_removal_result = None
                 if transparent_background:
                     control.checkpoint(job_id, "Removing background")
@@ -8705,6 +10458,7 @@ def run_generation(job_id: str, request: GenerateInput):
                 wall_elapsed = time.time() - started_at
                 paused_seconds = control.total_paused()
                 elapsed = max(0.0, wall_elapsed - paused_seconds)
+                workflow_warnings = []
                 output_path = save_image(
                     image,
                     job_id,
@@ -8717,12 +10471,19 @@ def run_generation(job_id: str, request: GenerateInput):
                     rtx_result,
                     background_removal_result,
                     conditioning_prompt=conditioning_prompt,
+                    inline_loras=inline_lora_audit,
                     seed=base_seed,
                     chain_seeds=chain_seeds,
                     batch_index=batch_index + 1,
                     image_index=image_index + 1,
                     before_commit=lambda: control.checkpoint(job_id, "Committing image"),
+                    workflow_request=request,
+                    workflow_warnings=workflow_warnings,
                 )
+                for workflow_warning in workflow_warnings:
+                    if workflow_warning not in (warning or ""):
+                        warning = append_warning(warning, workflow_warning)
+                        update_job(job_id, warning=warning)
                 output_paths.append(output_path)
                 control.checkpoint(job_id, "Recording saved image")
                 output_records.append({
@@ -8734,6 +10495,8 @@ def run_generation(job_id: str, request: GenerateInput):
                     "width": image.width,
                     "height": image.height,
                     "output_name": output_path.name,
+                    # Relative to the output root; the absolute path stays in the private fields.
+                    "output_relative": output_relative_path(output_path),
                     "image_url": f"/api/inference/jobs/{job_id}/images/{completed_images - 1}",
                     "transparent_background": transparent_background,
                     "background_removal": background_removal_result,
@@ -8769,6 +10532,7 @@ def run_generation(job_id: str, request: GenerateInput):
             output_paths=[str(path) for path in output_paths],
             outputs=output_records,
             output_name=output_path.name,
+            output_relative=output_relative_path(output_path),
             image_url=f"/api/inference/jobs/{job_id}/image",
             elapsed_seconds=round(elapsed, 1),
             wall_elapsed_seconds=round(wall_elapsed, 1),
@@ -8797,7 +10561,8 @@ def run_generation(job_id: str, request: GenerateInput):
         )
     except Exception as error:
         cleanup_partial_outputs()
-        traceback.print_exc()
+        if not isinstance(error, LoraPatchError):
+            traceback.print_exc()
         write_generation_failure_log(job_id, request, error)
         if is_oom_error(error):
             release_cuda_cache = True
@@ -8819,7 +10584,7 @@ def run_generation(job_id: str, request: GenerateInput):
                 pipeline = None
                 clear_pipeline()
             release_pipeline_after_job()
-            update_job(job_id, status="error", phase="Failed", stage="error", error=str(error), progress=0, completed_images=0, outputs=[], **pipeline_status_fields())
+            update_job(job_id, status="error", phase="Failed", stage="error", error=generation_failure_message(error), progress=0, completed_images=0, outputs=[], **pipeline_status_fields())
     finally:
         gc.collect()
         if release_cuda_cache and torch.cuda.is_available():
@@ -9239,6 +11004,17 @@ def hardware():
 def create_job(request: GenerateInput):
     if shutdown_requested:
         raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    submitted_request = request
+    try:
+        request, inline_lora_audit = preflight_inline_lora_request(request)
+    except (InlineLoraError, ValueError, OSError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    try:
+        validate_latent_resample_request(request)
+        validate_diffusers_postprocess_schedules(request)
+        prompt_encoding_audit = preflight_dynamic_prompt_request(request)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     if request.engine in NATIVE_ENGINES:
         if performance_settings["memory_mode"] == "ultra_low_vram":
             raise HTTPException(
@@ -9283,6 +11059,16 @@ def create_job(request: GenerateInput):
                 validate_postprocess_source_size(decoded_source.size)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+    if request.output_template is not None:
+        # The folders a template names are checked now, against the disk as it is: a segment that
+        # is already a link, a junction or a file refuses the job before anything runs.
+        try:
+            output_target(OUTPUT_DIRECTORY, request.output_template, moment=datetime.now(), engine=request.engine, create=False)
+        except OutputPathError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    resource_issue = expanded_canvas_resource_issue(request)
+    if resource_issue:
+        raise HTTPException(status_code=422, detail=resource_issue)
     _, directives = parse_prompt_directives(request.prompt)
     if directives["transparent_background"]:
         if not request.background_removal_model:
@@ -9335,6 +11121,12 @@ def create_job(request: GenerateInput):
             "source_image_enabled": request.source_image.enabled,
             "source_image_name": request.source_image.name or None,
             "source_image_resize_mode": request.source_image.resize_mode if request.source_image.enabled else None,
+            "img2img_fix_steps": uses_diffusers_img2img_fix_steps(request),
+            "img2img_schedule_steps": img2img_schedule_steps(request),
+            # The effective layer, never the raw field: an absent SD/iL value records what ran.
+            "clip_skip": effective_clip_skip(request),
+            # Relative to the output root and frozen with the job; `None` is the historical scheme.
+            "output_template": request.output_template,
             "background_removal_model": request.background_removal_model,
             "background_removal": None,
             "resample_units": len(request.active_resample_units),
@@ -9347,12 +11139,19 @@ def create_job(request: GenerateInput):
             "created_at": time.time(),
             "error": None,
             "warning": None,
+            # The submitted source is immutable audit data. Runtime sampling uses
+            # the stripped request produced above, while PNG metadata and failed
+            # jobs retain exactly what the client sent.
+            "prompt": submitted_request.prompt,
+            "negative_prompt": submitted_request.negative_prompt,
+            "prompt_encoding": copy.deepcopy(prompt_encoding_audit),
             "prompt_tokens": None,
             "prompt_blocks": None,
             "prompt_weighted_tokens": None,
             "negative_prompt_tokens": None,
             "negative_prompt_blocks": None,
             "negative_prompt_weighted_tokens": None,
+            "inline_loras": copy.deepcopy(inline_lora_audit),
             "adetailer_state": None,
             "elapsed_seconds": 0.0,
             "paused_seconds": 0.0,
@@ -9392,7 +11191,7 @@ def create_job(request: GenerateInput):
         response = public_job_view(jobs[job_id])
         if gallery_access_token:
             response["gallery_access_token"] = gallery_access_token
-    executor.submit(run_generation, job_id, request)
+    executor.submit(run_generation, job_id, request, submitted_request, inline_lora_audit)
     return response
 
 
@@ -9544,6 +11343,40 @@ def get_job_image_at(job_id: str, image_index: int):
     if not Path(output_path).is_file():
         raise HTTPException(status_code=404, detail="Generated image file is missing")
     return FileResponse(output_path, media_type="image/png", filename=Path(output_path).name, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/inference/output-template")
+def get_output_template(template: str | None = None, engine: str = "iL"):
+    """What Settings → General shows: the active root, the placeholder legend and a path preview.
+
+    The preview runs the same parser and directory walk a save does, without creating anything, so
+    a template the page calls valid is one a job will accept. Only relative locations are returned
+    for the preview; the root itself is named relative to the project when it lives inside it.
+    """
+    if engine not in {"SD", "iL", "Anima", "Flux", "Flux2", "Krea2"}:
+        raise HTTPException(status_code=422, detail="Unsupported engine")
+    payload = {
+        "root": output_root_display(OUTPUT_DIRECTORY, PROJECT_ROOT),
+        "default_template": DEFAULT_OUTPUT_TEMPLATE,
+        "placeholders": [{"name": name, "label": label} for name, label in OUTPUT_TEMPLATE_PLACEHOLDERS.items()],
+        "template": template,
+        "valid": True,
+        "legacy": True,
+        "error": "",
+        "preview": "",
+    }
+    try:
+        normalized = normalize_output_template(template)
+        target = output_target(OUTPUT_DIRECTORY, normalized, moment=datetime.now(), engine=engine, create=False)
+        name = preview_output_name(target)
+        payload.update({
+            "legacy": normalized is None,
+            "normalized": normalized,
+            "preview": f"{target.relative_directory}/{name}" if target.relative_directory else name,
+        })
+    except OutputPathError as error:
+        payload.update({"valid": False, "error": str(error)})
+    return payload
 
 
 @app.get("/api/inference/history")

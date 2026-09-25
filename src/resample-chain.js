@@ -19,21 +19,47 @@
 // so a chain can always say both what was asked for and what will actually be sampled.
 
 import { normalizeADetailerStage, activeADetailerUnits, adetailerPayload, adetailerSummary } from "./adetailer-units.js";
+import { DIFFUSERS_SCHEDULE_STEP_LIMIT, diffusersScheduleTotal } from "./diffusers-schedule.js";
 import { normalizeUint64Seed, supportsUsduTiled } from "./hires-settings.js";
 import { bankersRound, MAX_RTX_OUTPUT_EDGE, MAX_RTX_OUTPUT_PIXELS, RTX_TARGET_LIMIT_REASON } from "./postprocessing.js";
 
 export const RESAMPLE_UNIT_LIMIT = 8;
+export { DIFFUSERS_SCHEDULE_STEP_LIMIT, diffusersScheduleTotal };
 export const STAGE_TYPES = ["resample", "adetailer", "rtx"];
-// ComfyUI's `ImageScale` method list, minus the latent-only `bislerp`. The ids are the contract
-// with the backend, the labels are what the cards read.
+// The backend keeps latent and pixel resampling as two different contracts. Keep the two lists
+// separate here as well: a model-less unit can choose either family, but the request can never
+// accidentally send a latent id as `resize_algorithm` (or vice versa).
+export const LATENT_ALGORITHMS = Object.freeze([
+  { id: "latent", label: "Latent", detail: "潜空间双线性" },
+  { id: "latent-antialias", label: "Latent · Antialiased", detail: "潜空间双线性抗锯齿" },
+  { id: "latent-bicubic", label: "Latent · Bicubic", detail: "潜空间双三次" },
+  { id: "latent-bicubic-antialias", label: "Latent · Bicubic antialiased", detail: "潜空间双三次抗锯齿" },
+  { id: "latent-nearest", label: "Latent · Nearest", detail: "潜空间最近邻" },
+  { id: "latent-nearest-exact", label: "Latent · Nearest-exact", detail: "潜空间精确最近邻" },
+]);
+export const LATENT_ALGORITHM_IDS = LATENT_ALGORITHMS.map((item) => item.id);
+
+// ComfyUI's `ImageScale` method list, plus Forge's pixel-space `Nearest`. The ids are the
+// contract with the backend, the labels deliberately distinguish Forge PIL `nearest` from the
+// older Torch `nearest-exact` id.
 export const RESIZE_ALGORITHMS = Object.freeze([
   { id: "lanczos", label: "Lanczos", detail: "锐利，放大首选" },
-  { id: "bicubic", label: "Bicubic", detail: "平滑，过渡自然" },
+  { id: "nearest", label: "Nearest · Forge PIL", detail: "Forge PIL 硬边像素" },
+  { id: "nearest-exact", label: "Nearest-exact · Torch", detail: "Torch 精确最近邻（保留旧 id）" },
   { id: "bilinear", label: "Bilinear", detail: "最柔和" },
+  { id: "bicubic", label: "Bicubic", detail: "平滑，过渡自然" },
   { id: "area", label: "Area", detail: "缩小时保留均值" },
-  { id: "nearest-exact", label: "Nearest", detail: "硬边像素" },
 ]);
 export const RESIZE_ALGORITHM_IDS = RESIZE_ALGORITHMS.map((item) => item.id);
+
+export function isRelativeUpscalerId(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const normalized = value.replaceAll("\\", "/");
+  return normalized === value
+    && !normalized.startsWith("/")
+    && !/^[A-Za-z]:\//.test(normalized)
+    && !normalized.split("/").some((part) => !part || part === "." || part === "..");
+}
 
 // What each engine's latent grid accepts as a redraw canvas, mirroring the backend table. A unit
 // that does not redraw is not held to any of them.
@@ -47,6 +73,9 @@ export const RESAMPLE_UNIT_DEFAULTS = Object.freeze({
   name: "",
   // "" is "no model": a unit is useful without one, and the picker carries an explicit entry for it.
   upscaler: "",
+  // null is the compatibility-safe pixel/default state. Only createResampleUnit(..., { engine })
+  // for a user-added SD/iL unit opts into the latent default.
+  latentAlgorithm: null,
   scale: 1.5,
   resizeAlgorithm: "lanczos",
   denoise: 0.35,
@@ -113,8 +142,24 @@ function optionalNumber(value, minimum, maximum, { integer = false } = {}) {
   return integer ? Math.round(bounded) : bounded;
 }
 
-export function createResampleUnit(overrides = {}) {
-  return { ...RESAMPLE_UNIT_DEFAULTS, id: nextStageId("resample"), enabled: true, expanded: true, ...overrides };
+function engineSupportsLatent(engine) {
+  return engine === "SD" || engine === "iL";
+}
+
+export function createResampleUnit(overrides = {}, { engine = "" } = {}) {
+  const source = isPlainObject(overrides) ? overrides : {};
+  const newEngineDefault = engineSupportsLatent(engine)
+    && source.latentAlgorithm === undefined
+    && source.resizeAlgorithm === undefined
+    && !source.upscaler;
+  return {
+    ...RESAMPLE_UNIT_DEFAULTS,
+    ...(newEngineDefault ? { latentAlgorithm: "latent" } : {}),
+    id: nextStageId("resample"),
+    enabled: true,
+    expanded: true,
+    ...source,
+  };
 }
 
 export function createAdetailerStage(overrides = {}) {
@@ -133,7 +178,11 @@ export function normalizeResampleUnit(value, { samplers = [], schedulers = [], e
   // repairing "fixed with no number" here would undo the mode before a number could be typed. The
   // empty number is a run blocker instead, and the payload falls back to `inherit`.
   const seedMode = ["inherit", "fixed", "random"].includes(source.seedMode) ? source.seedMode : "inherit";
-  const executionMode = source.executionMode === "usdu_tiled" && supportsUsduTiled(engine) ? "usdu_tiled" : "full_frame";
+  // Keep the user's mode even while an engine cannot execute it. An engine switch must not
+  // silently rewrite an enabled unit (the issue is reported below) or destroy a disabled unit's
+  // metadata. The request is blocked for an enabled incompatible unit before it can reach the
+  // backend; disabled units are intentionally carried through untouched.
+  const executionMode = source.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame";
   const scale = Math.round(inRange(source.scale, RESAMPLE_UNIT_DEFAULTS.scale, 1, 4) * 10) / 10;
   const denoise = Math.round(inRange(source.denoise, RESAMPLE_UNIT_DEFAULTS.denoise, 0, 1) * 100) / 100;
   return {
@@ -143,6 +192,9 @@ export function normalizeResampleUnit(value, { samplers = [], schedulers = [], e
     expanded: source.expanded === true,
     name: typeof source.name === "string" ? source.name.slice(0, 80) : "",
     upscaler: typeof source.upscaler === "string" ? source.upscaler : "",
+    // Missing is intentionally null. Normalising a saved record must never turn it into the new
+    // user-add default, otherwise opening an old Hires/workspace record changes its run.
+    latentAlgorithm: LATENT_ALGORITHM_IDS.includes(source.latentAlgorithm) ? source.latentAlgorithm : null,
     scale,
     resizeAlgorithm: RESIZE_ALGORITHM_IDS.includes(source.resizeAlgorithm) ? source.resizeAlgorithm : "lanczos",
     denoise,
@@ -230,6 +282,7 @@ export function normalizeResampleChain(value, options = {}) {
 export function migrateResampleChain(record, options = {}) {
   const source = isPlainObject(record) ? record : {};
   if (Array.isArray(source.postprocessChain)) return normalizeResampleChain(source.postprocessChain, options);
+  const freshDefaults = !isPlainObject(source.hires) && !isPlainObject(source.adetailer) && !isPlainObject(source.rtx);
   const hires = isPlainObject(source.hires) ? source.hires : {};
   const order = Array.isArray(source.postprocessOrder) && source.postprocessOrder.length
     ? source.postprocessOrder
@@ -245,6 +298,7 @@ export function migrateResampleChain(record, options = {}) {
       steps: hires.steps ?? null,
       cfg: hires.cfg ?? null,
       name: "",
+      ...(freshDefaults && engineSupportsLatent(options.engine) ? { latentAlgorithm: "latent" } : {}),
     }, options),
     adetailer: normalizeAdetailerChainStage(source.adetailer),
     rtx: normalizeRtxStage(source.rtx),
@@ -286,8 +340,24 @@ export function resampleUnitSummary(unit) {
   if (!unit.enabled) return "关闭";
   const parts = [`${unit.scale.toFixed(1)}×`];
   parts.push(unit.upscaler ? "超分模型" : "算法缩放");
+  parts.push(resampleAlgorithmLabel(unit));
   parts.push(unit.denoise > 0 ? `重绘 ${unit.denoise.toFixed(2)}` : "不重绘");
   return parts.join(" · ");
+}
+
+export function resampleAlgorithmLabel(unit) {
+  if (unit?.latentAlgorithm) return LATENT_ALGORITHMS.find((item) => item.id === unit.latentAlgorithm)?.label || unit.latentAlgorithm;
+  return RESIZE_ALGORITHMS.find((item) => item.id === unit?.resizeAlgorithm)?.label || unit?.resizeAlgorithm || "Lanczos";
+}
+
+export function resampleAlgorithmSelectionUpdate(value) {
+  return LATENT_ALGORITHM_IDS.includes(value)
+    ? { latentAlgorithm: value, upscaler: "" }
+    : { resizeAlgorithm: value, latentAlgorithm: null };
+}
+
+export function resampleModelSelectionUpdate(value) {
+  return value ? { upscaler: value, latentAlgorithm: null } : { upscaler: "" };
 }
 
 export function enginePixelAlignment(engine) {
@@ -405,34 +475,59 @@ export function chainSummary(chain) {
 /**
  * How many denoise updates one unit's redraw performs, which is what "有效步数" promises.
  *
- * The same family split the backend makes: Diffusers image-to-image runs `int(steps × denoise)` of
- * them, while the native engines follow Comfy and execute every requested step whatever the denoise.
+ * Every redraw executes the requested count. Denoise selects the schedule's starting noise; SD/iL
+ * expand the Diffusers schedule separately so it no longer shrinks this value.
  */
-export function resampleUnitEffectiveSteps(unit, baseSteps, engine, nativeEngines) {
+export function resampleUnitEffectiveSteps(unit, baseSteps) {
   if (!(unit.denoise > 0)) return 0;
   const steps = Number(unit.steps ?? baseSteps ?? 0);
-  if (nativeEngines.includes(engine)) return Math.floor(steps);
-  return Math.floor(steps * Number(unit.denoise || 0));
+  return Number.isFinite(steps) ? Math.floor(steps) : 0;
 }
 
 /** Why the chain cannot run, in the order the user can act on it, or "" when it can. */
 export function resampleChainIssue(chain, { baseSteps, engine, nativeEngines = [], upscalers = null, size = null } = {}) {
   for (const unit of resampleUnits(chain)) {
-    if (!unit.enabled) continue;
     const number = resampleUnitNumber(chain, unit);
-    if (unit.upscaler && Array.isArray(upscalers) && !upscalers.some((item) => item.id === unit.upscaler && item.compatible !== false)) {
-      return `重采样 ${number} 选择的超分模型不可用`;
+    // Disabled units remain in the payload and metadata, but have no execution semantics until
+    // they are enabled again. This also keeps an old/engine-switched workspace editable.
+    if (!unit.enabled) continue;
+    const algorithmIssue = resampleUnitAlgorithmIssue(unit, engine);
+    if (algorithmIssue) return `重采样 ${number}：${algorithmIssue}`;
+    if (unit.upscaler && !isRelativeUpscalerId(unit.upscaler)) return `重采样 ${number}：超分模型必须是模型目录内的相对 ID`;
+    if (unit.upscaler && upscalers != null) {
+      const models = Array.isArray(upscalers) ? upscalers : Array.isArray(upscalers.models) ? upscalers.models : [];
+      const model = models.find((item) => item.id === unit.upscaler || item.local_id === unit.upscaler);
+      if (!model) return `重采样 ${number}：超分模型不可用：“${unit.upscaler}”不在当前可用目录中`;
+      if (model.compatible === false) return `重采样 ${number}：超分模型不可用：“${model.label || unit.upscaler}”不兼容：${model.reason || "当前运行时不支持"}`;
     }
     if (unit.seedMode === "fixed" && !unit.seed) return `重采样 ${number} 的固定 Seed 必须是 0 ～ 18446744073709551615`;
     if (unit.tileOverlap > Math.floor(unit.tileSize / 2)) return `重采样 ${number} 的分块重叠不能超过分块尺寸的一半`;
-    if (unit.denoise > 0 && resampleUnitEffectiveSteps(unit, baseSteps, engine, nativeEngines) < 1) {
-      return `重采样 ${number} 的步数乘以重绘强度至少需要产生 1 个有效步骤`;
+    const effectiveSteps = resampleUnitEffectiveSteps(unit, baseSteps);
+    if (unit.denoise > 0 && effectiveSteps < 1) {
+      return `重采样 ${number} 的有效步数至少需要 1 步`;
+    }
+    if (unit.denoise > 0 && !nativeEngines.includes(engine)
+      && diffusersScheduleTotal(effectiveSteps, unit.denoise) === null) {
+      return `重采样 ${number} 的重绘强度过低：调度总步数不能超过 ${DIFFUSERS_SCHEDULE_STEP_LIMIT}，请提高重绘强度或降低步数`;
     }
   }
   if (size) {
     const plan = resampleChainPlan(size, chain, engine);
     if (!plan.valid) return plan.reason;
   }
+  return "";
+}
+
+/** The three user-facing latent constraints, kept separate so panels and request blockers agree. */
+export function resampleUnitAlgorithmIssue(unit, engine) {
+  if (!unit) return "";
+  if (unit.latentAlgorithm) {
+    if (!engineSupportsLatent(engine)) return "潜空间算法仅支持 SD / iL 引擎";
+    if (unit.executionMode !== "full_frame") return "潜空间算法仅支持整图重绘（full_frame）";
+    if (unit.upscaler) return "潜空间算法不能与超分模型同时使用";
+  }
+  if (unit.executionMode === "usdu_tiled" && !supportsUsduTiled(engine)) return "USDU 分块重绘仅支持 Anima / Krea2 引擎";
+  if (unit.executionMode === "usdu_tiled" && !(unit.denoise > 0)) return "USDU 分块重绘需要大于 0 的重绘强度";
   return "";
 }
 
@@ -446,12 +541,15 @@ export function resampleChainPayload(chain, { engine, seedOverrides = null } = {
     const override = isPlainObject(seedOverrides) ? seedOverrides[stage.id] : null;
     const seedMode = override?.seedMode ?? stage.seedMode;
     const seed = override?.seed ?? stage.seed;
-    const fixed = seedMode === "fixed" && normalizeUint64Seed(seed) !== null;
+    const normalizedSeed = normalizeUint64Seed(seed);
+    const fixed = seedMode === "fixed" && normalizedSeed !== null;
+    const preserveDisabledFixedSeed = stage.enabled !== true && seedMode === "fixed";
     return {
       type: "resample",
       enabled: stage.enabled === true,
       name: stage.name || "",
       upscaler: stage.upscaler || null,
+      ...(stage.latentAlgorithm ? { latent_algorithm: stage.latentAlgorithm } : {}),
       scale: stage.scale,
       resize_algorithm: stage.resizeAlgorithm,
       denoise: stage.denoise,
@@ -459,11 +557,13 @@ export function resampleChainPayload(chain, { engine, seedOverrides = null } = {
       cfg: stage.cfg ?? null,
       sampler: stage.sampler || null,
       scheduler: stage.scheduler || null,
-      seed_mode: fixed ? "fixed" : seedMode === "random" ? "random" : "inherit",
-      ...(fixed ? { seed: normalizeUint64Seed(seed) } : {}),
+      seed_mode: fixed || preserveDisabledFixedSeed ? "fixed" : seedMode === "random" ? "random" : "inherit",
+      ...(fixed ? { seed: normalizedSeed } : preserveDisabledFixedSeed ? { seed: seed ?? "" } : {}),
       tile_size: stage.tileSize,
       tile_overlap: stage.tileOverlap,
-      execution_mode: supportsUsduTiled(engine) && stage.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
+      // Do not coerce a disabled unit's execution mode during an engine switch. The backend skips
+      // disabled stages, while metadata still needs to describe the complete saved unit.
+      execution_mode: stage.executionMode === "usdu_tiled" ? "usdu_tiled" : "full_frame",
       tile_width: "auto",
       tile_height: "auto",
       padding: stage.padding,
@@ -477,9 +577,9 @@ export function resampleChainPayload(chain, { engine, seedOverrides = null } = {
 }
 
 /** Add, remove and reorder. Each returns a new chain; none mutates the one it was given. */
-export function addResampleUnit(chain, overrides = {}) {
+export function addResampleUnit(chain, overrides = {}, options = {}) {
   if (resampleUnits(chain).length >= RESAMPLE_UNIT_LIMIT) return chain;
-  const unit = createResampleUnit(overrides);
+  const unit = createResampleUnit(overrides, options);
   const lastResample = chain.map((stage) => stage.type).lastIndexOf("resample");
   if (lastResample < 0) return [unit, ...chain];
   return [...chain.slice(0, lastResample + 1), unit, ...chain.slice(lastResample + 1)];

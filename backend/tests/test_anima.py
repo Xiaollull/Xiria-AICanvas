@@ -325,7 +325,7 @@ class AnimaPathAndHealthTests(unittest.TestCase):
         with patch.object(inference_server, "anima_health_fields", return_value=anima):
             health = inference_server.health()
         self.assertEqual(health["protocol"], inference_server.INFERENCE_PROTOCOL)
-        self.assertEqual(health["protocol"], 36)
+        self.assertEqual(health["protocol"], 39)
         self.assertEqual(health["engines"]["Anima"], anima)
         self.assertEqual(health["guidance"]["pag"]["engines"], ["SD", "iL", "Anima"])
         self.assertEqual(
@@ -1236,7 +1236,7 @@ class AnimaCacheAndMetadataTests(unittest.TestCase):
                     patch.object(inference_server, "configure_loras", side_effect=AssertionError("LoRA hook used")),
                     patch.object(
                         inference_server,
-                        "prepare_prompt_conditioning",
+                        "prepare_dynamic_prompt_conditioning",
                         side_effect=AssertionError("CLIP prompt hook used"),
                     ),
                 ):
@@ -1279,11 +1279,13 @@ class AnimaCacheAndMetadataTests(unittest.TestCase):
                 )
                 self.assertEqual(parameters["guidance"]["resolved_layer_count"], 28)
                 self.assertEqual(parameters["guidance"]["logical_prediction_branches"], 3)
+                # Each LoRA also records the relative ID it was mounted by, so a reader can tell
+                # same-named files apart; never an absolute path.
                 self.assertEqual(
                     parameters["loras"],
                     [
-                        {"name": "first.safetensors", "weight": 0.75},
-                        {"name": "second.safetensors", "weight": -0.25},
+                        {"name": "first.safetensors", "path": "styles/first.safetensors", "weight": 0.75},
+                        {"name": "second.safetensors", "path": "second.safetensors", "weight": -0.25},
                     ],
                 )
                 self.assertEqual(parameters["postprocess_stages"], ["rtx", "resample", "adetailer"])

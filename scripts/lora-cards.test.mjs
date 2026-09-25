@@ -313,7 +313,12 @@ test("the card routes require a same-origin request and are registered before th
   const handler = config.slice(config.indexOf("async function loraCardsApi"), config.indexOf("function loraCardsApiPlugin"));
   assert.match(handler, /requireSameOrigin\(request\)/);
   assert.match(handler, /max-age=31536000, immutable/, "an image named by its own hash is immutable");
-  assert.match(config, /uiStateApiPlugin\(\), loraCardsApiPlugin\(\)/);
+  // The prompt preset previews share the card store's decoding and sit beside it, under the same
+  // same-origin guard and content-addressed caching; both still precede the model API.
+  assert.match(config, /uiStateApiPlugin\(\), promptPresetPreviewApiPlugin\(\), loraCardsApiPlugin\(\), [^\]]*modelApiPlugin\(\)/);
+  const previews = config.slice(config.indexOf("async function promptPresetPreviewApi"), config.indexOf("function promptPresetPreviewApiPlugin"));
+  assert.match(previews, /requireSameOrigin\(request\)/);
+  assert.match(previews, /max-age=31536000, immutable/);
 });
 
 test("card sizes stay small enough that the whole store fits one request", () => {

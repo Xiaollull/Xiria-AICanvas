@@ -22,7 +22,10 @@ import {
   validatePromptPresetDraft,
 } from "../src/prompt-presets.js";
 
-const draft = (overrides = {}) => ({ name: "自定义", content: "custom prompt", position: "end", type: "positive", ...overrides });
+// A card belongs to a group and takes the group's type; the builtin 风格 group is positive.
+const POSITIVE_GROUP = "builtin-group-positive-style-v1";
+const NEGATIVE_GROUP = "builtin-group-negative-general-v1";
+const draft = (overrides = {}) => ({ name: "自定义", content: "custom prompt", position: "end", groupId: POSITIVE_GROUP, ...overrides });
 const cryptoWithUuids = (...ids) => ({ randomUUID: () => ids.shift(), getRandomValues: () => { throw new Error("unexpected fallback"); } });
 
 test("v1 seed contains the seven existing presets with stable IDs and complete records", () => {
@@ -117,41 +120,65 @@ test("illegal records are quarantined without content in warning and valid order
   for (const secret of ["SECRET-BAD", "SECRET-DUPLICATE", "SECRET-ID", "SECRET-CONTENT"]) assert.doesNotMatch(normalized.warning, new RegExp(secret));
 });
 
-test("draft validation enforces limits and same-type NFKC/casefold duplicate names", () => {
-  const records = [{ id: "one", name: "Ｃａｆｅ", content: "x", position: "end", type: "positive", order: 0, version: 1 }];
-  assert.equal(validatePromptPresetDraft(draft({ name: "cafe" }), records).valid, false);
-  assert.equal(validatePromptPresetDraft(draft({ name: "cafe", type: "negative" }), records).valid, true);
-  assert.equal(validatePromptPresetDraft(draft({ name: "cafe" }), records, "one").valid, true);
-  assert.match(validatePromptPresetDraft(draft({ name: "x".repeat(49) }), []).errors.name, /48/);
+test("draft validation enforces limits and same-group NFKC/casefold duplicate names", () => {
+  const container = {
+    ...emptyPromptPresetContainer(),
+    groups: [
+      { id: "g-a", type: "positive", name: "A", order: 0, version: 1 },
+      { id: "g-b", type: "positive", name: "B", order: 1, version: 1 },
+      { id: "g-n", type: "negative", name: "N", order: 0, version: 1 },
+    ],
+    records: [{ id: "one", name: "Ｃａｆｅ", content: "x", position: "end", type: "positive", groupId: "g-a", order: 0, version: 1 }],
+  };
+  const inGroup = (overrides) => draft({ groupId: "g-a", ...overrides });
+  // Names are unique within a group: the same name may sit in another group of either type.
+  assert.equal(validatePromptPresetDraft(inGroup({ name: "cafe" }), container).valid, false);
+  assert.match(validatePromptPresetDraft(inGroup({ name: "cafe" }), container).errors.name, /同一分组/);
+  assert.equal(validatePromptPresetDraft(inGroup({ name: "cafe", groupId: "g-b" }), container).valid, true);
+  assert.equal(validatePromptPresetDraft(inGroup({ name: "cafe", groupId: "g-n" }), container).valid, true);
+  assert.equal(validatePromptPresetDraft(inGroup({ name: "cafe" }), container, "one").valid, true);
+  // The card takes its group's type.
+  assert.equal(validatePromptPresetDraft(inGroup({ groupId: "g-n" }), container).value.type, "negative");
+  assert.match(validatePromptPresetDraft(inGroup({ groupId: "gone" }), container).errors.groupId, /分组/);
+  assert.match(validatePromptPresetDraft(inGroup({ name: "x".repeat(49) }), container).errors.name, /48/);
   // The name is a label and is limited; the content is prompt text and is not. A preset is
   // inserted into the prompt, so capping it would cap what the prompt itself can say.
-  assert.equal(validatePromptPresetDraft(draft({ content: "x".repeat(50_000) }), []).valid, true);
-  assert.match(validatePromptPresetDraft(draft({ content: "   " }), []).errors.content, /请输入/);
-  assert.equal(validatePromptPresetDraft(draft({ position: "sideways" }), []).valid, false);
-  assert.equal(validatePromptPresetDraft(draft({ name: "STRASSE" }), [{ ...records[0], name: "Straße" }]).valid, false);
-  assert.equal(validatePromptPresetDraft(draft({ name: "ΟΣ" }), [{ ...records[0], name: "ος" }]).valid, false);
+  assert.equal(validatePromptPresetDraft(inGroup({ content: "x".repeat(50_000) }), container).valid, true);
+  assert.match(validatePromptPresetDraft(inGroup({ content: "   " }), container).errors.content, /请输入/);
+  assert.equal(validatePromptPresetDraft(inGroup({ position: "sideways" }), container).valid, false);
+  const folded = (name) => ({ ...container, records: [{ ...container.records[0], name }] });
+  assert.equal(validatePromptPresetDraft(inGroup({ name: "STRASSE" }), folded("Straße")).valid, false);
+  assert.equal(validatePromptPresetDraft(inGroup({ name: "ΟΣ" }), folded("ος")).valid, false);
 });
 
-test("CRUD preserves IDs, increments versions, puts type moves at group end, and never revives deleted seeds", () => {
+test("CRUD preserves IDs, increments versions, puts group moves at the group end, and never revives deleted seeds", () => {
   const cryptoProvider = cryptoWithUuids("123e4567-e89b-42d3-a456-426614174000");
   const created = createPromptPreset(seededPromptPresetContainer(), draft({ position: "middle" }), { cryptoProvider });
   assert.equal(created.validation.valid, true);
   assert.equal(created.record.id, "123e4567-e89b-42d3-a456-426614174000");
   assert.equal(created.record.version, 1);
+  assert.equal(created.record.groupId, POSITIVE_GROUP);
   assert.equal(created.record.order, 4);
 
-  const edited = updatePromptPreset(created.container, created.record.id, draft({ name: "移到负向", type: "negative", position: "start" }));
+  // Editing a card into a group of the other type moves it there, last, with that group's type.
+  const edited = updatePromptPreset(created.container, created.record.id, draft({ name: "移到负向", groupId: NEGATIVE_GROUP, position: "start" }));
   assert.equal(edited.record.id, created.record.id);
   assert.equal(edited.record.version, 2);
   assert.equal(edited.record.type, "negative");
+  assert.equal(edited.record.groupId, NEGATIVE_GROUP);
   assert.equal(edited.record.order, 3);
   assert.equal(sortPromptPresetRecords(edited.container.records, "negative").at(-1).id, created.record.id);
 
-  const reordered = reorderPromptPreset(edited.container, created.record.id, 0, "positive");
+  // Dragging it into another group is also a change of card, so its version moves too.
+  const reordered = reorderPromptPreset(edited.container, created.record.id, 0, POSITIVE_GROUP);
   const moved = reordered.records.find((record) => record.id === created.record.id);
   assert.equal(moved.type, "positive");
+  assert.equal(moved.groupId, POSITIVE_GROUP);
   assert.equal(moved.order, 0);
   assert.equal(moved.version, 3);
+  // Reordering inside its own group is only a position.
+  const within = reorderPromptPreset(reordered, created.record.id, 2).records.find((record) => record.id === created.record.id);
+  assert.deepEqual([within.order, within.version], [2, 3]);
 
   const removed = deletePromptPreset(reordered, created.record.id);
   assert.equal(removed.records.some((record) => record.id === created.record.id), false);
@@ -163,6 +190,7 @@ test("invalid duplicate edits do not mutate the container", () => {
   const existing = seeded.records[0];
   const result = updatePromptPreset(seeded, existing.id, draft({ name: seeded.records[1].name }));
   assert.equal(result.validation.valid, false);
+  assert.match(result.validation.errors.name, /同名/);
   assert.deepEqual(result.container, seeded);
 });
 
@@ -185,6 +213,8 @@ test("IDs prefer randomUUID, retry collisions, and use a secure UUIDv4 fallback 
 
 test("App source pairs every state setter and enforces queued editing, persistence, selection, ARIA, modal, delete, and Gallery exclusion contracts", () => {
   const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  // The library's UI -- strips, floating window, card editor, confirmations -- is its own module.
+  const presetWindow = fs.readFileSync(new URL("../src/PromptPresetWindow.jsx", import.meta.url), "utf8");
   // The card settings schema and the dialog lifecycle live in gallery-core; the page and the
   // add-to-gallery dialog import them, so the preset library must stay absent from all three.
   const gallery = fs.readFileSync(new URL("../src/gallery-core.js", import.meta.url), "utf8");
@@ -200,7 +230,7 @@ test("App source pairs every state setter and enforces queued editing, persisten
   ]) {
     assert.match(app, new RegExp(`const \\[${state}, ${setter}\\] = useState`), `${state} state/setter pairing`);
   }
-  assert.match(app, /const \[menuId, setMenuId\] = useState\(""\)/, "PresetBox menu state/setter pairing");
+  assert.match(presetWindow, /const \[menuId, setMenuId\] = useState\(""\)/, "card menu state/setter pairing");
   assert.match(app, /loadWorkspaceState[\s\S]{0,7000}normalizePromptPresetContainer/);
   assert.equal((app.match(/normalizePromptPresetContainer\(/g) || []).length, 1, "loadWorkspaceState is the only App normalization call");
   assert.match(app, /workspaceSnapshot\.current = \{[\s\S]{0,500}promptPresets/);
@@ -224,20 +254,22 @@ test("App source pairs every state setter and enforces queued editing, persisten
   for (const handler of ["openPromptPresetDialog", "savePromptPreset", "requestDeletePromptPreset", "confirmDeletePromptPreset"]) {
     assert.doesNotMatch(app, new RegExp(`const ${handler}[\\s\\S]{0,180}status === "running"`), `${handler} remains available while another task runs`);
   }
-  assert.match(app, /<PresetBox[^>]*disabled=\{modelSwitching\}/);
+  // Every strip, on both pages, is held only by a model switch.
+  assert.equal((app.match(/<PromptPresetStrip [^>]*disabled=\{modelSwitching\}/g) || []).length, 4);
   assert.match(app, /jobs\/active[\s\S]{0,500}setStatus\("running"\)/, "active-job recovery enters the same running lock");
-  assert.match(app, /aria-expanded=\{open\}[\s\S]{0,100}aria-controls=\{listId\}/);
-  assert.match(app, /aria-haspopup="menu"[\s\S]{0,100}aria-expanded=/);
-  assert.match(app, /role="menu"/);
-  assert.match(app, /role="menuitem"/);
-  assert.match(app, /role="dialog"[\s\S]{0,100}aria-modal="true"/);
-  assert.match(app, /<input autoFocus data-dialog-autofocus/);
+  assert.match(presetWindow, /className="preset-strip-open"[\s\S]{0,400}aria-expanded=\{open\}/);
+  assert.match(presetWindow, /aria-haspopup="menu" aria-expanded=\{menuOpen\}/);
+  assert.match(presetWindow, /role="menu"/);
+  assert.match(presetWindow, /role="menuitem"/);
+  assert.match(presetWindow, /role="dialog"\s+aria-modal="true"/);
+  assert.match(presetWindow, /<input autoFocus data-dialog-autofocus/);
   assert.match(gallery, /querySelector\("\[autofocus\], \[data-dialog-autofocus\]"\)/);
-  assert.match(app, /预设删除后不会自动恢复/);
-  assert.match(app, /草稿尚未保存/);
-  assert.doesNotMatch(app, /生成任务运行期间只能查看/);
-  assert.match(app, /prompt-preset-main[\s\S]{0,500}prompt-preset-more/);
-  assert.match(app, /data-prompt-preset-focus-fallback/);
+  assert.match(app, /卡片删除后不会自动恢复，包括原有内置预设/);
+  assert.match(app, /分组中的 \$\{promptPresetDelete\.count\} 张卡片会一起删除，删除后不会自动恢复/);
+  assert.match(presetWindow, /卡片尚未保存，确定要放弃更改吗？/);
+  assert.doesNotMatch(app + presetWindow, /生成任务运行期间只能查看/);
+  assert.match(presetWindow, /className="preset-card-main"[\s\S]{0,1500}className="preset-card-more"/);
+  assert.match(presetWindow, /data-prompt-preset-focus-fallback=\{type\}/);
   assert.match(gallery, /focusReturnSelector[\s\S]{0,1800}document\.querySelector\(focusReturnSelectorRef\.current\)\?\.focus\(\)/);
   assert.doesNotMatch(app.match(/workspaceSnapshot\.current = \{[\s\S]{0,700}\};/)?.[0] || "", /caret|selection/i, "caret and selection are session-only");
   for (const source of gallerySources) assert.doesNotMatch(source, /promptPresets:/, "Gallery settings schema must not declare the preset library");
@@ -253,8 +285,9 @@ test("App source pairs every state setter and enforces queued editing, persisten
   assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/);
   assert.ok(!/(?:currentSettings|settings)=\{gallerySettingsWithoutPromptPresets\(/.test(app),
     "no card-producing prop may bypass galleryCardSettings");
-  for (const selector of [".prompt-preset-grid", ".prompt-preset-card", ".prompt-preset-menu", ".prompt-preset-backdrop", ".prompt-preset-dialog", ".prompt-preset-segmented", ".prompt-preset-error"]) assert.match(css, new RegExp(selector.replace(".", "\\.")));
-  assert.match(css, /@media \(max-width: 720px\)[\s\S]*\.prompt-preset-grid \{ grid-template-columns: 1fr;/);
+  for (const selector of [".preset-strip", ".preset-window", ".preset-card", ".preset-card-menu", ".prompt-preset-backdrop", ".prompt-preset-editor", ".prompt-preset-segmented", ".prompt-preset-error"]) assert.match(css, new RegExp(selector.replace(".", "\\.")));
+  // On a narrow screen the window spans the viewport instead of floating at its dragged position.
+  assert.match(css, /@media \(max-width: 640px\) \{\s*\.preset-window \{ top: 72px !important; right: 12px; left: 12px !important; width: auto;/);
 });
 
 test("a switched-on preset joins the prompt at generation, a blank line apart", () => {
@@ -307,8 +340,10 @@ test("the workspace remembers which presets are on, and a gallery card records w
   assert.match(app, /activePromptPresets: \{\s*positive: normalizeActivePromptPresetIds\(saved\.activePromptPresets\?\.positive/);
   assert.match(app, /promptPresets: persistedPromptPresets,\s*activePromptPresets,/);
   assert.match(app, /setActivePromptPresets\(workspace\.activePromptPresets\);/);
-  // Deleting a preset switches it off rather than leaving words nobody can see.
-  assert.match(app, /const confirmDeletePromptPreset[\s\S]{0,400}setActivePromptPresets\(\(current\) => \(\{\s*positive: current\.positive\.filter/);
+  // Deleting a preset -- or a group with its cards -- switches them off rather than leaving words
+  // nobody can see.
+  assert.match(app, /const dropActivePromptPresets = \(ids\) => \{[\s\S]{0,200}setActivePromptPresets\(\(current\) => \(\{\s*positive: current\.positive\.filter\(\(id\) => !gone\.has\(id\)\),\s*negative: current\.negative\.filter/);
+  assert.match(app, /const confirmDeletePromptPreset[\s\S]{0,500}dropActivePromptPresets\(result\.removedRecordIds\);[\s\S]{0,300}dropActivePromptPresets\(\[promptPresetDelete\.record\.id\]\);/);
   // The switches are workspace state, so they never ride along in a gallery card.
   assert.match(app, /activePromptPresets: _activePromptPresets,/);
   // The card records the words that ran, and the inspector shows them whenever they differ from
@@ -319,12 +354,16 @@ test("the workspace remembers which presets are on, and a gallery card records w
   assert.match(gallery, /effectivePrompt\(settings\) !== settings\.positive && \(/);
 });
 
-test("a preset card says it is on, and the box counts them", () => {
-  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+test("a preset card says it is on, and the strip counts them", () => {
+  const presetWindow = fs.readFileSync(new URL("../src/PromptPresetWindow.jsx", import.meta.url), "utf8");
   const css = fs.readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  assert.match(app, /className=\{`prompt-preset-card \$\{active \? "active" : ""\}`\}/);
-  assert.match(app, /aria-pressed=\{active\}/);
-  assert.match(app, /已启用/);
-  // The accent border is the signal, and hovering an inactive card must not be able to imitate it.
-  assert.match(css, /\.prompt-preset-card\.active, \.prompt-preset-card\.active:hover \{ border-color: var\(--lime\);/);
+  assert.match(presetWindow, /className=\{`preset-card \$\{on \? "active" : ""\}/);
+  assert.match(presetWindow, /className="preset-card-main" aria-pressed=\{on\}/);
+  assert.match(presetWindow, /张已启用/);
+  // The strip's open button carries the count of switched-on cards in its label and its badge.
+  assert.match(presetWindow, /已选 \$\{active\.length\} 项/);
+  assert.match(presetWindow, /\{active\.length > 0 && <b>\{active\.length\}<\/b>\}/);
+  // The module's colour is the signal, and hovering an inactive card must not be able to imitate it.
+  assert.match(css, /\.preset-card\.active \{ background: rgb\(var\(--preset-tone-rgb\) \/ \.08\); box-shadow: inset 2px 0 var\(--preset-tone\); \}/);
+  assert.match(css, /\.preset-card:hover, \.preset-card:focus-within \{ background: var\(--n-03\); \}/);
 });

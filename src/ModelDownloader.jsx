@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { formatFileSize } from "./format-size";
-import { configuredDownloadCredentialCount, createLatestRequestGate, normalizedDownloadCredentials, reconcileRecommendedSelection } from "./model-downloader-state";
+import { COMPLETED_DOWNLOAD_NOTICE_MS, DISMISSED_DOWNLOAD_NOTICE_KEY, completedDownloadNoticeKey, configuredDownloadCredentialCount, createLatestRequestGate, normalizedDownloadCredentials, reconcileRecommendedSelection } from "./model-downloader-state";
 
 export default function ModelDownloader({ onDownloaded }) {
   const [civitaiKey, setCivitaiKey] = useState("");
@@ -60,6 +60,22 @@ export default function ModelDownloader({ onDownloaded }) {
   const [connections, setConnections] = useState(8);
   const [connectionDraft, setConnectionDraft] = useState(8);
   const [download, setDownload] = useState({ status: "checking", message: "正在恢复本地下载任务...", currentBytes: 0, totalBytes: 0, speedBps: 0, connections: 0, route: "" });
+  const [dismissedCompletion, setDismissedCompletion] = useState(() => {
+    try { return window.sessionStorage.getItem(DISMISSED_DOWNLOAD_NOTICE_KEY) || ""; } catch { return ""; }
+  });
+  const completionNoticeKey = completedDownloadNoticeKey(download);
+  const showDownloadNotice = download.status !== "idle" && !(completionNoticeKey && dismissedCompletion === completionNoticeKey);
+  const dismissCompletedDownload = useCallback((key) => {
+    if (!key) return;
+    setDismissedCompletion(key);
+    try { window.sessionStorage.setItem(DISMISSED_DOWNLOAD_NOTICE_KEY, key); } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (!completionNoticeKey || dismissedCompletion === completionNoticeKey) return undefined;
+    const timer = window.setTimeout(() => dismissCompletedDownload(completionNoticeKey), COMPLETED_DOWNLOAD_NOTICE_MS);
+    return () => window.clearTimeout(timer);
+  }, [completionNoticeKey, dismissedCompletion, dismissCompletedDownload]);
   const [submittingDownload, setSubmittingDownload] = useState(false);
   const [downloadPollRevision, setDownloadPollRevision] = useState(0);
   const [recommended, setRecommended] = useState({ loading: true, refreshing: false, checkingInstalled: false, installedChecked: false, remoteRefreshed: false, families: [], error: "" });
@@ -92,7 +108,7 @@ export default function ModelDownloader({ onDownloaded }) {
     { id: "config", label: "配置", detail: "模型配置文件" },
   ];
   const selectedKind = kindOptions.find((item) => item.id === kind);
-  const isDownloading = ["checking", "queued", "resolving", "downloading", "metadata"].includes(download.status);
+  const isDownloading = download.active || ["checking", "queued", "resolving", "downloading", "metadata"].includes(download.status);
   const modelLinks = modelUrls.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
   const requiresEngine = kind === "checkpoint" || kind === "lora";
   const progress = download.totalBytes > 0 ? Math.min(100, download.currentBytes / download.totalBytes * 100) : 0;
@@ -419,14 +435,15 @@ export default function ModelDownloader({ onDownloaded }) {
         </div>
         <div className="download-destination"><FolderOpen size={15} /><span>下载位置</span><code>{targetLabel}</code>{selectedKind && <small>{selectedKind.label}</small>}</div>
       </section>
-      <section className={`download-progress-card ${download.status}`} aria-live="polite">
+      {showDownloadNotice && <section className={`download-progress-card ${download.status}`} aria-live="polite">
         <div className="download-progress-head"><div><span>{download.status === "complete" ? "READY" : download.status === "error" ? "DOWNLOAD ERROR" : download.status === "idle" ? "WAITING" : download.provider?.toUpperCase() || "PREPARING"}</span><strong>{download.filename || "等待模型链接"}</strong><small>{download.destination || "选择类型后自动确定本地保存位置"}</small></div>{isDownloading && <RefreshCw className="spin" size={19} />}{download.status === "complete" && <Check size={19} />}{download.status === "error" && <X size={19} />}</div>
         <div className="download-progress-track"><i style={{ width: `${progress}%` }} /></div>
         <div className="download-progress-meta"><span>{download.message}</span><b>{download.totalBytes ? `${formatFileSize(download.currentBytes)} / ${formatFileSize(download.totalBytes)}` : download.verified ? "SHA-256 将校验" : "等待远程文件信息"}</b></div>
         {(download.speedBps > 0 || download.connections > 0 || download.route) && <div className="download-transfer-meta"><span>{download.route || "正在测速"}</span>{download.speedBps > 0 && <span>{formatFileSize(download.speedBps)}/s</span>}{download.connections > 1 && <span>{download.connections} 路分片</span>}</div>}
         {download.warning && <p className="download-warning">{download.warning}</p>}
-      </section>
-      {visibleDownloadItems.length > 1 && <div className="download-batch-list">{visibleDownloadItems.map((item) => <div key={item.index} className={item.status}><b>{String(item.index).padStart(2, "0")}</b><span>{item.filename || item.url}</span><small>{item.status === "complete" ? item.destination : item.error || (item.status === "waiting" ? "等待队列" : item.status === "metadata" ? "正在同步 LoRA 信息" : "正在处理")}</small></div>)}</div>}
+        {completionNoticeKey && <div className="download-complete-dismiss"><small>下载完成，此提示将在 5 秒后自动收起</small><button type="button" onClick={() => dismissCompletedDownload(completionNoticeKey)} aria-label="收起已完成的下载提示"><X size={14} />收起</button></div>}
+      </section>}
+      {showDownloadNotice && visibleDownloadItems.length > 1 && <div className="download-batch-list">{visibleDownloadItems.map((item) => <div key={item.index} className={item.status}><b>{String(item.index).padStart(2, "0")}</b><span>{item.filename || item.url}</span><small>{item.status === "complete" ? item.destination : item.error || (item.status === "waiting" ? "等待队列" : item.status === "metadata" ? "正在同步 LoRA 信息" : "正在处理")}</small></div>)}</div>}
       <footer className="downloader-actions"><span>{isDownloading ? "当前下载继续运行，可追加链接或推荐模型" : modelLinks.length > 1 ? `${modelLinks.length} 个链接将按顺序下载并自动归类` : "自动测速 · 镜像回退 · 断点续传"} · 单文件最大 128 GB · 最多 32 路</span><div className="downloader-action-buttons">{download.failedModels > 0 && download.retryAvailable && <button type="button" className="secondary" disabled={submittingDownload} onClick={retryFailedDownloads}><RefreshCw className={submittingDownload ? "spin" : ""} size={16} />重试失败项（{download.failedModels}）</button>}<button type="submit" disabled={modelLinks.length === 0 || submittingDownload}>{submittingDownload ? <><RefreshCw className="spin" size={16} />正在提交</> : <><Download size={16} />{isDownloading ? "添加到队列" : "开始下载"}{modelLinks.length > 1 ? `（${modelLinks.length}）` : ""}</>}</button></div></footer>
     </form>
     {recommendedZoneOpen && <div className="recommended-zone-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setRecommendedZoneOpen(false); setRecommendedFamilyId(""); setRecommendedCategoryId(""); } }}>

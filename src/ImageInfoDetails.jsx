@@ -233,7 +233,7 @@ export default function ImageInfoDetails({ info, onClose }) {
             <h3>LoRA<b className="image-info-details-count">{info.loras?.length || 0}</b></h3>
             {info.loras?.length ? <div className="info-lora-list">
               {info.loras.map((item, position) => <div key={`${item.name}-${position}`}>
-                <ModelName match={item.match} fallback={item.name} />
+                <ModelName match={item.match} fallback={item.name} lora />
                 <b>{item.weight === null || item.weight === undefined || Number.isNaN(item.weight) ? "权重未记录" : item.weight}</b>
               </div>)}
             </div> : <p className="info-section-empty">未使用 LoRA</p>}

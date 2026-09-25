@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
@@ -33,7 +33,7 @@ import { acquireOfflineUpdateLock } from "./scripts/offline-update-lock.mjs";
 import { createOfflineUpdateTemp, removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
 import { configuredModelDirectory, defaultLoraCategories, groupLoraModels, mergeModelPaths } from "./scripts/model-paths.mjs";
 import { readPngMetadataChunks } from "./scripts/png-text-chunks.mjs";
-import { interpretImageMetadata, matchModelName, stripImageInfoMatches } from "./src/image-metadata.js";
+import { interpretImageMetadata, matchModelName, modelDisplayName, modelFolderAffinity, publicMatch, rankByFolder, settleAmbiguousMatch, settleByFolder, stripImageInfoMatches } from "./src/image-metadata.js";
 import {
   formatSharedRef,
   inspectSharedDirectory,
@@ -58,6 +58,7 @@ import { removePluginFolder, revealPluginFolder } from "./scripts/plugin-actions
 import { descriptionNeedsVersionIdentity, loraMetadataCacheValid, plainTextFromHtml, readLoraFileMetadata, reviewLoraPrompts, TRIGGER_REVIEW_SCHEMA } from "./scripts/lora-metadata.mjs";
 import { pruneCardAssets, readCardAsset, readLoraCardStore, writeCardAsset, writeLoraCardStore } from "./scripts/lora-cards.mjs";
 import { pruneToolboxAssets, readToolboxAsset, readToolboxState, writeToolboxAsset, writeToolboxState } from "./scripts/toolbox-state.mjs";
+import { prunePromptPresetPreviews, readPromptPresetPreview, referencedPreviewsInUiState, writePromptPresetPreview } from "./scripts/prompt-preset-previews.mjs";
 import { appendDownloadQueueState, filterPendingRecommendedArtifacts, itemStatusIsTerminal } from "./scripts/model-download-queue.mjs";
 import { fetchModelProviderDownload, fetchProviderMetadataJson } from "./scripts/provider-download-policy.mjs";
 import {
@@ -221,7 +222,7 @@ const loraPreviewRequests = new Map();
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 36;
+const inferenceProtocol = 39;
 export const inferenceWorkspaceId = workspaceId;
 const maximumUpdateArchiveBytes = 4 * 1024 ** 3;
 // The saved workspace carries the prompt, the negative prompt and every prompt preset, none of
@@ -971,7 +972,10 @@ async function findSharedModels(root, kind, extensions, includeMetadata) {
     const found = await findModels(directory, directory, includeMetadata, extensions, directory);
     for (const model of found) {
       const relative = prefix ? `${prefix}/${model.value}` : model.value;
-      models.push({ ...model, name: relative, value: formatSharedRef(root.id, relative), shared: true, rootId: root.id, rootLabel: root.label });
+      const shared = { ...model, name: relative, value: formatSharedRef(root.id, relative), shared: true, rootId: root.id, rootLabel: root.label };
+      // Server-side only (see `catalogEntry`): listings serialise without it.
+      Object.defineProperty(shared, "file", { value: path.join(directory, model.value), enumerable: false });
+      models.push(shared);
     }
   }
   models.sort((first, second) => first.name.localeCompare(second.name, "zh-CN"));
@@ -2065,6 +2069,7 @@ async function uiStateApi(request, response, next) {
       } finally {
         await rm(temporaryPath, { force: true });
       }
+      schedulePromptPresetPreviewPrune(state);
       response.statusCode = 204;
       response.end();
       return;
@@ -2081,6 +2086,68 @@ function uiStateApiPlugin() {
     name: "local-ui-state-api",
     configureServer(server) { server.middlewares.use(uiStateApi); },
     configurePreviewServer(server) { server.middlewares.use(uiStateApi); },
+  };
+}
+
+// Prompt preset preview pictures.
+//
+// A preset card names its picture by content hash; the bytes live in the state directory, never in
+// the workspace document. Pictures no card names any more are collected after a workspace save, at
+// most once a minute and only once they are an hour old, so a picture uploaded into a card that is
+// still being edited is never taken from under it.
+const PROMPT_PRESET_PREVIEW_PRUNE_INTERVAL_MS = 60 * 1000;
+let promptPresetPreviewPruneAt = 0;
+
+function schedulePromptPresetPreviewPrune(state) {
+  const referenced = referencedPreviewsInUiState(state);
+  if (!referenced || Date.now() - promptPresetPreviewPruneAt < PROMPT_PRESET_PREVIEW_PRUNE_INTERVAL_MS) return;
+  promptPresetPreviewPruneAt = Date.now();
+  prunePromptPresetPreviews(stateDirectory, referenced).catch(() => {});
+}
+
+async function promptPresetPreviewApi(request, response, next) {
+  const url = new URL(request.url, "http://localhost");
+  if (url.pathname !== "/api/prompt-presets/preview") {
+    next();
+    return;
+  }
+  try {
+    requireSameOrigin(request);
+    if (request.method === "GET") {
+      const preview = await readPromptPresetPreview(stateDirectory, url.searchParams.get("id"));
+      response.statusCode = 200;
+      response.setHeader("Content-Type", preview.contentType);
+      // Named by its own hash: a replaced picture arrives under a different id, never a stale hit.
+      response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+      response.end(preview.buffer);
+      return;
+    }
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Cache-Control", "no-store");
+    if (request.method === "POST") {
+      const payload = await readJsonRequest(request, 8 * 1024 * 1024);
+      const preview = await writePromptPresetPreview(stateDirectory, payload?.dataUrl);
+      response.statusCode = 200;
+      response.end(JSON.stringify({ id: preview.id, url: `/api/prompt-presets/preview?id=${preview.id}`, bytes: preview.bytes }));
+      return;
+    }
+    throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+  } catch (error) {
+    if (response.headersSent) {
+      response.end();
+      return;
+    }
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.statusCode = error.statusCode || 500;
+    response.end(JSON.stringify({ error: error.message || "预览图请求失败" }));
+  }
+}
+
+function promptPresetPreviewApiPlugin() {
+  return {
+    name: "local-prompt-preset-preview-api",
+    configureServer(server) { server.middlewares.use(promptPresetPreviewApi); },
+    configurePreviewServer(server) { server.middlewares.use(promptPresetPreviewApi); },
   };
 }
 
@@ -3384,6 +3451,10 @@ async function readRecommendedModelCatalog() {
     if (!downloadableModelKinds.has(artifact.role) || !Number.isSafeInteger(artifact.size) || artifact.size <= 0 || !normalizedSha256(artifact.sha256)) {
       throw Object.assign(new Error(`推荐资源 ${artifact.id} 缺少有效的类型、大小或 SHA-256`), { statusCode: 500 });
     }
+    if (artifact.role === "upscaler" && (!Number.isSafeInteger(artifact.scale) || artifact.scale < 1 || artifact.scale > 4
+      || typeof artifact.compatible !== "boolean" || (!artifact.compatible && typeof artifact.reason !== "string"))) {
+      throw Object.assign(new Error(`推荐超分资源 ${artifact.id} 缺少有效的倍率或兼容性信息`), { statusCode: 500 });
+    }
     try {
       safeModelFilename(artifact.filename, artifact.role);
       new URL(artifact.url);
@@ -3783,7 +3854,7 @@ async function cacheCompletedRecommendedInstallation(artifact, sha256, destinati
   if (!normalized) return;
   const root = await recommendedRootForRole(artifact.role);
   const entry = await installationEntryForFile({ sha256: normalized, role: artifact.role, filePath: destination, root });
-  if (!entry || (artifact.provider !== "Civitai" && artifact.size && entry.size !== artifact.size)) return null;
+  if (!entry || (artifact.size && entry.size !== artifact.size)) return null;
   if (artifact.sha256 && artifact.sha256 !== normalized) {
     recommendedInstallationCandidates.delete(artifact.sha256);
     recommendedTrustedInstallations.delete(artifact.sha256);
@@ -3919,7 +3990,10 @@ async function downloadRecommendedModels(request, response) {
   requireLocalRequest(request, "推荐模型下载仅允许在本机发起");
   const payload = await readJsonRequest(request);
   const catalog = await buildRecommendedCatalog();
-  const selected = recommendedArtifactById(catalog, payload.family_id, payload.model_id, "models");
+  // The resample picker can name only a manifest family plus artifact id.  It never accepts a URL,
+  // path, filename, or provider choice from the browser; the normal trusted-catalog resolution and
+  // SHA-256-verified atomic downloader remain the only route to disk.
+  const selected = recommendedArtifactById(catalog, payload.family_id, payload.artifact_id ?? payload.model_id, "models");
   const artifacts = [selected.artifact];
   if (selected.family.textEncoders.length) artifacts.push(recommendedArtifactById(catalog, payload.family_id, payload.text_encoder_id, "textEncoders").artifact);
   if (selected.family.vaes.length) artifacts.push(recommendedArtifactById(catalog, payload.family_id, payload.vae_id, "vaes").artifact);
@@ -3985,6 +4059,7 @@ async function runRecommendedModelDownloadBatch(job, response, startIndex, { sel
           routes: resolved.routes,
           destination,
           expectedSha256,
+          expectedSize: artifact.size,
           connections,
           thresholdBytes: 8 * 1024 ** 2,
           maximumBytes: maximumModelDownloadBytes,
@@ -3996,6 +4071,7 @@ async function runRecommendedModelDownloadBatch(job, response, startIndex, { sel
           onWarning: (message) => writeDownloadEvent(response, { type: "warning", model_index: modelIndex, message }),
         });
         const trustedInstallation = await cacheCompletedRecommendedInstallation(artifact, expectedSha256, destination);
+        if (!trustedInstallation) throw new Error("推荐模型完成校验失败");
         if (artifact.provider === "Civitai") await bindCompletedCivitaiArtifact(artifact, resolved, trustedInstallation);
         writeDownloadEvent(response, { type: "model-complete", model_index: modelIndex, filename: resolved.filename, destination: path.relative(projectRoot, destination).split(path.sep).join("/"), cached: result.cached });
       } catch (error) {
@@ -4307,6 +4383,137 @@ async function runModelDownloadBatch(job, response, startIndex, { payload, urls,
   }
 }
 
+// Folder navigation for the LoRA manager's path field.
+//
+// The field accepts a folder relative to the project (`models/loras/illustrious/style/Style_九V6.0`),
+// relative to the selected engine's LoRA root (`style/Style_九V6.0`), or an absolute path on this
+// host pasted for convenience. Whatever was typed, the answer is only ever a relative navigation
+// reference — which engine, which category, which folder below it — and it exists only if the real
+// path is a directory inside one of the six engine roots or an enabled shared root, reached without
+// passing through a link or junction. Generation never sees any of this: mounted LoRAs stay the
+// relative IDs the catalogue already uses. It is not a file browser: nothing outside those roots is
+// listed, and a refusal says which rule it hit rather than what is on the disk.
+async function linkOnTheWay(root, target) {
+  const relative = path.relative(root, target);
+  if (!relative) return false;
+  let current = root;
+  for (const segment of relative.split(path.sep)) {
+    current = path.join(current, segment);
+    const info = await lstat(current);
+    if (info.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
+async function resolveLoraFolder(payload) {
+  const raw = String(payload?.path ?? "").trim().replace(/^["']|["']$/g, "");
+  if (!raw) throw Object.assign(new Error("请输入 LoRA 文件夹路径"), { statusCode: 400 });
+  if (raw.length > 1024 || raw.includes("\0")) throw Object.assign(new Error("路径无效"), { statusCode: 400 });
+  const preferred = loraEnginePathKeys[payload?.engine] ? payload.engine : "";
+  const roots = [];
+  let config = {};
+  try {
+    config = JSON.parse(await readFile(modelPathConfig, "utf8"));
+  } catch {}
+  for (const [engine, key] of Object.entries(loraEnginePathKeys)) {
+    try {
+      // The real root decides containment; the configured spelling of it is what a typed path is
+      // compared with, so a project that itself sits behind a link still accepts its own folders.
+      roots.push({ engine, root: await getConfiguredDirectory(engine, "loras"), lexical: configuredModelDirectory(config, "loras", projectRoot, key) });
+    } catch {}
+  }
+  const absolute = path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\\\");
+  const candidates = [];
+  if (absolute) candidates.push(path.resolve(raw));
+  else {
+    candidates.push(path.resolve(projectRoot, raw));
+    const preferredRoot = roots.find((item) => item.engine === preferred);
+    if (preferredRoot) candidates.push(path.resolve(preferredRoot.root, raw));
+  }
+  let sharedRoots = [];
+  try {
+    sharedRoots = (await readSharedRoots(projectRoot)).filter((root) => root.enabled);
+  } catch {}
+  let lastError = null;
+  for (const candidate of candidates) {
+    let real;
+    try {
+      real = await realpath(candidate);
+    } catch {
+      lastError = Object.assign(new Error("文件夹不存在或无法访问"), { statusCode: 404 });
+      continue;
+    }
+    let folder = real;
+    let file = "";
+    const info = await stat(real);
+    if (info.isFile()) {
+      folder = path.dirname(real);
+      file = path.basename(real);
+    } else if (!info.isDirectory()) {
+      lastError = Object.assign(new Error("该路径不是文件夹"), { statusCode: 400 });
+      continue;
+    }
+    // Local engine roots first, the requested engine ahead of the others.
+    const owners = roots.filter((item) => isPathInside(item.root, folder)).sort((first, second) => (first.engine === preferred ? -1 : second.engine === preferred ? 1 : 0));
+    if (owners.length) {
+      const owner = owners[0];
+      // The typed path has to reach the folder without a link: a junction inside a root that points
+      // back into it, or a path that only lands in a root by following one, is refused.
+      const lexicalRoot = isPathInside(owner.root, candidate) ? owner.root : isPathInside(owner.lexical, candidate) ? owner.lexical : "";
+      if (!lexicalRoot) {
+        throw Object.assign(new Error("该路径经由符号链接或目录联接进入 LoRA 目录，已拒绝"), { statusCode: 403 });
+      }
+      if (await linkOnTheWay(lexicalRoot, candidate)) throw Object.assign(new Error("路径包含符号链接或目录联接，已拒绝"), { statusCode: 403 });
+      const relative = path.relative(owner.root, folder).split(path.sep).filter(Boolean);
+      if (relative.some((segment) => segment.includes(":"))) throw Object.assign(new Error("文件夹名称无效"), { statusCode: 400 });
+      const known = defaultLoraCategories.find((category) => category.directory === relative[0]);
+      return {
+        origin: "local",
+        engine: owner.engine,
+        categoryId: relative.length ? known?.id || `folder:${encodeURIComponent(relative[0])}` : "root",
+        folder: relative.slice(1).join("/"),
+        relative: relative.join("/"),
+        file,
+        display: [path.relative(projectRoot, owner.root).split(path.sep).join("/"), ...relative].join("/"),
+      };
+    }
+    for (const root of sharedRoots) {
+      const directories = await sharedKindDirectories(root, "loras");
+      for (const { directory, prefix } of directories) {
+        let resolvedDirectory;
+        try {
+          resolvedDirectory = await realpath(directory);
+        } catch {
+          continue;
+        }
+        if (!isPathInside(resolvedDirectory, folder)) continue;
+        const lexicalDirectory = isPathInside(resolvedDirectory, candidate) ? resolvedDirectory : isPathInside(directory, candidate) ? directory : "";
+        if (!lexicalDirectory || await linkOnTheWay(lexicalDirectory, candidate)) throw Object.assign(new Error("路径包含符号链接或目录联接，已拒绝"), { statusCode: 403 });
+        const engines = Array.isArray(root.engines) ? root.engines : [];
+        const engine = engines.includes(preferred) ? preferred : engines.length === 1 ? engines[0] : "";
+        if (!engine) {
+          throw Object.assign(new Error(engines.length
+            ? `该共享目录同时用于 ${engines.join("、")}，请先选择其中一个引擎再定位`
+            : "该共享目录未对任何引擎启用 LoRA"), { statusCode: 409 });
+        }
+        const inside = path.relative(resolvedDirectory, folder).split(path.sep).filter(Boolean);
+        const relative = [prefix, ...inside].filter(Boolean).join("/");
+        return {
+          origin: "shared",
+          engine,
+          rootId: root.id,
+          categoryId: "shared",
+          folder: relative,
+          file,
+          display: `${root.label} · ${relative || "/"}`,
+        };
+      }
+    }
+    lastError = Object.assign(new Error("该路径不在任何引擎的 LoRA 目录或已启用的共享目录内"), { statusCode: 403 });
+  }
+  throw lastError || Object.assign(new Error("文件夹不存在或无法访问"), { statusCode: 404 });
+}
+
 async function lookupLora(request, response) {
   if (request.method !== "POST") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
   const payload = await readJsonRequest(request);
@@ -4362,10 +4569,121 @@ let modelCatalogCache = null;
 // differ — the name is the path inside the shared root, the value is the
 // reference that addresses it. `engine` says which root it came from, because a
 // checkpoint is only selectable while that engine is the active one.
-function catalogEntry(origin, name, label, { value = name, engine = "" } = {}) {
-  const normalized = name.split("\\").join("/").toLowerCase();
+function catalogEntry(origin, name, label, { value = name, engine = "", engines = [], file = "" } = {}) {
+  const relative = name.split("\\").join("/");
+  const normalized = relative.toLowerCase();
   const base = normalized.split("/").pop();
-  return { origin, path: normalized, base, stem: base.replace(/\.[^.]+$/, ""), label, value, engine };
+  const entry = { origin, path: normalized, relative, display: modelDisplayName(relative), base, stem: base.replace(/\.[^.]+$/, ""), label, value, engine, engines };
+  // The file on this machine is needed to settle an ambiguous name by hash, and must never reach a
+  // browser: a non-enumerable property is dropped by every JSON serialisation and object spread.
+  if (file) Object.defineProperty(entry, "file", { value: file, enumerable: false });
+  return entry;
+}
+
+// Short hashes a producer may have recorded, computed only for the candidates of one ambiguous
+// name and cached by path, size and modification time. The whole-file SHA-256 is Forge's and
+// Civitai's; the tensor-data hash after the safetensors header is A1111's "addnet" hash; a trainer
+// may also have written `sshs_model_hash` into the header itself.
+const modelHashCache = new Map();
+const MODEL_HASH_CACHE_LIMIT = 256;
+const MODEL_HASH_BUDGET_BYTES = 2 * 1024 ** 3;
+const MODEL_HASH_CANDIDATE_LIMIT = 8;
+
+async function computeModelFileHashes(file) {
+  const full = createHash("sha256");
+  const addnet = createHash("sha256");
+  let headerEnd = -1;
+  let sshs = "";
+  if (file.toLowerCase().endsWith(".safetensors")) {
+    const handle = await open(file, "r");
+    try {
+      const prefix = Buffer.alloc(8);
+      await handle.read(prefix, 0, 8, 0);
+      const length = Number(prefix.readBigUInt64LE(0));
+      if (length > 0 && length < 100 * 1024 * 1024) {
+        headerEnd = 8 + length;
+        const header = Buffer.alloc(length);
+        await handle.read(header, 0, length, 8);
+        try {
+          const metadata = JSON.parse(header.toString("utf8"))?.__metadata__ || {};
+          if (typeof metadata.sshs_model_hash === "string") sshs = metadata.sshs_model_hash.toLowerCase();
+        } catch {}
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+  let position = 0;
+  await new Promise((resolve, reject) => {
+    const stream = createReadStream(file);
+    stream.on("error", reject);
+    stream.on("data", (chunk) => {
+      full.update(chunk);
+      if (headerEnd >= 0) {
+        const start = Math.max(0, headerEnd - position);
+        if (start < chunk.length) addnet.update(start ? chunk.subarray(start) : chunk);
+      }
+      position += chunk.length;
+    });
+    stream.on("end", resolve);
+  });
+  return { full: full.digest("hex"), addnet: headerEnd >= 0 ? addnet.digest("hex") : "", sshs };
+}
+
+async function modelFileHashes(file) {
+  const fileStat = await stat(file);
+  const key = `${file}\u0000${fileStat.size}\u0000${fileStat.mtimeMs}`;
+  if (!modelHashCache.has(key)) {
+    if (modelHashCache.size >= MODEL_HASH_CACHE_LIMIT) modelHashCache.delete(modelHashCache.keys().next().value);
+    modelHashCache.set(key, computeModelFileHashes(file).catch((error) => {
+      modelHashCache.delete(key);
+      throw error;
+    }));
+  }
+  return modelHashCache.get(key);
+}
+
+function hashAgrees(recorded, value) {
+  const wanted = String(recorded || "").trim().toLowerCase();
+  const actual = String(value || "").trim().toLowerCase();
+  if (wanted.length < 8 || actual.length < 8) return false;
+  return actual.startsWith(wanted) || wanted.startsWith(actual);
+}
+
+/**
+ * Settle one ambiguous match by the hash the picture recorded, reading only its candidates.
+ *
+ * Several candidates can carry the same bytes — a LoRA copied into two style folders. They are one
+ * model, so the choice between them cannot change a picture; it is made by where the picture's
+ * other models live (`affinity`, the same order `settleByFolder` uses), and the match says how many
+ * identical copies there were. What the hash cannot settle stays ambiguous with the candidates still
+ * in play — the ones carrying the hash, or all of them when none does — for the folder rule.
+ */
+async function settleByHash(match, recorded, affinity = new Map()) {
+  if (match?.status !== "ambiguous" || !recorded) return match;
+  const open = (settled, pending) => (settled.status === "ambiguous" ? { ...settled, pending } : settled);
+  const candidates = (match.pending || []).filter((entry) => entry.file);
+  if (!candidates.length || candidates.length > MODEL_HASH_CANDIDATE_LIMIT) return { ...open(settleAmbiguousMatch(match, null), match.pending), hashSkipped: "count" };
+  let total = 0;
+  for (const entry of candidates) {
+    try {
+      total += (await stat(entry.file)).size;
+    } catch {}
+  }
+  if (total > MODEL_HASH_BUDGET_BYTES) return { ...open(settleAmbiguousMatch(match, null), match.pending), hashSkipped: "size" };
+  const winners = [];
+  for (const entry of candidates) {
+    try {
+      const hashes = await modelFileHashes(entry.file);
+      if (hashAgrees(recorded, hashes.full) || hashAgrees(recorded, hashes.addnet) || hashAgrees(recorded, hashes.sshs)) winners.push({ entry, full: hashes.full });
+    } catch {}
+  }
+  if (winners.length > 1 && winners.every((item) => item.full === winners[0].full)) {
+    const [nearest] = rankByFolder(winners.map((item) => item.entry), affinity);
+    const settled = settleAmbiguousMatch(match, [nearest.entry]);
+    return { ...settled, precision: `${settled.precision}+duplicate`, duplicates: winners.length - 1 };
+  }
+  return open(settleAmbiguousMatch(match, winners.map((item) => item.entry)), winners.length > 1 ? winners.map((item) => item.entry) : match.pending);
 }
 
 // Everything the workspace could load, flattened for name matching. Local
@@ -4381,7 +4699,7 @@ async function buildModelCatalogs() {
       const directory = await getConfiguredDirectory(engine, "checkpoints");
       const relative = path.relative(projectRoot, directory).split(path.sep).join("/");
       for (const model of await findModels(directory, directory, false, checkpointExtensions)) {
-        checkpoints.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine }));
+        checkpoints.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine, file: path.join(directory, model.value) }));
       }
     } catch {
       // A missing or misconfigured engine root must not stop the other engines
@@ -4407,13 +4725,13 @@ async function buildModelCatalogs() {
       for (const model of scanned[index]) {
         if (claimed.has(model.value)) continue;
         claimed.add(model.value);
-        checkpoints.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine }));
+        checkpoints.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine, file: path.join(directory, model.value) }));
       }
     });
     // A file no engine recognises is still on disk, so the reader can say it was found. It names no
     // engine, which leaves applying it to the engine that is selected instead of guessing one.
     for (const model of await findModels(directory, directory, false, diffusionModelExtensions)) {
-      if (!claimed.has(model.value)) checkpoints.push(catalogEntry("local", model.value, relative));
+      if (!claimed.has(model.value)) checkpoints.push(catalogEntry("local", model.value, relative, { file: path.join(directory, model.value) }));
     }
   } catch {}
   for (const engine of Object.keys(loraEnginePathKeys)) {
@@ -4422,7 +4740,7 @@ async function buildModelCatalogs() {
       const relative = path.relative(projectRoot, directory).split(path.sep).join("/");
       const extensions = nativeEngines.has(engine) ? animaLoraExtensions : loraExtensions;
       for (const model of await findModels(directory, directory, false, extensions)) {
-        loras.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine }));
+        loras.push(catalogEntry("local", model.value, `${relative} · ${engine}`, { engine, file: path.join(directory, model.value) }));
       }
     } catch {}
   }
@@ -4436,10 +4754,10 @@ async function buildModelCatalogs() {
   for (const root of roots) {
     if (!root.enabled) continue;
     for (const model of await findSharedModels(root, "checkpoints", checkpointExtensions, false)) {
-      checkpoints.push(catalogEntry("shared", model.name, root.label, { value: model.value }));
+      checkpoints.push(catalogEntry("shared", model.name, root.label, { value: model.value, file: model.file }));
     }
     for (const model of await findSharedModels(root, "loras", loraExtensions, false)) {
-      loras.push(catalogEntry("shared", model.name, root.label, { value: model.value }));
+      loras.push(catalogEntry("shared", model.name, root.label, { value: model.value, engines: Array.isArray(root.engines) ? [...root.engines] : [], file: model.file }));
     }
   }
 
@@ -4498,13 +4816,38 @@ function decodeImageUpload(value) {
 async function resolveImageInfoModels(info) {
   if (!info || info.status !== "ok") return info;
   const catalogs = await buildModelCatalogs();
+  let checkpointMatch = info.checkpoint ? matchModelName(info.checkpoint, catalogs.checkpoints, { engine: info.engine || "" }) : null;
+  checkpointMatch = await settleByHash(checkpointMatch, info.checkpointHash);
+  // A LoRA is narrowed by the engine that produced the picture: the record's own engine, or the
+  // engine of a uniquely matched checkpoint when the producer (A1111) does not name one.
+  const resolved = checkpointMatch && (checkpointMatch.status === "local" || checkpointMatch.status === "shared");
+  const loraEngine = info.engine || (resolved ? checkpointMatch.match.engine || "" : "");
+  const first = (info.loras || []).map((item) => {
+    // This project's pictures carry the exact relative ID of the file they mounted, which is matched
+    // directly; if that file has moved, the name still gets its ordinary chance.
+    let match = item.path ? matchModelName(item.path, catalogs.loras, { engine: loraEngine }) : null;
+    // A recorded name is a name, not an ID: a same-named file at a root does not outrank the copies
+    // in folders, which are chosen between by the folder rule below.
+    if (!match || match.status === "missing") match = matchModelName(item.name, catalogs.loras, { engine: loraEngine, exactBareNames: false });
+    return { item, match };
+  });
+  // Where the picture's LoRAs live, counting every same-named candidate: the folder holding most of
+  // the set is where an ambiguous name is looked for first.
+  const affinity = modelFolderAffinity(first.map(({ match }) => match));
+  const loras = [];
+  for (const { item, match } of first) {
+    // A recorded hash decides first; what it cannot decide goes to the folder rule, so a LoRA with a
+    // file of its name here is always shown with one — only an absent one has none.
+    const settled = settleByFolder(await settleByHash(match, item.hash, affinity), affinity);
+    loras.push({ ...item, match: publicMatch(settled) });
+  }
   return {
     ...info,
-    checkpointMatch: info.checkpoint ? matchModelName(info.checkpoint, catalogs.checkpoints) : null,
-    loras: (info.loras || []).map((item) => ({ ...item, match: matchModelName(item.name, catalogs.loras) })),
+    checkpointMatch: publicMatch(checkpointMatch),
+    loras,
     animaAssets: info.animaAssets ? {
-      text_encoder: { name: info.animaAssets.text_encoder, match: matchModelName(info.animaAssets.text_encoder, catalogs.checkpoints) },
-      vae: { name: info.animaAssets.vae, match: matchModelName(info.animaAssets.vae, catalogs.checkpoints) },
+      text_encoder: { name: info.animaAssets.text_encoder, match: publicMatch(matchModelName(info.animaAssets.text_encoder, catalogs.checkpoints)) },
+      vae: { name: info.animaAssets.vae, match: publicMatch(matchModelName(info.animaAssets.vae, catalogs.checkpoints)) },
     } : null,
   };
 }
@@ -4647,7 +4990,7 @@ async function sharedPathsApi(request, response, url) {
 
 async function modelApi(request, response, next) {
   const url = new URL(request.url, "http://localhost");
-  const apiPaths = ["/api/models", "/api/loras", "/api/model-paths", "/api/shared-paths", "/api/shared-paths/inspect", "/api/image-info/scan", "/api/image-info/read", "/api/image-info/resolve", "/api/image-info/preview", "/api/lora-lookup", "/api/lora-preview", "/api/yolo/download", "/api/background-removal/download", "/api/model-download", "/api/model-download/job", "/api/model-download/retry", "/api/recommended-models", "/api/recommended-download"];
+  const apiPaths = ["/api/models", "/api/loras", "/api/lora-folder", "/api/model-paths", "/api/shared-paths", "/api/shared-paths/inspect", "/api/image-info/scan", "/api/image-info/read", "/api/image-info/resolve", "/api/image-info/preview", "/api/lora-lookup", "/api/lora-preview", "/api/yolo/download", "/api/background-removal/download", "/api/model-download", "/api/model-download/job", "/api/model-download/retry", "/api/recommended-models", "/api/recommended-download"];
   if (!apiPaths.includes(url.pathname)) {
     next();
     return;
@@ -4710,6 +5053,13 @@ async function modelApi(request, response, next) {
     }
     if (url.pathname === "/api/lora-lookup") {
       await lookupLora(request, response);
+      return;
+    }
+    if (url.pathname === "/api/lora-folder") {
+      if (request.method !== "POST") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+      const payload = await readJsonRequest(request);
+      response.statusCode = 200;
+      response.end(JSON.stringify({ folder: await resolveLoraFolder(payload) }));
       return;
     }
     if (request.method !== "GET") throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
@@ -5774,7 +6124,7 @@ function systemApiPlugin() {
 }
 
 export default defineConfig({
-  plugins: [connectionResiliencePlugin(), setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
+  plugins: [connectionResiliencePlugin(), setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), promptPresetPreviewApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
   cacheDir: path.join(cacheDirectory, "vite"),
   define: {
     // The browser may be on a different machine than the folders the user is

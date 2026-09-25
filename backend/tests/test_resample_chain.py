@@ -44,13 +44,20 @@ def gradient(width, height):
 
 class ResizeMethodTests(unittest.TestCase):
     def test_every_method_comfy_offers_is_usable_and_lands_on_the_requested_size(self):
-        self.assertEqual(resize.RESIZE_METHODS, ("nearest-exact", "bilinear", "area", "bicubic", "lanczos"))
+        # ComfyUI's ImageScale list, plus Forge's PIL `nearest` ahead of it.
+        self.assertEqual(resize.RESIZE_METHODS, ("nearest", "nearest-exact", "bilinear", "area", "bicubic", "lanczos"))
         source = gradient(64, 48)
         for method in resize.RESIZE_METHODS:
             with self.subTest(method=method):
                 result = resize.resize_image(source, 97, 33, method)
                 self.assertEqual(result.size, (97, 33))
                 self.assertEqual(result.mode, "RGB")
+
+    def test_forge_nearest_is_pils_own_pass_and_not_torch_nearest_exact(self):
+        source = gradient(40, 30)
+        result = resize.resize_image(source, 97, 33, "nearest")
+        self.assertEqual(result.tobytes(), source.resize((97, 33), Image.Resampling.NEAREST).tobytes())
+        self.assertNotEqual(result.tobytes(), resize.resize_image(source, 97, 33, "nearest-exact").tobytes())
 
     def test_an_unknown_method_is_refused_rather_than_silently_replaced(self):
         with self.assertRaisesRegex(ValueError, "Unsupported resize algorithm"):
@@ -243,7 +250,7 @@ class ResampleUnitExecutionTests(unittest.TestCase):
         with (
             patch.dict(inference_server.performance_settings, {"staged_vae_decode": False}),
             patch.object(inference_server.AutoPipelineForImage2Image, "from_pipe", return_value=ImagePipeline()),
-            patch.object(inference_server, "prepare_prompt_conditioning", return_value={}),
+            patch.object(inference_server, "prepare_dynamic_prompt_conditioning", return_value={}),
         ):
             result, diagnostics = inference_server.apply_resample_unit(
                 source, object(), "sd", request, request.resample_units[0], "missing-job", Control(), 0,
@@ -278,7 +285,7 @@ class ResampleUnitExecutionTests(unittest.TestCase):
         with (
             patch.dict(inference_server.performance_settings, {"staged_vae_decode": False}),
             patch.object(inference_server.AutoPipelineForImage2Image, "from_pipe", return_value=ImagePipeline()),
-            patch.object(inference_server, "prepare_prompt_conditioning", return_value={}),
+            patch.object(inference_server, "prepare_dynamic_prompt_conditioning", return_value={}),
         ):
             result, diagnostics = inference_server.apply_resample_unit(
                 source, object(), "sd", request, request.resample_units[0], "missing-job", Control(), 0,

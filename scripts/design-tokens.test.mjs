@@ -94,6 +94,7 @@ test("no ordinary dialog picks its own stacking number", () => {
     ".gallery-focus > .gallery-dialog-backdrop", // dialogs inside the Gallery focus view
     ".lora-page-notice",                    // the standalone LoRA page, which has no dialogs
     ".lora-group-create-menu",              // anchored inside the LoRA group panel
+    ".preset-card-menu",                    // anchored inside a card of the prompt preset window
   ]);
   const loose = [];
   for (const { selector, body } of rulesOutsideRoot()) {

@@ -61,11 +61,14 @@ test("Hires migrates execution mode by engine and sends the independent tiled-re
   // The per-unit execution mode and every tiling field now live in the chain module, which the
   // workspace, the gallery and image-to-image all normalise through.
   const chain = await readSource("src/resample-chain.js");
-  assert.match(chain, /const executionMode = source\.executionMode === "usdu_tiled" && supportsUsduTiled\(engine\) \? "usdu_tiled" : "full_frame"/);
+  // The stored mode is the user's: an engine switch reports an enabled unit it cannot tile as a run
+  // blocker instead of rewriting it, and a disabled unit is carried through untouched.
+  assert.match(chain, /const executionMode = source\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame";/);
+  assert.match(chain, /if \(unit\.executionMode === "usdu_tiled" && !supportsUsduTiled\(engine\)\) return "USDU 分块重绘仅支持 Anima \/ Krea2 引擎";/);
   assert.match(chain, /sampler: samplers\.includes\(source\.sampler\) \? source\.sampler : null/);
   assert.match(chain, /padding: Math\.round\(inRange\(source\.padding, 32, 0, 256\)\)/);
   assert.match(chain, /maskBlur: Math\.round\(inRange\(source\.maskBlur, 8, 0, 64\)\)/);
-  assert.match(chain, /execution_mode: supportsUsduTiled\(engine\) && stage\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame"/);
+  assert.match(chain, /execution_mode: stage\.executionMode === "usdu_tiled" \? "usdu_tiled" : "full_frame"/);
   for (const field of ["tile_width: \"auto\"", "tile_height: \"auto\"", "padding: stage.padding", "mask_blur: stage.maskBlur", "seam_mode: \"none\"", "uniform_tiles: stage.uniformTiles !== false", "tiled_decode: stage.tiledDecode !== false"]) assert.match(chain, new RegExp(field));
   assert.match(chain, /tile_size: stage\.tileSize,[\s\S]*?tile_overlap: stage\.tileOverlap,[\s\S]*?execution_mode/);
   assert.doesNotMatch(app, /tileWidth:\s*512|tileHeight:\s*512|tile_width:\s*512|tile_height:\s*512/);
@@ -82,8 +85,9 @@ test("Hires migrates execution mode by engine and sends the independent tiled-re
   // checkable as source text.
   assert.match(galleryCore, /import \{ migrateResampleChain \} from "\.\/resample-chain\.js"/);
   assert.match(galleryCore, /postprocessChain: migrateResampleChain\(/);
-  assert.match(galleryPage, /USDU 分块重绘（推荐）/);
-  assert.match(galleryPage, /像素放大分块/);
+  // The gallery editor renders the same panel as the workspace, so it offers the same modes.
+  assert.match(galleryPage, /import ResampleChainPanel from "\.\/ResampleChainPanel\.jsx"/);
+  assert.match(galleryPage, /<ResampleChainPanel\s+chain=\{settings\.postprocessChain\}/);
   for (const source of [galleryCore, galleryPage]) assert.doesNotMatch(source, /tileWidth:\s*512|tileHeight:\s*512/);
   assert.doesNotMatch(app, /Protocol 25 backend integration may return 422/);
   assert.match(app, /const hiresControlsLocked = modelSwitching;/);
@@ -253,9 +257,15 @@ test("Gallery preserves, edits, and displays Anima PAG with other supported sett
   assert.doesNotMatch(editor, /isAnima && (?:id|settings\.guidance|next) === "pag"/);
   assert.doesNotMatch(editor, /Anima 不支持 PAG/);
   assert.match(editor, /<summary><Zap size=\{14\} \/>后处理链<\/summary>/);
-  assert.match(editor, /settings\.postprocessChain\.map\(\(stage, index\) =>/);
-  // Every stage in the chain is switched the same way, whatever its type.
-  assert.match(editor, /<ToggleField label="启用" detail="" checked=\{stage\.enabled\} onChange=\{\(value\) => setStage\(stage\.id, \{ enabled: value \}\)\} \/>/);
+  assert.match(editor, /<ResampleChainPanel\s+chain=\{settings\.postprocessChain\}/);
+  // Every stage in the chain is switched the same way, whatever its type: one foldable card whose
+  // switch is only held while the editor is busy, never by the engine.
+  const chainCard = sourceBetween(gallery, "function GalleryChainCard", "\n}\n");
+  assert.match(chainCard, /<ToggleField label="启用" detail="" checked=\{enabled\} disabled=\{disabled\} onChange=\{onToggleEnabled\} \/>/);
+  const cards = editor.match(/<GalleryChainCard [^>]*>/g) || [];
+  assert.equal(cards.length, 3);
+  for (const card of cards) assert.match(card, / disabled=\{busy\} /);
+  assert.equal((editor.match(/onToggleEnabled=\{\(value\) => setStage\(stage\.id, \{ enabled: value \}\)\}/g) || []).length, 2);
   assert.doesNotMatch(editor, /label="启用 (?:Hires\.fix|ADetailer|RTX VSR)"[^>]*disabled=\{isAnima\}/);
   assert.doesNotMatch(gallery, /settings\.model === "Anima" \? 0 : settings\.loras/);
   assert.doesNotMatch(gallery, /Anima 首版不支持 (?:LoRA|Hires\.fix|ADetailer|RTX VSR)/);
@@ -289,7 +299,9 @@ test("main and Gallery Prompt composers document only the supported weight gramm
 
 test("changing the selection does not tear the loaded pipeline down", async () => {
   const app = await readSource("src/App.jsx");
-  const selectModel = sourceBetween(app, "  const selectModel = (nextModel)", "  const selectCheckpoint = (nextCheckpoint)");
+  const selectModel = sourceBetween(app, "  const selectModel = (nextModel)", "  const loraEngineSwitchBlocker = ");
+  // The LoRA manager's engine bar switches through selectModel and inherits the same rule.
+  const loraSwitch = sourceBetween(app, "  const switchEngineFromLoraManager = (engine)", "  loraEngineSwitchRef.current = ");
   const selectCheckpoint = sourceBetween(app, "  const selectCheckpoint = (nextCheckpoint)", "  const selectSplitModelAsset =");
   const selectAsset = sourceBetween(app, "  const selectSplitModelAsset =", "  const refreshCheckpoints = async");
   const release = sourceBetween(app, "  const releaseLoadedModel = async", "  const unloadLoadedModel = async");
@@ -297,7 +309,8 @@ test("changing the selection does not tear the loaded pipeline down", async () =
   // A picker change is a change of selection. Releasing first put a multi-gigabyte teardown — and a
   // full reload from disk on the next run — in front of a click, for a release both loaders perform
   // themselves when the request does not match what is loaded.
-  for (const [name, body] of [["selectModel", selectModel], ["selectCheckpoint", selectCheckpoint], ["selectSplitModelAsset", selectAsset]]) {
+  assert.match(loraSwitch, /selectModel\(engine\);/);
+  for (const [name, body] of [["selectModel", selectModel], ["switchEngineFromLoraManager", loraSwitch], ["selectCheckpoint", selectCheckpoint], ["selectSplitModelAsset", selectAsset]]) {
     assert.doesNotMatch(body, /releaseLoadedModel/, `${name} must not release the loaded pipeline`);
     assert.doesNotMatch(body, /await /, `${name} has nothing to wait for`);
   }

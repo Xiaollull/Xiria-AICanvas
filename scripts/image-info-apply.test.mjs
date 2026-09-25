@@ -97,7 +97,11 @@ test("a model that is not installed is reported rather than written", () => {
   // mounted library is reconciled against the scanned catalogue, so mounting a
   // file that is not there would be pruned moments later anyway.
   assert.deepEqual(plan.overlay.loras.map((item) => item.value), ["iL/charactor/kuro.safetensors"]);
-  assert.deepEqual(plan.missing, [{ kind: "lora", name: "style/ghost.safetensors" }]);
+  // Each omission is itemised with the reason the panel shows beside it.
+  assert.deepEqual(plan.missing, [{
+    kind: "lora", name: "style/ghost.safetensors", label: "style/ghost.safetensors",
+    reason: "本地与共享目录中都没有找到", reasonKind: "missing",
+  }]);
   assert.equal(plan.overlay.checkpoint, "iL/waiIllustrious_v17.safetensors");
   // Naming the engine is what lets the apply path switch to the right catalogue.
   assert.equal(plan.overlay.model, "iL");
@@ -105,7 +109,9 @@ test("a model that is not installed is reported rather than written", () => {
   const withoutCheckpoint = buildImageInfoApplyPlan(record({ checkpointMatch: missing("waiIllustrious_v17.safetensors") }), ["model", "loras"], "t2i");
   assert.equal("checkpoint" in withoutCheckpoint.overlay, false);
   assert.equal(withoutCheckpoint.groups.includes("model"), false);
-  assert.deepEqual(withoutCheckpoint.missing[0], { kind: "checkpoint", name: "waiIllustrious_v17.safetensors" });
+  assert.deepEqual(withoutCheckpoint.missing[0], {
+    kind: "checkpoint", name: "waiIllustrious_v17.safetensors", reason: "本地与共享目录中都没有找到", reasonKind: "missing",
+  });
 
   // Every LoRA missing means there is no mount to write, so the group is not
   // claimed — an empty list would read as "unmount everything".
@@ -160,10 +166,14 @@ test("the panel keeps its marks on screen and the workspace writes go through on
   const styles = await readSource("src/styles.css");
 
   // Which rows were unavailable comes from the applied plan, never from the
-  // record alone: the mark means "this apply could not carry it".
-  assert.match(panel, /const missingNames = new Set\(\(result\?\.missing \|\| \[\]\)\.map\(\(item\) => item\.name\)\)/);
+  // record alone: the row mark means "this apply could not carry it". An entry
+  // is also flagged before applying when the reader already knows it is absent,
+  // and after applying it names the plan's reason.
+  assert.match(panel, /const missingByName = new Map\(\(result\?\.missing \|\| \[\]\)\.map\(\(item\) => \[item\.name, item\]\)\)/);
+  assert.match(panel, /const rowMissing = result \? field\.missing\.some\(\(name\) => missingByName\.has\(name\)\) : false;/);
   assert.match(panel, /className=\{rowMissing \? "missing" : ""\}/);
-  assert.match(panel, /className=\{result && missingNames\.has\(entry\.name\) \? "missing" : ""\}/);
+  assert.match(panel, /const unapplied = result \? missingByName\.get\(entry\.name\) : null;\s*const flagged = unapplied \|\| entry\.missing;/);
+  assert.match(panel, /title=\{unapplied\?\.reason \|\| entry\.reason/);
   assert.match(panel, /imageInfoDefaultFields\(info\)/);
   assert.match(panel, /全部应用/);
 
@@ -176,7 +186,7 @@ test("the panel keeps its marks on screen and the workspace writes go through on
   // Model writes reuse the gallery apply path rather than a second copy of the
   // engine-switch, catalogue-validation and missing-checkpoint logic.
   assert.match(app, /const applyImageInfoParameters = async \(plan\) => \{/);
-  assert.match(app, /await applyGallerySettings\(\{ \.\.\.snapshot, \.\.\.overlay \}, workspaceGroups, \{ page: null, label: "图片参数", fillMissingAssets: true \}\)/);
+  assert.match(app, /await applyGallerySettings\(\{ \.\.\.snapshot, \.\.\.overlay \}, workspaceGroups, \{\s*page: null,\s*label: "图片参数",\s*fillMissingAssets: true,/);
   // Staying put is what keeps the panel's marks visible after applying.
   assert.match(app, /if \(page\) \{\s*\n\s*setActivePage\(page\);/);
   assert.match(app, /onApplyImageParameters=\{applyImageInfoParameters\}/);

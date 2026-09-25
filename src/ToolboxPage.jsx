@@ -14,7 +14,7 @@ export const TOOLBOX_TOOLS = [
   { id: "image-info", label: "图片信息读取", detail: "读取 PNG 生成信息 · 单张或整个文件夹", Icon: FileSearch },
 ];
 
-export default function ToolboxPage({ onDownloaded, onApplyImageParameters }) {
+export default function ToolboxPage({ onDownloaded, onApplyImageParameters, imageApplyContext = null }) {
   // The selected tool and the reader's working state are project state, not component state: this
   // page is lazily mounted and is unmounted as soon as the user navigates away, so anything held
   // in `useState` here was being thrown away on every visit.
@@ -53,7 +53,7 @@ export default function ToolboxPage({ onDownloaded, onApplyImageParameters }) {
             state afterwards would flash the empty view and then have to reconcile the restore
             against whatever the user had already started typing. */}
         {!ready ? <div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在读取工作区</span></div>
-          : activeTool === "image-info" ? <ImageInfoReader onApplyParameters={onApplyImageParameters} savedState={state.imageInfo} onStateChange={setImageInfo} />
+          : activeTool === "image-info" ? <ImageInfoReader onApplyParameters={onApplyImageParameters} savedState={state.imageInfo} onStateChange={setImageInfo} applyContext={imageApplyContext} />
             : <ModelDownloader onDownloaded={onDownloaded} />}
       </Suspense>
     </div>

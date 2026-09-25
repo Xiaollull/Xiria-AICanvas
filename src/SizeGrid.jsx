@@ -11,6 +11,8 @@ export default function SizeGrid({ width, height, onChange, min = 0, max = 2048,
   const safeHeight = snap(Number(height) || min);
   const widthPercent = ((safeWidth - min) / (max - min)) * 100;
   const heightPercent = ((safeHeight - min) / (max - min)) * 100;
+  const nearTop = heightPercent >= 87.5;
+  const nearLeft = widthPercent <= 37.5;
   emittedRef.current = { width: safeWidth, height: safeHeight };
   const emitChange = (nextWidth, nextHeight) => {
     const next = { width: snap(nextWidth), height: snap(nextHeight) };
@@ -74,7 +76,9 @@ export default function SizeGrid({ width, height, onChange, min = 0, max = 2048,
     <div className="grid-selection" style={{ width: `${widthPercent}%`, height: `${heightPercent}%` }} />
     <div className="grid-origin"><span>x1, y1</span></div>
     <button type="button" className="grid-handle-hitbox" role="slider" tabIndex={disabled ? -1 : 0} aria-label="画布尺寸" aria-valuemin={min} aria-valuemax={max} aria-valuenow={safeWidth} aria-valuetext={`${safeWidth} × ${safeHeight} 像素`} title="拖动调整画布尺寸；方向键微调，Shift + 方向键大步调整" disabled={disabled} onKeyDown={handleKeyDown} onPointerDown={handlePointerDown} style={{ left: `${widthPercent}%`, bottom: `${heightPercent}%` }}><span className="grid-handle" aria-hidden="true" /></button>
-    <span className={`grid-size-label ${safeHeight >= 1792 ? "near-top" : ""} ${safeWidth <= 768 ? "near-left" : ""}`} style={safeHeight >= 1792 ? { left: safeWidth <= 768 ? "8px" : `${widthPercent}%`, top: `calc(${100 - heightPercent}% + 12px)` } : { left: safeWidth <= 768 ? "8px" : `${widthPercent}%`, bottom: `calc(${heightPercent}% + 12px)` }}>{safeWidth} × {safeHeight}</span>
+    {/* The label flips inside the grid near its top and left edges. The thresholds are fractions of
+        the scale (1792 and 768 of the historical 2048), so a raised canvas bound keeps them. */}
+    <span className={`grid-size-label ${nearTop ? "near-top" : ""} ${nearLeft ? "near-left" : ""}`} style={nearTop ? { left: nearLeft ? "8px" : `${widthPercent}%`, top: `calc(${100 - heightPercent}% + 12px)` } : { left: nearLeft ? "8px" : `${widthPercent}%`, bottom: `calc(${heightPercent}% + 12px)` }}>{safeWidth} × {safeHeight}</span>
     <div className="grid-label label-tl">高</div><div className="grid-label label-br">宽</div>
   </div>;
 }

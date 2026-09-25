@@ -133,15 +133,16 @@ test("Flux refinement steps are counted like Anima's, not like Diffusers'", () =
   const unit = { useSteps: true, steps: 20, denoise: 0.2, detector: "face_yolov8n.pt" };
   assert.equal(adetailerUnitSteps(unit, 30, "Flux"), 20);
   assert.equal(adetailerUnitSteps(unit, 30, "Anima"), 20);
-  assert.equal(adetailerUnitSteps(unit, 30, "SD"), 4);
+  // Diffusers now executes the configured steps too, through a longer schedule of its own.
+  assert.equal(adetailerUnitSteps(unit, 30, "SD"), 20);
 
   const hires = { steps: 12, denoise: 0.05 };
   assert.equal(unitSteps(hires, "Flux"), 12);
-  assert.equal(unitSteps(hires, "SD"), 0);
+  assert.equal(unitSteps(hires, "SD"), 12);
 
-  // A low-denoise unit that Diffusers would round to zero steps is a legal Flux configuration, so
-  // the run blocker must not refuse it.
-  const faint = { enabled: true, useSteps: true, steps: 12, denoise: 0.05, detector: "face_yolov8n.pt" };
+  // A low-denoise unit whose Diffusers schedule would pass 1000 steps is a legal Flux
+  // configuration, so the run blocker must not refuse it there.
+  const faint = { enabled: true, useSteps: true, steps: 60, denoise: 0.05, detector: "face_yolov8n.pt" };
   const stage = { enabled: true, units: [faint] };
   assert.equal(adetailerStageIssue(stage, 30, () => true, "Flux"), "");
   assert.equal(adetailerStageIssue(stage, 30, () => true, "Anima"), "");

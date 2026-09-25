@@ -441,9 +441,10 @@ def convert_krea2_lora_state_dict(
 ) -> dict[str, torch.Tensor]:
     """Bring a published Krea 2 LoRA into this model's ``lora_A``/``lora_B`` naming.
 
-    Three spellings reach here: kohya's ``lora_down``/``lora_up``, Diffusers' ``lora_A``/``lora_B``
-    under either the Diffusers or the ComfyUI module names, and the ``diffusion_model.``/
-    ``transformer.``/``lycoris_`` prefixes ``comfy/lora.py`` accepts for each.
+    Four spellings reach here: kohya's ``lora_down``/``lora_up``, Diffusers' ``lora_A``/``lora_B``
+    under either the Diffusers or the ComfyUI module names, the ``diffusion_model.``/
+    ``transformer.``/``lycoris_`` prefixes ``comfy/lora.py`` accepts for each, and the
+    ``lora_unet_`` + flat-path spelling Musubi Tuner and kohya-ss write for this model.
     """
     if any("dora_scale" in key for key in state_dict):
         raise ValueError(f"{label} is a DoRA checkpoint, which this runtime cannot fuse")
@@ -460,6 +461,13 @@ def convert_krea2_lora_state_dict(
     for comfy_name in set(key_map.values()):
         for prefix in ("", "diffusion_model.", "transformer."):
             lookup.setdefault(f"{prefix}{comfy_name}", comfy_name)
+    # Musubi Tuner / kohya-ss write `lora_unet_` + the path flattened with underscores.  Deriving
+    # the flat spelling from the names already known keeps it unambiguous: flattening `attn.to_out`
+    # and `attn.to_out.0` still yields two distinct keys, so no name can shadow another.
+    for name, target in list(lookup.items()):
+        if name.startswith("lycoris_"):
+            continue
+        lookup[f"lora_unet_{name.replace('.', '_')}"] = target
 
     normalized = {}
     for key, value in state_dict.items():

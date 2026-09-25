@@ -12,13 +12,17 @@ import {
 // Applying a picture's settings to a generate page.
 //
 // The result is not "done": some of what a picture records cannot exist here —
-// a LoRA that was never downloaded, a sampler this workspace does not offer —
-// so the panel stays open afterwards and marks exactly which rows those were.
-// Closing it is the user's acknowledgement, not a timer's.
-export default function ImageInfoApply({ info, onApply, onRefresh = null, onClose }) {
+// a LoRA that was never downloaded, one that shares its name with another file,
+// an upscaler that is not installed, a sampler this workspace does not offer —
+// so the panel stays open afterwards and lists exactly which rows those were
+// and why. Closing it is the user's acknowledgement, not a timer's.
+export default function ImageInfoApply({ info, context = null, onApply, onRefresh = null, onClose }) {
   const fields = useMemo(() => imageInfoApplyFields(info), [info]);
   const [target, setTarget] = useState(IMAGE_INFO_APPLY_TARGETS[0].id);
   const [selected, setSelected] = useState(() => new Set(imageInfoDefaultFields(info)));
+  // A1111 never records whether Hires ran before ADetailer; the default is its own order, and the
+  // user may flip it before applying (or reorder the chain afterwards on the page).
+  const [chainOrder, setChainOrder] = useState("hires-first");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -31,6 +35,7 @@ export default function ImageInfoApply({ info, onApply, onRefresh = null, onClos
   const pictureKey = [info?.name, info?.bytes, info?.checkpoint, info?.positive].join("\u0000");
   useEffect(() => {
     setSelected(new Set(imageInfoDefaultFields(info)));
+    setChainOrder("hires-first");
     setResult(null);
     setError("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -50,7 +55,8 @@ export default function ImageInfoApply({ info, onApply, onRefresh = null, onClos
       // install. The match that decides which engine Apply switches to is checked again now; if it
       // cannot be checked, nothing is applied rather than acting on a claim that may be stale.
       const current = onRefresh ? await onRefresh() : info;
-      const plan = buildImageInfoApplyPlan(current, fieldIds, target);
+      const plan = buildImageInfoApplyPlan(current, fieldIds, target, { engine: context?.engine || "", maximumEdge: context?.maximumEdge });
+      plan.postprocessOrder = chainOrder;
       await onApply(plan);
       setResult(plan);
     } catch (applyError) {
@@ -62,7 +68,8 @@ export default function ImageInfoApply({ info, onApply, onRefresh = null, onClos
 
   // Which rows the last apply could not carry, so the marking survives the
   // panel re-rendering and never guesses from the record alone.
-  const missingNames = new Set((result?.missing || []).map((item) => item.name));
+  const missingByName = new Map((result?.missing || []).map((item) => [item.name, item]));
+  const chainField = fields.find((field) => field.id === "chain");
 
   if (!fields.length) return null;
 
@@ -83,10 +90,11 @@ export default function ImageInfoApply({ info, onApply, onRefresh = null, onClos
         onClick={() => setTarget(item.id)}
       >{item.label}</button>)}
     </div>
+    {target === "i2i" && <p className="image-info-apply-hint">写入图生图自己的提示词、采样与后处理；当前来源图保持不变。</p>}
 
     <ul className="image-info-apply-fields">
       {fields.map((field) => {
-        const rowMissing = result ? field.missing.some((name) => missingNames.has(name)) : false;
+        const rowMissing = result ? field.missing.some((name) => missingByName.has(name)) : false;
         return <li key={field.id} className={rowMissing ? "missing" : ""}>
           <button type="button" role="checkbox" aria-checked={selected.has(field.id)} disabled={busy} onClick={() => toggle(field.id)}>
             <i>{selected.has(field.id) && <Check size={11} />}</i>
@@ -96,23 +104,42 @@ export default function ImageInfoApply({ info, onApply, onRefresh = null, onClos
             </span>
           </button>
           {field.entries && <div className="image-info-apply-entries">
-            {field.entries.map((entry, position) => <span
-              key={`${entry.name}-${position}`}
-              className={result && missingNames.has(entry.name) ? "missing" : ""}
-              title={result && missingNames.has(entry.name) ? "本地模型目录与共享目录中都没有这个模型，未挂载" : entry.name}
-            >
-              {result && missingNames.has(entry.name) && <AlertTriangle size={10} />}
-              {entry.name.split("/").pop()}<b>{entry.weight}</b>
-            </span>)}
+            {field.entries.map((entry, position) => {
+              const unapplied = result ? missingByName.get(entry.name) : null;
+              const flagged = unapplied || entry.missing;
+              return <span
+                key={`${entry.name}-${position}`}
+                className={`${flagged ? "missing" : ""} ${entry.status === "ambiguous" ? "ambiguous" : ""}`}
+                title={unapplied?.reason || entry.reason || (entry.label !== entry.name ? `图片记录：${entry.name}` : entry.name)}
+              >
+                {flagged && <AlertTriangle size={10} />}
+                {entry.label}<b>{entry.weight}</b>
+              </span>;
+            })}
+          </div>}
+          {field.id === "chain" && chainField?.candidate?.order === "assumed" && <div className="image-info-apply-order" role="radiogroup" aria-label="Hires 与 ADetailer 的执行顺序">
+            <span>顺序未记录：</span>
+            {[["hires-first", "先 Hires 后 ADetailer"], ["ade-first", "先 ADetailer 后 Hires"]].map(([id, label]) => <button
+              type="button"
+              key={id}
+              role="radio"
+              aria-checked={chainOrder === id}
+              className={chainOrder === id ? "active" : ""}
+              disabled={busy}
+              onClick={() => setChainOrder(id)}
+            >{label}</button>)}
           </div>}
         </li>;
       })}
     </ul>
 
-    {result && <div className={`image-info-apply-result ${result.missing.length || result.skipped.length ? "warn" : ""}`} role="status">
-      <strong>{imageInfoApplySummary(result)} → {IMAGE_INFO_APPLY_TARGETS.find((item) => item.id === result.target)?.label}</strong>
-      {result.missing.length > 0 && <small>缺失的模型未被写入，需要先下载或放入模型目录：{result.missing.map((item) => item.name.split("/").pop()).join("、")}</small>}
+    {result && <div className={`image-info-apply-result ${result.missing.length || result.skipped.length || result.unapplied?.length ? "warn" : ""}`} role="status">
+      <strong>{imageInfoApplySummary(result)} → {IMAGE_INFO_APPLY_TARGETS.find((item) => item.id === result.target)?.label}{result.targetEngine ? ` · ${result.targetEngine}` : ""}</strong>
+      {result.chainApplied?.length > 0 && <small>后处理链已启用：{result.chainApplied.join(" → ")}</small>}
+      {result.missing.length > 0 && <small>未应用的模型：{result.missing.map((item) => `${item.label || item.name}（${item.reason || "未找到"}）`).join("、")}</small>}
+      {result.unapplied?.length > 0 && <small>未应用的后处理：{result.unapplied.join("；")}</small>}
       {result.skipped.length > 0 && <small>本工作区没有对应选项，已跳过：{result.skipped.join("、")}</small>}
+      {result.notes?.length > 0 && <small>说明：{result.notes.join("；")}</small>}
     </div>}
     {error && <p className="image-info-apply-error"><AlertTriangle size={12} />{error}</p>}
 

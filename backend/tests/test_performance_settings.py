@@ -298,9 +298,12 @@ class PerformanceSettingsTests(unittest.TestCase):
                 return self
 
         class Decoder:
+            # Real pixels: the decode is checked for non-finite values before it is handed on.
+            output = torch.zeros(1, 3, 8, 8)
+
             def forward(self, value):
                 events.append(("decode", "run"))
-                return value
+                return self.output
 
         class VAE:
             dtype = torch.float16
@@ -353,6 +356,14 @@ class PerformanceSettingsTests(unittest.TestCase):
         self.assertLess(events.index(("unet", "cpu")), events.index(("vae", "cuda")))
         self.assertLess(events.index(("vae", "cuda")), events.index(("decode", "run")))
         self.assertEqual([event for event in events if event[0] == "vae"][-1], ("vae", "cpu"))
+
+        # A decode that produced NaN is a failed stage, never a black picture handed on.
+        Decoder.output = torch.full((1, 3, 8, 8), float("nan"))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "non-finite"):
+                inference_server.decode_staged_latents(Pipeline(), Latents(), "sd", "missing-job", Control(), False)
+        finally:
+            inference_server.pipeline_cpu_parked = previous_parked
 
     def test_the_optional_accelerators_are_off_by_default_and_survive_a_round_trip(self):
         self.assertEqual(DEFAULT_PERFORMANCE_SETTINGS["compile_transformer"], False)

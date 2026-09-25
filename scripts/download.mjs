@@ -709,6 +709,7 @@ export async function downloadFile({
   routes,
   destination,
   expectedSha256,
+  expectedSize = 0,
   connections = 8,
   thresholdBytes = 64 * 1024 ** 2,
   // An *idle* timeout: it restarts on every chunk, so it only fires when a connection has gone
@@ -726,9 +727,12 @@ export async function downloadFile({
 }) {
   await mkdir(path.dirname(destination), { recursive: true });
   const normalizedDigest = expectedSha256?.toLowerCase();
+  if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new Error("Expected download size must be a non-negative integer");
   if (existsSync(destination)) {
-    if ((!normalizedDigest && existingFilePolicy === "reuse") || (normalizedDigest && await sha256(destination) === normalizedDigest)) {
-      const totalBytes = (await stat(destination)).size;
+    const destinationStat = await stat(destination);
+    const sizeMatches = !expectedSize || destinationStat.size === expectedSize;
+    if (sizeMatches && ((!normalizedDigest && existingFilePolicy === "reuse") || (normalizedDigest && await sha256(destination) === normalizedDigest))) {
+      const totalBytes = destinationStat.size;
       onRoute?.({ id: "cache", label: "本地缓存", cached: true, connections: 0 });
       onProgress?.({ currentBytes: totalBytes, totalBytes, speedBps: 0, connections: 0, cached: true });
       return { path: destination, cached: true, route: null, connections: 0 };
@@ -748,6 +752,11 @@ export async function downloadFile({
 
   const temporaryPath = `${destination}.part`;
   const finish = async (route, activeConnections, sources) => {
+    if (expectedSize && (await stat(temporaryPath)).size !== expectedSize) {
+      await rm(temporaryPath, { force: true });
+      await clearDownloadParts(temporaryPath, activeConnections);
+      throw new Error("下载文件大小与预期不一致");
+    }
     if (normalizedDigest) {
       const digest = await sha256(temporaryPath);
       if (digest !== normalizedDigest) {
