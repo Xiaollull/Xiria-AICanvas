@@ -321,6 +321,26 @@ try:
         remove_group_offload,
         tier_for_memory_mode,
     )
+    from .stage_scheduler import (
+        AUTO_LABEL,
+        BELOW_RECOMMENDED_WARNING,
+        NATIVE_BLOCK,
+        NATIVE_RESIDENT,
+        RECOMMENDED_MINIMUM_VRAM_BYTES,
+        TEXT_ENCODE_TRANSIENT_BYTES,
+        StageBudget,
+        StageMemoryError,
+        allocator_safety_margin_bytes,
+        auto_label,
+        below_recommended_vram,
+        cap_invariant,
+        choose_native_placement,
+        decision_record,
+        path_for_tier,
+        path_label,
+        png_schedule_note,
+    )
+    from .conditioning_reuse import StaticConditioningCache, lora_fusion_signature, tower_signature
     from .resize import DEFAULT_RESIZE_METHOD, RESIZE_METHODS, align_size, resize_image, scaled_size
     from .upscaler import resolve_model as resolve_upscaler_model, status as upscaler_status, upscale_image
     from .usdu_tiles import TileCompositor, plan_tiles, prepare_tile
@@ -456,6 +476,26 @@ except ImportError:
         remove_group_offload,
         tier_for_memory_mode,
     )
+    from stage_scheduler import (
+        AUTO_LABEL,
+        BELOW_RECOMMENDED_WARNING,
+        NATIVE_BLOCK,
+        NATIVE_RESIDENT,
+        RECOMMENDED_MINIMUM_VRAM_BYTES,
+        TEXT_ENCODE_TRANSIENT_BYTES,
+        StageBudget,
+        StageMemoryError,
+        allocator_safety_margin_bytes,
+        auto_label,
+        below_recommended_vram,
+        cap_invariant,
+        choose_native_placement,
+        decision_record,
+        path_for_tier,
+        path_label,
+        png_schedule_note,
+    )
+    from conditioning_reuse import StaticConditioningCache, lora_fusion_signature, tower_signature
     from resize import DEFAULT_RESIZE_METHOD, RESIZE_METHODS, align_size, resize_image, scaled_size
     from upscaler import resolve_model as resolve_upscaler_model, status as upscaler_status, upscale_image
     from usdu_tiles import TileCompositor, plan_tiles, prepare_tile
@@ -701,6 +741,10 @@ active_memory_strategy = None
 active_residency = None
 # The job the controller's moves are announced on. The controller outlives jobs; this does not.
 residency_job_id = None
+# AUTO · 动态决策 (QPlan P8): every stage decision this job has made, in one vocabulary for every
+# engine, and the job's shared static prompt encodings. Both belong to one job and are reset by it.
+active_stage_schedule = []
+active_conditioning_cache = None
 active_attention_backend = "none"
 active_compute_dtype = "none"
 active_vae_mode = "none"
@@ -3666,8 +3710,36 @@ MEMORY_OFFLOAD_MODES = {
     "low_vram": "sequential",
     "ultra_low_vram": "sequential_cfg_split",
 }
+# What each admission mode installs, in the path vocabulary AUTO reports (QPlan P8). The mode names
+# stay the manual tiers' own; a job under AUTO says "AUTO · 动态决策" and names the path instead.
+MEMORY_MODE_PATHS = {
+    "high_vram": "resident",
+    "normal_vram": "component",
+    "low_vram": "submodule",
+    "ultra_low_vram": "submodule",
+}
 # The next-heavier rung, for a Diffusers pass that runs out of memory after admission let it start.
 SD_OFFLOAD_ESCALATION = {"high_vram": "normal_vram", "normal_vram": "low_vram", "low_vram": "ultra_low_vram"}
+
+
+def auto_dynamic_requested():
+    """Whether the user asked for AUTO · 动态决策.
+
+    Only the literal `auto` setting. `sdxl_balanced` resolves to the automatic admission for a model
+    that is not SDXL, but it is still a manual choice and keeps the pre-P8 rule — manual tiers keep
+    today's behaviour (QPlan P8 §2).
+    """
+    return performance_settings.get("memory_mode") == "auto"
+
+
+def strategy_label(strategy, mode=None, path=None):
+    """The label a strategy reports: its manual tier's name, or AUTO plus the path it is on."""
+    mode = mode or strategy["mode"]
+    if strategy.get("dynamic"):
+        return auto_label(path or strategy.get("memory_path") or MEMORY_MODE_PATHS.get(mode))
+    return MEMORY_MODE_LABELS[mode]
+
+
 # The Diffusers families whose UNet admission is resident-first and whose CFG branches may be run
 # one after another. The native engines reach `select_memory_policy` through their own loaders and
 # keep the workspace-upfront rule, which is what their staged runtimes are written against.
@@ -3787,9 +3859,16 @@ def choose_memory_strategy(
         # Say it where the mode is said. Serial CFG is the other half of why this job fits, and a
         # health report that named only the rung would leave the halved activation peak unexplained.
         reason += "；CFG 正负分支串行推理，激活峰值减半"
+    dynamic = auto_dynamic_requested()
     return {
         **policy,
-        "label": MEMORY_MODE_LABELS[mode],
+        # AUTO · 动态决策: this admission is only the mount-stage decision; every later stage is
+        # re-decided (`plan_residency_for_stage`, `plan_native_stage`). `legacy_mode` is what the
+        # pre-P8 scheduler would have published, which is all the autoencoder's tiling may follow.
+        "dynamic": dynamic,
+        "legacy_mode": mode,
+        "memory_path": MEMORY_MODE_PATHS[mode],
+        "label": auto_label(MEMORY_MODE_PATHS[mode]) if dynamic else MEMORY_MODE_LABELS[mode],
         "reason": reason,
         "total_gb": round(budget_total_bytes / GIB, 1),
         "physical_total_gb": round(physical_total_bytes / GIB, 1),
@@ -3849,7 +3928,11 @@ def record_group_offload_fallback(pipeline, strategy):
         return False
     strategy.update(
         mode="low_vram",
-        label="LOW_VRAM 低显存",
+        label=strategy_label(strategy, "low_vram", NATIVE_BLOCK),
+        memory_path=NATIVE_BLOCK,
+        # The runtime fell back by itself mid-stage; AUTO does not promote it again this job, or an
+        # estimate that was just proven wrong would buy the same failed attempt at every stage.
+        native_promotion_locked=True,
         offload_mode="staged_transformer_group_offload",
         model_resident=False,
         transformer_group_offload=True,
@@ -3872,10 +3955,30 @@ def record_group_offload_fallback(pipeline, strategy):
     return True
 
 
+def reported_memory_mode(strategy):
+    """The mode a job or the health report names: `auto` under AUTO, never a manual tier's name."""
+    if strategy is None:
+        return None
+    return "auto" if strategy.get("dynamic") else strategy["mode"]
+
+
+def memory_path_fields(strategy):
+    """AUTO's secondary fields: which path the current stage is actually on, and the schedule so far."""
+    if strategy is None or not strategy.get("dynamic"):
+        return {}
+    path = strategy.get("memory_path")
+    return {
+        "memory_path": path,
+        "memory_path_label": path_label(path) if path else None,
+        "memory_tier": strategy.get("residency_tier"),
+        "memory_schedule": list(active_stage_schedule),
+    }
+
+
 def memory_job_fields(strategy, model_cached=True):
     parked = bool(model_cached and pipeline_cpu_parked)
     return {
-        "memory_mode": strategy["mode"],
+        "memory_mode": reported_memory_mode(strategy),
         "memory_label": strategy["label"],
         "memory_reason": strategy["reason"],
         "offload_mode": "cpu_parked" if parked else strategy["offload_mode"],
@@ -3893,6 +3996,7 @@ def memory_job_fields(strategy, model_cached=True):
         "cfg_mode": strategy.get("cfg_mode", "batched"),
         "memory_admission": strategy.get("admission"),
         "acceleration": strategy.get("acceleration"),
+        **memory_path_fields(strategy),
     }
 
 
@@ -4073,12 +4177,16 @@ def configure_vae_mode(pipeline, strategy):
     requested = performance_settings["vae_mode"]
     mode = requested
     if requested == "auto":
+        # `legacy_mode`, not `mode`: tiling decides pixels, and under AUTO the rung the model is on
+        # no longer is the rung the pre-P8 scheduler would have published. Following the legacy rung
+        # keeps every decode exactly where it was (QPlan P8 §2 pixel identity); under a manual tier
+        # the two are the same thing.
         mode = {
             "high_vram": "full",
             "normal_vram": "sliced",
             "low_vram": "tiled",
             "ultra_low_vram": "tiled",
-        }[strategy["mode"]]
+        }[strategy.get("legacy_mode") or strategy["mode"]]
     # On the autoencoder itself: the pipeline-level wrappers are deprecated in Diffusers 0.38 and
     # printed a FutureWarning on every reconfigure, which the console showed as an error.
     vae = pipeline.vae
@@ -4168,10 +4276,16 @@ def publish_residency(job_id=None):
     if tier is None:
         return
     mode = RESIDENCY_TIER_MEMORY_MODES.get(tier, active_memory_strategy["mode"])
+    legacy_tier = (active_residency.legacy_tier or tier) if active_residency.dynamic else tier
+    path = path_for_tier(tier)
     active_memory_strategy = {
         **active_memory_strategy,
         "mode": mode,
-        "label": MEMORY_MODE_LABELS[mode],
+        # Under a manual tier the legacy rung is the real one; under AUTO it is the rung the pre-P8
+        # rule would have published, and the autoencoder's tiling is reconfigured from it.
+        "legacy_mode": RESIDENCY_TIER_MEMORY_MODES.get(legacy_tier, mode),
+        "memory_path": path,
+        "label": strategy_label(active_memory_strategy, mode, path),
         "offload_mode": RESIDENCY_TIER_OFFLOAD_MODES.get(tier, active_memory_strategy["offload_mode"]),
         "model_resident": tier == "T0",
         "residency_tier": tier,
@@ -4180,13 +4294,401 @@ def publish_residency(job_id=None):
         update_job(job_id, **memory_job_fields(active_memory_strategy), **residency_job_fields())
 
 
-def plan_residency_for_stage(stage, family, canvas, guidance_scale, images_per_batch, job_id=None):
+STAGE_SCHEDULE_LIMIT = 64
+
+
+def stage_scheduling_active(strategy=None):
+    """Whether this job is scheduled by AUTO · 动态决策 (decided at admission, fixed for the job)."""
+    strategy = active_memory_strategy if strategy is None else strategy
+    return bool(strategy and strategy.get("dynamic"))
+
+
+def platform_reserve_bytes(physical_total_bytes):
+    """The platform/driver reserve admission keeps; a fixed VRAM wall already includes it."""
+    if performance_settings.get("vram_limit_gb", 0.0) > 0:
+        return 0
+    if RESERVED_VRAM_GB is not None:
+        return int(RESERVED_VRAM_GB * GIB)
+    return reserved_vram_bytes(
+        physical_total_bytes, allow_shared_memory=performance_settings["allow_shared_memory"],
+    )
+
+
+def read_stage_budget(resident_bytes=0):
+    """One reading of everything a stage decision needs (QPlan P8 §3.2), as a `StageBudget`.
+
+    Driver free memory, PyTorch's allocated / reserved / active bytes, the budget scope (device or
+    VRAM wall), the platform reserve and the pipeline's own resident weight. Memory other processes
+    hold is not estimated: it is simply absent from the driver's free figure.
+    """
+    free_bytes, physical_total_bytes = torch.cuda.mem_get_info()
+    stats = torch.cuda.memory_stats()
+    allocated = int(torch.cuda.memory_allocated())
+    reserved = int(stats.get("reserved_bytes.all.current", torch.cuda.memory_reserved()))
+    active = int(stats.get("active_bytes.all.current", allocated))
+    wall = performance_settings.get("vram_limit_gb", 0.0) > 0
+    limit = effective_vram_limit_bytes(
+        physical_total_bytes,
+        performance_settings.get("vram_limit_gb", 0.0),
+        allow_shared_memory=performance_settings["allow_shared_memory"],
+    )
+    return StageBudget(
+        driver_free_bytes=int(free_bytes),
+        physical_total_bytes=int(physical_total_bytes),
+        limit_bytes=int(limit),
+        allocated_bytes=allocated,
+        reserved_bytes=reserved,
+        active_bytes=active,
+        resident_bytes=int(resident_bytes),
+        platform_reserve_bytes=platform_reserve_bytes(physical_total_bytes),
+        allocator_ceiling_bytes=int(limit) if wall else None,
+    )
+
+
+def reset_stage_schedule():
+    global active_stage_schedule
+    active_stage_schedule = []
+
+
+def record_stage_decision(record, job_id=None):
+    """Append one stage decision to the job's schedule and put it in front of whoever is watching."""
+    active_stage_schedule.append(record)
+    if len(active_stage_schedule) > STAGE_SCHEDULE_LIMIT:
+        del active_stage_schedule[:-STAGE_SCHEDULE_LIMIT]
+    if job_id is not None:
+        update_job(job_id, memory_schedule=list(active_stage_schedule), memory_stage=record)
+    return record
+
+
+def record_mount_decision(job_id, family, engine, width, height, reused):
+    """Stage 1 of the matrix: where the model was mounted, sized by weights, adapters and the canvas.
+
+    The admission is the mount-stage decision — it has to place the weights somewhere before any
+    stage can be asked about — and a reused checkpoint/LoRA combination says so rather than
+    pretending it was admitted again.
+    """
+    strategy = active_memory_strategy
+    if not stage_scheduling_active(strategy):
+        return None
+    if is_native_family(family):
+        tier = None
+        path = NATIVE_BLOCK if strategy.get("transformer_group_offload") else NATIVE_RESIDENT
+    else:
+        tier = active_residency.tier if active_residency is not None else tier_for_memory_mode(strategy["mode"])
+        path = path_for_tier(tier)
+    admission = strategy.get("admission") or {}
+    required = (
+        admission.get("sampling_stage_required_bytes")
+        or (strategy.get("high_required_bytes") if strategy["mode"] == "high_vram" else strategy.get("normal_required_bytes"))
+    )
+    return record_stage_decision(decision_record(
+        stage="model_mount", engine=engine, family=family, path=path, tier=tier, canvas=(width, height),
+        reason="mount_reused" if reused else "mount_admitted", required_bytes=required,
+        detail={
+            "admission_mode": strategy["mode"],
+            "weight_bytes": strategy.get("base_weight_bytes"),
+            "adapter_bytes": strategy.get("adapter_source_bytes"),
+            "free_bytes": strategy.get("free_bytes"),
+            "reused": bool(reused),
+        },
+    ), job_id)
+
+
+def record_decode_decision(stage, family, canvas, evicted, job_id=None, reason=None, peak_bytes=None, tiled=None):
+    """A decode boundary: whether the diffusion model left the card before the autoencoder ran."""
+    if not stage_scheduling_active():
+        return None
+    return record_stage_decision(decision_record(
+        stage=stage, engine=loaded_engine, family=family, path="evicted" if evicted else "shared",
+        canvas=canvas, reason=reason or ("evict_before_decode" if evicted else "decode_beside_model"),
+        required_bytes=peak_bytes, detail={"tiled": tiled} if tiled is not None else None,
+    ), job_id)
+
+
+NATIVE_PLACEMENT_METHODS = (
+    "enable_transformer_group_offload",
+    "_remove_transformer_group_offload",
+    "configure_transformer_residency",
+)
+
+
+def native_resident_bytes(runtime):
+    """How much of a native runtime's weight is on the card right now, shared storage counted once."""
+    seen = set()
+    total = 0
+    for module in (getattr(runtime, "components", {}) or {}).values():
+        if not isinstance(module, torch.nn.Module):
+            continue
+        for tensor in (*module.parameters(), *module.buffers()):
+            if tensor.device.type != "cuda":
+                continue
+            pointer = tensor.data_ptr() or id(tensor)
+            if pointer in seen:
+                continue
+            seen.add(pointer)
+            total += tensor.numel() * tensor.element_size()
+    return total
+
+
+def native_placement_lock(runtime, strategy, current):
+    """Why a native runtime's transformer must stay where it is for this stage, or None.
+
+    Placement is only ever weight location. Where moving the transformer would change arithmetic or
+    lose work, it is not moved: a compiled transformer cannot take group-offload hooks and come out
+    the same, and Anima fuses its LoRA on the first GPU onload — hooks installed before that would
+    leave the adapter unapplied. A runtime that fell back to streaming by itself this job is not
+    promoted again: the estimate that admitted residency has just been shown to be wrong.
+    """
+    if not all(callable(getattr(runtime, name, None)) for name in NATIVE_PLACEMENT_METHODS):
+        return "runtime_has_no_placement_hooks"
+    if getattr(runtime, "_poisoned", False) or getattr(runtime, "_closed", False):
+        return "runtime_unavailable"
+    if bool((strategy.get("acceleration") or {}).get("compile_active")):
+        return "compiled_transformer"
+    if getattr(runtime, "lora_plans", None) and not getattr(runtime, "_diffusion_lora_applied", True):
+        return "adapter_fusion_pending"
+    if current == NATIVE_BLOCK and strategy.get("native_promotion_locked"):
+        return "runtime_fallback_this_job"
+    return None
+
+
+def plan_native_stage(stage, family, canvas, guidance_scale, images_per_batch, runtime, job_id=None):
+    """Re-decide a native runtime's transformer placement for the stage about to run (QPlan P8).
+
+    Admission placed the transformer against the chain's most demanding stage; under AUTO each
+    sampling stage — the base pass, every resample unit, every ADetailer region — is placed by what
+    it needs, through the same decision engine and the same cap rule as the component ladder, and
+    recorded in the same schedule. Resident when it fits (and, from streaming, with 15% to spare);
+    one block at a time otherwise; a readable stage error when not even that fits.
+    """
+    global active_memory_strategy
+    strategy = active_memory_strategy
+    if (
+        not stage_scheduling_active(strategy)
+        or not is_native_family(family)
+        or runtime is None
+        or not torch.cuda.is_available()
+    ):
+        return None
+    weights = getattr(runtime, "weight_sizes", {}) or {}
+    transformer_bytes = int(weights.get("transformer", 0) or 0)
+    block_bytes = int(weights.get("transformer_max_block", 0) or 0) + int(weights.get("transformer_unmatched", 0) or 0)
+    if transformer_bytes <= 0 or block_bytes <= 0:
+        return None
+    copies = int(strategy.get("actual_physical_forward_copies") or strategy.get("physical_forward_copies") or 1)
+    batch = int(strategy.get("sampling_batch_size") or images_per_batch or 1)
+    inference_bytes = estimate_inference_bytes(family, canvas[0], canvas[1], guidance_scale, batch, copies)
+    reserve = int(strategy.get("reserved_bytes", 0) or 0)
+    # The same rule admission uses for these runtimes: the transformer (or one block group) with 10%
+    # for the allocator, the stage's activations and the platform reserve.
+    resident_required = int(transformer_bytes * 1.10) + inference_bytes + reserve
+    block_required = int(block_bytes * 1.10) + inference_bytes + reserve
+    budget = read_stage_budget(native_resident_bytes(runtime))
+    margin = allocator_safety_margin_bytes(budget.limit_bytes)
+    current = NATIVE_BLOCK if getattr(runtime, "transformer_group_offload_enabled", False) else NATIVE_RESIDENT
+    lock = native_placement_lock(runtime, strategy, current)
+    choice = choose_native_placement(
+        current=current,
+        resident_required=resident_required,
+        block_required=block_required,
+        budget=budget,
+        margin_bytes=margin,
+        resident_workspace=inference_bytes,
+        block_workspace=inference_bytes,
+        transformer_bytes=transformer_bytes,
+        block_bytes=block_bytes,
+        locked=lock is not None,
+    )
+    target = choice.tier
+    reason = choice.reason
+    if target == NATIVE_BLOCK and reason == "stage_plan_floor":
+        if block_required > budget.planning_free_bytes:
+            raise StageMemoryError(
+                stage, canvas, block_required, budget.planning_free_bytes, detail=f"{family} 单块流式",
+            )
+        reason = "stage_floor_without_margin"
+    if target != current:
+        blocks = int(strategy.get("transformer_blocks_per_group") or 1)
+        if target == NATIVE_BLOCK:
+            runtime.configure_transformer_residency(False)
+            runtime.enable_transformer_group_offload(max(1, blocks))
+        else:
+            runtime._remove_transformer_group_offload()
+            runtime.configure_transformer_residency(bool(strategy.get("keep_transformer_resident", False)))
+        block = target == NATIVE_BLOCK
+        strategy.update(
+            transformer_group_offload=block,
+            transformer_blocks_per_group=max(1, blocks) if block else 0,
+            offload_mode="staged_transformer_group_offload" if block else "staged_transformer_resident",
+            mode="low_vram" if block else (strategy.get("native_resident_mode") or "normal_vram"),
+        )
+    if strategy.get("mode") != "low_vram":
+        strategy["native_resident_mode"] = strategy["mode"]
+    strategy.update(memory_path=target, label=strategy_label(strategy, path=target))
+    invariant = cap_invariant(
+        budget,
+        inference_bytes + (block_bytes if target == NATIVE_BLOCK else transformer_bytes),
+        margin,
+    )
+    record_stage_decision(decision_record(
+        stage=stage, engine=loaded_engine, family=family, path=target, canvas=canvas, reason=reason,
+        budget=budget, required_bytes=resident_required if target == NATIVE_RESIDENT else block_required,
+        workspace_bytes=inference_bytes, invariant=invariant, changed=target != current,
+        detail={"lock": lock, **choice.fits},
+    ), job_id)
+    if job_id is not None:
+        update_job(job_id, **memory_job_fields(strategy))
+    return target
+
+
+def static_prompt(prompt, negative_prompt):
+    """One conditioning state for the whole pass: no schedule, no alternation, no `AND`."""
+    try:
+        syntax = compile_conditioning_syntax(prompt, negative_prompt)
+    except Exception:
+        return False
+    return not syntax.dynamic and not syntax.composable
+
+
+def stage_prompt_conditioning(pipeline, family, prompt, negative_prompt, *, timeline, clip_skip,
+                              before_encode=None):
+    """SD/iL prompt conditioning for one stage, encoded once per job when the prompt is static.
+
+    The base pass, every resample redraw and every ADetailer unit ask for the conditioning of the
+    same strings through towers that do not change inside a job, so a static prompt is encoded by
+    the first stage and handed to the rest (QPlan P8 §3.5). The key carries the text, the negative,
+    CLIP skip, the family, the towers and the fused adapter set; a dynamic prompt, or an adapter
+    state that cannot be trusted, is encoded exactly as before and never shared. `before_encode`
+    runs only when a real encode is about to happen — a stage that reuses the shared encoding moves
+    no tower and needs no plan for it.
+    """
+    def encode():
+        if before_encode is not None:
+            before_encode()
+        return prepare_dynamic_prompt_conditioning(
+            pipeline, family, prompt, negative_prompt, timeline=timeline, clip_skip=clip_skip,
+        )
+
+    cache = active_conditioning_cache
+    if cache is None:
+        return encode()
+    owner = loaded_pipeline if loaded_pipeline is not None else pipeline
+    adapters = lora_fusion_signature(owner)
+    if adapters is None or not static_prompt(prompt, negative_prompt):
+        return cache.bypass(encode)
+    key = cache.key(
+        family=family, prompt=prompt, negative_prompt=negative_prompt, clip_skip=clip_skip,
+        emphasis="forge", model_signature=tower_signature(pipeline, loaded_checkpoint), lora_signature=adapters,
+    )
+    return cache.get_or_encode(key, encode)
+
+
+# What one tiled pass of an ESRGAN-class upscaler allocates beside its weights: the RRDB trunk at the
+# tile's own size and the upsampled feature maps at up to four times it. Generous on purpose — the
+# alternative to parking first is the old answer, an OOM followed by the same park and a retry.
+UPSCALER_TILE_WORKSPACE_BYTES = 768 * 1024**2
+
+
+def plan_upscale_stage(stage, pipeline, family, source_size, destination, settings, job_id=None):
+    """Stage 5a: whether the diffusion model has to leave the card before a GPU upscaler runs.
+
+    The upscaler used to be tried beside the model and the model parked only after an OOM. Under
+    AUTO the question is asked first: if what is free beside the model cannot hold the upscaler's
+    weights and one tile's working set with the band's margin, the model is parked before it runs,
+    and restored after it exactly as the OOM path did. The upscaler runs on the GPU either way.
+    """
+    if not stage_scheduling_active() or not torch.cuda.is_available():
+        return None
+    try:
+        model_bytes = int(resolve_upscaler_model(UPSCALER_MODEL_DIRECTORY, settings.upscaler).stat().st_size)
+    except Exception:
+        model_bytes = 64 * 1024**2
+    native = is_native_family(family)
+    resident = native_resident_bytes(pipeline) if native else (
+        active_residency.resident_bytes() if active_residency is not None else 0
+    )
+    budget = read_stage_budget(resident)
+    margin = allocator_safety_margin_bytes(budget.limit_bytes)
+    workspace = 2 * model_bytes + UPSCALER_TILE_WORKSPACE_BYTES
+    fits = budget.ambient_free_bytes >= workspace + margin
+    park = not fits and not native and not pipeline_cpu_parked
+    if park:
+        update_job(job_id, phase=f"{stage_display_label(stage)} · Parking diffusion model", stage="sampler_offload")
+        park_pipeline_for_external_stage(pipeline, family)
+    return record_stage_decision(decision_record(
+        stage=stage, engine=loaded_engine, family=family, path="parked" if park else "shared",
+        canvas=destination, reason="park_before_upscale" if park else "upscale_beside_model",
+        budget=budget, required_bytes=workspace + margin, workspace_bytes=workspace,
+        detail={"source_size": list(source_size), "model_bytes": model_bytes},
+    ), job_id)
+
+
+def record_native_decode(stage, family, canvas, job_id=None):
+    """A native runtime decodes inside its own call; whether it evicts first is the configured setting.
+
+    The runtimes choose tiled or whole decoding from the free memory they see at that moment, so
+    AUTO does not move the transformer around their decode — that would change what they see, and
+    with it the pixels. The schedule records the decision the setting made.
+    """
+    evicted = bool(performance_settings.get("unload_before_decode", True))
+    return record_decode_decision(
+        stage, family, canvas, evicted=evicted, job_id=job_id, reason="configured_unload_before_decode",
+    )
+
+
+def record_final_decode(family, canvas, job_id=None):
+    """Stage 7: the decode that produced the picture about to be saved, and how it ran."""
+    if not stage_scheduling_active():
+        return None
+    last = None
+    for record in reversed(active_stage_schedule):
+        stage = str(record.get("stage") or "")
+        if stage.startswith(("base_decode", "hires_decode")):
+            last = record
+            break
+    evicted = last.get("path") == "evicted" if last is not None else bool(
+        performance_settings.get("unload_before_decode", True)
+    )
+    return record_decode_decision(
+        "final_decode", family, canvas, evicted=evicted, job_id=job_id, reason="final_decode_and_save",
+        peak_bytes=(last or {}).get("required_bytes"),
+    )
+
+
+def stage_display_label(stage):
+    return str(stage).replace("_", " ")
+
+
+def component_decode_bytes(pipeline, width, height, images_per_batch=1):
+    """The autoencoder peak of a Diffusers call that decodes before it returns.
+
+    Whole-image when the autoencoder is untiled; bounded by one tile plus the output buffer when it
+    is tiled (measured 4.09 GiB for a tiled 1152x1920 SDXL decode, `estimate_vae_decode_bytes`).
+    """
+    vae = getattr(pipeline, "vae", None)
+    sliced = bool(getattr(vae, "use_slicing", False))
+    whole = estimate_vae_decode_bytes(width, height, images_per_batch=images_per_batch, sliced=sliced)
+    if bool(getattr(vae, "use_tiling", False)):
+        copies = 1 if sliced else max(1, int(images_per_batch))
+        tiled = estimate_vae_decode_bytes(1024, 1024) * copies + 12 * int(width) * int(height) * copies
+        return min(whole, tiled)
+    return whole
+
+
+def plan_residency_for_stage(stage, family, canvas, guidance_scale, images_per_batch, job_id=None, *,
+                             kind="sampling", decode_in_call=False, legacy_point=True, inference_bytes=None):
     """Re-ask where the diffusion model should live, for the stage about to run.
 
     This is the difference Phase 1 exists to make. Admission sizes the whole chain against its most
     demanding stage, so a 768x1280 base pass used to be placed by what a 1152x1920 redraw needed;
     here each sampling stage is placed by what *it* needs against the memory free at that moment.
-    Only the Diffusers families have a controller — the native engines schedule their own.
+    Only the Diffusers families have a controller — the native engines go through
+    `plan_native_stage`.
+
+    Under AUTO (QPlan P8) the same call also carries what kind of stage it is — a sampling pass, a
+    prompt encode — and whether the call decodes before it returns, and the decision is recorded in
+    the job's stage schedule. A stage that cannot run even on the floor raises `StageMemoryError`
+    rather than starting; any other failure to install a rung keeps the previous one, as before.
     """
     if torch.cuda.is_available() and pipeline_cpu_parked and not is_native_family(family):
         restore_parked_pipeline()
@@ -4195,12 +4697,26 @@ def plan_residency_for_stage(stage, family, canvas, guidance_scale, images_per_b
     if active_residency is None or family not in SD_COMPONENT_FAMILIES or loaded_pipeline is None:
         return None
     copies = int((active_memory_strategy or {}).get("physical_forward_copies", 1))
-    inference_bytes = estimate_inference_bytes(
-        family, canvas[0], canvas[1], guidance_scale, images_per_batch, copies
-    )
+    if inference_bytes is None:
+        inference_bytes = estimate_inference_bytes(
+            family, canvas[0], canvas[1], guidance_scale, images_per_batch, copies
+        )
+    dynamic = active_residency.dynamic
+    demand = None
+    if dynamic:
+        demand = {"kind": kind, "inference_bytes": int(inference_bytes)}
+        if decode_in_call and canvas:
+            demand["decode_bytes"] = component_decode_bytes(
+                loaded_pipeline, canvas[0], canvas[1], images_per_batch
+            )
     previous = active_residency.tier
     try:
-        tier = active_residency.plan_for_stage(stage, inference_bytes, canvas=canvas)
+        tier = active_residency.plan_for_stage(
+            stage, inference_bytes, canvas=canvas, demand=demand, legacy_point=legacy_point,
+        )
+    except StageMemoryError:
+        publish_residency(job_id)
+        raise
     except Exception:
         # A rung that will not install is not a reason to lose the job: the pipeline keeps whatever
         # it had, and the run continues on it.
@@ -4210,6 +4726,27 @@ def plan_residency_for_stage(stage, family, canvas, guidance_scale, images_per_b
         except Exception:
             traceback.print_exc()
         return None
+    if dynamic and active_residency.last_decision is not None:
+        entry = active_residency.last_decision
+        record_stage_decision(decision_record(
+            stage=stage, engine=loaded_engine, family=family, path=path_for_tier(tier), tier=tier,
+            canvas=canvas, reason=entry.get("reason"), changed=entry.get("changed", False),
+            required_bytes=entry.get("required_bytes"), workspace_bytes=entry.get("workspace_bytes"),
+            legacy_tier=active_residency.legacy_tier,
+            # The same top-level cap fields a native decision carries, so one reader serves both.
+            invariant={
+                "cap_bytes": entry.get("cap_bytes"),
+                "required_cap_bytes": entry.get("required_cap_bytes"),
+                "holds": entry.get("cap_holds"),
+            },
+            detail={
+                "kind": kind,
+                "free_bytes": entry.get("free_bytes"),
+                "ambient_free_bytes": entry.get("ambient_free_bytes"),
+                "cap_demotions": entry.get("cap_demotions") or None,
+                "decode_in_call": bool(decode_in_call),
+            },
+        ), job_id)
     if tier != previous:
         # Deliberately *not* reconfiguring the VAE here. A tiled decode and a whole-image decode do
         # not produce the same pixels, so letting the rung redecide it would make the picture depend
@@ -4641,6 +5178,7 @@ def decode_staged_latents(
     start_progress=94,
     final_progress=98,
     phase_prefix=None,
+    decision_stage=None,
 ):
     global active_vae_mode
     latents = latents.to("cpu")
@@ -4651,6 +5189,20 @@ def decode_staged_latents(
     vae = pipeline.vae
     if not use_tiling and not whole_image_decode_fits(latents, vae):
         use_tiling = True
+    if decision_stage:
+        # The staged decode is the user's setting and always evicts first; what the schedule records
+        # is that it did, the decode's own peak, and which of tiled/whole it ran — the one decision
+        # here that decides pixels, and one AUTO never makes differently.
+        scale = 2 ** (len(getattr(vae.config, "block_out_channels", (0,) * 4)) - 1)
+        record_decode_decision(
+            decision_stage, family, (int(latents.shape[-1]) * scale, int(latents.shape[-2]) * scale),
+            evicted=True, job_id=job_id, reason="staged_decode_setting",
+            peak_bytes=estimate_vae_decode_bytes(
+                int(latents.shape[-1]) * scale, int(latents.shape[-2]) * scale,
+                images_per_batch=int(latents.shape[0]), sliced=bool(getattr(vae, "use_slicing", False)),
+            ),
+            tiled=bool(use_tiling),
+        )
     # The configured mode is a preference; what the report has to name is the decode that ran.
     active_vae_mode = "tiled" if use_tiling else active_vae_mode
     original_dtype = vae.dtype
@@ -4731,13 +5283,16 @@ def restore_cached_pipeline_state(job_id=None, request=None):
         if is_native_family(loaded_family):
             loaded_pipeline.to_cpu()
             return True
+        # The published mode the pre-P8 scheduler would have left: a reconfigure here also resets the
+        # autoencoder's tiling for the next job, so it has to happen exactly when it used to.
+        published = active_memory_strategy.get("legacy_mode") or active_memory_strategy["mode"]
         if pipeline_cpu_parked:
             return True
         elif performance_settings["staged_vae_decode"]:
             park_pipeline_for_vae(loaded_pipeline)
-        elif active_memory_strategy["mode"] == "normal_vram":
+        elif published == "normal_vram":
             loaded_pipeline.maybe_free_model_hooks()
-        elif active_memory_strategy["mode"] in {"low_vram", "ultra_low_vram"}:
+        elif published in {"low_vram", "ultra_low_vram"}:
             reconfigure_memory_strategy(loaded_pipeline, active_memory_strategy)
         return True
     except Exception as error:
@@ -4803,7 +5358,7 @@ def pipeline_weight_sizes(pipeline):
 
 
 def is_oom_error(error):
-    if isinstance(error, torch.OutOfMemoryError):
+    if isinstance(error, (torch.OutOfMemoryError, StageMemoryError)):
         return True
     accelerator_error = getattr(torch, "AcceleratorError", None)
     return bool(accelerator_error and isinstance(error, accelerator_error) and error_looks_like_oom(error)) or error_looks_like_oom(error)
@@ -4898,6 +5453,10 @@ def build_residency_controller(pipeline, strategy):
         # ceiling is the device, and the cap is what keeps the allocator inside what is free.
         allocator_ceiling_bytes=int(strategy.get("vram_limit_bytes", 0)) if fixed_wall else None,
         on_transition=announce_residency_transition,
+        dynamic=stage_scheduling_active(strategy),
+        budget_reader=read_stage_budget,
+        # The band is the budget scope's: a 24 GB card behind an 8 GB wall is an 8 GB card here.
+        safety_margin_bytes=allocator_safety_margin_bytes(int(strategy.get("vram_limit_bytes", 0) or 0)),
     )
 
 
@@ -4953,9 +5512,13 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
             )
             # The guidance execution order is part of what is installed on the UNet, so a job that
             # is admitted for a different one has to reinstall it even when the rung has not moved.
+            # The comparison is with the *legacy* published mode: a reconfigure also resets the
+            # autoencoder's tiling, and under AUTO the model's real rung is not what the pre-P8
+            # scheduler would have left published — comparing with it would reconfigure (and so
+            # re-tile) in different jobs than before (QPlan P8 pixel identity).
             if (
                 pipeline_cpu_parked
-                or strategy["mode"] != active_memory_strategy["mode"]
+                or strategy["mode"] != (active_memory_strategy.get("legacy_mode") or active_memory_strategy["mode"])
                 or strategy.get("cfg_mode") != active_memory_strategy.get("cfg_mode")
             ):
                 update_job(job_id, phase=f"Adjusting VRAM policy · {strategy['label']}", progress=8)
@@ -4977,11 +5540,13 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
             if active_residency is None:
                 active_residency = build_residency_controller(loaded_pipeline, strategy)
             else:
+                active_residency.dynamic = stage_scheduling_active(strategy)
                 # The rung a restore reinstalls is the controller's, not the admission's — the last
                 # job may have left it streaming — so the strategy is told what is actually on the
                 # pipeline. The base stage plan re-checks it against this job's canvas before any
                 # step runs, which is why starting where the last job left off is safe and cheap.
                 publish_residency()
+            record_mount_decision(job_id, family, engine, width, height, reused=True)
             update_job(
                 job_id,
                 phase="Reusing loaded model",
@@ -5059,6 +5624,7 @@ def load_pipeline(checkpoint: Path, family: str, engine: str, width: int, height
         loaded_family = family
         loaded_engine = engine
         active_memory_strategy = strategy
+        record_mount_decision(job_id, family, engine, width, height, reused=False)
         update_job(
             job_id,
             phase=f"Model ready · {strategy['label']}",
@@ -5147,7 +5713,7 @@ def choose_anima_memory_strategy(
             "请减小画布或批量，或释放其他 GPU 程序后重试"
         )
     if group_offload:
-        strategy.update(mode="low_vram", label="LOW_VRAM 低显存")
+        strategy.update(mode="low_vram", label=strategy_label(strategy, "low_vram", NATIVE_BLOCK))
     group_cfg_requested = anima_group_cfg_batch_requested()
     resident_cfg_env_requested = os.environ.get("XIRAI_ANIMA_RESIDENT_CFG_BATCH", "").strip() == "1"
     resident_cfg_requested = anima_resident_cfg_batch_requested()
@@ -5341,6 +5907,11 @@ def choose_anima_memory_strategy(
             + ("；完整双前向预算通过，正负条件合并为单次批量前向" if cfg_batch else "；默认保持串行 CFG")
         ),
     )
+    # The mount-stage path, in AUTO's vocabulary; `cfg_batch_strategy` may have replaced the dict
+    # above, so it is set on the one actually returned.
+    strategy["memory_path"] = NATIVE_BLOCK if group_offload else NATIVE_RESIDENT
+    if strategy.get("dynamic"):
+        strategy["label"] = strategy_label(strategy)
     return strategy
 
 
@@ -5471,7 +6042,7 @@ def choose_flux_memory_strategy(
             "请减小画布或批量，或释放其他 GPU 程序后重试"
         )
     if group_offload:
-        strategy.update(mode="low_vram", label="LOW_VRAM 低显存")
+        strategy.update(mode="low_vram", label=strategy_label(strategy, "low_vram", NATIVE_BLOCK))
     # Holding the transformer between jobs is admitted on its own terms rather than by requiring
     # HIGH_VRAM. What the hold has to survive is the *next* job's conditioning, which runs with the
     # transformer still on the card: the peak is every weight plus the encoder's own activations,
@@ -5533,6 +6104,9 @@ def choose_flux_memory_strategy(
             + ("；正负分支串行执行，单次前向峰值" if guidance_copies > 1 else "；蒸馏引导，单次前向无负向分支")
         ),
     )
+    strategy["memory_path"] = NATIVE_BLOCK if group_offload else NATIVE_RESIDENT
+    if strategy.get("dynamic"):
+        strategy["label"] = strategy_label(strategy)
     return strategy
 
 
@@ -5726,6 +6300,7 @@ def load_anima_pipeline(
             active_compute_dtype = "bf16"
             active_vae_mode = configure_anima_vae(loaded_pipeline, strategy)
             pipeline_cpu_parked = False
+            record_mount_decision(job_id, "anima", "Anima", width, height, reused=True)
             update_job(
                 job_id,
                 phase="Reusing loaded Anima runtime",
@@ -5821,6 +6396,7 @@ def load_anima_pipeline(
             active_memory_strategy = strategy
             active_compute_dtype = "bf16"
             active_vae_mode = configure_anima_vae(runtime, strategy)
+            record_mount_decision(job_id, "anima", "Anima", width, height, reused=False)
         except Exception:
             if runtime is not None:
                 runtime.close()
@@ -6000,6 +6576,7 @@ def load_flux_pipeline(
             active_compute_dtype = "bf16"
             active_vae_mode = configure_flux_vae(loaded_pipeline, strategy)
             pipeline_cpu_parked = False
+            record_mount_decision(job_id, family, engine, width, height, reused=True)
             update_job(
                 job_id,
                 phase=f"Reusing loaded {engine} runtime",
@@ -6103,6 +6680,7 @@ def load_flux_pipeline(
             active_memory_strategy = strategy
             active_compute_dtype = "bf16"
             active_vae_mode = configure_flux_vae(runtime, strategy)
+            record_mount_decision(job_id, family, engine, width, height, reused=False)
         except Exception:
             if runtime is not None:
                 runtime.close()
@@ -6964,13 +7542,18 @@ def run_with_offload_escalation(pipeline, pipeline_kwargs, call):
     try:
         return call()
     except BaseException as error:
-        if not is_oom_error(error):
+        if not is_oom_error(error) or isinstance(error, StageMemoryError):
             raise
         # With a controller the next rung is the next one down *its* ladder. The mode ladder cannot
         # express that — T3 and T4 both report `low_vram` — and asking `reconfigure_memory_strategy`
         # for it would have the controller reinstall the rung that has just run out of memory.
         controlled = active_residency is not None and active_residency.pipeline is pipeline
         lower_tier = active_residency.next_lower_tier() if controlled else None
+        dynamic = bool(controlled and active_residency.dynamic)
+        if dynamic and lower_tier is None:
+            # AUTO's floor is the per-submodule rung. The serial-CFG survival mode below it stays a
+            # manual choice (QPlan P8 §3.3), so an OOM here is a readable stage error instead.
+            raise stage_oom_error("采样期间显存不足，已处于最低驻留路径") from error
         heavier = (
             RESIDENCY_TIER_MEMORY_MODES[lower_tier] if lower_tier is not None
             else SD_OFFLOAD_ESCALATION.get((active_memory_strategy or {}).get("mode"))
@@ -6986,10 +7569,24 @@ def run_with_offload_escalation(pipeline, pipeline_kwargs, call):
         # to split them: it halves the activation peak without touching the arithmetic, which is a
         # cheaper answer than the next offload rung and arrives with it rather than after it.
         serial_now = active_memory_strategy.get("cfg_serial_eligible", False)
+        previous_tier = active_residency.tier if controlled else None
+        if dynamic:
+            # The legacy rung follows the escalation when it was where the real one was: the pre-P8
+            # scheduler would have run out of memory in the same place and stepped down the same way.
+            if active_residency.legacy_tier == previous_tier:
+                active_residency.legacy_tier = lower_tier
+            legacy_mode = RESIDENCY_TIER_MEMORY_MODES.get(active_residency.legacy_tier, heavier)
+        else:
+            legacy_mode = heavier
         escalated = {
             **active_memory_strategy,
             "mode": heavier,
-            "label": MEMORY_MODE_LABELS[heavier],
+            "legacy_mode": legacy_mode,
+            "memory_path": path_for_tier(lower_tier) if lower_tier is not None else MEMORY_MODE_PATHS.get(heavier),
+            "label": strategy_label(
+                active_memory_strategy, heavier,
+                path_for_tier(lower_tier) if lower_tier is not None else MEMORY_MODE_PATHS.get(heavier),
+            ),
             "offload_mode": offload_to,
             "model_resident": False,
             "residency_tier": lower_tier or active_memory_strategy.get("residency_tier"),
@@ -7015,6 +7612,8 @@ def run_with_offload_escalation(pipeline, pipeline_kwargs, call):
             }
         if lower_tier is not None:
             active_residency.set_tier(lower_tier, reason="oom_escalation", stage=active_residency.stage or "sampling")
+            if dynamic:
+                active_residency.cap_allocator()
             apply_cfg_execution_mode(pipeline, escalated)
         else:
             # The bottom of the controller's ladder, or no controller at all: the existing rung
@@ -7026,9 +7625,40 @@ def run_with_offload_escalation(pipeline, pipeline_kwargs, call):
                     active_residency.observe(), "oom_escalation_ultra_low",
                 )
         active_memory_strategy = escalated
+        if dynamic:
+            record_stage_decision(decision_record(
+                stage=active_residency.stage or "sampling", engine=loaded_engine, family=loaded_family,
+                path=path_for_tier(lower_tier), tier=lower_tier, reason="oom_retry_one_tier_lower",
+                changed=True, legacy_tier=active_residency.legacy_tier,
+            ), residency_job_id)
         for generator, state in zip(generators, states):
             generator.set_state(state)
-        return call()
+        if not dynamic:
+            return call()
+        try:
+            return call()
+        except BaseException as retry_error:
+            # One retry, one rung lower, the same noise (QPlan P8 §3.6). A second failure is the
+            # stage's answer: say so plainly rather than keep stepping down.
+            if is_oom_error(retry_error) and not isinstance(retry_error, StageMemoryError):
+                raise stage_oom_error("降级一次重试后仍显存不足") from retry_error
+            raise
+
+
+def stage_oom_error(detail):
+    """A mid-stage OOM under AUTO, restated as the stage error QPlan P8 §3.6 asks for."""
+    decision = (active_residency.last_decision if active_residency is not None else None) or {}
+    try:
+        available = read_stage_budget(active_residency.resident_bytes() if active_residency else 0).ambient_free_bytes
+    except Exception:
+        available = 0
+    return StageMemoryError(
+        (active_residency.stage if active_residency is not None else None) or "sampling",
+        decision.get("canvas"),
+        decision.get("required_bytes") or 0,
+        available,
+        detail=detail,
+    )
 
 
 def keep_prompt_lease_seated(callback, prompt_lease):
@@ -7964,7 +8594,7 @@ def _apply_resample_unit_stages(
         )
         if not reuses_latents:
             plan_residency_for_stage(
-                "hires_latent_encode", family, tuple(destination), unit_cfg, 1, job_id
+                f"hires_latent_encode_{unit_number}", family, tuple(destination), unit_cfg, 1, job_id
             )
         preparation = "Reusing scaled latents" if reuses_latents else "Encoding image to latents"
         control.checkpoint(job_id, f"{label} latent {'reuse' if reuses_latents else 'encode'}")
@@ -8058,6 +8688,10 @@ def _apply_resample_unit_stages(
 
         if settings.upscaler:
             update_job(job_id, phase=f"{label} · Loading upscaler", stage="resample_upscale", stage_step=0, stage_total=0, progress=progress_start)
+            if use_cuda_upscaler:
+                plan_upscale_stage(
+                    f"hires_upscale_{unit_number}", pipeline, family, image.size, destination, settings, job_id,
+                )
             try:
                 try:
                     # The upscaler used to be given the card unconditionally, which meant parking the
@@ -8171,6 +8805,9 @@ def _apply_resample_unit_stages(
             )
             tile_count = len(plan.regions)
             stage_total = tile_count * unit_steps
+            plan_native_stage(
+                f"hires_sampling_{unit_number}", family, tuple(plan.processing_size), unit_cfg, 1, pipeline, job_id,
+            )
             update_job(
                 job_id,
                 phase=f"{label} · Tile 1/{tile_count}",
@@ -8317,6 +8954,9 @@ def _apply_resample_unit_stages(
         def on_anima_hires_checkpoint(_step, _total, _latents):
             control.checkpoint(job_id, phase)
 
+        plan_native_stage(
+            f"hires_sampling_{unit_number}", family, tuple(upscaled.size), unit_cfg, 1, pipeline, job_id,
+        )
         previous_metrics = dict(getattr(pipeline, "last_generation_metrics", {}) or {})
         refined = pipeline.refine_batch(
             images=[upscaled.convert("RGB")],
@@ -8359,7 +8999,10 @@ def _apply_resample_unit_stages(
     # back and the upscaler has been parked, so where the diffusion model should live is a different
     # question from the one the base pass answered — and on a 1152x1920 redraw it is the question
     # that used to be answered once, for the whole chain, by whichever stage needed the most.
-    plan_residency_for_stage("hires_sampling", family, tuple(destination), unit_cfg, 1, job_id)
+    plan_residency_for_stage(
+        f"hires_sampling_{unit_number}", family, tuple(destination), unit_cfg, 1, job_id,
+        decode_in_call=not deferred_decode,
+    )
     image_pipeline, guidance_kwargs = derived_sampling_pipeline(
         pipeline, AutoPipelineForImage2Image, request.guidance, request.pag
     )
@@ -8368,7 +9011,7 @@ def _apply_resample_unit_stages(
     # A redraw after a base pass continues the base pass's schedule timeline, as Forge's
     # Hires fix does; `pipeline` still carries the base pass's scheduler.
     base_timeline = None if request.postprocess_only else sampling_timeline(pipeline, request.steps)
-    conditioning = prepare_dynamic_prompt_conditioning(
+    conditioning = stage_prompt_conditioning(
         image_pipeline, family, request.prompt, request.negative_prompt,
         timeline=sampling_timeline(image_pipeline, unit_steps, continues=base_timeline),
         clip_skip=effective_clip_skip(request),
@@ -8439,11 +9082,17 @@ def _apply_resample_unit_stages(
                 active_vae_mode == "tiled",
                 start_progress=sampling_end,
                 final_progress=progress_end,
+                decision_stage=f"hires_decode_{unit_number}",
             )
             result = decoded[0].convert("RGB")
             del decoded, pipeline_output
         else:
             result = pipeline_output[0].convert("RGB")
+            record_decode_decision(
+                f"hires_decode_{unit_number}", family, tuple(destination), evicted=False, job_id=job_id,
+                reason="decode_in_sampling_call",
+                peak_bytes=component_decode_bytes(pipeline, destination[0], destination[1]),
+            )
         diagnostics.update(resample_stage_facts(
             settings, unit_number, base_seed, hires_seed,
             source_size=resample_source_size, target_size=target_size, executed_size=result.size,
@@ -8676,6 +9325,12 @@ def apply_adetailer_unit(
             crop = current_image.crop(crop_box).resize(process_size, Image.Resampling.LANCZOS)
             hard_crop = hard_mask.crop(crop_box).resize(process_size, Image.Resampling.NEAREST)
             region_seed = ((request.seed if image_seed is None else image_seed) + index + 1) & 0xFFFFFFFFFFFFFFFF
+            # Stage 6: each region is placed for its own processing canvas; regions of one size
+            # land on the same decision, so they do not move the model between them.
+            plan_native_stage(
+                f"adetailer_region_{unit_index + 1}_{index + 1}", family, tuple(process_size), detail_cfg, 1,
+                pipeline, job_id,
+            )
             previous_metrics = dict(getattr(pipeline, "last_generation_metrics", {}) or {})
             refined = pipeline.refine_batch(
                 images=[crop.convert("RGB")],
@@ -8724,11 +9379,6 @@ def apply_adetailer_unit(
     detail_pipeline, guidance_kwargs = derived_sampling_pipeline(
         pipeline, AutoPipelineForInpainting, request.guidance, request.pag
     )
-    conditioning = prepare_dynamic_prompt_conditioning(
-        detail_pipeline, family, detail_prompt, detail_negative_prompt,
-        timeline=sampling_timeline(detail_pipeline, detail_steps),
-        clip_skip=effective_clip_skip(request),
-    )
     sample_size = detail_pipeline.unet.config.sample_size
     vae_scale = detail_pipeline.vae_scale_factor
     if isinstance(sample_size, (tuple, list)):
@@ -8736,6 +9386,21 @@ def apply_adetailer_unit(
         detail_width = int(sample_size[-1]) * vae_scale
     else:
         detail_width = detail_height = int(sample_size) * vae_scale
+
+    def plan_detail_encode():
+        # Only a unit with its own prompt reaches here; the others reuse the job's encoding.
+        if stage_scheduling_active():
+            plan_residency_for_stage(
+                f"adetailer_encode_{unit_index + 1}", family, (detail_width, detail_height), detail_cfg, 1,
+                job_id, kind="encode", inference_bytes=TEXT_ENCODE_TRANSIENT_BYTES, legacy_point=False,
+            )
+
+    conditioning = stage_prompt_conditioning(
+        detail_pipeline, family, detail_prompt, detail_negative_prompt,
+        timeline=sampling_timeline(detail_pipeline, detail_steps),
+        clip_skip=effective_clip_skip(request),
+        before_encode=plan_detail_encode,
+    )
 
     try:
         for index, detection in enumerate(detections):
@@ -8811,6 +9476,12 @@ def apply_adetailer_unit(
             }
             kwargs["padding_mask_crop"] = settings.padding
             kwargs.update(conditioning)
+            if stage_scheduling_active():
+                # Stage 6: the inpainting call samples and decodes its crop canvas before it returns.
+                plan_residency_for_stage(
+                    f"adetailer_region_{unit_index + 1}_{index + 1}", family, (detail_width, detail_height),
+                    detail_cfg, 1, job_id, decode_in_call=True, legacy_point=False,
+                )
             detailed = run_guided_pipeline(
                 pipeline, detail_pipeline, kwargs, guidance_kwargs, conditioning
             ).images[0].convert("RGB")
@@ -9289,6 +9960,10 @@ def save_image(
         parameters["transparent_background"] = background_removal_result
     if conditioning_prompt and conditioning_prompt != request.prompt:
         parameters["conditioning_prompt"] = conditioning_prompt
+    if stage_scheduling_active():
+        # A new key, written only under AUTO: which path each stage actually ran on. No existing
+        # field changes meaning, and nothing machine-specific (bytes, free memory) is recorded.
+        parameters["memory_schedule"] = png_schedule_note(active_stage_schedule)
     metadata.add_text("parameters", json.dumps(parameters, ensure_ascii=False))
     # The runtime request, when the caller has it, is what ran: inline tags resolved into LoRAs and
     # the prompt the encoders were given. The submitted one still describes the job above.
@@ -9332,6 +10007,17 @@ def cuda_memory_diagnostics():
         )
     except Exception as error:
         snapshot["mem_get_info_error"] = str(error)
+    # Two different scopes, reported side by side and named as such (QPlan P8 §1): the budget is the
+    # device or the user's wall; the allocator cap is what PyTorch may actually hold right now. The
+    # 12 GB report showed an 11.91 GiB budget beside a 6.62 GiB cap with nothing saying which was which.
+    snapshot["budget_scope"] = (
+        "vram_wall" if performance_settings.get("vram_limit_gb", 0.0) > 0 else "device"
+    )
+    if active_residency is not None:
+        snapshot["allocator_cap_bytes"] = active_residency.allocator_cap_bytes
+        snapshot["allocator_cap_scope"] = (
+            "stage_cap" if active_residency.allocator_cap_bytes is not None else "configured_ceiling"
+        )
     for name, reader in (
         ("allocated_bytes", torch.cuda.memory_allocated),
         ("reserved_bytes", torch.cuda.memory_reserved),
@@ -9516,6 +10202,15 @@ def write_generation_failure_log(job_id: str, request: GenerateInput, error: Exc
                 "loaded_model_assets": loaded_model_asset_references(),
                 "loaded_family": loaded_family,
                 "loaded_engine": loaded_engine,
+                # Where the model was and every move it made, and — under AUTO — every stage decision
+                # with the cap it was checked against. The 12 GB report had none of this.
+                "residency": active_residency.snapshot() if active_residency is not None else None,
+                "residency_trace": list(active_residency.trace) if active_residency is not None else [],
+                "stage_schedule": list(active_stage_schedule),
+                "stage_error": error.diagnostics() if isinstance(error, StageMemoryError) else None,
+                "conditioning_reuse": (
+                    active_conditioning_cache.stats() if active_conditioning_cache is not None else None
+                ),
             },
             "lora_fusion": job.get("lora_fusion") if isinstance(job.get("lora_fusion"), dict) else None,
             "cuda_memory": cuda_memory_diagnostics(),
@@ -9576,7 +10271,7 @@ def run_generation(
     audit_request: GenerateInput | None = None,
     inline_lora_audit=None,
 ):
-    global active_attention_backend, active_vae_mode
+    global active_attention_backend, active_vae_mode, active_conditioning_cache
     control = job_controls.get(job_id)
     # A queued job can be cancelled before the worker ever reaches it. Checking here means it is
     # dropped without loading a model or claiming the pipeline, rather than running to completion
@@ -9655,6 +10350,9 @@ def run_generation(
             job["stage_preview_paths"] = paths
         return True
 
+    # One job, one stage schedule and one set of shared prompt encodings (QPlan P8).
+    reset_stage_schedule()
+    active_conditioning_cache = StaticConditioningCache()
     try:
         control.checkpoint(job_id, "Preparing model")
         if not torch.cuda.is_available():
@@ -10027,7 +10725,14 @@ def run_generation(
             negative_prompt_weighted_tokens=negative_prompt_weighted_tokens,
         )
 
-        conditioning = None if is_native_family(family) else prepare_dynamic_prompt_conditioning(
+        if not is_native_family(family) and stage_scheduling_active():
+            # Stage 2 of the matrix: the text towers' own pass, placed before it runs.
+            plan_residency_for_stage(
+                "prompt_encode", family, (request.width, request.height), request.cfg,
+                request.images_per_batch, job_id, kind="encode",
+                inference_bytes=TEXT_ENCODE_TRANSIENT_BYTES, legacy_point=False,
+            )
+        conditioning = None if is_native_family(family) else stage_prompt_conditioning(
             pipeline, family, request.prompt, request.negative_prompt,
             timeline=sampling_timeline(pipeline, request.steps),
             clip_skip=effective_clip_skip(request),
@@ -10128,6 +10833,10 @@ def run_generation(
                 # stage chain with its own seed, and the stages composite in place.
                 images = [source_image.copy() for _ in range(request.images_per_batch)]
             elif family == "anima":
+                plan_native_stage(
+                    "base_sampling", family, (request.width, request.height), request.cfg,
+                    request.images_per_batch, pipeline, job_id,
+                )
                 anima_batch_size = (active_memory_strategy or {}).get(
                     "sampling_batch_size", request.images_per_batch
                 )
@@ -10181,6 +10890,7 @@ def run_generation(
                         on_step_checkpoint=on_anima_step_checkpoint,
                         sampling_batch_size=anima_batch_size,
                     )
+                record_native_decode("base_decode", family, (request.width, request.height), job_id)
                 actual_cfg_batch = bool(getattr(pipeline, "batch_cfg", False))
                 actual_transformer_resident = bool(getattr(pipeline, "transformer_resident", False))
                 runtime_attention_backend = getattr(pipeline, "attention_backend", None)
@@ -10226,6 +10936,10 @@ def run_generation(
                 )
                 merge_runtime_metrics(job_id, getattr(pipeline, "last_generation_metrics", None))
             elif family in ("flux", "flux2", "krea2"):
+                plan_native_stage(
+                    "base_sampling", family, (request.width, request.height), request.cfg,
+                    request.images_per_batch, pipeline, job_id,
+                )
                 flux_batch_size = (active_memory_strategy or {}).get(
                     "sampling_batch_size", request.images_per_batch
                 )
@@ -10272,6 +10986,7 @@ def run_generation(
                         on_step_checkpoint=on_anima_step_checkpoint,
                         sampling_batch_size=flux_batch_size,
                     )
+                record_native_decode("base_decode", family, (request.width, request.height), job_id)
                 runtime_attention_backend = getattr(pipeline, "attention_backend", None)
                 if runtime_attention_backend:
                     active_attention_backend = anima_attention_backend_label(runtime_attention_backend)
@@ -10302,6 +11017,7 @@ def run_generation(
                 plan_residency_for_stage(
                     "base_sampling", family, (request.width, request.height),
                     request.cfg, request.images_per_batch, job_id,
+                    decode_in_call=not performance_settings["staged_vae_decode"],
                 )
                 if performance_settings["staged_vae_decode"]:
                     pipeline_kwargs["output_type"] = "latent"
@@ -10318,11 +11034,17 @@ def run_generation(
                         active_vae_mode == "tiled",
                         start_progress=round(sampling_end),
                         final_progress=round(decode_end),
+                        decision_stage="base_decode",
                     )
                     del latents
                 else:
                     images = run_guided_pipeline_batch(
                         pipeline, request.guidance, pipeline_kwargs, request.pag, sampling_factory, conditioning
+                    )
+                    record_decode_decision(
+                        "base_decode", family, (request.width, request.height), evicted=False, job_id=job_id,
+                        reason="decode_in_sampling_call",
+                        peak_bytes=component_decode_bytes(pipeline, request.width, request.height, request.images_per_batch),
                     )
             if len(images) != request.images_per_batch:
                 raise RuntimeError(
@@ -10455,6 +11177,7 @@ def run_generation(
                     stage_total=total_images,
                     progress=min(98, round(detail_end)),
                 )
+                record_final_decode(family, tuple(image.size), job_id)
                 wall_elapsed = time.time() - started_at
                 paused_seconds = control.total_paused()
                 elapsed = max(0.0, wall_elapsed - paused_seconds)
@@ -10521,6 +11244,8 @@ def run_generation(
         paused_seconds = control.total_paused()
         elapsed = max(0.0, wall_elapsed - paused_seconds)
         output_path = output_paths[0]
+        if active_conditioning_cache is not None:
+            update_job(job_id, conditioning_reuse=active_conditioning_cache.stats())
         release_pipeline_after_job()
         update_job(
             job_id,
@@ -10573,7 +11298,12 @@ def run_generation(
                 status="error",
                 phase="Failed",
                 stage="error",
-                error="GPU memory exhausted. Try a smaller canvas, fewer images per batch, or fewer LoRAs.",
+                # A stage AUTO could not place says which stage, on what canvas, needing how much
+                # against how much (QPlan P8 §3.6); a bare allocator failure keeps the old advice.
+                error=(
+                    str(error) if isinstance(error, StageMemoryError)
+                    else "GPU memory exhausted. Try a smaller canvas, fewer images per batch, or fewer LoRAs."
+                ),
                 progress=0,
                 completed_images=0,
                 outputs=[],
@@ -10586,6 +11316,10 @@ def run_generation(
             release_pipeline_after_job()
             update_job(job_id, status="error", phase="Failed", stage="error", error=generation_failure_message(error), progress=0, completed_images=0, outputs=[], **pipeline_status_fields())
     finally:
+        # The shared prompt encodings belong to this job alone; nothing encoded here may reach the next.
+        if active_conditioning_cache is not None:
+            active_conditioning_cache.clear()
+            active_conditioning_cache = None
         gc.collect()
         if release_cuda_cache and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -10693,9 +11427,19 @@ def health():
         "loaded_engine": loaded_engine,
         "loaded_model_assets": loaded_model_asset_references(),
         "model_cached": loaded_pipeline is not None,
-        "memory_mode": active_memory_strategy["mode"] if active_memory_strategy else None,
+        "memory_mode": reported_memory_mode(active_memory_strategy),
         "memory_label": active_memory_strategy["label"] if active_memory_strategy else None,
         "memory_reason": active_memory_strategy["reason"] if active_memory_strategy else None,
+        # AUTO · 动态决策: the requested mode stays `auto`; these say which path the current stage is
+        # actually on and every decision the job has made (QPlan P8 §4 step 5).
+        **memory_path_fields(active_memory_strategy),
+        "memory_mode_label": AUTO_LABEL if performance_settings["memory_mode"] == "auto" else None,
+        "memory_mode_warning": (
+            BELOW_RECOMMENDED_WARNING
+            if performance_settings["memory_mode"] == "auto" and torch.cuda.is_available()
+            and below_recommended_vram(torch.cuda.get_device_properties(0).total_memory)
+            else None
+        ),
         "memory_total_gb": active_memory_strategy["total_gb"] if active_memory_strategy else None,
         "memory_free_gb": active_memory_strategy["free_gb"] if active_memory_strategy else None,
         "memory_weight_gb": active_memory_strategy["weight_gb"] if active_memory_strategy else None,
@@ -10754,7 +11498,13 @@ def performance_payload():
     return {
         "settings": performance_settings.copy(),
         "active": {
-            "memory_mode": active_memory_strategy["mode"] if active_memory_strategy else None,
+            "memory_mode": reported_memory_mode(active_memory_strategy),
+            "memory_label": active_memory_strategy["label"] if active_memory_strategy else None,
+            "memory_path": (active_memory_strategy or {}).get("memory_path") if stage_scheduling_active() else None,
+            "memory_path_label": (
+                path_label(active_memory_strategy.get("memory_path"))
+                if stage_scheduling_active() and active_memory_strategy.get("memory_path") else None
+            ),
             "attention_backend": current_attention_backend(),
             "compute_dtype": active_compute_dtype,
             "vae_mode": active_vae_mode,
@@ -10786,6 +11536,11 @@ def performance_payload():
             "triton": find_spec("triton") is not None,
             "sage": installed_version("sageattention") is not None and find_spec("triton") is not None,
             "nvfp4": nvfp4_capabilities(torch),
+            # AUTO · 动态决策 stays selectable below the recommended 6 GB; this is only the notice.
+            "auto_below_recommended": bool(
+                cuda_available and below_recommended_vram(torch.cuda.get_device_properties(0).total_memory)
+            ),
+            "auto_recommended_minimum_bytes": RECOMMENDED_MINIMUM_VRAM_BYTES,
         },
     }
 
@@ -10988,7 +11743,7 @@ def hardware():
             pass
     if active_memory_strategy:
         stats.update({
-            "memory_mode": active_memory_strategy["mode"],
+            "memory_mode": reported_memory_mode(active_memory_strategy),
             "memory_label": active_memory_strategy["label"],
             "memory_reason": active_memory_strategy["reason"],
             "offload_mode": active_memory_strategy["offload_mode"],

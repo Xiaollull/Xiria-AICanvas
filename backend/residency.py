@@ -44,6 +44,27 @@ import gc
 
 import torch
 
+try:
+    from .stage_scheduler import (
+        StageBudget,
+        StageMemoryError,
+        allocator_safety_margin_bytes,
+        cap_invariant,
+        choose_component_tier,
+        legacy_component_tier,
+        path_for_tier,
+    )
+except ImportError:
+    from stage_scheduler import (
+        StageBudget,
+        StageMemoryError,
+        allocator_safety_margin_bytes,
+        cap_invariant,
+        choose_component_tier,
+        legacy_component_tier,
+        path_for_tier,
+    )
+
 
 GIB = 1024**3
 MIB = 1024**2
@@ -217,8 +238,23 @@ class ResidencyController:
     """
 
     def __init__(self, pipeline, *, reserved_bytes, free_memory, tier=None, stream_capable=None,
-                 trace_limit=64, allocator_ceiling_bytes=None, on_transition=None):
+                 trace_limit=64, allocator_ceiling_bytes=None, on_transition=None,
+                 dynamic=False, budget_reader=None, safety_margin_bytes=None):
         self.pipeline = pipeline
+        # AUTO · 动态决策 (QPlan P8). A manual tier keeps the rule below exactly as it was; AUTO
+        # plans through `stage_scheduler` with one budget reading, hysteresis and the cap invariant.
+        # `budget_reader(resident_bytes)` returns a `StageBudget` for the moment it is called.
+        self.dynamic = bool(dynamic)
+        self._budget_reader = budget_reader
+        self.safety_margin_bytes = (
+            int(safety_margin_bytes) if safety_margin_bytes is not None
+            else allocator_safety_margin_bytes(allocator_ceiling_bytes or 0)
+        )
+        # The rung the pre-P8 rule would have left installed. Under a manual tier it is always the
+        # real one; under AUTO it only decides what the autoencoder's tiling is reconfigured from
+        # after a parked restore, which is what keeps a fixed seed's pixels where they were.
+        self.legacy_tier = tier
+        self.last_decision = None
         # Told about every move that changed something, so the owner can put it in front of whoever
         # is watching. A failure to report is never allowed to become a failure to place.
         self.on_transition = on_transition
@@ -243,6 +279,8 @@ class ResidencyController:
         self.other_bytes = 0
         self.block_group_bytes = 0
         self.leaf_bytes = 0
+        self.text_encoder_bytes = 0
+        self.vae_bytes = 0
         self.measure()
 
     # ---- measurement -------------------------------------------------------
@@ -278,11 +316,85 @@ class ResidencyController:
         self.other_bytes = max(0, total - self.unet_bytes)
         self.block_group_bytes = largest_block_group_bytes(self.unet, 1)
         self.leaf_bytes = largest_leaf_bytes(self.unet)
+        # What a prompt encode or a decode moves on the component rung, where accelerate brings one
+        # component in per call: the larger text tower, or the autoencoder.
+        def component(name):
+            module = getattr(self.pipeline, name, None)
+            return module if isinstance(module, torch.nn.Module) else None
+
+        self.text_encoder_bytes = max(module_bytes(component("text_encoder")), module_bytes(component("text_encoder_2")))
+        self.vae_bytes = module_bytes(component("vae"))
         return self
 
     def observe(self):
         """Free bytes right now, as the caller's reader reports them."""
         return int(self._free_memory())
+
+    def resident_bytes(self):
+        """How much of this pipeline's weight is on the card right now, shared storage counted once."""
+        components = getattr(self.pipeline, "components", {}) or {}
+        seen = set()
+        total = 0
+        for component in components.values():
+            if not isinstance(component, torch.nn.Module):
+                continue
+            for tensor in (*component.parameters(), *component.buffers()):
+                if tensor.device.type != "cuda":
+                    continue
+                pointer = tensor.data_ptr() or id(tensor)
+                if pointer in seen:
+                    continue
+                seen.add(pointer)
+                total += tensor.numel() * tensor.element_size()
+        return total
+
+    def read_budget(self):
+        """One `StageBudget` reading for a decision, with this pipeline's resident weight in it."""
+        if self._budget_reader is None:
+            raise RuntimeError("AUTO stage planning needs a budget reader")
+        return self._budget_reader(self.resident_bytes())
+
+    # ---- what each rung needs for a given stage (AUTO) ---------------------
+
+    def install_resident_bytes(self, tier):
+        """The weight a freshly installed rung leaves on the card between stages."""
+        if tier == T0_RESIDENT:
+            return self.total_weight_bytes
+        if tier in (T2_BLOCK_STREAM, T3_LEAF_STREAM):
+            # Group offload covers the UNet alone; the towers and the autoencoder are placed on the
+            # card by hand (`_install`).
+            return self.other_bytes
+        return 0
+
+    def stage_workspace(self, tier, demand):
+        """What a stage adds on top of the installed rung while it runs.
+
+        `demand` says what kind of stage it is: a sampling pass (the UNet and its activations), a
+        prompt encode (a text tower and its transient), and optionally a decode that runs inside
+        the same call — a Diffusers pipeline decodes before it returns unless the staged decode
+        takes the latents out first.
+        """
+        inference = max(0, int(demand.get("inference_bytes", 0)))
+        if demand.get("kind") == "encode":
+            moving = {T1_COMPONENT: self.text_encoder_bytes, T4_SUBMODULE: self.leaf_bytes}.get(tier, 0)
+        else:
+            moving = {
+                T1_COMPONENT: self.unet_bytes,
+                T2_BLOCK_STREAM: 2 * self.block_group_bytes,
+                T3_LEAF_STREAM: 2 * self.leaf_bytes,
+                T4_SUBMODULE: self.leaf_bytes,
+            }.get(tier, 0)
+        work = moving + inference
+        decode = max(0, int(demand.get("decode_bytes", 0) or 0))
+        if decode:
+            # On the component rung the hook chain offloads the UNet when the autoencoder is called,
+            # so the decode peak is the autoencoder alone beside its activations.
+            decode_moving = {T1_COMPONENT: self.vae_bytes, T4_SUBMODULE: self.leaf_bytes}.get(tier, 0)
+            work = max(work, decode_moving + decode)
+        return work
+
+    def stage_requirement(self, tier, demand):
+        return self.install_resident_bytes(tier) + self.stage_workspace(tier, demand) + self.reserved_bytes
 
     # ---- what each rung needs ---------------------------------------------
 
@@ -408,12 +520,25 @@ class ResidencyController:
         self._promoted_this_stage = False
         return self
 
-    def plan_for_stage(self, stage, inference_bytes, canvas=None):
+    def plan_for_stage(self, stage, inference_bytes, canvas=None, demand=None, legacy_point=True):
         """Choose and install the rung this stage should run on, and say so in the trace.
 
         Called at stage boundaries only. A promotion is weight placement between steps, never inside
         a forward, so the arithmetic of the stage it precedes is untouched.
+
+        Under AUTO the decision goes through `_plan_dynamic`. `legacy_point` marks the boundaries
+        the pre-P8 controller also planned at (the sampling stages); only those advance the legacy
+        rung, because the old scheduler never re-planned anywhere else.
         """
+        if self.dynamic:
+            return self._plan_dynamic(stage, inference_bytes, canvas=canvas, demand=demand,
+                                      legacy_point=legacy_point)
+        tier = self._plan_fixed(stage, inference_bytes, canvas=canvas)
+        self.legacy_tier = self.tier
+        return tier
+
+    def _plan_fixed(self, stage, inference_bytes, canvas=None):
+        """The pre-P8 rule, unchanged: what every manual tier still runs."""
         self.stage = stage
         self._promoted_this_stage = False
         self.reclaim()
@@ -431,6 +556,106 @@ class ResidencyController:
         reason = "stage_plan_promote" if self._is_promotion(wanted) else "stage_plan_demote"
         self.set_tier(wanted, reason=reason, stage=stage, inference_bytes=inference_bytes, canvas=canvas)
         self.cap_allocator()
+        return self.tier
+
+    # ---- AUTO · 动态决策 -----------------------------------------------------
+
+    def legacy_choice(self, inference_bytes, budget):
+        """The rung the pre-P8 rule would pick here, from the reading the pre-P8 rule would have seen.
+
+        That rule counted this pipeline's own resident weight as spent. When AUTO has placed the
+        model differently from where the old rule would have, the reading is corrected by the
+        difference between the two placements, so the old rule is asked the question it would
+        actually have been asked.
+        """
+        ambient = budget.ambient_free_bytes
+        if not self.parked and self.legacy_tier is not None and self.legacy_tier != self.tier:
+            ambient += int(budget.resident_bytes) - self.install_resident_bytes(self.legacy_tier)
+        return legacy_component_tier(
+            ladder=self.candidate_tiers(),
+            requirement=lambda tier: self.requirement(tier, inference_bytes),
+            ambient_free=max(0, ambient),
+        )
+
+    def verify_cap(self, demand, budget=None):
+        """The cap invariant for the rung now installed, from a fresh reading."""
+        budget = budget or self.read_budget()
+        workspace = self.stage_workspace(self.tier, demand)
+        return budget, workspace, cap_invariant(budget, workspace, self.safety_margin_bytes)
+
+    def _plan_dynamic(self, stage, inference_bytes, canvas=None, demand=None, legacy_point=True):
+        self.stage = stage
+        self._promoted_this_stage = False
+        demand = dict(demand or {})
+        demand.setdefault("kind", "sampling")
+        demand.setdefault("inference_bytes", int(inference_bytes))
+        self.reclaim()
+        budget = self.read_budget()
+        if legacy_point:
+            self.legacy_tier = self.legacy_choice(int(inference_bytes), budget)
+        previous = self.tier
+        choice = choose_component_tier(
+            ladder=self.candidate_tiers(),
+            current=previous,
+            requirement=lambda tier: self.stage_requirement(tier, demand),
+            resident_after=self.install_resident_bytes,
+            workspace=lambda tier: self.stage_workspace(tier, demand),
+            budget=budget,
+            margin_bytes=self.safety_margin_bytes,
+            # A prompt encode stays where it is unless it has to move down (measured: promoting
+            # T4 -> T1 for the encode cost a second move when base sampling was placed on T3).
+            allow_promotion=demand["kind"] != "encode",
+        )
+        if choice.tier == self.tier:
+            if self.parked:
+                self.reinstall(choice.tier)
+        else:
+            self.set_tier(choice.tier, reason=choice.reason, stage=stage, inference_bytes=inference_bytes,
+                          canvas=canvas, record=False)
+        # The decision was made on a prediction; the move has happened, so check the cap it actually
+        # gets. Windows can report free memory before a move that is not there after it — the 12 GB
+        # report's redraw saw room for the whole model and then 0 bytes free once it had moved in —
+        # so a stage never starts on the prediction alone.
+        after, workspace, invariant = self.verify_cap(demand)
+        demoted = []
+        while not invariant["holds"]:
+            lower = self.next_lower_tier()
+            if lower is None:
+                break
+            demoted.append(self.tier)
+            self.set_tier(lower, reason="cap_invariant_demote", stage=stage, inference_bytes=inference_bytes,
+                          canvas=canvas)
+            self.reclaim()
+            after, workspace, invariant = self.verify_cap(demand)
+        if not invariant["holds"] and not invariant["holds_without_margin"]:
+            raise StageMemoryError(
+                stage, canvas, int(after.allocated_bytes) + int(workspace), invariant["cap_bytes"],
+                detail=f"最低路径 {path_for_tier(self.tier)}",
+            )
+        self.cap_allocator()
+        reason = choice.reason if not demoted else "cap_invariant_demote"
+        if not invariant["holds"]:
+            reason = "stage_floor_without_margin"
+        entry = self._record(
+            stage, previous, self.tier, budget.planning_free_bytes, reason,
+            inference_bytes=inference_bytes, canvas=canvas,
+            required_bytes=self.stage_requirement(self.tier, demand),
+            extra={
+                "path": path_for_tier(self.tier),
+                "kind": demand.get("kind"),
+                "workspace_bytes": int(workspace),
+                "ambient_free_bytes": budget.ambient_free_bytes,
+                "resident_bytes": int(budget.resident_bytes),
+                "allocated_bytes": int(after.allocated_bytes),
+                "cap_bytes": self.allocator_cap_bytes if self.allocator_cap_bytes is not None else invariant["cap_bytes"],
+                "required_cap_bytes": invariant["required_cap_bytes"],
+                "cap_holds": invariant["holds"],
+                "safety_margin_bytes": self.safety_margin_bytes,
+                "legacy_tier": self.legacy_tier,
+                "cap_demotions": demoted,
+            },
+        )
+        self.last_decision = entry
         return self.tier
 
     def promote_if_fits(self, inference_bytes, stage=None):
@@ -471,11 +696,12 @@ class ResidencyController:
     # ---- mechanism ---------------------------------------------------------
 
     def set_tier(self, tier, *, reason, stage=None, inference_bytes=None, canvas=None,
-                 blocks_per_group=None):
+                 blocks_per_group=None, record=True):
         """Install a rung. Idempotent, and ordered so the two mechanisms never overlap.
 
         Remove what is installed, empty the cache only when dropping to a smaller rung (going up,
         the memory is about to be used anyway and the call costs a synchronisation), then install.
+        `record=False` is for a caller that records the whole decision itself, once.
         """
         if tier == self.tier:
             return False
@@ -484,9 +710,10 @@ class ResidencyController:
         self.release(empty_cache=downgrading)
         self._install(tier, blocks_per_group)
         self.tier = tier
-        free_bytes = self.observe()
-        self._record(stage if stage is not None else self.stage, previous, tier, free_bytes, reason,
-                     inference_bytes=inference_bytes, canvas=canvas)
+        if record:
+            free_bytes = self.observe()
+            self._record(stage if stage is not None else self.stage, previous, tier, free_bytes, reason,
+                         inference_bytes=inference_bytes, canvas=canvas)
         return True
 
     def reinstall(self, tier=None):
@@ -585,7 +812,8 @@ class ResidencyController:
             return False
         return ladder.index(tier) > ladder.index(self.tier)
 
-    def _record(self, stage, from_tier, to_tier, free_bytes, reason, inference_bytes=None, canvas=None):
+    def _record(self, stage, from_tier, to_tier, free_bytes, reason, inference_bytes=None, canvas=None,
+                required_bytes=None, extra=None):
         entry = {
             # A move made before any stage has been planned is the job bringing a parked model back.
             "stage": stage or "job_start",
@@ -594,12 +822,17 @@ class ResidencyController:
             "blocks_per_group": self.blocks_per_group,
             "free_bytes": int(free_bytes),
             "free_gb": round(free_bytes / GIB, 2),
-            "required_bytes": 0 if to_tier == "parked" else int(self.requirement(to_tier, inference_bytes or 0)),
+            "required_bytes": (
+                int(required_bytes) if required_bytes is not None
+                else 0 if to_tier == "parked" else int(self.requirement(to_tier, inference_bytes or 0))
+            ),
             "inference_bytes": int(inference_bytes) if inference_bytes is not None else None,
             "canvas": list(canvas) if canvas else None,
             "reason": reason,
             "changed": from_tier != to_tier,
         }
+        if extra:
+            entry.update(extra)
         self.trace.append(entry)
         # A long job would otherwise grow this without bound; the oldest records are the ones a
         # report needs least.
@@ -629,4 +862,8 @@ class ResidencyController:
             "block_group_bytes": self.block_group_bytes,
             "leaf_bytes": self.leaf_bytes,
             "transitions": sum(1 for entry in self.trace if entry["changed"]),
+            "dynamic": self.dynamic,
+            "path": path_for_tier(self.tier),
+            "legacy_tier": self.legacy_tier,
+            "safety_margin_bytes": self.safety_margin_bytes if self.dynamic else None,
         }

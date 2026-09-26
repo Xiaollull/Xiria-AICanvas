@@ -56,7 +56,7 @@ export function performanceDefaultsFor(vramGb) {
  */
 export function performancePresetsFor(vramGb) {
   return [
-    { id: "auto", label: "自适应推荐", range: "全部显卡", detail: "按模型、画布与实时空闲显存自动安排", settings: performanceDefaultsFor(vramGb) },
+    { id: "auto", label: "AUTO · 动态决策", range: "推荐 6 GB 以上", detail: "每个阶段按实时显存重新决定驻留路径，8 GB 手动配置不受影响", settings: performanceDefaultsFor(vramGb) },
     { id: "speed", label: "高速直通", range: "12 GB 以上", detail: "优先让模型完整驻留 GPU，适合连续生成", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "high_vram", vae_mode: "full" } },
     { id: "large-model", label: "大型模型调度", range: "8 GB 以上", detail: "大型模型采样后转入内存，再单独执行 VAE 解码", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "sdxl_balanced", staged_vae_decode: true } },
     { id: "balanced", label: "显存平衡", range: "4 GB 以上", detail: "按组件迁移，采样后释放显存并切片解码", settings: { ...DEFAULT_PERFORMANCE, memory_mode: "normal_vram", vae_mode: "sliced", staged_vae_decode: true } },

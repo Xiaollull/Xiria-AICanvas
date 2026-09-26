@@ -230,6 +230,27 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
         <a href="models.html#quantization">quantization, honestly</a>.</p>
     </div>
 
+    <h3 id="auto-dynamic">AUTO · Dynamic Decisions</h3>
+    <p>The default <code>auto</code> mode is shown as <strong>AUTO · 动态决策</strong> (AUTO · Dynamic
+      Decisions). It does not pick one of the modes above for the whole job: it places the model again at
+      every stage boundary — model mount, prompt encoding, base sampling, each resample unit's upscale and
+      redraw, every ADetailer region and the final decode — for SD, Illustrious, Anima, FLUX.1, FLUX.2 and
+      Krea 2 alike, from one reading of what is free, what the program already holds and what that stage
+      will add. A stage keeps its placement while it fits, moves up only with 15% to spare, and moves down
+      only when it does not fit, so a placement never changes inside a sampling loop.</p>
+    <p>Before a stage starts, the memory cap the program gives itself must hold what is already allocated,
+      what the stage will add and a safety margin sized for the card (0.75–1 GB on 6–12 GB cards, 0.5 GB on
+      16 GB, unchanged on 24 GB); if it would not, the model is moved further off the card first. When not
+      even the lowest placement fits, the job stops with a message naming the stage, the canvas, what it
+      needs and what is available — it never shrinks the canvas, lowers the step count or falls back to the
+      CPU, and it never enters the serial-CFG survival mode, which stays a manual choice. A static prompt is
+      encoded once per job and shared by the base pass, the redraws and ADetailer.</p>
+    <p>The recommended minimum is 6 GB. Below it AUTO stays available and the settings page says
+      <em>低于推荐配置，可能无法完成任务</em> (below the recommended configuration; the job may not complete).
+      The manual modes behave exactly as before, and a fixed seed draws the same picture under AUTO as it did
+      before this mode existed. A picture made under AUTO records which path each stage ran on in its
+      parameters (<code>memory_schedule</code>).</p>
+
     <h2 id="cache">The pipeline cache</h2>
     <p>All three modes keep the loaded pipeline object cached after a successful, cancelled, or
       non-OOM failed generation, so another generation with the same engine and model identity does

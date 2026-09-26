@@ -596,7 +596,7 @@ function drawEdgeLine(context, x, y, width, height, options, scale = 1, hiddenSi
 }
 const performanceChoices = {
   memory_mode: [
-    ["auto", "动态预算", "按模型、画布与空闲显存实时选择"],
+    ["auto", "AUTO · 动态决策", "每个阶段按实时显存重新决定驻留路径，推荐 6 GB 以上"],
     ["high_vram", "GPU 常驻", "空间足够时优先吞吐，超预算会安全降级"],
     ["sdxl_balanced", "仅大型模型调度", "大型模型使用组件迁移，普通模型保持动态选择"],
     ["normal_vram", "组件调度", "在 GPU 与内存间按组件迁移"],
@@ -6695,7 +6695,11 @@ function App() {
   const pluginSummary = pluginRegistrySummary(pluginRegistry);
   const configuredPerformanceLabel = (key) => performanceChoices[key]?.find(([value]) => value === performanceConfig[key])?.[1] || "自动";
   const actualPerformanceValue = (...values) => values.find((value) => value && String(value).toLowerCase() !== "none");
-  const runtimeMemoryMode = actualPerformanceValue(performanceActive.memory_mode, inferenceHealth?.memory_mode);
+  // Under AUTO · 动态决策 the mode stays `auto` and the label carries the path the current stage is on.
+  const runtimeMemoryMode = actualPerformanceValue(performanceActive.memory_label, inferenceHealth?.memory_label, performanceActive.memory_mode, inferenceHealth?.memory_mode);
+  // AUTO stays selectable on a card below the recommended 6 GB; it only says so.
+  const autoBelowRecommended = performanceConfig.memory_mode === "auto"
+    && (performanceCapabilities.auto_below_recommended ?? (vramGb > 0 && vramGb < 5.5));
   const runtimeAttentionBackend = actualPerformanceValue(performanceActive.attention_backend, inferenceHealth?.attention_backend);
   const runtimeComputeDtype = actualPerformanceValue(performanceActive.compute_dtype, inferenceHealth?.compute_dtype);
   const renderModalLoraCard = (item, categoryLabel, displayName = "") => {
@@ -7586,6 +7590,7 @@ function App() {
                     <i />
                   </button>)}
                 </div>}
+                {autoBelowRecommended && <div className="auto-vram-notice" role="status"><strong>AUTO · 动态决策</strong><p>低于推荐配置，可能无法完成任务。推荐显存 6 GB 以上；AUTO 仍可使用，每个阶段会按实时显存选择最省显存的驻留路径，但不会缩小画布、减少步数或回退 CPU。</p></div>}
                 {performanceEditorMode === "recommended" && activePerformancePreset === "ultra-low" && <div className="ultra-low-notice"><strong>1024 大型模型生存模式</strong><p>应用后会关闭 Hires.fix、ADetailer、RTX VSR 和已挂载 LoRA；正负条件改为串行计算，单张耗时可能明显增加。建议系统分页文件至少保留 24 GB 可用空间。</p></div>}
                 {performanceEditorMode === "manual" && <div className="performance-manual-panel">{[
                   ["memory_mode", "显存调度", "按任务峰值预算决定模型驻留和 CPU 卸载方式"],
