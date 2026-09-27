@@ -49,11 +49,14 @@ models/
 - `loras/sd`: SD LoRA root. The four default categories remain available, while
   custom folders and arbitrary nesting are discovered automatically.
 - `loras/illustrious`: Illustrious LoRA root with the same recursive behavior.
-- `vae`: Standalone and shared VAEs used by split model pipelines.
+- `vae`: Standalone and shared VAEs used by split model pipelines;
+  `.safetensors`, plus `.gguf` for FLUX.1, FLUX.2 and Krea 2.
 - `diffusion_models`: Anima, Flux, FLUX.2, Krea 2, and other split diffusion
   weights. `.safetensors` throughout, plus `.gguf` for the three engines that
   read it.
-- `text_encoders`: Standalone text encoders required by split model pipelines.
+- `text_encoders`: Standalone text encoders required by split model pipelines;
+  `.safetensors`, plus llama.cpp `.gguf` T5 / Qwen3 / Qwen3-VL encoders for
+  FLUX.1, FLUX.2 and Krea 2.
 - `embeddings`: Reserved for future textual inversion support.
 - `yolo`: Project-owned Ultralytics `.pt` detection or segmentation models for
   local ADetailer passes. Community models may be placed here, including in
@@ -90,6 +93,19 @@ Anima, FLUX.1, FLUX.2, and Krea 2 use `diffusion_models`, `text_encoders`, and
 directory it mounts. The Anima Qwen3 and T5 tokenizer JSON files ship with the
 program and are integrity-checked during setup, startup and updates.
 
-FLUX.1, FLUX.2, and Krea 2 also load a `.gguf` diffusion model; text encoders
-and VAEs stay `.safetensors`. A GGUF is expanded to the compute dtype while
-loading, so it is a smaller download rather than a smaller model in memory.
+FLUX.1, FLUX.2, and Krea 2 also load every component from `.gguf`. A llama.cpp
+text encoder is renamed back into ComfyUI's tensor names (`t5encoder` for
+FLUX.1, `qwen3` for FLUX.2, `qwen3vl` for Krea 2) and refused if its family is
+not the engine's; a Mistral (`llama`) GGUF is refused by name. A GGUF is
+expanded to the compute dtype while loading, so it is a smaller download rather
+than a smaller model in memory.
+
+ComfyUI's quantized safetensors layouts — FP8, INT8 and ConvRot INT8, ConvRot
+W4A4 INT4, MXFP8 and NVFP4, marked per layer or in the header's
+`_quantization_metadata` — are read the way ComfyUI 0.33.0 reads them. Krea 2
+keeps them in their stored form (INT8/W4A4 run ComfyUI's integer matmul, on built-in Triton kernels
+where available;
+NVFP4/MXFP8 are dequantized per layer below SM 10.0, as ComfyUI does);
+FLUX.1/FLUX.2 expand them at load. The ComfyUI-INT8-Fast custom node's
+format-less marker and `asym_w4a8_int8` are refused by name. See
+`docs/models.html#quantization` for the full matrix.

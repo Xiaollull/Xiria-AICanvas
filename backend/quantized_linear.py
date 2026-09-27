@@ -22,16 +22,19 @@ moves the multiplication to where ComfyUI keeps it.
 The scale must stay float32 to get that equality.  Rounding it to bfloat16 first changes 210 of
 Krea 2's 256 transformer tensors, by up to 3.1e-2 — the one shortcut that is not free.
 
-Formats fall into two groups:
+What a layer's marker means, and the arithmetic each layout runs, come from :mod:`comfy_quant`,
+which ports ComfyUI 0.33.0 and the comfy-kitchen it pins (P9).  The formats fall into three groups:
 
-* **Scalar scale** — ``float8_e4m3fn``, ``float8_e5m2`` and ``int8_tensorwise`` store an ordinary
-  matrix of the layer's own shape and one number.  Recovering the weight is a cast and a multiply,
-  which is what makes them exactly foldable and exactly deferrable.
-* **Block scale** — ``nvfp4`` and ``mxfp8`` store a packed or sub-byte matrix with one scale per
-  group of elements along the input axis.  ComfyUI reads these through ``comfy_kitchen``'s
-  compiled kernels, which are not a dependency here; the dequantisation below is the same
-  arithmetic in plain PyTorch, so such a file loads and runs rather than being refused, without
-  claiming ComfyUI's fused matmul performance.
+* **FP8** — ``float8_e4m3fn`` and ``float8_e5m2`` store the layer's own matrix and one number.
+  They are dequantised per layer and multiplied at full precision, exactly as before P9.
+* **Weight-only integer** — ``int8_tensorwise`` (optionally ConvRot-rotated) and ``convrot_w4a4``.
+  ComfyUI keeps the activation in the compute dtype and hands it to the layout's own matmul, which
+  rotates it (ConvRot), quantises it per row and multiplies integers.  That is what runs here too,
+  unless the marker asks for ``full_precision_matrix_mult`` or a LoRA is mounted on the layer — the
+  two cases where ComfyUI dequantises instead.
+* **Block-scaled float** — ``nvfp4`` and ``mxfp8`` pack their values and keep one scale per group
+  of 16 or 32 in cuBLAS's tiled order.  ComfyUI's native matmul for them needs SM 10.0; below that
+  it disables the format and dequantises the layer, which is the path taken here on every card.
 """
 
 from __future__ import annotations
@@ -44,52 +47,62 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# `<layer>.comfy_quant` holds JSON naming the format. Everything else beside a quantised weight is
-# addressed relative to the layer, so one layer name is enough to gather a whole quantised linear.
-COMFY_QUANT_SUFFIX = ".comfy_quant"
+try:
+    from . import comfy_quant
+    from .comfy_quant import (
+        COMFY_QUANT_SUFFIX,
+        FP4_E2M1_VALUES,
+        MXFP8_GROUP_SIZE,
+        NVFP4_GROUP_SIZE,
+        LayerQuantConfig,
+        UnsupportedQuantization,
+        config_for_legacy_fp8,
+        parse_layer_config,
+    )
+except ImportError:  # pragma: no cover - flat import when run from backend/
+    import comfy_quant
+    from comfy_quant import (
+        COMFY_QUANT_SUFFIX,
+        FP4_E2M1_VALUES,
+        MXFP8_GROUP_SIZE,
+        NVFP4_GROUP_SIZE,
+        LayerQuantConfig,
+        UnsupportedQuantization,
+        config_for_legacy_fp8,
+        parse_layer_config,
+    )
+
+__all__ = [
+    "COMFY_QUANT_SUFFIX", "FP4_E2M1_VALUES", "MXFP8_GROUP_SIZE", "NVFP4_GROUP_SIZE",
+    "QuantizedLinear", "UnsupportedQuantization", "apply_quantized_linears", "checkpoint_runtime_bytes",
+    "combine_lora_adapters", "dequantize_mxfp8", "dequantize_nvfp4", "dequantize_scalar_scale",
+    "expand_quantized_layers", "logical_shape_view", "quantized_state_dict", "quantized_weight_bytes",
+    "scan_quantized_layers",
+]
 
 # The two spellings of a per-tensor scale. ComfyUI's own repackages write the first; the Krea 2
 # and Qwen3-VL fp8 checkpoints write the second. `.scale` alone is deliberately not a scale key:
 # these checkpoints use it for ordinary norm weights.
 SCALE_WEIGHT_SUFFIXES = (".scale_weight", ".weight_scale")
 
-# An activation scale only matters to a kernel that quantises its input. Nothing here does, so it
-# is read and dropped rather than carried into a module that has no use for it.
-INPUT_SCALE_SUFFIXES = (".scale_input", ".input_scale", ".pre_quant_scale")
+# An activation scale only matters to a kernel that quantises its input with a fixed scale — the
+# fp8/nvfp4/mxfp8 tensor-core paths, none of which runs here. It is read and dropped.
+INPUT_SCALE_SUFFIXES = (".scale_input", ".input_scale")
 
-# Markers that sit beside ``format`` and change the arithmetic rather than describing it.
-#
-# ``convrot`` is the one that exists today. Krea 2's INT8 build is written as
-# ``{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}``: the weight was
-# rotated in groups before it was quantised, and ComfyUI undoes that by rotating the activation
-# inside ``comfy_kitchen``'s ``int8_linear`` kernel. Read the format alone and the layer looks like
-# an ordinary tensor-wise int8 one, dequantises without complaint, and multiplies a rotated weight
-# by an unrotated input — which is not an approximation of the right answer, it is noise. The file
-# has to be refused by name, because the thing that makes it wrong is the thing being ignored.
-#
-# Keys that only describe how to compute the same value belong nowhere near this set:
-# ``full_precision_matrix_mult`` is on every layer of the working Qwen3-VL fp8 encoder.
-ARITHMETIC_MODIFIER_KEYS = ("convrot",)
+# AWQ-style smoothing. On a layout that declares it (NVFP4), ComfyUI multiplies the activation by it
+# before anything else, so it changes the result and is carried into the module rather than dropped.
+PRE_QUANT_SCALE_SUFFIX = ".pre_quant_scale"
 
 BLOCK_SCALE_SUFFIX = ".weight_scale"
 GLOBAL_SCALE_SUFFIX = ".weight_scale_2"
 
-# FP4 E2M1, the 16 values a nibble can hold. Index is the raw code: sign in bit 3, then two
-# exponent bits and one mantissa bit.
-FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-                   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
-
-NVFP4_GROUP_SIZE = 16
-MXFP8_GROUP_SIZE = 32
-
-
-class UnsupportedQuantization(ValueError):
-    """A quantised layer this loader cannot express, named rather than silently approximated."""
+# Module buffer name -> ComfyUI parameter name.
+BUFFER_PARAMETERS = {"scale_weight": "weight_scale", "scale_weight_2": "weight_scale_2"}
 
 
 @dataclass(frozen=True)
 class QuantFormat:
-    """How one quantisation format is stored and how it is turned back into a weight."""
+    """How one quantisation format is stored and which scales sit beside it."""
 
     name: str
     storage_dtype: torch.dtype
@@ -99,29 +112,28 @@ class QuantFormat:
 
     @property
     def packed(self) -> bool:
-        """Whether the stored tensor's shape differs from the layer's shape."""
-        return self.name == "nvfp4"
+        """Whether the stored tensor holds two values per byte, so its shape is not the layer's."""
+        return self.name in ("nvfp4", "convrot_w4a4")
 
+
+_ONE_SCALE = (("scale_weight", BLOCK_SCALE_SUFFIX),)
 
 QUANT_FORMATS: dict[str, QuantFormat] = {
-    "float8_e4m3fn": QuantFormat("float8_e4m3fn", torch.float8_e4m3fn, (("scale_weight", BLOCK_SCALE_SUFFIX),)),
-    "float8_e5m2": QuantFormat("float8_e5m2", torch.float8_e5m2, (("scale_weight", BLOCK_SCALE_SUFFIX),)),
-    "int8_tensorwise": QuantFormat("int8_tensorwise", torch.int8, (("scale_weight", BLOCK_SCALE_SUFFIX),)),
+    "float8_e4m3fn": QuantFormat("float8_e4m3fn", torch.float8_e4m3fn, _ONE_SCALE),
+    "float8_e5m2": QuantFormat("float8_e5m2", torch.float8_e5m2, _ONE_SCALE),
+    "int8_tensorwise": QuantFormat("int8_tensorwise", torch.int8, _ONE_SCALE),
+    "convrot_w4a4": QuantFormat("convrot_w4a4", torch.int8, _ONE_SCALE),
     "nvfp4": QuantFormat(
         "nvfp4",
         torch.uint8,
         (("scale_weight", BLOCK_SCALE_SUFFIX), ("scale_weight_2", GLOBAL_SCALE_SUFFIX)),
         group_size=NVFP4_GROUP_SIZE,
     ),
-    "mxfp8": QuantFormat(
-        "mxfp8",
-        torch.float8_e4m3fn,
-        (("scale_weight", BLOCK_SCALE_SUFFIX),),
-        group_size=MXFP8_GROUP_SIZE,
-    ),
+    "mxfp8": QuantFormat("mxfp8", torch.float8_e4m3fn, _ONE_SCALE, group_size=MXFP8_GROUP_SIZE),
 }
 
-SCALAR_SCALE_FORMATS = ("float8_e4m3fn", "float8_e5m2", "int8_tensorwise")
+SCALAR_SCALE_FORMATS = ("float8_e4m3fn", "float8_e5m2")
+INTEGER_MATMUL_FORMATS = ("int8_tensorwise", "convrot_w4a4")
 
 
 @dataclass(frozen=True)
@@ -135,6 +147,13 @@ class QuantizedLayer:
     scale_keys: Mapping[str, str] = field(default_factory=dict)
     # Keys consumed by this layer that the module has no parameter for.
     dropped_keys: tuple[str, ...] = ()
+    config: LayerQuantConfig | None = None
+    # Buffer name -> key, for parameters only some files carry (``pre_quant_scale``).
+    optional_keys: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def layer_config(self) -> LayerQuantConfig:
+        return self.config or LayerQuantConfig(self.format)
 
 
 def _scale_layer(key: str) -> str | None:
@@ -145,33 +164,15 @@ def _scale_layer(key: str) -> str | None:
     return None
 
 
-def _quant_format_name(marker: torch.Tensor, layer: str) -> str:
-    """Read the format out of a ``comfy_quant`` tensor, which is JSON stored as bytes."""
-    try:
-        text = bytes(marker.to(dtype=torch.uint8).reshape(-1).tolist()).decode("utf-8")
-        configuration = json.loads(text)
-    except (UnicodeDecodeError, ValueError) as error:
-        raise UnsupportedQuantization(f"Layer {layer!r} has an unreadable comfy_quant marker") from error
-    if not isinstance(configuration, dict) or not configuration.get("format"):
-        raise UnsupportedQuantization(f"Layer {layer!r} declares no quantisation format")
-    for modifier in ARITHMETIC_MODIFIER_KEYS:
-        if configuration.get(modifier):
-            raise UnsupportedQuantization(
-                f"Layer {layer!r} is {configuration['format']!r} with {modifier!r}, which stores "
-                f"the weight in a rotated basis that this runtime cannot undo. Loading it would "
-                f"produce noise rather than a picture, so it is refused. Use the fp8 or bf16 build "
-                f"of this model instead."
-            )
-    return str(configuration["format"])
-
-
 def scan_quantized_layers(state_dict: Mapping[str, torch.Tensor], label: str = "checkpoint") -> dict[str, QuantizedLayer]:
     """Locate every quantised linear in a checkpoint without reading its weights.
 
     Two layouts describe the same thing. The newer one marks each layer with ``comfy_quant`` JSON
     naming the format; the older fp8 one has no marker at all and is recognised by an fp8 weight
     sitting beside a per-tensor scale. A marker always wins, so a file carrying both spellings is
-    read as the format it declares.
+    read as the format it declares. Files that keep their markers in the safetensors header are
+    read through :func:`comfy_quant.load_safetensors_state_dict`, which turns them into the same
+    ``comfy_quant`` entries first.
     """
     layers: dict[str, QuantizedLayer] = {}
 
@@ -179,16 +180,11 @@ def scan_quantized_layers(state_dict: Mapping[str, torch.Tensor], label: str = "
         if not key.endswith(COMFY_QUANT_SUFFIX):
             continue
         layer = key[: -len(COMFY_QUANT_SUFFIX)]
-        name = _quant_format_name(marker, layer)
-        if name not in QUANT_FORMATS:
-            raise UnsupportedQuantization(
-                f"{label} layer {layer!r} is quantised as {name!r}, which this loader cannot read; "
-                "use an fp8, int8, nvfp4 or unquantised file instead"
-            )
+        config = parse_layer_config(marker, layer, label)
         weight_key = f"{layer}.weight"
         if weight_key not in state_dict:
             raise UnsupportedQuantization(f"{label} layer {layer!r} is quantised but carries no weight")
-        layers[layer] = _describe(state_dict, layer, QUANT_FORMATS[name], weight_key, key, label)
+        layers[layer] = _describe(state_dict, layer, config, weight_key, key, label)
 
     for key, value in state_dict.items():
         layer = _scale_layer(key)
@@ -198,13 +194,24 @@ def scan_quantized_layers(state_dict: Mapping[str, torch.Tensor], label: str = "
         weight = state_dict.get(weight_key)
         if weight is None or weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
             continue
-        name = "float8_e4m3fn" if weight.dtype == torch.float8_e4m3fn else "float8_e5m2"
-        layers[layer] = _describe(state_dict, layer, QUANT_FORMATS[name], weight_key, None, label, scale_key=key)
+        layers[layer] = _describe(
+            state_dict, layer, config_for_legacy_fp8(weight.dtype), weight_key, None, label, scale_key=key
+        )
 
     return layers
 
 
-def _describe(state_dict, layer, quant_format, weight_key, marker_key, label, scale_key=None) -> QuantizedLayer:
+def describe_quantized_layer(state_dict: Mapping[str, torch.Tensor], layer: str, marker, label: str = "checkpoint") -> QuantizedLayer:
+    """One marked layer, validated — for loaders that expand layers one at a time."""
+    config = parse_layer_config(marker, layer, label)
+    weight_key = f"{layer}.weight"
+    if weight_key not in state_dict:
+        raise UnsupportedQuantization(f"{label} layer {layer!r} is quantised but carries no weight")
+    return _describe(state_dict, layer, config, weight_key, f"{layer}{COMFY_QUANT_SUFFIX}", label)
+
+
+def _describe(state_dict, layer, config: LayerQuantConfig, weight_key, marker_key, label, scale_key=None) -> QuantizedLayer:
+    quant_format = QUANT_FORMATS[config.format]
     weight = state_dict[weight_key]
     if weight.dtype != quant_format.storage_dtype:
         raise UnsupportedQuantization(
@@ -224,19 +231,30 @@ def _describe(state_dict, layer, quant_format, weight_key, marker_key, label, sc
                         break
         if candidate not in state_dict:
             raise UnsupportedQuantization(
-                f"{label} layer {layer!r} is {quant_format.name} but carries no {buffer_name}"
+                f"{label} layer {layer!r} is {config.label} but carries no {BUFFER_PARAMETERS[buffer_name]}"
             )
         scale_keys[buffer_name] = candidate
 
-    if quant_format.group_size == 0:
-        scale = state_dict[scale_keys["scale_weight"]]
-        if scale.numel() != 1:
-            raise UnsupportedQuantization(
-                f"{label} layer {layer!r} carries a {scale.numel()}-element scale where "
-                f"{quant_format.name} expects one per-tensor value"
-            )
+    comfy_quant.validate_layer(
+        config,
+        tuple(weight.shape),
+        {BUFFER_PARAMETERS[name]: tuple(state_dict[key].shape) for name, key in scale_keys.items()},
+        None,
+        None,
+        layer,
+        label,
+    )
 
+    # `pre_quant_scale` is a parameter of exactly the layouts whose QUANT_ALGOS entry lists it
+    # (NVFP4); ComfyUI loads it there and nowhere else, so on any other layout it is dropped unread.
+    optional: dict[str, str] = {}
     dropped = [key for key in (marker_key,) if key]
+    candidate = f"{layer}{PRE_QUANT_SCALE_SUFFIX}"
+    if candidate in state_dict:
+        if "pre_quant_scale" in config.algo.parameters:
+            optional["pre_quant_scale"] = candidate
+        else:
+            dropped.append(candidate)
     for suffix in INPUT_SCALE_SUFFIXES:
         candidate = f"{layer}{suffix}"
         if candidate in state_dict:
@@ -247,6 +265,8 @@ def _describe(state_dict, layer, quant_format, weight_key, marker_key, label, sc
         weight_key=weight_key,
         scale_keys=scale_keys,
         dropped_keys=tuple(dropped),
+        config=config,
+        optional_keys=optional,
     )
 
 
@@ -272,31 +292,10 @@ def dequantize_nvfp4(
     out_features: int,
     in_features: int,
 ) -> torch.Tensor:
-    """Expand NVFP4: two E2M1 nibbles per byte, one fp8 scale per 16 elements, one global scale."""
-    codes = weight.reshape(out_features, -1)
-    low = codes & 0x0F
-    high = (codes >> 4) & 0x0F
-    # The low nibble is the earlier element, so the two halves interleave rather than concatenate.
-    nibbles = torch.stack((low, high), dim=-1).reshape(out_features, -1)
-    if nibbles.shape[1] < in_features:
-        raise UnsupportedQuantization(
-            f"An NVFP4 weight unpacked to {nibbles.shape[1]} columns, short of the layer's {in_features}"
-        )
-    nibbles = nibbles[:, :in_features]
-
-    table = torch.tensor(FP4_E2M1_VALUES, device=weight.device, dtype=torch.float32)
-    values = table[nibbles.long()]
-
-    scales = block_scale.to(device=weight.device, dtype=torch.float32).reshape(out_features, -1)
-    groups = scales.shape[1]
-    expanded = scales.repeat_interleave(NVFP4_GROUP_SIZE, dim=1)
-    if expanded.shape[1] < in_features:
-        raise UnsupportedQuantization(
-            f"An NVFP4 weight carries {groups} block scales, too few for {in_features} columns"
-        )
-    values = values * expanded[:, :in_features]
-    values = values * global_scale.to(device=weight.device, dtype=torch.float32).reshape(())
-    return values.to(dtype=dtype)
+    """Expand NVFP4 the way comfy-kitchen does: high nibble first, block scales in cuBLAS's tiled
+    order. Before P9 this read the low nibble first and the scales row-major; on a real Krea 2
+    layer that decoded to noise (cosine 0.001 against the BF16 build, 0.996 read correctly)."""
+    return comfy_quant.dequantize_nvfp4(weight, global_scale, block_scale, dtype, out_features, in_features)
 
 
 def dequantize_mxfp8(
@@ -306,22 +305,16 @@ def dequantize_mxfp8(
     out_features: int,
     in_features: int,
 ) -> torch.Tensor:
-    """Expand MXFP8: an fp8 matrix with one power-of-two scale per 32 elements."""
-    values = weight.reshape(out_features, -1).to(dtype=torch.float32)
-    scales = block_scale.reshape(out_features, -1)
-    if scales.dtype == torch.uint8:
-        # E8M0: the byte is a raw exponent, biased by 127, with 255 reserved for NaN.
-        exponent = scales.to(device=weight.device, dtype=torch.float32) - 127.0
-        scales = torch.exp2(exponent)
-    else:
-        scales = scales.to(device=weight.device, dtype=torch.float32)
-    expanded = scales.repeat_interleave(MXFP8_GROUP_SIZE, dim=1)
-    if expanded.shape[1] < in_features or values.shape[1] < in_features:
-        raise UnsupportedQuantization(
-            f"An MXFP8 weight expands to {min(expanded.shape[1], values.shape[1])} columns, "
-            f"short of the layer's {in_features}"
-        )
-    return (values[:, :in_features] * expanded[:, :in_features]).to(dtype=dtype)
+    """Expand MXFP8: fp8 values times one E8M0 scale per 32, the scales in cuBLAS's tiled order."""
+    return comfy_quant.dequantize_mxfp8(weight, block_scale, dtype, out_features, in_features)
+
+
+def _dequantize(config: LayerQuantConfig, weight, scales: Mapping[str, torch.Tensor], dtype, rows, cols):
+    """One layer's full-precision weight; ``scales`` is keyed by buffer name."""
+    if config.format in SCALAR_SCALE_FORMATS:
+        return dequantize_scalar_scale(weight, scales["scale_weight"], dtype)
+    parameters = {BUFFER_PARAMETERS[name]: value for name, value in scales.items()}
+    return comfy_quant.dequantize_layer(weight, parameters, config, dtype, rows, cols)
 
 
 # -- the module --------------------------------------------------------------------------------
@@ -365,11 +358,14 @@ class QuantizedLinear(nn.Linear):
         scale_dtypes: Mapping[str, torch.dtype],
         device=None,
         compute_dtype: torch.dtype = torch.bfloat16,
+        config: LayerQuantConfig | None = None,
+        optional_shapes: Mapping[str, tuple[tuple[int, ...], torch.dtype]] | None = None,
     ):
         nn.Module.__init__(self)
         self.in_features = in_features
         self.out_features = out_features
         self.quant_format = quant_format.name
+        self.quant_config = config or LayerQuantConfig(quant_format.name)
         self.compute_dtype = compute_dtype
         self.weight = nn.Parameter(
             torch.empty(storage_shape, dtype=quant_format.storage_dtype, device=device),
@@ -384,6 +380,9 @@ class QuantizedLinear(nn.Linear):
                     device=device,
                 ),
             )
+        self._optional_buffers = tuple(sorted((optional_shapes or {})))
+        for buffer_name, (shape, dtype) in (optional_shapes or {}).items():
+            self.register_buffer(buffer_name, torch.empty(shape, dtype=dtype, device=device))
         if bias:
             self.bias = nn.Parameter(
                 torch.empty(out_features, dtype=compute_dtype, device=device), requires_grad=False
@@ -400,9 +399,18 @@ class QuantizedLinear(nn.Linear):
             scale = state_dict[spec.scale_keys[buffer_name]]
             scale_shapes[buffer_name] = tuple(scale.shape)
             scale_dtypes[buffer_name] = scale.dtype
+        optional = {
+            name: (tuple(state_dict[key].shape), state_dict[key].dtype) for name, key in spec.optional_keys.items()
+        }
+        rows, cols = linear.out_features, linear.in_features
+        comfy_quant.validate_layer(
+            spec.layer_config, tuple(weight.shape),
+            {BUFFER_PARAMETERS[name]: shape for name, shape in scale_shapes.items()},
+            rows, cols, spec.layer, "checkpoint",
+        )
         return cls(
-            in_features=linear.in_features,
-            out_features=linear.out_features,
+            in_features=cols,
+            out_features=rows,
             bias=linear.bias is not None,
             quant_format=quant_format,
             storage_shape=tuple(weight.shape),
@@ -410,7 +418,12 @@ class QuantizedLinear(nn.Linear):
             scale_dtypes=scale_dtypes,
             device="meta",
             compute_dtype=compute_dtype,
+            config=spec.layer_config,
+            optional_shapes=optional,
         )
+
+    def _protected_names(self):
+        return [name for name, _ in QUANT_FORMATS[self.quant_format].scales] + list(self._optional_buffers)
 
     def _apply(self, fn, recurse=True):
         """Let a device move through while refusing a dtype cast.
@@ -423,9 +436,7 @@ class QuantizedLinear(nn.Linear):
         """
         protected_weight = self._parameters.pop("weight", None)
         protected_scales = {
-            name: self._buffers.pop(name)
-            for name, _ in QUANT_FORMATS[self.quant_format].scales
-            if name in self._buffers
+            name: self._buffers.pop(name) for name in self._protected_names() if name in self._buffers
         }
         try:
             module = super()._apply(fn, recurse)
@@ -434,19 +445,14 @@ class QuantizedLinear(nn.Linear):
                 moved = _apply_without_cast(fn, protected_weight.data)
                 self._parameters["weight"] = nn.Parameter(moved, requires_grad=False)
             for name, tensor in protected_scales.items():
-                self._buffers[name] = _apply_without_cast(fn, tensor)
+                self._buffers[name] = _apply_without_cast(fn, tensor) if tensor is not None else None
         return module
 
+    def _scales(self) -> dict[str, torch.Tensor]:
+        return {name: getattr(self, name) for name, _ in QUANT_FORMATS[self.quant_format].scales}
+
     def dequantized_weight(self, dtype: torch.dtype) -> torch.Tensor:
-        if self.quant_format in SCALAR_SCALE_FORMATS:
-            return dequantize_scalar_scale(self.weight, self.scale_weight, dtype)
-        if self.quant_format == "nvfp4":
-            return dequantize_nvfp4(
-                self.weight, self.scale_weight, self.scale_weight_2, dtype, self.out_features, self.in_features
-            )
-        if self.quant_format == "mxfp8":
-            return dequantize_mxfp8(self.weight, self.scale_weight, dtype, self.out_features, self.in_features)
-        raise UnsupportedQuantization(f"No dequantisation for {self.quant_format!r}")
+        return _dequantize(self.quant_config, self.weight, self._scales(), dtype, self.out_features, self.in_features)
 
     def set_lora_adapter(self, down: torch.Tensor, up: torch.Tensor) -> None:
         """Carry a LoRA alongside the quantised weight instead of inside it.
@@ -461,6 +467,10 @@ class QuantizedLinear(nn.Linear):
         ``(x A^T) B^T`` is the same value by association, computed against the sequence rather than
         against the weight. Several adapters combine into one pair by concatenation, so the cost is
         one extra pair of rank-sized matmuls however many are mounted.
+
+        On an integer layer this also moves the base matmul to full precision, because that is
+        what ComfyUI does once a LoRA patches the layer: its weight function dequantises the weight
+        and the quantised matmul is skipped.
         """
         if down.shape[0] != up.shape[1]:
             raise ValueError(f"LoRA rank mismatch: down is {tuple(down.shape)}, up is {tuple(up.shape)}")
@@ -476,9 +486,35 @@ class QuantizedLinear(nn.Linear):
     def has_lora_adapter(self) -> bool:
         return getattr(self, "lora_down", None) is not None
 
+    @property
+    def uses_integer_matmul(self) -> bool:
+        """ComfyUI's ``_use_quantized`` for a weight-only layout (``mixed_precision_ops``)."""
+        return (
+            self.quant_format in INTEGER_MATMUL_FORMATS
+            and not self.quant_config.full_precision_mm
+            and not self.has_lora_adapter
+        )
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        weight = self.dequantized_weight(input.dtype)
-        out = F.linear(input, weight, self.bias)
+        pre_quant_scale = getattr(self, "pre_quant_scale", None)
+        if pre_quant_scale is not None:
+            input = input * pre_quant_scale.to(device=input.device, dtype=input.dtype)
+        if self.uses_integer_matmul:
+            config = self.quant_config
+            if self.quant_format == "int8_tensorwise":
+                out = comfy_quant.int8_linear(
+                    input, self.weight, self.scale_weight, self.bias, input.dtype,
+                    convrot=config.convrot, convrot_groupsize=config.convrot_groupsize,
+                )
+            else:
+                out = comfy_quant.convrot_w4a4_linear(
+                    input, self.weight, self.scale_weight, self.bias,
+                    convrot_groupsize=config.convrot_groupsize,
+                    quant_group_size=config.quant_group_size,
+                    linear_dtype=config.linear_dtype,
+                )
+        else:
+            out = F.linear(input, self.dequantized_weight(input.dtype), self.bias)
         if self.has_lora_adapter:
             out = out + F.linear(F.linear(input, self.lora_down.to(input.dtype)), self.lora_up.to(input.dtype))
         return out
@@ -486,29 +522,28 @@ class QuantizedLinear(nn.Linear):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"bias={self.bias is not None}, quant={self.quant_format}"
+            f"bias={self.bias is not None}, quant={self.quant_config.label}"
         )
 
 
 # The safetensors header spells dtypes itself; reading it avoids opening the tensors at all.
 SAFETENSORS_DTYPE_BYTES = {
-    "F64": 8, "F32": 4, "F16": 2, "BF16": 2, "F8_E4M3": 1, "F8_E5M2": 1,
+    "F64": 8, "F32": 4, "F16": 2, "BF16": 2, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1,
     "I64": 8, "I32": 4, "I16": 2, "I8": 1, "U8": 1, "BOOL": 1,
 }
 
 QUANTIZED_STORAGE_DTYPE_NAMES = ("F8_E4M3", "F8_E5M2", "I8", "U8")
 
 
-def read_safetensors_header(path) -> dict:
+def read_safetensors_header(path, with_metadata: bool = False):
     """The tensor table at the front of a safetensors file, without mapping any tensor data."""
-    import json as _json
     import struct
 
     with open(path, "rb") as handle:
         (length,) = struct.unpack("<Q", handle.read(8))
-        header = _json.loads(handle.read(length))
-    header.pop("__metadata__", None)
-    return header
+        header = json.loads(handle.read(length))
+    metadata = header.pop("__metadata__", None) or {}
+    return (header, metadata) if with_metadata else header
 
 
 def checkpoint_runtime_bytes(path, compute_dtype_bytes: int = 2) -> int:
@@ -519,11 +554,12 @@ def checkpoint_runtime_bytes(path, compute_dtype_bytes: int = 2) -> int:
     per element overstates Krea 2's transformer by 11.6 GiB — enough to send a model that fits
     comfortably down the block-streaming path it no longer needs.
     """
-    header = read_safetensors_header(path)
+    header, metadata = read_safetensors_header(path, with_metadata=True)
 
     quantised_layers = {
         key[: -len(COMFY_QUANT_SUFFIX)] for key in header if key.endswith(COMFY_QUANT_SUFFIX)
     }
+    quantised_layers.update(comfy_quant.header_quant_layers(metadata, str(path)))
     for key in header:
         layer = _scale_layer(key)
         if layer is None:
@@ -599,6 +635,22 @@ class logical_shape_view(Mapping):
         return len(self._state_dict)
 
 
+def expanded_layer_weight(spec: QuantizedLayer, state_dict: Mapping[str, torch.Tensor], dtype: torch.dtype,
+                          fold_pre_quant_scale: bool = True) -> torch.Tensor:
+    """One quantised layer as a full-precision weight — the value ComfyUI's full-precision path
+    multiplies. A ``pre_quant_scale`` scales the activation's columns, which is the same as scaling
+    the weight's input columns, so an expanded linear carries it inside the weight."""
+    weight = state_dict[spec.weight_key]
+    rows, cols = logical_weight_shape(spec, weight)
+    scales = {name: state_dict[key] for name, key in spec.scale_keys.items()}
+    value = _dequantize(spec.layer_config, weight, scales, dtype, rows, cols)
+    pre_key = spec.optional_keys.get("pre_quant_scale")
+    if fold_pre_quant_scale and pre_key is not None:
+        pre = state_dict[pre_key].to(device=value.device, dtype=torch.float32).reshape(1, -1)
+        value = (value.to(torch.float32) * pre).to(dtype)
+    return value
+
+
 def expand_quantized_layers(
     state_dict: Mapping[str, torch.Tensor],
     layers: Mapping[str, QuantizedLayer],
@@ -607,10 +659,8 @@ def expand_quantized_layers(
 ) -> dict[str, torch.Tensor]:
     """Fold the scales of the named layers back into full-precision weights.
 
-    Used for the layers a LoRA patches. ``fuse_flux_lora_state_dict`` adds its delta into the base
-    weight and casts the sum back to the base dtype, which for a quantised weight would round the
-    adapter away; expanding first is what keeps a LoRA exact. Every other layer stays quantised, so
-    mounting one costs only the layers it actually touches.
+    Used for the layers a module cannot hold quantised — a quantised embedding, say. Every other
+    layer stays quantised, so this costs only the layers it actually touches.
     """
     targets = {layer for layer in targets if layer in layers}
     if not targets:
@@ -620,25 +670,10 @@ def expand_quantized_layers(
     expanded: dict[str, torch.Tensor] = {}
     for layer in targets:
         spec = layers[layer]
-        weight = state_dict[spec.weight_key]
-        quant_format = QUANT_FORMATS[spec.format]
-        scales = {name: state_dict[key] for name, key in spec.scale_keys.items()}
-        if spec.format in SCALAR_SCALE_FORMATS:
-            value = dequantize_scalar_scale(weight, scales["scale_weight"], dtype)
-        elif spec.format == "nvfp4":
-            rows, columns = logical_weight_shape(spec, weight)
-            value = dequantize_nvfp4(
-                weight, scales["scale_weight"], scales["scale_weight_2"], dtype, rows, columns
-            )
-        elif spec.format == "mxfp8":
-            rows, columns = logical_weight_shape(spec, weight)
-            value = dequantize_mxfp8(weight, scales["scale_weight"], dtype, rows, columns)
-        else:  # pragma: no cover - every registered format is handled above
-            raise UnsupportedQuantization(f"No dequantisation for {spec.format!r}")
-        expanded[spec.weight_key] = value
+        expanded[spec.weight_key] = expanded_layer_weight(spec, state_dict, dtype)
         consumed.update(spec.scale_keys.values())
         consumed.update(spec.dropped_keys)
-        del quant_format
+        consumed.update(spec.optional_keys.values())
 
     resolved = {key: value for key, value in state_dict.items() if key not in consumed}
     resolved.update(expanded)
@@ -728,6 +763,9 @@ def quantized_state_dict(
         for buffer_name, key in spec.scale_keys.items():
             renamed[f"{layer}.{buffer_name}"] = state_dict[key]
             consumed.add(key)
+        for buffer_name, key in spec.optional_keys.items():
+            renamed[f"{layer}.{buffer_name}"] = state_dict[key]
+            consumed.add(key)
         consumed.update(spec.dropped_keys)
     for layer, spec in layers.items():
         if layer in replaced:
@@ -736,3 +774,8 @@ def quantized_state_dict(
     resolved = {key: value for key, value in state_dict.items() if key not in consumed}
     resolved.update(renamed)
     return resolved
+
+
+def quantization_summary(layers: Mapping[str, QuantizedLayer], replaced) -> list[str]:
+    """The distinct layout labels a loaded component runs, for the load report."""
+    return sorted({spec.layer_config.label for layer, spec in layers.items() if layer in replaced})

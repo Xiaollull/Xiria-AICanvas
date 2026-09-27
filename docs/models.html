@@ -132,25 +132,41 @@
     </ul>
 
     <div class="note">
-      <span class="label">Take the FLUX.2 text encoder at BF16</span>
-      <p>The published fp8 Qwen 3 8B file quantizes 85 of its layers to <code>nvfp4</code>, which
-        stores packed weights this program cannot expand. The BF16 file is the one that loads. See
-        the <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">quantization
-        support matrix</a> in the wiki.</p>
+      <span class="label">FLUX.2's fp8 text encoder loads</span>
+      <p>The published fp8 Qwen 3 8B file stores 141 layers as fp8 and 85 as <code>nvfp4</code>. Both
+        are decoded the way ComfyUI decodes them and expanded at load, so the smaller file is a real
+        choice; the BF16 file remains the full-precision reference. See the
+        <a href="#quantization">support matrix</a> below.</p>
     </div>
 
     <p>FLUX.1 has no recommended family: it runs from diffusion model, CLIP-L, T5-XXL and VAE files
       you supply yourself.</p>
 
     <h2 id="file-formats">File formats</h2>
-    <p>Every component loads from <code>.safetensors</code>. FLUX.1, FLUX.2 and Krea 2 also load a
-      <code>.gguf</code> diffusion model, which is the only form some quantizations are published
-      in. The text encoder and VAE stay <code>.safetensors</code>: a GGUF text encoder is named in
-      llama.cpp's key space rather than the checkpoint's, and translating that is not something this
-      program does.</p>
+    <p>Every component loads from <code>.safetensors</code>. For FLUX.1, FLUX.2 and Krea 2 every
+      component — diffusion model, text encoder and VAE — also loads from <code>.gguf</code>, which
+      is the only form some quantizations are published in. Anima's components stay
+      <code>.safetensors</code>.</p>
 
-    <p>A GGUF placed in <code>models/diffusion_models</code> appears in the picker beside the
-      safetensors files and is identified the same way — by the tensors it holds, not by its
+    <p>A GGUF diffusion model or VAE keeps the checkpoint's own tensor names, the way ComfyUI-GGUF
+      writes them, including its record of the 5-D convolution shapes ggml cannot hold. Text encoders
+      are mostly published by llama.cpp, which renames every tensor; the families below are renamed
+      back into ComfyUI's naming and must match the architecture the file declares. Anything else is
+      refused by name rather than loaded partially.</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>llama.cpp architecture</th><th>Read as</th><th>Engine</th></tr></thead>
+        <tbody>
+          <tr><td><code>t5encoder</code></td><td>T5-XXL</td><td>FLUX.1</td></tr>
+          <tr><td><code>qwen3</code></td><td>Qwen3 4B / 8B</td><td>FLUX.2 [klein]</td></tr>
+          <tr><td><code>qwen3vl</code></td><td>Qwen3-VL-4B's language half (the separate vision <code>mmproj</code> is not needed)</td><td>Krea 2</td></tr>
+          <tr><td><code>llama</code> (Mistral)</td><td>Refused: llama.cpp permutes its query/key rows, and the file carries no Tekken tokenizer</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>A GGUF appears in the picker beside the safetensors files and is identified the same way — by
+      the tensors it holds and, for a llama.cpp encoder, the architecture it declares — not by its
       filename.</p>
 
     <p>The block layouts read are:</p>
@@ -170,10 +186,39 @@
 
     <h2 id="quantization">Quantization, honestly</h2>
     <p>Quantized variants are offered where the publisher ships them, so the same model can be taken
-      at bf16, fp8, mxfp8, nvfp4, int4/int8 or GGUF Q4–Q8. Not all of them load; the picker hides
-      what the runtime cannot read, and the
-      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">wiki matrix</a>
-      lists the current state.</p>
+      at bf16, fp8, mxfp8, nvfp4, int4/int8 or GGUF Q4–Q8. Each of ComfyUI's quantized layouts is read
+      the way ComfyUI 0.33.0 reads it — the per-layer <code>comfy_quant</code> marker or the
+      <code>_quantization_metadata</code> header table, the scales beside the weight, and whether the
+      weight was rotated before it was quantized. The arithmetic is ported from ComfyUI and the
+      comfy-kitchen 0.2.31 it pins rather than re-derived; the notices are in
+      <code>backend/resources/comfy-quant</code>.</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Layout</th><th>Krea 2</th><th>FLUX.1 / FLUX.2</th><th>Native kernel</th></tr></thead>
+        <tbody>
+          <tr><td>FP8 (<code>float8_e4m3fn</code>, <code>float8_e5m2</code>)</td><td>Stays fp8, dequantized per layer</td><td>Expanded at load</td><td>—</td></tr>
+          <tr><td>ConvRot INT8 (<code>int8_tensorwise</code> + <code>convrot</code>)</td><td>Stays int8; the activation is rotated and quantized per row, then an integer matmul — ComfyUI's W8A8 path</td><td>Rotation undone, expanded at load</td><td>INT8 tensor cores, SM 7.5+</td></tr>
+          <tr><td>INT8 (<code>int8_tensorwise</code>, per tensor or per row)</td><td>Stays int8, W8A8 integer matmul</td><td>Expanded at load</td><td>SM 7.5+</td></tr>
+          <tr><td>ConvRot W4A4 INT4 (<code>convrot_w4a4</code>)</td><td>Stays packed; W4A4 on SM 8.x, W4A8 elsewhere, as the pinned CUDA backend chooses</td><td>Rotation undone, expanded at load</td><td>SM 7.5+</td></tr>
+          <tr><td>MXFP8</td><td>Stays fp8, dequantized per layer</td><td>Expanded at load</td><td>SM 10.0+ and PyTorch 2.10+; below that ComfyUI dequantizes too</td></tr>
+          <tr><td>NVFP4</td><td>Stays packed, dequantized per layer</td><td>Expanded at load</td><td>SM 10.0+; below that ComfyUI dequantizes too</td></tr>
+          <tr><td>GGUF</td><td colspan="2">Expanded at load, for all three components</td><td>—</td></tr>
+          <tr><td>ConvRot W4A8 (<code>asym_w4a8_int8</code>), SVDQuant, ComfyUI-INT8-Fast's format-less marker</td><td colspan="3">Refused by name</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>A layer marked <code>full_precision_matrix_mult</code>, or one a LoRA patches, is dequantized and
+      multiplied at full precision instead — ComfyUI's own rule. On an NVIDIA card of SM 8.0 or newer
+      the two integer matmuls run on built-in Triton kernels: the activation is quantized in one pass
+      and the matmul unpacks W4A4's 4-bit weights in registers, with results bit-identical to the
+      PyTorch port that reproduces comfy-kitchen's eager backend. They are checked against that port
+      the first time they are used and give way to it on any failure; without Triton the port runs.
+      On an RTX 4060 a Krea 2 block in ConvRot INT8 takes 17 ms against 40 ms at BF16 and 73 ms on the
+      port. An installed comfy-kitchen is used in their place but is never installed by this program,
+      and <code>XIRAI_QUANT_TRITON=0</code> turns the kernels off. The path each layout takes on the
+      current card is published as <code>capabilities.quantization</code> in the performance payload.</p>
 
     <p>Whether a quantized file is also smaller <em>in memory</em> depends on the engine, because it
       depends on whether there is a linear op to hand the stored weight to.</p>
@@ -184,9 +229,10 @@
         <tbody>
           <tr>
             <td>Krea 2</td>
-            <td>Its stored size. The weight stays in the checkpoint's own type and the scale is
-              applied inside the linear, so an fp8 diffusion model occupies about 12 GB rather than
-              the 24 GB it expands to — the difference between resident on a 24 GB card and not.</td>
+            <td>Its stored size, for every layout in the matrix above. The weight stays in the
+              checkpoint's own type and the scale is applied inside the linear, so an fp8 diffusion
+              model occupies about 12 GB rather than the 24 GB it expands to — the difference between
+              resident on a 24 GB card and not — and an NVFP4 one about 7 GB.</td>
           </tr>
           <tr>
             <td>Anima, FLUX.1, FLUX.2</td>
@@ -198,12 +244,11 @@
       </table>
     </div>
 
-    <p>Krea 2 reads the two layouts ComfyUI writes — a per-tensor scale beside an fp8 or int8 weight,
-      under either spelling of the key, and the newer per-layer <code>comfy_quant</code> marker.
-      Applying that scale at compute time is not an approximation: for every format whose weight is
-      an ordinary matrix scaled by one number, it lands on the same bits as folding it at load, which
-      is what makes deferring it free rather than a trade. A quantized layer a LoRA patches keeps its
-      storage too — the adapter is carried beside the weight instead of being fused into it.</p>
+    <p>For fp8, applying the scale at compute time is not an approximation: for every format whose
+      weight is an ordinary matrix scaled by one number, it lands on the same bits as folding it at
+      load, which is what makes deferring it free rather than a trade. A quantized layer a LoRA
+      patches keeps its storage too — the adapter is carried beside the weight instead of being fused
+      into it.</p>
 
     <div class="note">
       <span class="label">GGUF is always expanded</span>

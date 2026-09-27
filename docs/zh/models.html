@@ -114,19 +114,32 @@
     </ul>
 
     <div class="note">
-      <span class="label">FLUX.2 文本编码器请选 BF16</span>
-      <p>官方发布的 fp8 版 Qwen 3 8B 有 85 层量化为 <code>nvfp4</code>，其压缩权重本程序无法展开。能够加载的是 BF16 文件。详见
-        Wiki 中的<a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">量化支持矩阵</a>。</p>
+      <span class="label">FLUX.2 的 fp8 文本编码器可以加载</span>
+      <p>官方发布的 fp8 版 Qwen 3 8B 有 141 层为 fp8、85 层为 <code>nvfp4</code>。两者都按 ComfyUI
+        的方式解码并在加载时展开，因此体积更小的文件是真正可用的选择；BF16 文件仍是全精度基准。详见下方的<a href="#quantization">支持矩阵</a>。</p>
     </div>
 
     <p>FLUX.1 没有推荐系列：它使用你自行准备的扩散模型、CLIP-L、T5-XXL 与 VAE 文件运行。</p>
 
     <h2 id="file-formats">文件格式</h2>
-    <p>所有组件都支持 <code>.safetensors</code>。FLUX.1、FLUX.2 与 Krea 2 的扩散模型还支持
-      <code>.gguf</code>——某些量化版本只以这种形式发布。文本编码器与 VAE 仍然只接受
-      <code>.safetensors</code>：GGUF 文本编码器使用的是 llama.cpp 的张量命名空间，而不是检查点自身的命名，本程序不做这层转换。</p>
+    <p>所有组件都支持 <code>.safetensors</code>。FLUX.1、FLUX.2 与 Krea 2 的全部组件——扩散模型、文本编码器与
+      VAE——还支持 <code>.gguf</code>，某些量化版本只以这种形式发布。Anima 的组件仍然只接受 <code>.safetensors</code>。</p>
 
-    <p>放入 <code>models/diffusion_models</code> 的 GGUF 文件会与 safetensors 文件一同出现在选择器中，并以同样的方式识别——依据文件内含的张量，而非文件名。</p>
+    <p>GGUF 扩散模型与 VAE 保留检查点自身的张量命名（ComfyUI-GGUF 的写法），包括它对 ggml 无法容纳的 5 维卷积形状的记录。文本编码器多由
+      llama.cpp 发布，它会重命名每个张量；下表中的系列会被改回 ComfyUI 的命名，并且必须与文件声明的架构一致。其他情况按名称拒绝，而不是只加载一部分。</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>llama.cpp 架构</th><th>读取为</th><th>引擎</th></tr></thead>
+        <tbody>
+          <tr><td><code>t5encoder</code></td><td>T5-XXL</td><td>FLUX.1</td></tr>
+          <tr><td><code>qwen3</code></td><td>Qwen3 4B / 8B</td><td>FLUX.2 [klein]</td></tr>
+          <tr><td><code>qwen3vl</code></td><td>Qwen3-VL-4B 的语言部分（不需要单独的视觉 <code>mmproj</code>）</td><td>Krea 2</td></tr>
+          <tr><td><code>llama</code>（Mistral）</td><td>拒绝：llama.cpp 会置换其 query/key 行，且文件不含 Tekken 分词器</td><td>——</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>GGUF 文件会与 safetensors 文件一同出现在选择器中，并以同样的方式识别——依据文件内含的张量（llama.cpp 编码器还依据其声明的架构），而非文件名。</p>
 
     <p>可读取的块布局为：</p>
     <div class="scroller">
@@ -144,8 +157,31 @@
 
     <h2 id="quantization">关于量化，说实话</h2>
     <p>发布方提供量化版本时也会一并列出，因此同一个模型可以选择 bf16、fp8、mxfp8、nvfp4、int4/int8 或 GGUF
-      Q4-Q8。并非全部都能加载；选择器会隐藏运行时无法读取的文件，当前状态列在
-      <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Quantization-support">Wiki 的支持矩阵</a>中。</p>
+      Q4-Q8。ComfyUI 的每种量化布局都按 ComfyUI 0.33.0 的方式读取——逐层 <code>comfy_quant</code> 标记或
+      <code>_quantization_metadata</code> 头部表、权重旁的缩放，以及权重在量化前是否经过旋转。运算直接移植自 ComfyUI
+      及其固定版本的 comfy-kitchen 0.2.31，而不是重新推导；许可与声明位于 <code>backend/resources/comfy-quant</code>。</p>
+
+    <div class="scroller">
+      <table>
+        <thead><tr><th>布局</th><th>Krea 2</th><th>FLUX.1 / FLUX.2</th><th>原生内核</th></tr></thead>
+        <tbody>
+          <tr><td>FP8（<code>float8_e4m3fn</code>、<code>float8_e5m2</code>）</td><td>保持 fp8，逐层解码</td><td>加载时展开</td><td>——</td></tr>
+          <tr><td>ConvRot INT8（<code>int8_tensorwise</code> + <code>convrot</code>）</td><td>保持 int8；激活先旋转、逐行量化，再做整数矩阵乘——即 ComfyUI 的 W8A8 路径</td><td>还原旋转后加载时展开</td><td>INT8 张量核心，SM 7.5+</td></tr>
+          <tr><td>INT8（<code>int8_tensorwise</code>，逐张量或逐行）</td><td>保持 int8，W8A8 整数矩阵乘</td><td>加载时展开</td><td>SM 7.5+</td></tr>
+          <tr><td>ConvRot W4A4 INT4（<code>convrot_w4a4</code>）</td><td>保持打包形式；SM 8.x 上为 W4A4，其他为 W4A8，与固定版本的 CUDA 后端一致</td><td>还原旋转后加载时展开</td><td>SM 7.5+</td></tr>
+          <tr><td>MXFP8</td><td>保持 fp8，逐层解码</td><td>加载时展开</td><td>SM 10.0+ 且 PyTorch 2.10+；低于此 ComfyUI 同样解码</td></tr>
+          <tr><td>NVFP4</td><td>保持打包形式，逐层解码</td><td>加载时展开</td><td>SM 10.0+；低于此 ComfyUI 同样解码</td></tr>
+          <tr><td>GGUF</td><td colspan="2">加载时展开，三个组件均可</td><td>——</td></tr>
+          <tr><td>ConvRot W4A8（<code>asym_w4a8_int8</code>）、SVDQuant、ComfyUI-INT8-Fast 缺少 format 的标记</td><td colspan="3">按名称拒绝</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>标记了 <code>full_precision_matrix_mult</code> 的层，或被 LoRA 修改的层，会改为解码后以全精度相乘——这是 ComfyUI
+      自己的规则。在 SM 8.0 及以上的 NVIDIA 显卡上，两种整数矩阵乘由内置 Triton 内核完成：激活一次遍历完成量化，W4A4 的 4 位权重在寄存器中解包，结果与复现
+      comfy-kitchen eager 后端的 PyTorch 移植实现逐位一致。内核首次使用时先与移植实现比对，任何故障都会退回移植实现；没有 Triton 时直接运行移植实现。在
+      RTX 4060 上，一个 ConvRot INT8 的 Krea 2 块耗时 17 ms，BF16 为 40 ms，移植实现为 73 ms。已安装的 comfy-kitchen 会被优先使用，但程序从不自动安装它；设置
+      <code>XIRAI_QUANT_TRITON=0</code> 可关闭内置内核。每种布局在当前显卡上的执行路径会写在性能接口的 <code>capabilities.quantization</code> 中。</p>
 
     <p>量化文件在<em>内存中</em>是否也更小，取决于引擎——取决于是否有一个线性算子可以接收它存储的权重。</p>
 
@@ -155,8 +191,8 @@
         <tbody>
           <tr>
             <td>Krea 2</td>
-            <td>就是它存储的大小。权重保持检查点自身的类型，缩放在线性算子内部完成，因此一个 fp8
-              扩散模型占用约 12 GB，而不是展开后的 24 GB——这正是能否常驻 24 GB 显卡的分界线。</td>
+            <td>就是它存储的大小，适用于上表中的每种布局。权重保持检查点自身的类型，缩放在线性算子内部完成，因此一个 fp8
+              扩散模型占用约 12 GB，而不是展开后的 24 GB——这正是能否常驻 24 GB 显卡的分界线——NVFP4 则约为 7 GB。</td>
           </tr>
           <tr>
             <td>Anima、FLUX.1、FLUX.2</td>
@@ -167,8 +203,7 @@
       </table>
     </div>
 
-    <p>Krea 2 能读取 ComfyUI 写出的两种布局：fp8 或 int8 权重旁的逐张量缩放（两种键名拼写都接受），以及较新的逐层
-      <code>comfy_quant</code> 标记。把缩放推迟到计算时并不是近似：对于权重仍是一个普通矩阵、只乘一个数的格式，它与在加载时折算得到的比特完全一致——这正是推迟它不需要付出代价的原因。被
+    <p>对 fp8 而言，把缩放推迟到计算时并不是近似：对于权重仍是一个普通矩阵、只乘一个数的格式，它与在加载时折算得到的比特完全一致——这正是推迟它不需要付出代价的原因。被
       LoRA 修改的量化层同样保持其存储形式，适配器挂在权重旁边，而不是融合进去。</p>
 
     <div class="note">

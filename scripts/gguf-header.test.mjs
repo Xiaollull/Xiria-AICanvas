@@ -7,7 +7,10 @@ import test from "node:test";
 import {
   DIFFUSION_MODEL_EXTENSIONS,
   GGUF_SUPPORTED_TYPES,
+  GGUF_TEXT_ENCODER_FAMILIES,
+  GGUF_TEXT_ENCODER_KEY_MAPS,
   componentFileExtensions,
+  ggufTextEncoderKey,
   readDiffusionModelHeader,
   readGgufHeader,
 } from "./gguf-header.mjs";
@@ -238,12 +241,112 @@ test("a file holding no tensors is refused", async (context) => {
   await assert.rejects(readGgufHeader(file), /no tensors/);
 });
 
-test("only the diffusion model slot widens past safetensors", () => {
-  assert.deepEqual([...componentFileExtensions("diffusion_model")].sort(), [".gguf", ".safetensors"]);
-  for (const role of ["text_encoder", "text_encoder_2", "vae"]) {
-    assert.deepEqual([...componentFileExtensions(role)], [".safetensors"]);
+test("every native component slot reads GGUF; anything else stays safetensors", () => {
+  // P9: a GGUF text encoder or VAE is listed only when its tensors classify as that role, which a
+  // llama.cpp encoder does only after `renameGgufTextEncoder` (see the tests below).
+  for (const role of ["diffusion_model", "text_encoder", "text_encoder_2", "vae"]) {
+    assert.deepEqual([...componentFileExtensions(role)].sort(), [".gguf", ".safetensors"], role);
   }
+  assert.deepEqual([...componentFileExtensions("lora")], [".safetensors"]);
   assert.deepEqual([...DIFFUSION_MODEL_EXTENSIONS].sort(), [".gguf", ".safetensors"]);
+});
+
+// The same tables `backend/tests/test_gguf_loader.py` pins (`EXPECTED_TEXT_ENCODER_KEY_MAPS`).
+const EXPECTED_TEXT_ENCODER_FAMILIES = { t5encoder: "t5", t5: "t5", qwen3: "qwen3", qwen3vl: "qwen3" };
+const EXPECTED_TEXT_ENCODER_KEY_MAPS = {
+  t5: {
+    prefix: "enc.blk.",
+    block: "encoder.block.{index}.",
+    parts: {
+      attn_q: "layer.0.SelfAttention.q", attn_k: "layer.0.SelfAttention.k",
+      attn_v: "layer.0.SelfAttention.v", attn_o: "layer.0.SelfAttention.o",
+      attn_rel_b: "layer.0.SelfAttention.relative_attention_bias", attn_norm: "layer.0.layer_norm",
+      ffn_gate: "layer.1.DenseReluDense.wi_0", ffn_up: "layer.1.DenseReluDense.wi_1",
+      ffn_down: "layer.1.DenseReluDense.wo", ffn_norm: "layer.1.layer_norm",
+    },
+    globals: { token_embd: "shared", "enc.output_norm": "encoder.final_layer_norm" },
+    dropped: [],
+  },
+  qwen3: {
+    prefix: "blk.",
+    block: "model.layers.{index}.",
+    parts: {
+      attn_q: "self_attn.q_proj", attn_k: "self_attn.k_proj", attn_v: "self_attn.v_proj",
+      attn_output: "self_attn.o_proj", attn_q_norm: "self_attn.q_norm", attn_k_norm: "self_attn.k_norm",
+      attn_norm: "input_layernorm", ffn_norm: "post_attention_layernorm",
+      ffn_gate: "mlp.gate_proj", ffn_up: "mlp.up_proj", ffn_down: "mlp.down_proj",
+    },
+    globals: { token_embd: "model.embed_tokens", output_norm: "model.norm" },
+    dropped: ["output.weight"],
+  },
+};
+
+test("the llama.cpp rename tables are the ones the runtime uses", () => {
+  assert.deepEqual(Object.fromEntries(GGUF_TEXT_ENCODER_FAMILIES), EXPECTED_TEXT_ENCODER_FAMILIES);
+  assert.deepEqual(GGUF_TEXT_ENCODER_KEY_MAPS, EXPECTED_TEXT_ENCODER_KEY_MAPS);
+  assert.equal(ggufTextEncoderKey("enc.blk.0.attn_rel_b.weight", "t5"), "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight");
+  assert.equal(ggufTextEncoderKey("blk.35.attn_output.weight", "qwen3"), "model.layers.35.self_attn.o_proj.weight");
+  assert.equal(ggufTextEncoderKey("blk.0.attn_q.bias", "qwen3"), "model.layers.0.self_attn.q_proj.bias");
+  for (const unknown of ["blk.0.attn_qkv.weight", "blk.x.attn_q.weight", "rope_freqs.weight", "blk.0.attn_q.scale"]) {
+    assert.equal(ggufTextEncoderKey(unknown, "qwen3"), null, unknown);
+  }
+});
+
+function qwenTensors({ hidden = 2560, lmHead = true, extra = [] } = {}) {
+  const tensors = [
+    { name: "token_embd.weight", type: "F32", shape: [8, hidden], payload: Buffer.alloc(8 * hidden * 4) },
+    { name: "blk.0.attn_q.weight", type: "F32", shape: [4, hidden], payload: Buffer.alloc(4 * hidden * 4) },
+    { name: "blk.0.attn_q_norm.weight", type: "F32", shape: [128], payload: Buffer.alloc(512) },
+    { name: "blk.0.ffn_norm.weight", type: "F32", shape: [hidden], payload: Buffer.alloc(hidden * 4) },
+    { name: "output_norm.weight", type: "F32", shape: [hidden], payload: Buffer.alloc(hidden * 4) },
+    ...extra,
+  ];
+  if (lmHead) tensors.push({ name: "output.weight", type: "F32", shape: [8, hidden], payload: Buffer.alloc(8 * hidden * 4) });
+  return tensors;
+}
+
+test("a llama.cpp Qwen3 or Qwen3-VL encoder is read back in ComfyUI's names, head dropped", async (context) => {
+  const directory = await temporaryDirectory(context);
+  for (const architecture of ["qwen3", "qwen3vl"]) {
+    const file = await writeGguf(path.join(directory, `${architecture}.gguf`), qwenTensors(), { metadata: [["general.architecture", architecture]] });
+    const header = await readGgufHeader(file);
+    assert.deepEqual(header.__metadata__, { "general.architecture": architecture });
+    assert.deepEqual(Object.keys(header).filter((key) => key !== "__metadata__").sort(), [
+      "model.embed_tokens.weight",
+      "model.layers.0.post_attention_layernorm.weight",
+      "model.layers.0.self_attn.q_norm.weight",
+      "model.layers.0.self_attn.q_proj.weight",
+      "model.norm.weight",
+    ]);
+    assert.deepEqual(header["model.layers.0.self_attn.q_proj.weight"].shape, [4, 2560]);
+  }
+});
+
+test("a llama.cpp T5 encoder is read back in the FLUX.1 T5-XXL layout", async (context) => {
+  const directory = await temporaryDirectory(context);
+  const file = await writeGguf(path.join(directory, "t5.gguf"), [
+    { name: "token_embd.weight", type: "F32", shape: [4, 8], payload: Buffer.alloc(128) },
+    { name: "enc.blk.0.attn_rel_b.weight", type: "F32", shape: [32, 64], payload: Buffer.alloc(32 * 64 * 4) },
+    { name: "enc.output_norm.weight", type: "F32", shape: [8], payload: Buffer.alloc(32) },
+  ], { metadata: [["general.architecture", "t5encoder"]] });
+  const header = await readGgufHeader(file);
+  assert.deepEqual(header.__metadata__, { "general.architecture": "t5encoder" });
+  assert.deepEqual(Object.keys(header).filter((key) => key !== "__metadata__").sort(), [
+    "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight",
+    "encoder.final_layer_norm.weight",
+    "shared.weight",
+  ]);
+});
+
+test("an encoder the runtime cannot map keeps llama.cpp's names, so no classifier lists it", async (context) => {
+  const directory = await temporaryDirectory(context);
+  // Mistral (`llama`) is refused by the runtime; an unnameable tensor refuses a whole Qwen3 file.
+  const mistral = await writeGguf(path.join(directory, "mistral.gguf"), qwenTensors({ hidden: 5120 }), { metadata: [["general.architecture", "llama"]] });
+  assert.ok(Object.hasOwn(await readGgufHeader(mistral), "blk.0.attn_q.weight"));
+  const odd = await writeGguf(path.join(directory, "odd.gguf"), qwenTensors({
+    extra: [{ name: "blk.0.attn_qkv.weight", type: "F32", shape: [4, 8], payload: Buffer.alloc(128) }],
+  }), { metadata: [["general.architecture", "qwen3"]] });
+  assert.ok(Object.hasOwn(await readGgufHeader(odd), "blk.0.attn_q.weight"));
 });
 
 test("the dispatcher reads each container with its own reader", async (context) => {

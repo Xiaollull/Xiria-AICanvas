@@ -40,6 +40,10 @@ DISTILLED_ENGINES = frozenset({"Flux", "Flux2"})
 # LoraLoader (its LoRAs carry no text-encoder weights for the CLIP input to apply).
 LORA_CLIP_ENGINES = frozenset({"SD", "iL", "Anima"})
 NODE_PACK = {"cnr_id": "comfy-core", "ver": "0.33.0"}
+# city96/ComfyUI-GGUF, the custom node ComfyUI needs to read a GGUF model or text encoder. Core
+# ComfyUI's UNETLoader and CLIPLoader read safetensors only, so a GGUF component is exported through
+# this pack's loaders and the graph says it needs them (P9).
+GGUF_NODE_PACK = {"cnr_id": "comfyui-gguf"}
 # Fixed so the same run always yields the same identifiers, and a workflow is recognisably XirAI's.
 WORKFLOW_NAMESPACE = uuid.UUID("5f0c8a3e-7b21-4c6d-9e44-2a9d1b7c3e58")
 
@@ -431,6 +435,7 @@ class _WorkflowBuilder:
         self.root = _Graph(self.ids)
         self.subgraphs: list[_Subgraph] = []
         self.notes: list[str] = []
+        self.requirements: list[str] = []
         self.bottoms: dict[str, int] = {}
 
     # -- values ------------------------------------------------------------------------------
@@ -522,38 +527,68 @@ class _WorkflowBuilder:
             return (loader, 0), (loader, 1), (loader, 2)
         label = ENGINE_LABELS[engine]
         diffusion = comfy_asset_name(request.diffusion_model)
-        if diffusion.lower().endswith(".gguf"):
-            self.notes.append(
-                f"{diffusion.split(chr(92))[-1]} is a GGUF file; ComfyUI's native UNETLoader cannot load it "
-                "(the ComfyUI-GGUF custom node's loader can)."
-            )
-        unet = self.root.add(
-            "UNETLoader", f"{label} Diffusion Model", (x, 110), (300, 105),
-            outputs=(("MODEL", "MODEL"),),
-            widgets=(("unet_name", diffusion), ("weight_dtype", "default")),
-        )
-        if engine == "Flux":
-            encoder = self.root.add(
-                "DualCLIPLoader", "FLUX.1 Text Encoders · CLIP-L + T5-XXL", (x, 240), (300, 160),
-                outputs=(("CLIP", "CLIP"),),
-                widgets=(
-                    ("clip_name1", comfy_asset_name(request.text_encoder)),
-                    ("clip_name2", comfy_asset_name(request.text_encoder_2)),
-                    ("type", "flux"),
-                    ("device", "default"),
-                ),
+        if _is_gguf(diffusion):
+            self.requirements.append("ComfyUI-GGUF (city96): UnetLoaderGGUF reads the GGUF diffusion model.")
+            unet = self.root.add(
+                "UnetLoaderGGUF", f"{label} Diffusion Model · GGUF", (x, 110), (300, 80),
+                outputs=(("MODEL", "MODEL"),),
+                widgets=(("unet_name", diffusion),),
+                properties={**GGUF_NODE_PACK, "Node name for S&R": "UnetLoaderGGUF"},
             )
         else:
-            encoder = self.root.add(
-                "CLIPLoader", TEXT_ENCODER_TITLES[engine], (x, 240), (300, 135),
-                outputs=(("CLIP", "CLIP"),),
-                widgets=(("clip_name", comfy_asset_name(request.text_encoder)), ("type", TEXT_ENCODER_TYPES[engine]), ("device", "default")),
+            unet = self.root.add(
+                "UNETLoader", f"{label} Diffusion Model", (x, 110), (300, 105),
+                outputs=(("MODEL", "MODEL"),),
+                widgets=(("unet_name", diffusion), ("weight_dtype", "default")),
+            )
+        if engine == "Flux":
+            names = (comfy_asset_name(request.text_encoder), comfy_asset_name(request.text_encoder_2))
+            if any(_is_gguf(name) for name in names):
+                self.requirements.append("ComfyUI-GGUF (city96): DualCLIPLoaderGGUF reads the GGUF text encoder.")
+                encoder = self.root.add(
+                    "DualCLIPLoaderGGUF", "FLUX.1 Text Encoders · CLIP-L + T5-XXL · GGUF", (x, 240), (300, 135),
+                    outputs=(("CLIP", "CLIP"),),
+                    widgets=(("clip_name1", names[0]), ("clip_name2", names[1]), ("type", "flux")),
+                    properties={**GGUF_NODE_PACK, "Node name for S&R": "DualCLIPLoaderGGUF"},
+                )
+            else:
+                encoder = self.root.add(
+                    "DualCLIPLoader", "FLUX.1 Text Encoders · CLIP-L + T5-XXL", (x, 240), (300, 160),
+                    outputs=(("CLIP", "CLIP"),),
+                    widgets=(
+                        ("clip_name1", names[0]),
+                        ("clip_name2", names[1]),
+                        ("type", "flux"),
+                        ("device", "default"),
+                    ),
+                )
+        else:
+            name = comfy_asset_name(request.text_encoder)
+            if _is_gguf(name):
+                self.requirements.append("ComfyUI-GGUF (city96): CLIPLoaderGGUF reads the GGUF text encoder.")
+                encoder = self.root.add(
+                    "CLIPLoaderGGUF", f"{TEXT_ENCODER_TITLES[engine]} · GGUF", (x, 240), (300, 110),
+                    outputs=(("CLIP", "CLIP"),),
+                    widgets=(("clip_name", name), ("type", TEXT_ENCODER_TYPES[engine])),
+                    properties={**GGUF_NODE_PACK, "Node name for S&R": "CLIPLoaderGGUF"},
+                )
+            else:
+                encoder = self.root.add(
+                    "CLIPLoader", TEXT_ENCODER_TITLES[engine], (x, 240), (300, 135),
+                    outputs=(("CLIP", "CLIP"),),
+                    widgets=(("clip_name", name), ("type", TEXT_ENCODER_TYPES[engine]), ("device", "default")),
+                )
+        vae_name = comfy_asset_name(request.vae)
+        if _is_gguf(vae_name):
+            self.notes.append(
+                f"{vae_name.split(chr(92))[-1]} is a GGUF VAE. ComfyUI's VAELoader reads safetensors only and "
+                "ComfyUI-GGUF has no VAE loader, so load this VAE's safetensors release there."
             )
         vae_y = encoder["pos"][1] + encoder["size"][1] + 25
         loader = self.root.add(
             "VAELoader", f"{label} VAE", (x, vae_y), (300, 100),
             outputs=(("VAE", "VAE"),),
-            widgets=(("vae_name", comfy_asset_name(request.vae)),),
+            widgets=(("vae_name", vae_name),),
         )
         self.bottoms["model"] = vae_y + 100
         return (unet, 0), (encoder, 0), (loader, 0)
@@ -909,8 +944,13 @@ class _WorkflowBuilder:
             "inputs": (("images", "IMAGE"),), "outputs": (("images", "IMAGE"),),
             "widgets": (("filename_prefix", f"XirAI-{self.engine}"),),
         })
+        sections = []
+        if self.requirements:
+            sections.append("Requires:\n" + "\n".join(f"- {line}" for line in dict.fromkeys(self.requirements)))
         if self.notes:
-            text = "Not reproduced by this graph:\n" + "\n".join(f"- {line}" for line in dict.fromkeys(self.notes))
+            sections.append("Not reproduced by this graph:\n" + "\n".join(f"- {line}" for line in dict.fromkeys(self.notes)))
+        if sections:
+            text = "\n\n".join(sections)
             lines = sum(1 + len(line) // 44 for line in text.split("\n"))
             entries.append({
                 "type": "Note", "title": "XirAI Notes", "size": (340, 40 + 18 * lines),
@@ -1036,6 +1076,10 @@ def validate_workflow(workflow: dict) -> None:
 
 # Widgets that name a file on disk; every one must stay a relative ID.
 ASSET_WIDGETS = ("ckpt_name", "unet_name", "clip_name", "clip_name1", "clip_name2", "vae_name", "lora_name", "model_name")
+
+
+def _is_gguf(name: str) -> bool:
+    return name.lower().endswith(".gguf")
 
 
 def _looks_absolute(value: str) -> bool:

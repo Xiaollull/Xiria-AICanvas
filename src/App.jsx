@@ -128,6 +128,7 @@ import {
   updateChainStage,
 } from "./resample-chain.js";
 import { DEFAULT_PERFORMANCE, performanceDefaultsFor, performancePresetsFor } from "./performance-defaults.js";
+import { quantizationKitchenSummary, quantizationStatusRows } from "./quantization-status.js";
 import { APP_VERSION } from "./app-version";
 import { BrandLogo, LoadingLogo } from "./BrandLogo";
 import { formatFileSize } from "./format-size";
@@ -7636,6 +7637,10 @@ function App() {
                   <div><span>BLACKWELL PATH</span><strong>NVFP4 实验能力</strong><p>{performanceCapabilities.nvfp4?.hardware_supported ? performanceCapabilities.nvfp4?.runtime_ready ? "已检测到 50 系硬件和量化运行库；为保护单文件 SDXL、LoRA 与 CPU offload 兼容性，本版本仅检测不启用。" : "显卡支持 NVFP4，但项目缺少经过验证的 TorchAO / ModelOpt 量化运行链。" : "当前显卡不提供 NVFP4 Tensor Core 路径；不影响 FP16 / BF16 与 SDPA 优化。"}</p></div>
                   <b>{performanceCapabilities.nvfp4?.runtime_ready ? "RUNTIME DETECTED" : performanceCapabilities.nvfp4?.hardware_supported ? "RUNTIME REQUIRED" : "NOT APPLICABLE"}</b>
                 </div>
+                {quantizationStatusRows(performanceCapabilities).length > 0 && <div className="nvfp4-status quant-status">
+                  <div><span>COMFYUI LAYOUTS</span><strong>量化模型执行路径</strong><p>按 ComfyUI 0.33.0 / comfy-kitchen 0.2.31 的布局读取 Krea 2 量化模型；FLUX.1 / FLUX.2 在加载时解码展开。{quantizationKitchenSummary(performanceCapabilities)}</p>
+                    <ul>{quantizationStatusRows(performanceCapabilities).map((row) => <li key={row.label}><b>{row.label}</b><small>{row.detail}</small></li>)}</ul></div>
+                </div>}
                 <div className="performance-actions"><button type="button" onClick={() => setPerformanceConfig((current) => ({ ...performanceDefaultsFor(vramGb), vram_limit_gb: current.vram_limit_gb }))} disabled={performanceSaving}><RefreshCw size={14} />恢复建议值</button><button type="button" className="performance-apply" onClick={savePerformanceSettings} disabled={performanceLoading || performanceSaving || status === "running"}>{performanceSaving ? <RefreshCw className="spin" size={14} /> : <Check size={14} />}{performanceSaving ? "正在应用" : "应用性能方案"}</button></div>
                 {status === "running" && <p className="settings-notice">生成任务运行期间不能修改性能方案。</p>}
                 {performanceError && <p className="settings-error">{performanceError}</p>}

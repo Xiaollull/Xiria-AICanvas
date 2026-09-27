@@ -113,7 +113,7 @@ test("recursively discovers each FLUX.1 role in its configured root", async (con
   const headers = new Map([
     ["flux1-dev.safetensors", fluxDiffusionHeader("model.diffusion_model.")],
     ["flux1-dev-Q4_K.gguf", fluxDiffusionHeader()],
-    ["t5xxl-Q8_0.gguf", t5Header()],
+    ["t5xxl-Q8_0.gguf", { ...t5Header(), __metadata__: { "general.architecture": "t5encoder" } }],
     ["anima.safetensors", { "net.llm_adapter.embed.weight": tensor([32128, 1024]) }],
     ["clip_l.safetensors", clipHeader()],
     ["t5xxl_fp16.safetensors", t5Header()],
@@ -125,10 +125,9 @@ test("recursively discovers each FLUX.1 role in its configured root", async (con
   });
 
   assert.deepEqual(discovered.diffusion_model.map((model) => model.value), ["flux1-dev-Q4_K.gguf", "nested/flux1-dev.safetensors"]);
-  // The encoder GGUF classifies, and is still left out: only the diffusion slot reads one.
-  assert.ok(!discovered.text_encoder_2.some((model) => model.value.endsWith(".gguf")));
+  // P9: the renamed llama.cpp T5 GGUF is listed beside ComfyUI's safetensors release.
   assert.deepEqual(discovered.text_encoder.map((model) => model.value), ["clip_l.safetensors"]);
-  assert.deepEqual(discovered.text_encoder_2.map((model) => model.value), ["t5xxl_fp16.safetensors"]);
+  assert.deepEqual(discovered.text_encoder_2.map((model) => model.value), ["t5xxl_fp16.safetensors", "t5xxl-Q8_0.gguf"]);
   assert.deepEqual(discovered.vae.map((model) => model.value), ["ae.safetensors"]);
   assert.ok(discovered.diffusion_model[0].size > 0);
 });

@@ -544,13 +544,19 @@ class ComponentSlotTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             anima_pipeline._require_diffusion_weights(self.root / "absent.gguf", "Flux diffusion model")
 
-    def test_every_other_component_stays_safetensors_only(self):
-        # A GGUF text encoder is named in llama.cpp's key space, not the checkpoint's, so accepting
-        # one here would mean listing a file that then fails thousands of tensors into a load.
+    def test_native_components_accept_gguf_and_anima_stays_safetensors_only(self):
+        # P9: a FLUX.1 / FLUX.2 / Krea 2 text encoder or VAE may be GGUF, because a llama.cpp
+        # encoder is now renamed into ComfyUI's naming (or refused) when it is read. Anima's
+        # components still go through `_require_safetensors`.
         path = self.root / "encoder.gguf"
         path.write_bytes(b"weights")
+        self.assertEqual(anima_pipeline._require_component_weights(path, "Flux text encoder"), path.resolve())
         with self.assertRaisesRegex(ValueError, "safetensors"):
-            anima_pipeline._require_safetensors(path, "Flux text encoder")
+            anima_pipeline._require_safetensors(path, "Anima text encoder")
+        other = self.root / "encoder.bin"
+        other.write_bytes(b"weights")
+        with self.assertRaisesRegex(ValueError, r"\.safetensors or \.gguf"):
+            anima_pipeline._require_component_weights(other, "Flux text encoder")
 
     def test_the_dispatcher_reads_a_gguf_and_leaves_safetensors_to_the_caller(self):
         weight = torch.tensor([[1.0, 2.0, 3.0]])
@@ -563,6 +569,193 @@ class ComponentSlotTests(unittest.TestCase):
         deps = {"load_file": lambda path_value, device: sentinel}
         self.assertIs(
             anima_pipeline._load_diffusion_state_dict(self.root / "other.safetensors", torch.bfloat16, deps, "Flux"),
+            sentinel,
+        )
+
+
+# The same tables `scripts/gguf-header.mjs` publishes (`GGUF_TEXT_ENCODER_KEY_MAPS`), pinned on both
+# sides so the picker and the runtime cannot disagree about what a llama.cpp encoder is called.
+EXPECTED_TEXT_ENCODER_FAMILIES = {"t5encoder": "t5", "t5": "t5", "qwen3": "qwen3", "qwen3vl": "qwen3"}
+EXPECTED_TEXT_ENCODER_KEY_MAPS = {
+    "t5": {
+        "prefix": "enc.blk.",
+        "block": "encoder.block.{index}.",
+        "parts": {
+            "attn_q": "layer.0.SelfAttention.q", "attn_k": "layer.0.SelfAttention.k",
+            "attn_v": "layer.0.SelfAttention.v", "attn_o": "layer.0.SelfAttention.o",
+            "attn_rel_b": "layer.0.SelfAttention.relative_attention_bias", "attn_norm": "layer.0.layer_norm",
+            "ffn_gate": "layer.1.DenseReluDense.wi_0", "ffn_up": "layer.1.DenseReluDense.wi_1",
+            "ffn_down": "layer.1.DenseReluDense.wo", "ffn_norm": "layer.1.layer_norm",
+        },
+        "globals": {"token_embd": "shared", "enc.output_norm": "encoder.final_layer_norm"},
+        "dropped": [],
+    },
+    "qwen3": {
+        "prefix": "blk.",
+        "block": "model.layers.{index}.",
+        "parts": {
+            "attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
+            "attn_output": "self_attn.o_proj", "attn_q_norm": "self_attn.q_norm", "attn_k_norm": "self_attn.k_norm",
+            "attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm",
+            "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj",
+        },
+        "globals": {"token_embd": "model.embed_tokens", "output_norm": "model.norm"},
+        "dropped": ["output.weight"],
+    },
+}
+
+
+def qwen3_gguf_tensors(hidden=64, heads=2, head_dim=32, mlp=128, vocab=96, layers=2, lm_head=True, seed=0):
+    """A small llama.cpp-named Qwen3 language model, quantised the way llama.cpp leaves it."""
+    generator = torch.Generator().manual_seed(seed)
+    reference, tensors = {}, []
+
+    def add(name, shape, target, quantize=True):
+        value = torch.randn(*shape, generator=generator) * 0.1
+        if quantize and len(shape) == 2 and shape[-1] % 32 == 0:
+            tensors.append((name, "Q8_0", tuple(shape), quantize_q8_0(value)))
+            blocks = torch.frombuffer(bytearray(quantize_q8_0(value)), dtype=torch.uint8).reshape(-1, 34)
+            reference[target] = gguf_loader._dequantize_q8_0(blocks).reshape(shape)
+        else:
+            tensors.append(plain_tensor(name, value))
+            reference[target] = value
+    add("token_embd.weight", (vocab, hidden), "model.embed_tokens.weight")
+    for index in range(layers):
+        prefix, target = f"blk.{index}.", f"model.layers.{index}."
+        add(prefix + "attn_q.weight", (heads * head_dim, hidden), target + "self_attn.q_proj.weight")
+        add(prefix + "attn_k.weight", (head_dim, hidden), target + "self_attn.k_proj.weight")
+        add(prefix + "attn_v.weight", (head_dim, hidden), target + "self_attn.v_proj.weight")
+        add(prefix + "attn_output.weight", (hidden, heads * head_dim), target + "self_attn.o_proj.weight")
+        add(prefix + "attn_q_norm.weight", (head_dim,), target + "self_attn.q_norm.weight")
+        add(prefix + "attn_k_norm.weight", (head_dim,), target + "self_attn.k_norm.weight")
+        add(prefix + "attn_norm.weight", (hidden,), target + "input_layernorm.weight")
+        add(prefix + "ffn_norm.weight", (hidden,), target + "post_attention_layernorm.weight")
+        add(prefix + "ffn_gate.weight", (mlp, hidden), target + "mlp.gate_proj.weight")
+        add(prefix + "ffn_up.weight", (mlp, hidden), target + "mlp.up_proj.weight")
+        add(prefix + "ffn_down.weight", (hidden, mlp), target + "mlp.down_proj.weight")
+    add("output_norm.weight", (hidden,), "model.norm.weight")
+    if lm_head:
+        tensors.append(plain_tensor("output.weight", torch.zeros(vocab, hidden)))
+    return tensors, reference
+
+
+class TextEncoderAndVaeTests(unittest.TestCase):
+    """P9: GGUF text encoders and autoencoders, renamed into ComfyUI's naming or refused by name."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        self.addCleanup(self._directory.cleanup)
+
+    def test_the_rename_tables_are_pinned(self):
+        self.assertEqual(gguf_loader.GGUF_TEXT_ENCODER_FAMILIES, EXPECTED_TEXT_ENCODER_FAMILIES)
+        self.assertEqual(gguf_loader.GGUF_TEXT_ENCODER_KEY_MAPS, EXPECTED_TEXT_ENCODER_KEY_MAPS)
+
+    def test_llama_cpp_names_map_to_comfys(self):
+        key = gguf_loader.gguf_text_encoder_key
+        self.assertEqual(key("enc.blk.0.attn_rel_b.weight", "t5"), "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight")
+        self.assertEqual(key("enc.blk.23.ffn_gate.weight", "t5"), "encoder.block.23.layer.1.DenseReluDense.wi_0.weight")
+        self.assertEqual(key("token_embd.weight", "t5"), "shared.weight")
+        self.assertEqual(key("enc.output_norm.weight", "t5"), "encoder.final_layer_norm.weight")
+        self.assertEqual(key("blk.35.attn_output.weight", "qwen3"), "model.layers.35.self_attn.o_proj.weight")
+        self.assertEqual(key("blk.0.attn_q.bias", "qwen3"), "model.layers.0.self_attn.q_proj.bias")
+        self.assertEqual(key("output_norm.weight", "qwen3"), "model.norm.weight")
+        for unknown in ("blk.0.attn_qkv.weight", "blk.x.attn_q.weight", "rope_freqs.weight", "blk.0.attn_q.scale"):
+            self.assertIsNone(key(unknown, "qwen3"), unknown)
+
+    def test_a_qwen3_encoder_loads_in_comfys_names_without_reading_its_head(self):
+        tensors, reference = qwen3_gguf_tensors()
+        path = write_gguf(self.root / "qwen3.gguf", tensors, metadata=[("general.architecture", "qwen3")])
+        loaded = gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32, "Qwen3 encoder")
+        self.assertEqual(set(loaded), set(reference))
+        for key, value in reference.items():
+            self.assertTrue(torch.equal(loaded[key], value), key)
+        # Qwen3-VL (Krea 2's encoder) uses the same tables.
+        path = write_gguf(self.root / "qwen3vl.gguf", tensors, metadata=[("general.architecture", "qwen3vl")])
+        self.assertEqual(set(gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32)), set(reference))
+
+    def test_the_renamed_encoder_classifies_the_way_its_safetensors_release_does(self):
+        import flux2_pipeline
+        import krea2_pipeline
+
+        tensors, _ = qwen3_gguf_tensors()
+        path = write_gguf(self.root / "qwen3.gguf", tensors, metadata=[("general.architecture", "qwen3vl")])
+        keys = gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32).keys()
+        self.assertEqual(krea2_pipeline.classify_krea2_text_encoder(keys), "qwen3vl")
+        # Renamed, the tensors are FLUX.2's Qwen3 as well; only the declared family keeps a
+        # Qwen3-VL file out of FLUX.2, so each engine names the families its encoder may be.
+        self.assertEqual(flux2_pipeline.classify_flux2_text_encoder(keys), "qwen3")
+        with self.assertRaisesRegex(ValueError, "qwen3vl"):
+            anima_pipeline._load_component_state_dict(
+                path, torch.float32, {}, "FLUX.2 text encoder", "text_encoder", gguf_architectures=("qwen3",)
+            )
+        loaded = anima_pipeline._load_component_state_dict(
+            path, torch.float32, {}, "Krea 2 text encoder", "text_encoder", gguf_architectures=("qwen3vl",)
+        )
+        self.assertEqual(set(loaded), set(keys))
+
+    def test_a_t5_encoder_is_renamed_into_the_flux_t5_layout(self):
+        import flux_pipeline
+
+        tensors = [
+            plain_tensor("token_embd.weight", torch.randn(40, 32)),
+            plain_tensor("enc.blk.0.attn_rel_b.weight", torch.randn(32, 4)),
+            plain_tensor("enc.blk.0.attn_q.weight", torch.randn(32, 32)),
+            plain_tensor("enc.blk.0.ffn_gate.weight", torch.randn(64, 32)),
+            plain_tensor("enc.output_norm.weight", torch.ones(32)),
+        ]
+        path = write_gguf(self.root / "t5.gguf", tensors, metadata=[("general.architecture", "t5encoder")])
+        loaded = gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32)
+        self.assertIn("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight", loaded)
+        self.assertEqual(flux_pipeline._classify_text_encoder(loaded.keys()), "t5xxl")
+
+    def test_a_llama_family_encoder_is_refused_by_name(self):
+        tensors, _ = qwen3_gguf_tensors(lm_head=False)
+        for architecture in ("llama", "mistral3"):
+            path = write_gguf(self.root / f"{architecture}.gguf", tensors, metadata=[("general.architecture", architecture)])
+            with self.assertRaisesRegex(ValueError, "permutes"):
+                gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32, "FLUX.2 text encoder")
+
+    def test_a_tensor_the_table_cannot_name_refuses_the_whole_file(self):
+        tensors, _ = qwen3_gguf_tensors(lm_head=False)
+        tensors.append(plain_tensor("blk.0.attn_qkv.weight", torch.zeros(4, 4)))
+        path = write_gguf(self.root / "odd.gguf", tensors, metadata=[("general.architecture", "qwen3")])
+        with self.assertRaisesRegex(ValueError, "attn_qkv"):
+            gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32)
+
+    def test_llama_names_under_an_unmapped_architecture_are_refused(self):
+        tensors, _ = qwen3_gguf_tensors(lm_head=False)
+        path = write_gguf(self.root / "gemma.gguf", tensors, metadata=[("general.architecture", "gemma3")])
+        for role in ("text_encoder", "vae", "diffusion_model"):
+            with self.assertRaisesRegex(ValueError, "llama.cpp way"):
+                gguf_loader.load_gguf_component_state_dict(path, role, torch.float32)
+
+    def test_a_comfy_converted_encoder_keeps_its_names(self):
+        weight = torch.randn(8, 32)
+        path = write_gguf(self.root / "clip.gguf", [plain_tensor("text_model.final_layer_norm.weight", weight)])
+        loaded = gguf_loader.load_gguf_component_state_dict(path, "text_encoder", torch.float32)
+        self.assertTrue(torch.equal(loaded["text_model.final_layer_norm.weight"], weight))
+
+    def test_a_vae_restores_the_convolution_shape_comfy_recorded(self):
+        # Wan 2.1's causal convolutions are 5-D; ggml holds four, so the converter flattens and
+        # records the original under `comfy.gguf.orig_shape.<name>`.
+        weight = torch.randn(4, 3, 3, 3, 3)
+        flat = plain_tensor("encoder.conv1.weight", weight.reshape(4, 3, 27))
+        path = write_gguf(self.root / "vae.gguf", [flat, plain_tensor("encoder.conv1.bias", torch.randn(4))],
+                          metadata=[("comfy.gguf.orig_shape.encoder.conv1.weight", [4, 3, 3, 3, 3])])
+        loaded = gguf_loader.load_gguf_component_state_dict(path, "vae", torch.float32)
+        self.assertEqual(tuple(loaded["encoder.conv1.weight"].shape), (4, 3, 3, 3, 3))
+        self.assertTrue(torch.equal(loaded["encoder.conv1.weight"], weight))
+
+    def test_the_component_dispatcher_reads_either_container(self):
+        tensors, reference = qwen3_gguf_tensors()
+        path = write_gguf(self.root / "enc.gguf", tensors, metadata=[("general.architecture", "qwen3")])
+        loaded = anima_pipeline._load_component_state_dict(path, torch.bfloat16, {}, "Krea 2 text encoder", "text_encoder")
+        self.assertEqual(loaded["model.norm.weight"].dtype, torch.bfloat16)
+        sentinel = {"marker": torch.zeros(1)}
+        deps = {"load_file": lambda path_value, device: sentinel}
+        self.assertIs(
+            anima_pipeline._load_component_state_dict(self.root / "enc.safetensors", torch.bfloat16, deps, "x", "text_encoder"),
             sentinel,
         )
 

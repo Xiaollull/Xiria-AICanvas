@@ -30,7 +30,8 @@ try:
         resolve_anima_sampler,
         validate_prepared_anima_refinement_sigmas,
     )
-    from .gguf_loader import GGUF_SUFFIX, load_gguf_state_dict
+    from .comfy_quant import load_safetensors_state_dict
+    from .gguf_loader import GGUF_SUFFIX, load_gguf_component_state_dict, load_gguf_state_dict
     from .prompt_encoding import pad_weighted_encodings, tokenize_weighted_prompt
 except ImportError:
     from anima_sampling import (
@@ -43,7 +44,8 @@ except ImportError:
         resolve_anima_sampler,
         validate_prepared_anima_refinement_sigmas,
     )
-    from gguf_loader import GGUF_SUFFIX, load_gguf_state_dict
+    from comfy_quant import load_safetensors_state_dict
+    from gguf_loader import GGUF_SUFFIX, load_gguf_component_state_dict, load_gguf_state_dict
     from prompt_encoding import pad_weighted_encodings, tokenize_weighted_prompt
 
 
@@ -468,16 +470,45 @@ def _require_diffusion_weights(path_value: str | Path, label: str) -> Path:
     return path
 
 
+def _require_component_weights(path_value: str | Path, label: str) -> Path:
+    """A FLUX.1 / FLUX.2 / Krea 2 text encoder or autoencoder: safetensors, or since P9 GGUF.
+
+    Whether a GGUF is really the component it was mounted as is decided when it is read
+    (:func:`gguf_loader.gguf_component_names`), where a llama.cpp encoder is renamed into ComfyUI's
+    naming or refused, and the engine's own classifier then checks the tensors as it does for
+    safetensors.
+    """
+    return _require_diffusion_weights(path_value, label)
+
+
+def _load_component_state_dict(
+    path: Path, dtype: torch.dtype, deps, label: str, role: str, gguf_architectures=None,
+) -> dict[str, torch.Tensor]:
+    """Read a text encoder or autoencoder from either container, in ComfyUI's tensor names.
+
+    ``gguf_architectures`` names the llama.cpp families a GGUF encoder may be for this engine.
+    """
+    if path.suffix.lower() == GGUF_SUFFIX:
+        return load_gguf_component_state_dict(
+            path, role, dtype=dtype, label=label, architectures=gguf_architectures
+        )
+    return load_safetensors_state_dict(path, deps["load_file"], label)
+
+
 def _load_diffusion_state_dict(path: Path, dtype: torch.dtype, deps, label: str) -> dict[str, torch.Tensor]:
     """Read a diffusion model from either container into one plain state dict.
 
     A GGUF is expanded to ``dtype`` here, which puts it in exactly the state the safetensors branch
     reaches after ``resolve_quantized_state_dict``: from this point on nothing downstream can tell
     the two apart, so conversion, LoRA fusion and the strict load stay single-path.
+
+    A safetensors file that keeps ComfyUI's per-layer markers in its header (``_quantization_metadata``,
+    how Krea 2's MXFP8 and NVFP4 builds are written) has them turned into ``comfy_quant`` entries
+    here, so every quantisation reader downstream sees one spelling.
     """
     if path.suffix.lower() == GGUF_SUFFIX:
         return load_gguf_state_dict(path, dtype=dtype, label=label)
-    return deps["load_file"](str(path), device="cpu")
+    return load_safetensors_state_dict(path, deps["load_file"], label)
 
 
 def _require_tokenizer_json(path_value: str | Path, label: str) -> Path:

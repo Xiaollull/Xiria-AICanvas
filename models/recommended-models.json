@@ -170,7 +170,7 @@
       "size": 16381517176,
       "sha256": "f0ff9239d56269ca1d05e5f86da6a79fac111af464955681f11c7ab0ec5ef6c1",
       "url": "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/23fbc8aa8b621f29f2249cd1bd9c47e5d0eebd83/split_files/text_encoders/qwen_3_8b.safetensors",
-      "detail": "推荐：目前唯一可加载的 FLUX.2 文本编码器；显存与磁盘占用最高"
+      "detail": "全精度基准；显存与磁盘占用最高"
     },
     {
       "id": "flux-qwen-8b-fp8",
@@ -180,7 +180,7 @@
       "size": 8664848742,
       "sha256": "abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6",
       "url": "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/23fbc8aa8b621f29f2249cd1bd9c47e5d0eebd83/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
-      "detail": "混合量化：其中 85 层为 nvfp4 压缩权重，本程序无法展开，请改用 BF16"
+      "detail": "混合量化（141 层 FP8 + 85 层 NVFP4）：按 ComfyUI 布局解码，加载时展开为计算精度"
     },
     {
       "id": "flux-qwen-8b-fp4",
@@ -190,7 +190,7 @@
       "size": 6802593327,
       "sha256": "bbf16f981d98e16d080c566134814c4e9f6aadd0d0e1383c60bc44ba939d760d",
       "url": "https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/23fbc8aa8b621f29f2249cd1bd9c47e5d0eebd83/split_files/text_encoders/qwen_3_8b_fp4mixed.safetensors",
-      "detail": "低占用量化选项，需兼容加载器"
+      "detail": "混合量化（76 层 FP8 + 173 层 NVFP4）：按 ComfyUI 布局解码，加载时展开为计算精度"
     },
     {
       "id": "flux2-vae",
@@ -241,7 +241,7 @@
       "size": 9705714392,
       "sha256": "c8ae0ae2d3447d2f79d783cc0d85a72bc18261c8c7778b915ce59a56b90a039f",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-mxfp8.safetensors",
-      "detail": "需要兼容 MXFP8 的加载器和硬件"
+      "detail": "MXFP8：按 ComfyUI 布局解码，加载时展开为计算精度（原生 MXFP8 矩阵乘需 SM 10.0+）"
     },
     {
       "id": "flux-true-v3-nvfp4",
@@ -251,7 +251,7 @@
       "size": 5616278928,
       "sha256": "cde4c6c1d536cb9437ceaccfb9df949bc559215f97f5f44548a6ab63b0de0d5c",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-nvfp4.safetensors",
-      "detail": "NVIDIA FP4 量化"
+      "detail": "NVFP4：按 ComfyUI 布局解码，加载时展开为计算精度（原生 FP4 矩阵乘需 SM 10.0+）"
     },
     {
       "id": "flux-true-v3-int4",
@@ -261,7 +261,7 @@
       "size": 5077801520,
       "sha256": "2b0b4348d21506ae178f165eeb78c9b8a7cba133b1d27dfaa0e081dd254f2bf4",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-int4_convrot.safetensors",
-      "detail": "INT4 ConvRot，加载器版本敏感"
+      "detail": "ConvRot W4A4 INT4：还原旋转后展开为计算精度，下载体积最小"
     },
     {
       "id": "flux-true-v3-int8-row",
@@ -271,7 +271,7 @@
       "size": 9439884768,
       "sha256": "6d23ea6946f410a496bf706b136b17bea5e1cdd1a6ba17a1b5f23c64d30c7088",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-int8mixedrow.safetensors",
-      "detail": "官方 Comfy INT8 路线"
+      "detail": "INT8 逐行缩放（ComfyUI int8_tensorwise）：加载时展开为计算精度"
     },
     {
       "id": "flux-true-v3-int8-convrot",
@@ -281,7 +281,7 @@
       "size": 9405843376,
       "sha256": "ff2f21d41dbfde4376658a6c38ac58562d2755137bfd802c9f46b40e899ad32d",
       "url": "https://huggingface.co/wikeeyang/Flux2-Klein-9B-True-V3/blob/997e0977d4ba7d3103d2cfb6c7029724603b73a8/Flux2-Klein-9B-True-V3-INT8-ConvRot.safetensors",
-      "detail": "需要 ComfyUI-INT8-Fast"
+      "detail": "ComfyUI-INT8-Fast 节点专用格式（标记缺少 format），ComfyUI 本体与本程序均不加载；请改用 INT8 Mixed Row 或 INT4 ConvRot"
     },
     {
       "id": "flux-true-v3-gguf-q4",
@@ -361,7 +361,7 @@
       "size": 13492686496,
       "sha256": "5585a4a38c4bcfb6fde2d480a4aa6edf7f665721ebde56d30662c35a45f5fa5c",
       "url": "https://huggingface.co/Comfy-Org/Krea-2/blob/952f49d49653cb42e7d6cf7cbfad74738073ec7d/diffusion_models/krea2_raw_int8_convrot.safetensors",
-      "detail": "Raw INT8 量化"
+      "detail": "ConvRot INT8：量化权重常驻，按 ComfyUI 做 W8A8 整数矩阵乘"
     },
     {
       "id": "krea2-turbo-bf16",
@@ -391,7 +391,7 @@
       "size": 13492686496,
       "sha256": "8e4eeda70dd5037ab1ba2bef6b417f9f901e26093117cf397f741fc1fdaaf3f1",
       "url": "https://huggingface.co/Comfy-Org/Krea-2/blob/952f49d49653cb42e7d6cf7cbfad74738073ec7d/diffusion_models/krea2_turbo_int8_convrot.safetensors",
-      "detail": "Turbo INT8 量化"
+      "detail": "ConvRot INT8：量化权重常驻，按 ComfyUI 做 W8A8 整数矩阵乘"
     },
     {
       "id": "krea2-turbo-mxfp8",
@@ -401,7 +401,7 @@
       "size": 13532318080,
       "sha256": "4c09131a442c3a01e95f934b43c76c1e691b9f683694a7b68d6fc707d5ecfce3",
       "url": "https://huggingface.co/Comfy-Org/Krea-2/blob/952f49d49653cb42e7d6cf7cbfad74738073ec7d/diffusion_models/krea2_turbo_mxfp8.safetensors",
-      "detail": "需要兼容 MXFP8 的加载器和硬件"
+      "detail": "MXFP8：量化权重常驻，逐层解码为计算精度（原生 MXFP8 需 SM 10.0+）"
     },
     {
       "id": "krea2-turbo-nvfp4",
@@ -411,7 +411,7 @@
       "size": 7673668448,
       "sha256": "61527003b2d537055494d01bc8efe51d6e86e64192ba23e3721a5647231fe394",
       "url": "https://huggingface.co/Comfy-Org/Krea-2/blob/952f49d49653cb42e7d6cf7cbfad74738073ec7d/diffusion_models/krea2_turbo_nvfp4.safetensors",
-      "detail": "NVIDIA FP4 量化"
+      "detail": "NVFP4：量化权重常驻，逐层解码为计算精度（原生 FP4 需 SM 10.0+）"
     },
     {
       "id": "krea2-text-bf16",

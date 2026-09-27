@@ -41,8 +41,10 @@ try:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_component_state_dict,
         _load_diffusion_state_dict,
         _module_nbytes,
+        _require_component_weights,
         _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
@@ -50,6 +52,8 @@ try:
         euler_rf_step,
     )
     from .gguf_loader import GGUF_SUFFIX, read_gguf_header
+    from .comfy_quant import header_quant_layers
+    from .quantized_linear import describe_quantized_layer, expanded_layer_weight
     from .flux_sampling import (
         FLUX_SAMPLERS,
         FLUX_SCHEDULERS,
@@ -65,8 +69,10 @@ except ImportError:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_component_state_dict,
         _load_diffusion_state_dict,
         _module_nbytes,
+        _require_component_weights,
         _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
@@ -74,6 +80,8 @@ except ImportError:
         euler_rf_step,
     )
     from gguf_loader import GGUF_SUFFIX, read_gguf_header
+    from comfy_quant import header_quant_layers
+    from quantized_linear import describe_quantized_layer, expanded_layer_weight
     from flux_sampling import (
         FLUX_SAMPLERS,
         FLUX_SCHEDULERS,
@@ -366,9 +374,13 @@ def dequantize_mixed_precision(
 
     The same reasoning as :func:`dequantize_scaled_fp8`, one layout later: ComfyUI keeps the fp8
     storage and applies the scale inside its own quantised linear, and Diffusers' modules have no
-    such op, so the scale is applied once here instead.  A format whose stored tensor is packed
-    rather than scaled is refused by name — expanding it would need ComfyUI's own kernels, and
-    guessing at the packing would load a model that is quietly wrong rather than one that fails.
+    such op, so the scale is applied once here instead.
+
+    The packed and rotated layouts (INT8 and ConvRot INT8, ConvRot W4A4, MXFP8, NVFP4) are expanded
+    with ComfyUI's own dequantisation from :mod:`comfy_quant` — the value its full-precision
+    matmul multiplies, which is also what it runs for NVFP4/MXFP8 on any card below SM 10.0. These
+    engines keep no quantised module, so the integer matmul ComfyUI runs for INT8/W4A4 by default
+    is not reproduced here; the expanded weight is the dequantised one, rotation undone.
     """
     resolved = {}
     consumed = set()
@@ -381,10 +393,11 @@ def dequantize_mixed_precision(
         if weight is None:
             raise ValueError(f"{label} layer {layer!r} is quantised but carries no weight")
         if quant_format not in FLUX_SCALAR_SCALE_QUANT_FORMATS:
-            raise ValueError(
-                f"{label} is quantised as {quant_format!r}, which stores packed weights this "
-                "loader cannot expand; use an fp8 (float8_e4m3fn) or unquantised file instead"
-            )
+            resolved[f"{layer}.weight"] = _expand_comfy_layout(state_dict, layer, marker, dtype, label)
+            consumed.add(key)
+            consumed.add(f"{layer}.weight")
+            consumed.update(f"{layer}{suffix}" for suffix in FLUX_COMFY_QUANT_PARAMETER_SUFFIXES)
+            continue
         scale = state_dict.get(f"{layer}{FLUX_WEIGHT_SCALE_SUFFIX}")
         if scale is None:
             raise ValueError(f"{label} layer {layer!r} is {quant_format} but carries no weight scale")
@@ -393,7 +406,12 @@ def dequantize_mixed_precision(
                 f"{label} layer {layer!r} carries a {scale.numel()}-element block scale rather than "
                 "one per-tensor scale; that layout needs ComfyUI's quantisation kernels"
             )
-        resolved[f"{layer}.weight"] = weight.to(dtype=torch.float32) * scale.to(dtype=torch.float32).reshape(())
+        # Narrowed per layer, as `dequantize_scaled_fp8` does and for the same reason: an fp8 file
+        # that keeps its markers in the header arrives here too, and holding every layer in float32
+        # until the final cast is the 4-bytes-per-parameter peak that OOM-killed a Krea 2 load.
+        resolved[f"{layer}.weight"] = (
+            weight.to(dtype=torch.float32) * scale.to(dtype=torch.float32).reshape(())
+        ).to(dtype)
         consumed.add(key)
         consumed.add(f"{layer}.weight")
         consumed.update(f"{layer}{suffix}" for suffix in FLUX_COMFY_QUANT_PARAMETER_SUFFIXES)
@@ -402,6 +420,12 @@ def dequantize_mixed_precision(
             continue
         resolved[key] = value
     return _cast_state_dict(resolved, dtype)
+
+
+def _expand_comfy_layout(state_dict, layer: str, marker, dtype: torch.dtype, label: str) -> torch.Tensor:
+    """One packed or rotated ComfyUI layer as the full-precision weight ComfyUI dequantises it to."""
+    spec = describe_quantized_layer(state_dict, layer, marker, label)
+    return expanded_layer_weight(spec, state_dict, dtype)
 
 
 def resolve_quantized_state_dict(
@@ -773,17 +797,46 @@ def flux_component_bytes(paths) -> int:
     total = 0
     for path in paths:
         path = Path(path)
+        packed: set[str] = set()
         if path.suffix.lower() == GGUF_SUFFIX:
             shapes = [tensor.shape for tensor in read_gguf_header(path).tensors]
         else:
             with safe_open(str(path), framework="pt", device="cpu") as handle:
-                shapes = [handle.get_slice(key).get_shape() for key in handle.keys()]
+                keys = list(handle.keys())
+                shapes = [handle.get_slice(key).get_shape() for key in keys]
+                packed = _packed_weight_keys(handle, keys)
+            shapes = [
+                list(shape[:-1]) + [int(shape[-1]) * 2] if key in packed else shape
+                for key, shape in zip(keys, shapes)
+            ]
         for shape in shapes:
             elements = 1
             for dimension in shape:
                 elements *= int(dimension)
             total += elements * 2
     return total
+
+
+def _packed_weight_keys(handle, keys) -> set[str]:
+    """Weights stored two values per byte (NVFP4, ConvRot W4A4), which expand to twice their stored
+    width. The layout is only in the markers — a W4A4 weight is an ordinary int8 tensor to the
+    header — so the few bytes of each marker are read, and the header's own table is consulted."""
+    formats = {}
+    for key in keys:
+        if key.endswith(FLUX_COMFY_QUANT_SUFFIX):
+            layer = key[: -len(FLUX_COMFY_QUANT_SUFFIX)]
+            try:
+                formats[layer] = _comfy_quant_format(handle.get_tensor(key), layer)
+            except ValueError:
+                continue  # the load refuses it by name; the estimate need not
+    try:
+        table = header_quant_layers(handle.metadata() or {})
+    except ValueError:
+        table = {}
+    for layer, conf in table.items():
+        if isinstance(conf, dict) and isinstance(conf.get("format"), str):
+            formats[layer] = conf["format"]
+    return {f"{layer}.weight" for layer, name in formats.items() if name in ("nvfp4", "convrot_w4a4")}
 
 
 def _lora_descriptors(loras, label: str = "Flux LoRA") -> list[tuple[Path, float]]:
@@ -988,7 +1041,7 @@ def _load_t5_text_encoder(state_dict, dtype: torch.dtype, deps):
 
 
 def _load_flux_vae(path: Path, dtype: torch.dtype, deps):
-    state_dict = deps["load_file"](str(path), device="cpu")
+    state_dict = _load_component_state_dict(path, dtype, deps, "FLUX.1 autoencoder", "vae")
     state_dict = resolve_quantized_state_dict(state_dict, dtype, "FLUX.1 autoencoder")
     if any(key.startswith("decoder.up_blocks.") for key in state_dict):
         converted = dict(state_dict)
@@ -1805,15 +1858,17 @@ def load_flux_runtime(
     """
     deps = _runtime_dependencies()
     diffusion_path = _require_diffusion_weights(diffusion_model, "Flux diffusion model")
-    first_path = _require_safetensors(text_encoder, "Flux text encoder")
-    second_path = _require_safetensors(text_encoder_2, "Flux second text encoder")
-    vae_path = _require_safetensors(vae, "Flux VAE")
+    first_path = _require_component_weights(text_encoder, "Flux text encoder")
+    second_path = _require_component_weights(text_encoder_2, "Flux second text encoder")
+    vae_path = _require_component_weights(vae, "Flux VAE")
     if first_path == second_path:
         raise ValueError("Flux requires two different text encoders: CLIP-L and T5-XXL")
 
     encoders = {}
     for path in (first_path, second_path):
-        state = deps["load_file"](str(path), device="cpu")
+        state = _load_component_state_dict(
+            path, dtype, deps, f"Flux text encoder {path.name}", "text_encoder", gguf_architectures=("t5encoder", "t5")
+        )
         kind = _classify_text_encoder(state.keys())
         if kind == "unknown":
             raise ValueError(f"{path.name} is neither a CLIP-L nor a T5-XXL text encoder")

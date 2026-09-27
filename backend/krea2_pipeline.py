@@ -46,8 +46,10 @@ try:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_component_state_dict,
         _load_diffusion_state_dict,
         _module_nbytes,
+        _require_component_weights,
         _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
@@ -88,6 +90,7 @@ try:
         combine_lora_adapters,
         expand_quantized_layers,
         logical_shape_view,
+        quantization_summary,
         quantized_state_dict,
         scan_quantized_layers,
     )
@@ -107,8 +110,10 @@ except ImportError:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_component_state_dict,
         _load_diffusion_state_dict,
         _module_nbytes,
+        _require_component_weights,
         _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
@@ -149,6 +154,7 @@ except ImportError:
         combine_lora_adapters,
         expand_quantized_layers,
         logical_shape_view,
+        quantization_summary,
         quantized_state_dict,
         scan_quantized_layers,
     )
@@ -583,6 +589,7 @@ def _load_krea2_transformer(path: Path, dtype: torch.dtype, deps, loras=(), stat
             "quantized_layers": sorted(replaced),
             "adapted_layers": sorted(adapters),
             "quantization": sorted({spec.format for layer, spec in quantized.items() if layer in replaced}),
+            "quantization_labels": quantization_summary(quantized, replaced),
         },
     )
 
@@ -626,6 +633,7 @@ def _cast_quantized_state_dict(weights, quantized_layers, dtype: torch.dtype):
         protected.add(f"{layer}.weight")
         protected.add(f"{layer}.scale_weight")
         protected.add(f"{layer}.scale_weight_2")
+        protected.add(f"{layer}.pre_quant_scale")
     return {
         key: value if key in protected else (
             value.to(dtype=dtype) if value.is_floating_point() and value.dtype != dtype else value
@@ -776,7 +784,7 @@ def infer_krea2_vae_config(state_dict: Mapping[str, torch.Tensor]) -> dict:
 
 
 def _load_krea2_vae(path: Path, dtype: torch.dtype, deps):
-    state_dict = deps["load_file"](str(path), device="cpu")
+    state_dict = _load_component_state_dict(path, dtype, deps, "Krea 2 autoencoder", "vae")
     state_dict = resolve_quantized_state_dict(state_dict, dtype, "Krea 2 autoencoder")
     config = infer_krea2_vae_config(state_dict)
     if krea2_vae_layout(state_dict) == "diffusers":
@@ -1763,11 +1771,13 @@ def load_krea2_runtime(
     """Load the three ComfyUI component files into one runtime."""
     deps = _runtime_dependencies()
     diffusion_path = _require_diffusion_weights(diffusion_model, "Krea2 diffusion model")
-    encoder_path = _require_safetensors(text_encoder, "Krea2 text encoder")
-    vae_path = _require_safetensors(vae, "Krea2 VAE")
+    encoder_path = _require_component_weights(text_encoder, "Krea2 text encoder")
+    vae_path = _require_component_weights(vae, "Krea2 VAE")
 
     tokenizer = _load_krea2_tokenizer(qwen_tokenizer_path, deps)
-    encoder_state = deps["load_file"](str(encoder_path), device="cpu")
+    encoder_state = _load_component_state_dict(
+        encoder_path, dtype, deps, "Krea 2 text encoder", "text_encoder", gguf_architectures=("qwen3vl",)
+    )
     if classify_krea2_text_encoder(encoder_state.keys()) == "unknown":
         raise ValueError(f"{encoder_path.name} is not a Krea 2 Qwen3-VL text encoder")
     language_model = _load_krea2_text_encoder(encoder_state, dtype, deps)

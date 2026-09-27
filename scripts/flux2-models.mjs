@@ -94,12 +94,19 @@ function isFlux2Vae(tensors) {
     && hasShape(tensors, "decoder.conv_out.weight", [3, 128, 3, 3]);
 }
 
+// A llama.cpp GGUF encoder states its family (see `renameGgufTextEncoder`); [klein] reads Qwen3,
+// and a Qwen3-VL file renamed into the same tensors is Krea 2's encoder, not this one.
+function ggufArchitecture(header) {
+  return header?.__metadata__?.["general.architecture"];
+}
+
 export function classifyFlux2SafetensorsHeader(header) {
   const tensors = tensorMap(header);
   if (!tensors) return null;
+  const architecture = ggufArchitecture(header);
   const matches = [
     ["diffusion_model", isFlux2Diffusion(tensors)],
-    ["text_encoder", isFlux2TextEncoder(tensors)],
+    ["text_encoder", (architecture === undefined || architecture === "qwen3") && isFlux2TextEncoder(tensors)],
     ["vae", isFlux2Vae(tensors)],
   ].filter(([, matched]) => matched);
   return matches.length === 1 ? matches[0][0] : null;

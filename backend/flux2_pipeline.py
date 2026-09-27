@@ -41,8 +41,10 @@ try:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_component_state_dict,
         _load_diffusion_state_dict,
         _module_nbytes,
+        _require_component_weights,
         _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
@@ -84,8 +86,10 @@ except ImportError:
         _cpu_noise_like_batch,
         _discard_module_storage,
         _empty_cuda_cache,
+        _load_component_state_dict,
         _load_diffusion_state_dict,
         _module_nbytes,
+        _require_component_weights,
         _require_diffusion_weights,
         _require_safetensors,
         _strict_assign,
@@ -559,7 +563,7 @@ def _load_flux2_text_encoder(state_dict, dtype: torch.dtype, deps):
 
 def _load_flux2_vae(path: Path, dtype: torch.dtype, deps):
     """Load the FLUX.2 autoencoder and the packing statistics that live beside it."""
-    state_dict = deps["load_file"](str(path), device="cpu")
+    state_dict = _load_component_state_dict(path, dtype, deps, "FLUX.2 autoencoder", "vae")
     state_dict = resolve_quantized_state_dict(state_dict, dtype, "FLUX.2 autoencoder")
     moved = {}
     for key, value in state_dict.items():
@@ -1360,10 +1364,12 @@ def load_flux2_runtime(
     """
     deps = _runtime_dependencies()
     diffusion_path = _require_diffusion_weights(diffusion_model, "Flux2 diffusion model")
-    encoder_path = _require_safetensors(text_encoder, "Flux2 text encoder")
-    vae_path = _require_safetensors(vae, "Flux2 VAE")
+    encoder_path = _require_component_weights(text_encoder, "Flux2 text encoder")
+    vae_path = _require_component_weights(vae, "Flux2 VAE")
 
-    encoder_state = deps["load_file"](str(encoder_path), device="cpu")
+    encoder_state = _load_component_state_dict(
+        encoder_path, dtype, deps, "FLUX.2 text encoder", "text_encoder", gguf_architectures=("qwen3",)
+    )
     family = classify_flux2_text_encoder(encoder_state.keys())
     if family == "unknown":
         raise ValueError(f"{encoder_path.name} is not a FLUX.2 text encoder")

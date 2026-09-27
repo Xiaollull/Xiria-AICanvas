@@ -225,12 +225,13 @@ class MixedPrecisionTests(unittest.TestCase):
         }
         self.assertEqual(sorted(resolve_quantized_state_dict(state, torch.float32)), ["img_in.weight"])
 
-    def test_a_packed_format_is_refused_by_name_rather_than_loaded_wrongly(self):
-        # nvfp4 stores two weights per byte, so its tensor is not the layer's matrix at all. The
-        # failure has to say so: a shape mismatch thousands of tensors later does not.
+    def test_a_malformed_packed_layer_is_refused_by_name_rather_than_loaded_wrongly(self):
+        # nvfp4 stores two weights per byte and its block scales in cuBLAS's tiled order, so a
+        # table of the wrong size cannot be read at all. The failure has to say so: a shape
+        # mismatch thousands of tensors later does not. (Before P9 every nvfp4 file was refused.)
         state = {
-            "img_in.weight": torch.zeros(4, 2, dtype=torch.uint8),
-            "img_in.weight_scale": torch.zeros(4),
+            "img_in.weight": torch.zeros(4, 8, dtype=torch.uint8),
+            "img_in.weight_scale": torch.zeros(4).to(torch.float8_e4m3fn),
             "img_in.weight_scale_2": torch.tensor(1.0),
             "img_in.comfy_quant": comfy_quant_marker("nvfp4"),
         }
@@ -238,6 +239,103 @@ class MixedPrecisionTests(unittest.TestCase):
             resolve_quantized_state_dict(state, torch.float32, "FLUX.2 diffusion model")
         self.assertIn("nvfp4", str(error.exception))
         self.assertIn("FLUX.2 diffusion model", str(error.exception))
+
+    def test_packed_and_rotated_layers_expand_to_comfys_dequantised_weight(self):
+        # P9: the layouts ComfyUI 0.33.0 defines are expanded with its own dequantisation, the
+        # value its full-precision matmul multiplies. The Flux engines keep no quantised module.
+        from comfy_quant import build_hadamard, dequantize_layer, parse_layer_config, quantize_int8_rowwise, rotate_weight, to_blocked
+
+        torch.manual_seed(0)
+        weight = torch.randn(4, 256) * 0.05
+        rotated = rotate_weight(weight, build_hadamard(64), 64)
+        q, scale = quantize_int8_rowwise(rotated)
+        codes = torch.randint(0, 16, (4, 32), dtype=torch.uint8)
+        state = {
+            "img_in.weight": q,
+            "img_in.weight_scale": scale,
+            "img_in.comfy_quant": comfy_quant_marker("int8_tensorwise", convrot=True, convrot_groupsize=64),
+            "txt_in.weight": codes[:, 0::2] << 4 | codes[:, 1::2],
+            "txt_in.weight_scale": to_blocked(torch.ones(4, 2)).to(torch.float8_e4m3fn),
+            "txt_in.weight_scale_2": torch.tensor(0.5),
+            "txt_in.input_scale": torch.tensor(1.0),
+            "txt_in.comfy_quant": comfy_quant_marker("nvfp4"),
+        }
+        resolved = resolve_quantized_state_dict(state, torch.bfloat16, "FLUX.2 diffusion model")
+        self.assertEqual(sorted(resolved), ["img_in.weight", "txt_in.weight"])
+        int8_config = parse_layer_config(state["img_in.comfy_quant"], "img_in")
+        self.assertTrue(torch.equal(
+            resolved["img_in.weight"],
+            dequantize_layer(q, {"weight_scale": scale}, int8_config, torch.bfloat16, 4, 256),
+        ))
+        self.assertLess(((resolved["img_in.weight"].float() - weight).norm() / weight.norm()).item(), 0.02)
+        nvfp4_config = parse_layer_config(state["txt_in.comfy_quant"], "txt_in")
+        self.assertTrue(torch.equal(resolved["txt_in.weight"], dequantize_layer(
+            state["txt_in.weight"],
+            {"weight_scale": state["txt_in.weight_scale"], "weight_scale_2": state["txt_in.weight_scale_2"]},
+            nvfp4_config, torch.bfloat16, 4, 32,
+        )))
+
+    def test_a_smoothing_scale_is_folded_into_the_expanded_weight(self):
+        state = {
+            "img_in.weight": torch.tensor([[2.0, 4.0]]).to(torch.float8_e4m3fn),
+            "img_in.weight_scale": torch.tensor(0.5),
+            "img_in.pre_quant_scale": torch.tensor([3.0, 0.25]),
+            "img_in.comfy_quant": comfy_quant_marker("float8_e4m3fn"),
+        }
+        # ComfyUI lists `pre_quant_scale` only among NVFP4's parameters, so on fp8 it is left
+        # unread (dropped here, as before P9); on NVFP4 it is folded into the expanded weight,
+        # which is what ComfyUI's `input * pre_quant_scale` amounts to.
+        self.assertEqual(sorted(resolve_quantized_state_dict(state, torch.float32)), ["img_in.weight"])
+        codes = torch.full((1, 16), 2, dtype=torch.uint8)  # +1.0
+        from comfy_quant import to_blocked
+
+        state = {
+            "img_in.weight": codes[:, 0::2] << 4 | codes[:, 1::2],
+            "img_in.weight_scale": to_blocked(torch.ones(1, 1)).to(torch.float8_e4m3fn),
+            "img_in.weight_scale_2": torch.tensor(1.0),
+            "img_in.pre_quant_scale": torch.linspace(1.0, 2.5, 16),
+            "img_in.comfy_quant": comfy_quant_marker("nvfp4"),
+        }
+        resolved = resolve_quantized_state_dict(state, torch.float32)
+        self.assertTrue(torch.equal(resolved["img_in.weight"], torch.linspace(1.0, 2.5, 16).reshape(1, 16)))
+
+    def test_packed_weights_are_budgeted_at_the_width_they_expand_to(self):
+        # A W4A4 weight is an ordinary int8 tensor to the header and an NVFP4 one a uint8 tensor;
+        # both hold two values per byte and expand to twice their stored width at load.
+        from safetensors.torch import save_file
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "packed.safetensors"
+            save_file({
+                "a.weight": torch.zeros(4, 8, dtype=torch.int8),
+                "a.comfy_quant": comfy_quant_marker("convrot_w4a4"),
+                "b.weight": torch.zeros(4, 8, dtype=torch.uint8),
+                "c.weight": torch.zeros(4, 8, dtype=torch.int8),
+                "c.comfy_quant": comfy_quant_marker("int8_tensorwise"),
+            }, str(path), metadata={"_quantization_metadata": json.dumps({"layers": {"b": {"format": "nvfp4"}}})})
+            markers = len(comfy_quant_marker("convrot_w4a4")) + len(comfy_quant_marker("int8_tensorwise"))
+            # a and b count 4x16 elements, c 4x8, the markers their bytes; all at two bytes each.
+            self.assertEqual(flux_pipeline.flux_component_bytes([path]), (64 + 64 + 32 + markers) * 2)
+
+    def test_an_fp8_file_marked_in_its_header_expands_like_the_scaled_spelling(self):
+        # Krea 2 / FLUX fp8 exports that keep `_quantization_metadata` in the header now arrive
+        # here as marker entries. They must expand to exactly what the scale-only reading gave.
+        from comfy_quant import apply_header_quant_metadata
+
+        torch.manual_seed(1)
+        state = {
+            "img_in.weight": (torch.randn(3, 5) * 20).to(torch.float8_e4m3fn),
+            "img_in.weight_scale": torch.tensor(0.0371),
+            "last.norm.scale": torch.tensor([3.0]),
+        }
+        table = {"layers": {"img_in": {"format": "float8_e4m3fn", "full_precision_matrix_mult": True}}}
+        marked = apply_header_quant_metadata(state, {"_quantization_metadata": json.dumps(table)})
+        for dtype in (torch.float32, torch.bfloat16):
+            before = resolve_quantized_state_dict(state, dtype)
+            after = resolve_quantized_state_dict(marked, dtype)
+            self.assertEqual(sorted(before), sorted(after))
+            for key in before:
+                self.assertTrue(torch.equal(before[key], after[key]), (key, dtype))
 
     def test_a_block_scale_is_refused_rather_than_broadcast(self):
         state = {

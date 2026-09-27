@@ -77,8 +77,14 @@ const KREA2_DEEPSTACK_KEYS = [
 // The deepest conditioning tap is layer 35, so a shallower checkpoint cannot be a Krea 2 encoder.
 const KREA2_DEEPEST_TAP = 35;
 
-function isKrea2TextEncoder(tensors) {
-  if (!KREA2_DEEPSTACK_KEYS.some((key) => tensors.has(key))) return false;
+function isKrea2TextEncoder(tensors, ggufArchitecture) {
+  // A llama.cpp GGUF carries the language half only (the vision tower is a separate `mmproj`
+  // file), so there it is the declared family, not the DeepStack merger, that says Qwen3-VL.
+  if (ggufArchitecture !== undefined) {
+    if (ggufArchitecture !== "qwen3vl") return false;
+  } else if (!KREA2_DEEPSTACK_KEYS.some((key) => tensors.has(key))) {
+    return false;
+  }
   const prefix = languageModelPrefix(tensors);
   if (prefix == null) return false;
   const norm = shapeOf(tensors, `${prefix}layers.0.post_attention_layernorm.weight`);
@@ -107,7 +113,7 @@ export function classifyKrea2SafetensorsHeader(header) {
   if (!tensors) return null;
   const matches = [
     ["diffusion_model", isKrea2Diffusion(tensors)],
-    ["text_encoder", isKrea2TextEncoder(tensors)],
+    ["text_encoder", isKrea2TextEncoder(tensors, header?.__metadata__?.["general.architecture"])],
     ["vae", isKrea2Vae(tensors)],
   ].filter(([, matched]) => matched);
   return matches.length === 1 ? matches[0][0] : null;

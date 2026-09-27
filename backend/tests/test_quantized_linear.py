@@ -12,6 +12,8 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
+    from .. import comfy_quant
+    from ..comfy_quant import to_blocked
     from ..quantized_linear import (
         FP4_E2M1_VALUES,
         MXFP8_GROUP_SIZE,
@@ -29,6 +31,8 @@ try:
         scan_quantized_layers,
     )
 except ImportError:
+    import comfy_quant
+    from comfy_quant import to_blocked
     from quantized_linear import (
         FP4_E2M1_VALUES,
         MXFP8_GROUP_SIZE,
@@ -47,8 +51,12 @@ except ImportError:
     )
 
 
+def marker(conf: dict) -> torch.Tensor:
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+
+
 def comfy_quant_marker(fmt: str) -> torch.Tensor:
-    return torch.tensor(list(json.dumps({"format": fmt}).encode("utf-8")), dtype=torch.uint8)
+    return marker({"format": fmt})
 
 
 def fp8_layer(rows=8, columns=16, scale=0.0125, suffix=".weight_scale", prefix="block"):
@@ -93,32 +101,57 @@ class ScanTests(unittest.TestCase):
             scan_quantized_layers(state, "test checkpoint")
         self.assertIn("int4_awq", str(raised.exception))
 
-    def test_a_rotated_int8_weight_is_refused_rather_than_read_as_plain_int8(self):
-        """Krea 2's INT8 build is the real case, and it is the dangerous shape of one.
+    def test_a_rotated_int8_weight_is_read_with_its_rotation(self):
+        """Krea 2's INT8 build: ``{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}``.
 
-        Its marker is ``{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}``.
-        The format names something this loader supports, so reading only that field accepts the
-        file, dequantises it as an ordinary tensor-wise int8 layer, and multiplies a weight stored
-        in a rotated basis by an unrotated activation. ComfyUI undoes the rotation inside its own
-        compiled kernel; there is nothing here that can, so the answer is not close to right and
-        the file has to be refused instead of run.
+        Before P9 this was refused, because reading only ``format`` would multiply a weight stored
+        in a rotated basis by an unrotated activation. The rotation is now carried into the layer,
+        which rotates the activation the way comfy-kitchen's ``int8_linear`` does.
         """
         state = {
-            "block.weight": torch.zeros(4, 4, dtype=torch.int8),
-            "block.weight_scale": torch.tensor(0.02),
-            "block.comfy_quant": torch.tensor(
-                list(json.dumps({
-                    "format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256,
-                }).encode("utf-8")),
-                dtype=torch.uint8,
-            ),
+            "block.weight": torch.zeros(4, 256, dtype=torch.int8),
+            "block.weight_scale": torch.full((4, 1), 0.02),
+            "block.comfy_quant": marker({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}),
+        }
+        config = scan_quantized_layers(state, "test checkpoint")["block"].config
+        self.assertEqual((config.format, config.convrot, config.convrot_groupsize), ("int8_tensorwise", True, 256))
+
+    def test_a_rotation_the_input_width_cannot_hold_is_refused(self):
+        state = {
+            "block.weight": torch.zeros(4, 100, dtype=torch.int8),
+            "block.weight_scale": torch.full((4, 1), 0.02),
+            "block.comfy_quant": marker({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 64}),
         }
         with self.assertRaises(UnsupportedQuantization) as raised:
             scan_quantized_layers(state, "test checkpoint")
-        message = str(raised.exception)
-        self.assertIn("convrot", message)
-        # The message has to say what to do instead, or it is just a wall.
-        self.assertIn("fp8", message)
+        self.assertIn("ConvRot", str(raised.exception))
+
+    def test_an_unknown_marker_field_is_refused_rather_than_ignored(self):
+        state = fp8_layer()
+        state["block.comfy_quant"] = marker({"format": "float8_e4m3fn", "smoothing": "awq"})
+        with self.assertRaises(UnsupportedQuantization) as raised:
+            scan_quantized_layers(state)
+        self.assertIn("smoothing", str(raised.exception))
+
+    def test_a_smoothing_scale_is_carried_where_comfy_reads_it_and_dropped_elsewhere(self):
+        # ComfyUI multiplies an NVFP4 layer's activation by `pre_quant_scale`; dropping it there
+        # changes every output. No other layout lists the parameter, so ComfyUI leaves it unread.
+        codes = torch.zeros(16, 16, dtype=torch.uint8)
+        state = {
+            "block.weight": codes,
+            "block.weight_scale": tiled(torch.ones(16, 2)).to(torch.float8_e4m3fn),
+            "block.weight_scale_2": torch.tensor(1.0),
+            "block.pre_quant_scale": torch.ones(32),
+            "block.comfy_quant": comfy_quant_marker("nvfp4"),
+        }
+        layer = scan_quantized_layers(state)["block"]
+        self.assertEqual(dict(layer.optional_keys), {"pre_quant_scale": "block.pre_quant_scale"})
+        self.assertNotIn("block.pre_quant_scale", layer.dropped_keys)
+        state = fp8_layer()
+        state["block.pre_quant_scale"] = torch.ones(16)
+        layer = scan_quantized_layers(state)["block"]
+        self.assertEqual(dict(layer.optional_keys), {})
+        self.assertIn("block.pre_quant_scale", layer.dropped_keys)
 
     def test_a_marker_that_only_describes_the_matmul_is_not_a_refusal(self):
         """`full_precision_matrix_mult` rides along on every layer of the Qwen3-VL fp8 encoder that
@@ -189,32 +222,56 @@ class ScalarScaleTests(unittest.TestCase):
             self.assertEqual(recovered.dtype, dtype)
 
 
+def tiled(matrix: torch.Tensor) -> torch.Tensor:
+    """A ``[rows, blocks]`` scale matrix in cuBLAS's 128x4 tile order, how ComfyUI stores it."""
+    return to_blocked(matrix)
+
+
 class BlockScaleTests(unittest.TestCase):
     """NVFP4 and MXFP8 pack or group their scales, so the arithmetic is checked against a
-    hand-built tensor rather than against the loader that produced it."""
+    hand-built tensor rather than against the loader that produced it.
+
+    The layout is comfy-kitchen's: NVFP4 puts the **first** of two values in the **high** nibble,
+    and both formats keep their block scales in cuBLAS's tiled order. The pre-P9 versions of these
+    tests pinned the opposite nibble order and row-major scales; on a real Krea 2 layer that
+    reading decoded to noise (see ``Temp/p9-claude/verify_layers.log``).
+    """
 
     def test_nvfp4_unpacks_both_nibbles_in_order(self):
-        # Codes 1 (+0.5) and 6 (+4.0) in one byte, low nibble first.
-        weight = torch.tensor([[0x61]], dtype=torch.uint8)
-        block = torch.tensor([[1.0]], dtype=torch.float32)
-        recovered = dequantize_nvfp4(weight, block, torch.tensor(1.0), torch.float32, 1, 2)
-        self.assertTrue(torch.equal(recovered, torch.tensor([[0.5, 4.0]])))
+        # Codes 1 (+0.5) and 6 (+4.0) in the first byte of a block, high nibble first.
+        weight = torch.zeros(1, NVFP4_GROUP_SIZE // 2, dtype=torch.uint8)
+        weight[0, 0] = 0x16
+        block = tiled(torch.ones(1, 1)).to(torch.float8_e4m3fn)
+        recovered = dequantize_nvfp4(weight, block, torch.tensor(1.0), torch.float32, 1, NVFP4_GROUP_SIZE)
+        self.assertTrue(torch.equal(recovered[:, :2], torch.tensor([[0.5, 4.0]])))
+        with self.assertRaises(UnsupportedQuantization):
+            dequantize_nvfp4(weight[:, :1], block, torch.tensor(1.0), torch.float32, 1, 2)
 
     def test_nvfp4_decodes_every_code_in_the_table(self):
         codes = torch.arange(16, dtype=torch.uint8)
-        packed = (codes[1::2] << 4 | codes[0::2]).reshape(1, -1)
-        block = torch.ones(1, 1, dtype=torch.float32)
+        packed = (codes[0::2] << 4 | codes[1::2]).reshape(1, -1)
+        block = tiled(torch.ones(1, 1)).to(torch.float8_e4m3fn)
         recovered = dequantize_nvfp4(packed, block, torch.tensor(1.0), torch.float32, 1, 16)
         self.assertTrue(torch.equal(recovered[0], torch.tensor(FP4_E2M1_VALUES)))
 
     def test_nvfp4_applies_the_block_scale_per_group_and_the_global_scale_once(self):
         codes = torch.full((1, NVFP4_GROUP_SIZE), 2, dtype=torch.uint8)  # code 2 is +1.0
-        packed = (codes[:, 1::2] << 4 | codes[:, 0::2])
+        packed = (codes[:, 0::2] << 4 | codes[:, 1::2])
         packed = torch.cat([packed, packed], dim=1)
-        block = torch.tensor([[2.0, 3.0]], dtype=torch.float32)
+        block = tiled(torch.tensor([[2.0, 3.0]])).to(torch.float8_e4m3fn)
         recovered = dequantize_nvfp4(packed, block, torch.tensor(10.0), torch.float32, 1, 2 * NVFP4_GROUP_SIZE)
         self.assertTrue(torch.equal(recovered[0, :NVFP4_GROUP_SIZE], torch.full((NVFP4_GROUP_SIZE,), 20.0)))
         self.assertTrue(torch.equal(recovered[0, NVFP4_GROUP_SIZE:], torch.full((NVFP4_GROUP_SIZE,), 30.0)))
+
+    def test_nvfp4_scales_are_read_in_tile_order_not_row_order(self):
+        # Row 1's scale sits 16 entries into the first tile, not at index 1 (which is row 0's
+        # second block). A row-major read would hand row 1 the scale of row 0's second block.
+        scales = torch.tensor([[1.0], [4.0]])
+        codes = torch.full((2, NVFP4_GROUP_SIZE), 2, dtype=torch.uint8)
+        packed = codes[:, 0::2] << 4 | codes[:, 1::2]
+        block = tiled(scales).to(torch.float8_e4m3fn)
+        recovered = dequantize_nvfp4(packed, block, torch.tensor(1.0), torch.float32, 2, NVFP4_GROUP_SIZE)
+        self.assertTrue(torch.equal(recovered[:, 0], torch.tensor([1.0, 4.0])))
 
     def test_nvfp4_refuses_a_weight_with_too_few_block_scales(self):
         packed = torch.zeros(1, NVFP4_GROUP_SIZE, dtype=torch.uint8)
@@ -223,17 +280,17 @@ class BlockScaleTests(unittest.TestCase):
 
     def test_mxfp8_reads_a_power_of_two_exponent_byte(self):
         weight = torch.ones(1, MXFP8_GROUP_SIZE, dtype=torch.float32).to(torch.float8_e4m3fn)
-        # 127 is 2^0, 128 is 2^1.
-        for byte, expected in ((127, 1.0), (128, 2.0), (126, 0.5)):
-            block = torch.tensor([[byte]], dtype=torch.uint8)
+        # 127 is 2^0, 128 is 2^1; 0 is how comfy-kitchen writes an all-zero block and reads as 0.
+        for byte, expected in ((127, 1.0), (128, 2.0), (126, 0.5), (0, 0.0)):
+            block = tiled(torch.tensor([[byte]], dtype=torch.uint8))
             recovered = dequantize_mxfp8(weight, block, torch.float32, 1, MXFP8_GROUP_SIZE)
             self.assertTrue(torch.equal(recovered, torch.full((1, MXFP8_GROUP_SIZE), expected)))
 
-    def test_mxfp8_accepts_a_float_block_scale_unchanged(self):
+    def test_mxfp8_refuses_a_float_block_scale(self):
+        # ComfyUI views the stored scale as E8M0 bytes; a float32 table is not that layout.
         weight = torch.full((1, MXFP8_GROUP_SIZE), 2.0).to(torch.float8_e4m3fn)
-        block = torch.tensor([[3.0]], dtype=torch.float32)
-        recovered = dequantize_mxfp8(weight, block, torch.float32, 1, MXFP8_GROUP_SIZE)
-        self.assertTrue(torch.equal(recovered, torch.full((1, MXFP8_GROUP_SIZE), 6.0)))
+        with self.assertRaises(UnsupportedQuantization):
+            dequantize_mxfp8(weight, tiled(torch.tensor([[3.0]])), torch.float32, 1, MXFP8_GROUP_SIZE)
 
 
 class QuantizedLinearTests(unittest.TestCase):
@@ -348,14 +405,29 @@ class ExpansionTests(unittest.TestCase):
 class LogicalShapeTests(unittest.TestCase):
     def test_a_packed_weight_reports_the_layer_shape_not_the_stored_one(self):
         state = {
-            "block.weight": torch.zeros(8, 16, dtype=torch.uint8),
-            "block.weight_scale": torch.ones(8, 2, dtype=torch.float32),
+            "block.weight": torch.zeros(16, 16, dtype=torch.uint8),
+            "block.weight_scale": tiled(torch.ones(16, 2)).to(torch.float8_e4m3fn),
             "block.weight_scale_2": torch.tensor(1.0),
             "block.comfy_quant": comfy_quant_marker("nvfp4"),
+            "w4.weight": torch.zeros(8, 128, dtype=torch.int8),
+            "w4.weight_scale": torch.ones(8),
+            "w4.comfy_quant": comfy_quant_marker("convrot_w4a4"),
         }
         layers = scan_quantized_layers(state)
         view = logical_shape_view(state, layers)
-        self.assertEqual(tuple(view["block.weight"].shape), (8, 32))
+        self.assertEqual(tuple(view["block.weight"].shape), (16, 32))
+        self.assertEqual(tuple(view["w4.weight"].shape), (8, 256))
+
+    def test_an_nvfp4_block_scale_table_of_the_wrong_size_is_refused_at_scan(self):
+        state = {
+            "block.weight": torch.zeros(16, 16, dtype=torch.uint8),
+            "block.weight_scale": torch.ones(16, 2).to(torch.float8_e4m3fn),
+            "block.weight_scale_2": torch.tensor(1.0),
+            "block.comfy_quant": comfy_quant_marker("nvfp4"),
+        }
+        with self.assertRaises(UnsupportedQuantization) as raised:
+            scan_quantized_layers(state, "test checkpoint")
+        self.assertIn("tiled", str(raised.exception))
 
     def test_an_unpacked_weight_is_passed_through_as_the_tensor_itself(self):
         state = fp8_layer(8, 16)
@@ -363,6 +435,130 @@ class LogicalShapeTests(unittest.TestCase):
         self.assertIs(view["block.weight"], state["block.weight"])
         self.assertEqual(len(view), len(state))
         self.assertEqual(set(view), set(state))
+
+
+class ComfyLayoutModuleTests(unittest.TestCase):
+    """P9: each ported layout inside the module, against the arithmetic ComfyUI runs for it."""
+
+    def build(self, state, rows, cols):
+        module = nn.Module()
+        module.net = nn.Linear(cols, rows, bias=False)
+        layers = scan_quantized_layers(state)
+        replaced, deferred = apply_quantized_linears(module, layers, state, torch.float32)
+        self.assertEqual((replaced, deferred), (["net"], []))
+        module.load_state_dict(quantized_state_dict(state, layers, set(replaced)), strict=True, assign=True)
+        return module.net
+
+    def convrot_int8_state(self, extra=None):
+        torch.manual_seed(5)
+        weight = torch.randn(8, 512) * 0.05
+        rotated = comfy_quant.rotate_weight(weight, comfy_quant.build_hadamard(256), 256)
+        q, scale = comfy_quant.quantize_int8_rowwise(rotated)
+        conf = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256, **(extra or {})}
+        return weight, {"net.weight": q, "net.weight_scale": scale, "net.comfy_quant": marker(conf)}
+
+    def test_convrot_int8_runs_comfys_integer_matmul(self):
+        weight, state = self.convrot_int8_state()
+        layer = self.build(state, 8, 512)
+        x = torch.randn(3, 512)
+        self.assertTrue(layer.uses_integer_matmul)
+        want = comfy_quant.int8_linear(x, state["net.weight"], state["net.weight_scale"], None, torch.float32, True, 256)
+        self.assertTrue(torch.equal(layer(x), want))
+        exact = x @ weight.T
+        self.assertLess(((layer(x) - exact).norm() / exact.norm()).item(), 0.03)
+
+    def test_a_full_precision_marker_or_a_lora_dequantises_instead(self):
+        # ComfyUI's `_use_quantized` is false for both, and the weight is dequantised instead.
+        x = torch.randn(3, 512)
+        _, state = self.convrot_int8_state({"full_precision_matrix_mult": True})
+        layer = self.build(state, 8, 512)
+        dequantised = comfy_quant.dequantize_int8(state["net.weight"], state["net.weight_scale"], torch.float32, True, 256)
+        self.assertFalse(layer.uses_integer_matmul)
+        self.assertTrue(torch.equal(layer(x), F.linear(x, dequantised)))
+
+        _, state = self.convrot_int8_state()
+        layer = self.build(state, 8, 512)
+        down, up = torch.randn(2, 512) * 0.1, torch.randn(8, 2) * 0.1
+        layer.set_lora_adapter(down, up)
+        self.assertFalse(layer.uses_integer_matmul)
+        expected = F.linear(x, dequantised) + F.linear(F.linear(x, down), up)
+        self.assertTrue(torch.allclose(layer(x), expected, atol=1e-5))
+
+    def test_w4a4_runs_comfys_integer_matmul(self):
+        torch.manual_seed(6)
+        values = torch.randint(-7, 8, (8, 256), dtype=torch.int8)
+        scale = torch.rand(8) * 0.01 + 0.001
+        state = {
+            "net.weight": comfy_quant.pack_int4(values),
+            "net.weight_scale": scale,
+            "net.comfy_quant": marker({"format": "convrot_w4a4", "convrot_groupsize": 64}),
+        }
+        layer = self.build(state, 8, 256)
+        x = torch.randn(2, 3, 256)
+        self.assertTrue(layer.uses_integer_matmul)
+        want = comfy_quant.convrot_w4a4_linear(x, state["net.weight"], scale, None, 64)
+        self.assertTrue(torch.equal(layer(x), want))
+        self.assertEqual(tuple(layer(x).shape), (2, 3, 8))
+
+    def test_nvfp4_and_mxfp8_multiply_the_dequantised_weight(self):
+        torch.manual_seed(7)
+        codes = torch.randint(0, 16, (16, 32), dtype=torch.uint8)
+        nvfp4 = {
+            "net.weight": codes[:, 0::2] << 4 | codes[:, 1::2],
+            "net.weight_scale": tiled(torch.tensor([[0.5, 2.0]]).repeat(16, 1)).to(torch.float8_e4m3fn),
+            "net.weight_scale_2": torch.tensor(0.25),
+            "net.comfy_quant": comfy_quant_marker("nvfp4"),
+        }
+        layer = self.build(nvfp4, 16, 32)
+        x = torch.randn(4, 32)
+        weight = dequantize_nvfp4(nvfp4["net.weight"], nvfp4["net.weight_scale"], nvfp4["net.weight_scale_2"], torch.float32, 16, 32)
+        self.assertTrue(torch.equal(layer(x), F.linear(x, weight)))
+        self.assertEqual(layer.weight.dtype, torch.uint8)
+
+        mxfp8 = {
+            "net.weight": (torch.randn(16, 64) * 4).to(torch.float8_e4m3fn),
+            "net.weight_scale": tiled(torch.tensor([[126, 128]], dtype=torch.uint8).repeat(16, 1)),
+            "net.comfy_quant": comfy_quant_marker("mxfp8"),
+        }
+        layer = self.build(mxfp8, 16, 64)
+        x = torch.randn(4, 64)
+        weight = dequantize_mxfp8(mxfp8["net.weight"], mxfp8["net.weight_scale"], torch.float32, 16, 64)
+        self.assertTrue(torch.equal(layer(x), F.linear(x, weight)))
+
+    def test_the_smoothing_scale_multiplies_the_input(self):
+        torch.manual_seed(8)
+        codes = torch.randint(0, 16, (16, 32), dtype=torch.uint8)
+        state = {
+            "net.weight": codes[:, 0::2] << 4 | codes[:, 1::2],
+            "net.weight_scale": tiled(torch.ones(16, 2)).to(torch.float8_e4m3fn),
+            "net.weight_scale_2": torch.tensor(0.5),
+            "net.pre_quant_scale": torch.linspace(0.5, 2.0, 32),
+            "net.comfy_quant": comfy_quant_marker("nvfp4"),
+        }
+        layer = self.build(state, 16, 32)
+        x = torch.randn(2, 32)
+        weight = dequantize_nvfp4(state["net.weight"], state["net.weight_scale"], state["net.weight_scale_2"], torch.float32, 16, 32)
+        self.assertTrue(torch.equal(layer(x), F.linear(x * state["net.pre_quant_scale"], weight)))
+        expanded = expand_quantized_layers(state, scan_quantized_layers(state), {"net"}, torch.float32)
+        self.assertNotIn("net.pre_quant_scale", expanded)
+        self.assertTrue(torch.allclose(F.linear(x, expanded["net.weight"]), layer(x), atol=1e-5))
+
+    def test_a_dtype_cast_keeps_integer_storage_and_float32_scales(self):
+        _, state = self.convrot_int8_state()
+        layer = self.build(state, 8, 512)
+        layer.to(dtype=torch.bfloat16)
+        self.assertEqual((layer.weight.dtype, layer.scale_weight.dtype), (torch.int8, torch.float32))
+
+    def test_a_header_marked_fp8_file_loads_exactly_as_its_legacy_spelling(self):
+        # Krea 2's fp8_scaled transformer keeps its markers in the header. Converted to marker
+        # entries it must land on the same layers, scales and outputs as the scale-only reading.
+        legacy = fp8_layer(prefix="net")
+        table = {"layers": {"net": {"format": "float8_e4m3fn", "full_precision_matrix_mult": True}}}
+        header = comfy_quant.apply_header_quant_metadata(legacy, {"_quantization_metadata": json.dumps(table)})
+        a, b = scan_quantized_layers(legacy)["net"], scan_quantized_layers(header)["net"]
+        self.assertEqual((a.format, dict(a.scale_keys)), (b.format, dict(b.scale_keys)))
+        x = torch.randn(4, 16)
+        self.assertTrue(torch.equal(self.build(legacy, 8, 16)(x), self.build(header, 8, 16)(x)))
 
 
 if __name__ == "__main__":

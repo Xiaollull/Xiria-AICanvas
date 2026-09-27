@@ -1,4 +1,4 @@
-"""GGUF diffusion-model files for the native engines.
+"""GGUF files for the native engines: diffusion models, and since P9 text encoders and autoencoders.
 
 ComfyUI reads GGUF through the ComfyUI-GGUF nodes, which keep the packed blocks resident and
 expand them inside their own linear op.  This module takes the other half of that design: it
@@ -556,3 +556,174 @@ def load_gguf_state_dict(
 
 def is_gguf_path(path: str | Path) -> bool:
     return Path(path).suffix.lower() == GGUF_SUFFIX
+
+
+# -- text encoders and autoencoders (P9) ------------------------------------------------------
+#
+# A GGUF diffusion model keeps the checkpoint's own tensor names, because ComfyUI-GGUF's converter
+# writes them unchanged. Text encoders are mostly published by llama.cpp's converter instead, which
+# renames every tensor into its own scheme and records the model family as `general.architecture`.
+# Each family below is renamed back into the spelling ComfyUI's safetensors release of the same
+# encoder uses, so every classifier and loader downstream sees one naming. `scripts/gguf-header.mjs`
+# carries the same tables; both test suites pin them literally so the picker and the runtime cannot
+# disagree about which file is which.
+#
+# llama.cpp permutes the query and key rows of the `llama` family (Mistral) for its rotary layout
+# and does not for Qwen; T5 has no rotary embedding. Undoing that permutation is not implemented,
+# and FLUX.2's Mistral also needs the Tekken tokenizer ComfyUI embeds in its file, so a `llama`
+# encoder is refused by name rather than loaded with scrambled attention.
+
+GGUF_TEXT_ENCODER_FAMILIES = {"t5encoder": "t5", "t5": "t5", "qwen3": "qwen3", "qwen3vl": "qwen3"}
+GGUF_REFUSED_TEXT_ENCODER_ARCHITECTURES = {
+    "llama": "llama.cpp permutes this family's query/key rows and the file carries no Tekken tokenizer",
+    "mistral3": "llama.cpp permutes this family's query/key rows and the file carries no Tekken tokenizer",
+}
+
+GGUF_TEXT_ENCODER_KEY_MAPS = {
+    "t5": {
+        "prefix": "enc.blk.",
+        "block": "encoder.block.{index}.",
+        "parts": {
+            "attn_q": "layer.0.SelfAttention.q",
+            "attn_k": "layer.0.SelfAttention.k",
+            "attn_v": "layer.0.SelfAttention.v",
+            "attn_o": "layer.0.SelfAttention.o",
+            "attn_rel_b": "layer.0.SelfAttention.relative_attention_bias",
+            "attn_norm": "layer.0.layer_norm",
+            "ffn_gate": "layer.1.DenseReluDense.wi_0",
+            "ffn_up": "layer.1.DenseReluDense.wi_1",
+            "ffn_down": "layer.1.DenseReluDense.wo",
+            "ffn_norm": "layer.1.layer_norm",
+        },
+        "globals": {"token_embd": "shared", "enc.output_norm": "encoder.final_layer_norm"},
+        "dropped": [],
+    },
+    "qwen3": {
+        "prefix": "blk.",
+        "block": "model.layers.{index}.",
+        "parts": {
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_output": "self_attn.o_proj",
+            "attn_q_norm": "self_attn.q_norm",
+            "attn_k_norm": "self_attn.k_norm",
+            "attn_norm": "input_layernorm",
+            "ffn_norm": "post_attention_layernorm",
+            "ffn_gate": "mlp.gate_proj",
+            "ffn_up": "mlp.up_proj",
+            "ffn_down": "mlp.down_proj",
+        },
+        "globals": {"token_embd": "model.embed_tokens", "output_norm": "model.norm"},
+        # The language-model head: conditioning taps hidden states, never logits.
+        "dropped": ["output.weight"],
+    },
+}
+
+# Names only llama.cpp's converter writes. A file carrying them under an architecture the tables
+# above do not cover is refused rather than passed through under names no loader recognises.
+_LLAMA_CPP_NAME_PREFIXES = ("blk.", "enc.blk.", "dec.blk.", "token_embd.", "output_norm.", "enc.output_norm.")
+
+
+def gguf_text_encoder_key(name: str, family: str) -> str | None:
+    """The ComfyUI name of one llama.cpp text-encoder tensor, or None when it has none."""
+    table = GGUF_TEXT_ENCODER_KEY_MAPS[family]
+    stem, dot, suffix = name.rpartition(".")
+    if not dot or suffix not in ("weight", "bias"):
+        return None
+    if stem in table["globals"]:
+        return f"{table['globals'][stem]}.{suffix}"
+    prefix = table["prefix"]
+    if not stem.startswith(prefix):
+        return None
+    index, dot, part = stem[len(prefix):].partition(".")
+    if not dot or not index.isdigit() or part not in table["parts"]:
+        return None
+    return f"{table['block'].format(index=int(index))}{table['parts'][part]}.{suffix}"
+
+
+def gguf_component_names(header: GgufHeader, role: str, label: str = "GGUF checkpoint") -> dict[str, str | None]:
+    """File tensor name -> the name the loader should see, or None for a tensor that is dropped.
+
+    ``role`` is ``diffusion_model``, ``text_encoder`` or ``vae``. Names are passed through unchanged
+    unless the file is a llama.cpp text encoder, which is renamed per :data:`GGUF_TEXT_ENCODER_KEY_MAPS`.
+    Anything that cannot be named for the role is refused here, before a tensor is read.
+    """
+    names = [tensor.name for tensor in header.tensors]
+    architecture = (header.architecture or "").lower()
+    llama_named = [name for name in names if name.startswith(_LLAMA_CPP_NAME_PREFIXES)]
+    if role == "text_encoder" and architecture in GGUF_REFUSED_TEXT_ENCODER_ARCHITECTURES:
+        raise ValueError(
+            f"{label} is a llama.cpp {architecture!r} text encoder, which this runtime does not read: "
+            f"{GGUF_REFUSED_TEXT_ENCODER_ARCHITECTURES[architecture]}. Use ComfyUI's safetensors release"
+        )
+    family = GGUF_TEXT_ENCODER_FAMILIES.get(architecture) if role == "text_encoder" else None
+    if family is None:
+        if llama_named:
+            raise ValueError(
+                f"{label} names its tensors the llama.cpp way ({llama_named[0]!r}) under architecture "
+                f"{architecture or 'unknown'!r}, which is not a {role.replace('_', ' ')} this runtime can map"
+            )
+        return {name: name for name in names}
+    table = GGUF_TEXT_ENCODER_KEY_MAPS[family]
+    mapped: dict[str, str | None] = {}
+    unknown = []
+    for name in names:
+        if name in table["dropped"]:
+            mapped[name] = None
+            continue
+        target = gguf_text_encoder_key(name, family)
+        if target is None:
+            unknown.append(name)
+        mapped[name] = target
+    if unknown:
+        raise ValueError(
+            f"{label} is a llama.cpp {architecture!r} text encoder carrying tensors with no ComfyUI "
+            f"counterpart ({', '.join(sorted(unknown)[:4])}); it is refused rather than loaded partially"
+        )
+    targets = [target for target in mapped.values() if target is not None]
+    if len(set(targets)) != len(targets):
+        raise ValueError(f"{label} maps two tensors onto one ComfyUI name")
+    return mapped
+
+
+def load_gguf_component_state_dict(
+    path: str | Path,
+    role: str,
+    dtype: torch.dtype | None = None,
+    label: str = "GGUF checkpoint",
+    header: GgufHeader | None = None,
+    architectures: Sequence[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    """A text encoder or autoencoder GGUF as an ordinary state dict in ComfyUI's naming.
+
+    Expanded one tensor at a time to ``dtype``, as :func:`load_gguf_state_dict` does for a diffusion
+    model; a dropped tensor (a language-model head) is never read at all.
+
+    ``architectures`` is the llama.cpp families the engine's encoder may be. Renamed, Qwen3-VL's
+    language half and Qwen3-4B carry identical tensor names and shapes — the vision tower that tells
+    them apart in ComfyUI's release ships separately (``mmproj``) — so the declared architecture is
+    the only thing that keeps a Krea 2 encoder out of FLUX.2 and the reverse.
+    """
+    path = Path(path)
+    header = header or read_gguf_header(path, label)
+    names = gguf_component_names(header, role, label)
+    architecture = (header.architecture or "").lower()
+    if (
+        role == "text_encoder"
+        and architectures is not None
+        and architecture in GGUF_TEXT_ENCODER_FAMILIES
+        and architecture not in architectures
+    ):
+        raise ValueError(
+            f"{label} is a llama.cpp {architecture!r} text encoder; this engine's encoder is "
+            f"{' or '.join(repr(name) for name in architectures)}"
+        )
+    state_dict: dict[str, torch.Tensor] = {}
+    with open(path, "rb") as handle:
+        for tensor in header.tensors:
+            target = names[tensor.name]
+            if target is None:
+                continue
+            state_dict[target] = _read_tensor(handle, header, tensor, dtype, label)
+    return state_dict

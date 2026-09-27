@@ -287,6 +287,7 @@ try:
         pag_layer_pattern,
     )
     from . import rtx_vsr
+    from .comfy_quant import quantization_capabilities
     from .performance_settings import (
         file_sha256,
         disable_sequential_batch_forward,
@@ -442,6 +443,7 @@ except ImportError:
         pag_layer_pattern,
     )
     import rtx_vsr
+    from comfy_quant import quantization_capabilities
     from performance_settings import (
         file_sha256,
         disable_sequential_batch_forward,
@@ -2827,9 +2829,12 @@ CHECKPOINT_EXTENSIONS = frozenset({".safetensors", ".ckpt"})
 LORA_EXTENSIONS = frozenset({".safetensors", ".ckpt", ".pt", ".pth"})
 ANIMA_LORA_EXTENSIONS = frozenset({".safetensors"})
 # FLUX.1, FLUX.2 and Krea 2 also read a GGUF diffusion model, which is the only form some of their
-# quantisations are published in. The other three components stay safetensors: see
-# `anima_pipeline._require_diffusion_weights` for why a GGUF text encoder is not the same problem.
+# quantisations are published in. Since P9 their text encoders and autoencoders may be GGUF too:
+# `gguf_loader.gguf_component_names` renames a llama.cpp encoder into ComfyUI's naming or refuses
+# it, and the engine's classifier then checks the tensors as it does for safetensors. Anima's
+# components stay safetensors.
 NATIVE_DIFFUSION_EXTENSIONS = frozenset({".safetensors", ".gguf"})
+NATIVE_COMPONENT_EXTENSIONS = NATIVE_DIFFUSION_EXTENSIONS
 
 
 def validate_child_path(requested_path: str, root: Path, label: str):
@@ -2852,6 +2857,14 @@ def validate_anima_component(requested_path: str, root: Path, label: str):
 def validate_native_diffusion_model(requested_path: str, root: Path, label: str):
     path = validate_child_path(requested_path, root, label)
     if path.suffix.lower() not in NATIVE_DIFFUSION_EXTENSIONS:
+        raise ValueError(f"{label} must be a .safetensors or .gguf file")
+    return path
+
+
+def validate_native_component(requested_path: str, root: Path, label: str):
+    """A FLUX.1 / FLUX.2 / Krea 2 text encoder or autoencoder: safetensors or GGUF."""
+    path = validate_child_path(requested_path, root, label)
+    if path.suffix.lower() not in NATIVE_COMPONENT_EXTENSIONS:
         raise ValueError(f"{label} must be a .safetensors or .gguf file")
     return path
 
@@ -10383,13 +10396,13 @@ def run_generation(
             diffusion_model = validate_native_diffusion_model(
                 request.diffusion_model, roots["diffusion_model"], "Flux diffusion model"
             )
-            text_encoder = validate_anima_component(
+            text_encoder = validate_native_component(
                 request.text_encoder, roots["text_encoder"], "Flux text encoder"
             )
-            text_encoder_2 = validate_anima_component(
+            text_encoder_2 = validate_native_component(
                 request.text_encoder_2, roots["text_encoder"], "Flux second text encoder"
             )
-            vae = validate_anima_component(request.vae, roots["vae"], "Flux VAE")
+            vae = validate_native_component(request.vae, roots["vae"], "Flux VAE")
             tokenizer_sources = flux_tokenizer_sources()
             checkpoint = diffusion_model
             anima_loras = []
@@ -10410,11 +10423,11 @@ def run_generation(
             diffusion_model = validate_native_diffusion_model(
                 request.diffusion_model, roots["diffusion_model"], "Flux2 diffusion model"
             )
-            text_encoder = validate_anima_component(
+            text_encoder = validate_native_component(
                 request.text_encoder, roots["text_encoder"], "Flux2 text encoder"
             )
             text_encoder_2 = None
-            vae = validate_anima_component(request.vae, roots["vae"], "Flux2 VAE")
+            vae = validate_native_component(request.vae, roots["vae"], "Flux2 VAE")
             tokenizer_sources = flux2_tokenizer_sources()
             checkpoint = diffusion_model
             anima_loras = []
@@ -10435,11 +10448,11 @@ def run_generation(
             diffusion_model = validate_native_diffusion_model(
                 request.diffusion_model, roots["diffusion_model"], "Krea2 diffusion model"
             )
-            text_encoder = validate_anima_component(
+            text_encoder = validate_native_component(
                 request.text_encoder, roots["text_encoder"], "Krea2 text encoder"
             )
             text_encoder_2 = None
-            vae = validate_anima_component(request.vae, roots["vae"], "Krea2 VAE")
+            vae = validate_native_component(request.vae, roots["vae"], "Krea2 VAE")
             tokenizer_sources = krea2_tokenizer_sources()
             checkpoint = diffusion_model
             anima_loras = []
@@ -11536,6 +11549,8 @@ def performance_payload():
             "triton": find_spec("triton") is not None,
             "sage": installed_version("sageattention") is not None and find_spec("triton") is not None,
             "nvfp4": nvfp4_capabilities(torch),
+            # P9: every ComfyUI layout the loaders read, and how each runs on this card.
+            "quantization": quantization_capabilities(),
             # AUTO · 动态决策 stays selectable below the recommended 6 GB; this is only the notice.
             "auto_below_recommended": bool(
                 cuda_available and below_recommended_vram(torch.cuda.get_device_properties(0).total_memory)

@@ -354,6 +354,41 @@ def named_note(workflow):
     return notes[0]["widgets_values"][0] if notes else ""
 
 
+class GgufLoaderTests(unittest.TestCase):
+    """P9: a GGUF component is exported through ComfyUI-GGUF's loaders, never a core loader."""
+
+    def test_a_gguf_model_and_encoder_use_comfyui_gguf_and_say_so(self):
+        workflow = build_workflow(request(
+            engine="Krea2", diffusion_model="krea2-turbo-Q4_K.gguf", text_encoder="Qwen3VL-4B-Q8_0.gguf",
+        ), facts(0, clip_skip=None))
+        self.assertEqual(nodes_of(workflow, "UNETLoader"), [])
+        self.assertEqual(nodes_of(workflow, "CLIPLoader"), [])
+        unet = nodes_of(workflow, "UnetLoaderGGUF")[0]
+        self.assertEqual(named(unet), {"unet_name": "krea2-turbo-Q4_K.gguf"})
+        self.assertEqual(unet["properties"]["cnr_id"], "comfyui-gguf")
+        encoder = nodes_of(workflow, "CLIPLoaderGGUF")[0]
+        self.assertEqual(named(encoder), {"clip_name": "Qwen3VL-4B-Q8_0.gguf", "type": "krea2"})
+        note = named_note(workflow)
+        self.assertTrue(note.startswith("Requires:\n- ComfyUI-GGUF (city96)"), note)
+
+    def test_flux_takes_the_dual_gguf_loader_when_either_encoder_is_gguf(self):
+        workflow = build_workflow(request(engine="Flux", text_encoder_2="t5-v1_1-xxl-encoder-Q8_0.gguf"), facts(0, clip_skip=None, negative=""))
+        self.assertEqual(nodes_of(workflow, "DualCLIPLoader"), [])
+        dual = nodes_of(workflow, "DualCLIPLoaderGGUF")[0]
+        self.assertEqual(named(dual), {"clip_name1": "flux-te.safetensors", "clip_name2": "t5-v1_1-xxl-encoder-Q8_0.gguf", "type": "flux"})
+        self.assertEqual(len(nodes_of(workflow, "UNETLoader")), 1)
+
+    def test_a_gguf_vae_is_named_as_something_comfyui_cannot_load(self):
+        workflow = build_workflow(request(engine="Krea2", vae="qwen_image_vae-BF16.gguf"), facts(0, clip_skip=None))
+        self.assertIn("qwen_image_vae-BF16.gguf is a GGUF VAE", named_note(workflow))
+
+    def test_an_all_safetensors_graph_is_unchanged(self):
+        workflow = build_workflow(request(engine="Flux2"), facts(0, clip_skip=None, negative=""))
+        types = {node["type"] for node in workflow["nodes"]}
+        self.assertFalse(types & {"UnetLoaderGGUF", "CLIPLoaderGGUF", "DualCLIPLoaderGGUF"})
+        self.assertNotIn("Requires:", named_note(workflow))
+
+
 class ContentTests(unittest.TestCase):
     def test_omitted_stages_are_named_not_drawn(self):
         tiled = pixel_unit(2, tiled=True)

@@ -127,12 +127,18 @@ test("recursively discovers each FLUX.2 role in its configured root", async (con
     writeFile(path.join(roots.diffusion_model, "flux2-dev.ckpt"), "not a safetensors file"),
     writeFile(path.join(roots.diffusion_model, "flux2-dev-Q4_K.gguf"), "fixture"),
     writeFile(path.join(roots.text_encoder, "flux2-text-encoder-Q8_0.gguf"), "fixture"),
+    writeFile(path.join(roots.text_encoder, "qwen3-4b-Q4_K_M.gguf"), "fixture"),
+    writeFile(path.join(roots.text_encoder, "qwen3vl-4b-Q8_0.gguf"), "fixture"),
   ]);
 
   const headers = new Map([
     ["flux2-dev.safetensors", flux2DiffusionHeader("model.diffusion_model.")],
     ["flux2-dev-Q4_K.gguf", flux2DiffusionHeader()],
-    ["flux2-text-encoder-Q8_0.gguf", languageModelHeader({ hidden: 5120 })],
+    // What `readGgufHeader` returns: a Mistral (`llama`) file keeps llama.cpp's names, and a Qwen3
+    // or Qwen3-VL file comes back renamed with its family beside the tensors.
+    ["flux2-text-encoder-Q8_0.gguf", { "token_embd.weight": tensor([131072, 5120]), "blk.0.attn_q.weight": tensor([4096, 5120]) }],
+    ["qwen3-4b-Q4_K_M.gguf", { ...languageModelHeader({ hidden: 2560, qwen: true }), __metadata__: { "general.architecture": "qwen3" } }],
+    ["qwen3vl-4b-Q8_0.gguf", { ...languageModelHeader({ hidden: 2560, qwen: true }), __metadata__: { "general.architecture": "qwen3vl" } }],
     ["flux1-dev.safetensors", {
       "double_blocks.0.img_attn.norm.key_norm.scale": tensor([128]),
       "img_in.weight": tensor([3072, 64]),
@@ -147,9 +153,8 @@ test("recursively discovers each FLUX.2 role in its configured root", async (con
   });
 
   assert.deepEqual(discovered.diffusion_model.map((model) => model.value), ["flux2-dev-Q4_K.gguf", "nested/flux2-dev.safetensors"]);
-  // The encoder GGUF classifies, and is still left out: only the diffusion slot reads one.
-  assert.ok(!discovered.text_encoder.some((model) => model.value.endsWith(".gguf")));
-  assert.deepEqual(discovered.text_encoder.map((model) => model.value), ["flux2-text-encoder.safetensors"]);
+  // P9: a Qwen3 GGUF is listed; the Mistral one (never renamed) and Krea 2's Qwen3-VL are not.
+  assert.deepEqual(discovered.text_encoder.map((model) => model.value), ["flux2-text-encoder.safetensors", "qwen3-4b-Q4_K_M.gguf"]);
   assert.deepEqual(discovered.vae.map((model) => model.value), ["flux2-vae.safetensors"]);
   assert.ok(discovered.diffusion_model[0].size > 0);
 });

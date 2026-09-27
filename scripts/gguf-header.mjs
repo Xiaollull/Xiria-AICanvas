@@ -52,11 +52,93 @@ export const GGUF_SUPPORTED_TYPES = new Map([
 
 export const DIFFUSION_MODEL_EXTENSIONS = new Set([".safetensors", ".gguf"]);
 const SAFETENSORS_ONLY_EXTENSIONS = new Set([".safetensors"]);
+// P9: FLUX.1, FLUX.2 and Krea 2 read every component from GGUF as well. A GGUF is only *listed*
+// when its tensors classify as that role, and a llama.cpp encoder only classifies once
+// `renameGgufTextEncoder` has put its tensors back into ComfyUI's names — so a family the runtime
+// cannot map (a Mistral `llama` file) keeps llama.cpp's names, matches no classifier and stays out.
+const NATIVE_COMPONENT_ROLES = new Set(["diffusion_model", "text_encoder", "text_encoder_2", "vae"]);
 
-// Only the diffusion model widens. A text encoder or VAE offered as GGUF would be listed here and
-// then refused by the runtime, which is the failure this whole change exists to remove.
 export function componentFileExtensions(role) {
-  return role === "diffusion_model" ? DIFFUSION_MODEL_EXTENSIONS : SAFETENSORS_ONLY_EXTENSIONS;
+  return NATIVE_COMPONENT_ROLES.has(role) ? DIFFUSION_MODEL_EXTENSIONS : SAFETENSORS_ONLY_EXTENSIONS;
+}
+
+// The same tables as `gguf_loader.GGUF_TEXT_ENCODER_KEY_MAPS`; both test suites pin them literally.
+export const GGUF_TEXT_ENCODER_FAMILIES = new Map([["t5encoder", "t5"], ["t5", "t5"], ["qwen3", "qwen3"], ["qwen3vl", "qwen3"]]);
+export const GGUF_TEXT_ENCODER_KEY_MAPS = {
+  t5: {
+    prefix: "enc.blk.",
+    block: "encoder.block.{index}.",
+    parts: {
+      attn_q: "layer.0.SelfAttention.q",
+      attn_k: "layer.0.SelfAttention.k",
+      attn_v: "layer.0.SelfAttention.v",
+      attn_o: "layer.0.SelfAttention.o",
+      attn_rel_b: "layer.0.SelfAttention.relative_attention_bias",
+      attn_norm: "layer.0.layer_norm",
+      ffn_gate: "layer.1.DenseReluDense.wi_0",
+      ffn_up: "layer.1.DenseReluDense.wi_1",
+      ffn_down: "layer.1.DenseReluDense.wo",
+      ffn_norm: "layer.1.layer_norm",
+    },
+    globals: { token_embd: "shared", "enc.output_norm": "encoder.final_layer_norm" },
+    dropped: [],
+  },
+  qwen3: {
+    prefix: "blk.",
+    block: "model.layers.{index}.",
+    parts: {
+      attn_q: "self_attn.q_proj",
+      attn_k: "self_attn.k_proj",
+      attn_v: "self_attn.v_proj",
+      attn_output: "self_attn.o_proj",
+      attn_q_norm: "self_attn.q_norm",
+      attn_k_norm: "self_attn.k_norm",
+      attn_norm: "input_layernorm",
+      ffn_norm: "post_attention_layernorm",
+      ffn_gate: "mlp.gate_proj",
+      ffn_up: "mlp.up_proj",
+      ffn_down: "mlp.down_proj",
+    },
+    globals: { token_embd: "model.embed_tokens", output_norm: "model.norm" },
+    dropped: ["output.weight"],
+  },
+};
+
+export function ggufTextEncoderKey(name, family) {
+  const table = GGUF_TEXT_ENCODER_KEY_MAPS[family];
+  const dot = name.lastIndexOf(".");
+  if (dot < 0) return null;
+  const stem = name.slice(0, dot);
+  const suffix = name.slice(dot + 1);
+  if (suffix !== "weight" && suffix !== "bias") return null;
+  if (Object.hasOwn(table.globals, stem)) return `${table.globals[stem]}.${suffix}`;
+  if (!stem.startsWith(table.prefix)) return null;
+  const rest = stem.slice(table.prefix.length);
+  const split = rest.indexOf(".");
+  if (split < 0) return null;
+  const index = rest.slice(0, split);
+  const part = rest.slice(split + 1);
+  if (!/^\d+$/.test(index) || !Object.hasOwn(table.parts, part)) return null;
+  return `${table.block.replace("{index}", String(Number(index)))}${table.parts[part]}.${suffix}`;
+}
+
+// A llama.cpp text encoder of a mapped family, in ComfyUI's names; any other file unchanged. A
+// file with even one tensor the table cannot name is returned unchanged too, so it classifies as
+// nothing — the runtime refuses such a file whole rather than loading part of it.
+export function renameGgufTextEncoder(header, architecture) {
+  const family = GGUF_TEXT_ENCODER_FAMILIES.get(String(architecture || "").toLowerCase());
+  if (!family) return header;
+  const table = GGUF_TEXT_ENCODER_KEY_MAPS[family];
+  // The architecture rides along where a safetensors header keeps its metadata: renamed, Qwen3-VL's
+  // language half and Qwen3-4B are the same tensors, and only this tells Krea 2's encoder from FLUX.2's.
+  const renamed = { __metadata__: { "general.architecture": String(architecture).toLowerCase() } };
+  for (const [name, descriptor] of Object.entries(header)) {
+    if (table.dropped.includes(name)) continue;
+    const target = ggufTextEncoderKey(name, family);
+    if (target === null || Object.hasOwn(renamed, target)) return header;
+    renamed[target] = descriptor;
+  }
+  return renamed;
 }
 
 const FIXED_VALUE_SIZES = new Map([[0, 1], [1, 1], [2, 2], [3, 2], [4, 4], [5, 4], [6, 4], [7, 1], [10, 8], [11, 8], [12, 8]]);
@@ -145,8 +227,10 @@ function readMetadataValue(cursor, valueType, keep) {
   return keep ? values : null;
 }
 
+const GGUF_ARCHITECTURE_KEY = "general.architecture";
+
 function wantedMetadataKey(key) {
-  return key.startsWith(COMFY_ORIGINAL_SHAPE_PREFIX);
+  return key === GGUF_ARCHITECTURE_KEY || key.startsWith(COMFY_ORIGINAL_SHAPE_PREFIX);
 }
 
 function originalShape(metadata, name, elements) {
@@ -207,7 +291,7 @@ export function parseGgufHeader(buffer, fileSize) {
   }
   if (!Object.keys(header).length) throw new Error("GGUF file holds no tensors");
   if (cursor.offset > fileSize) throw new Error("GGUF header is truncated");
-  return header;
+  return renameGgufTextEncoder(header, metadata.get(GGUF_ARCHITECTURE_KEY));
 }
 
 export async function readGgufHeader(filePath, maximumHeaderBytes = MAX_GGUF_HEADER_BYTES) {
