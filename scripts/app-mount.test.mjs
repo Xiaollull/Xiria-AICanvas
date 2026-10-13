@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { build as buildFixture } from "vite";
+import react from "@vitejs/plugin-react";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -80,45 +83,33 @@ test("every page mounts and the resample chain can be worked without throwing", 
     return;
   }
 
-  // Ask the OS for a free port and hand that to Vite, rather than parsing one back out of its
-  // ANSI-decorated banner.
-  const scout = createServer();
-  await new Promise((done) => scout.listen(0, "127.0.0.1", done));
-  const port = scout.address().port;
-  await new Promise((done) => scout.close(done));
+  // Real App/lazy chunks and interactions, with the existing CPU-only API fixture.
+  // Never load the production Vite config: its runtime/download recovery belongs
+  // to the application, not a render smoke test. No unexpected API can escape.
+  const profile = await mkdtemp(join(tmpdir(), "xirai-app-mount-"));
+  const output = join(profile, "build");
+  await buildFixture({ configFile: false, root: projectRoot, cacheDir: join(profile, "vite-cache"),
+    plugins: [react()], logLevel: "error", css: { postcss: { plugins: [] } },
+    build: { outDir: output, emptyOutDir: true,
+      rolldownOptions: { input: join(projectRoot, "scripts", "app-mount.test.fixture.html") } } });
+  const html = await readFile(join(output, "scripts", "app-mount.test.fixture.html"), "utf8");
 
-  const vite = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "--port", String(port), "--strictPort"], {
-    cwd: projectRoot, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
-  });
-  let output = "";
-  vite.stdout.on("data", (chunk) => { output += chunk; });
-  vite.stderr.on("data", (chunk) => { output += chunk; });
-
-  const started = await new Promise((done) => {
-    const timer = setInterval(() => {
-      if (output.includes("ready in") && output.includes(String(port))) {
-        clearInterval(timer);
-        done(true);
-      }
-    }, 250);
-    setTimeout(() => { clearInterval(timer); done(false); }, 60000);
-  });
-
-  // The probe has to reach the page, and the page is served by Vite rather than read from disk, so
-  // a proxy in front of it carries the script instead of the repository's own index.html.
+  // Serve the real production App and its lazy chunks over owned HTTP. There is
+  // no dev-client/HMR socket, default-root recovery, browser profile or live API.
   const proxy = createServer(async (request, response) => {
     try {
-      const upstream = await fetch(`http://127.0.0.1:${port}${request.url}`, {
-        headers: { ...request.headers, host: `127.0.0.1:${port}` },
-      });
-      const type = upstream.headers.get("content-type") || "application/octet-stream";
-      if (type.includes("text/html")) {
-        response.writeHead(upstream.status, { "content-type": type });
-        response.end((await upstream.text()).replace("<head>", `<head>${probe}`));
+      if (request.url === "/") {
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.end(html.replace("<head>", `<head>${probe}`));
         return;
       }
-      response.writeHead(upstream.status, { "content-type": type });
-      response.end(Buffer.from(await upstream.arrayBuffer()));
+      if (request.url.startsWith("/api/")) { response.writeHead(409); response.end("Unexpected API forbidden in render fixture"); return; }
+      const file = resolve(output, `.${decodeURIComponent(new URL(request.url, "http://fixture").pathname)}`);
+      if (!file.startsWith(output + "/") && !file.startsWith(output + "\\")) { response.writeHead(403); response.end(); return; }
+      const type = file.endsWith(".js") ? "text/javascript" : file.endsWith(".css") ? "text/css" : file.endsWith(".svg") ? "image/svg+xml" : "application/octet-stream";
+      const content = await readFile(file);
+      response.writeHead(200, { "content-type": type });
+      response.end(content);
     } catch (error) {
       response.writeHead(502);
       response.end(String(error));
@@ -126,10 +117,10 @@ test("every page mounts and the resample chain can be worked without throwing", 
   });
 
   try {
-    assert.ok(started, `the dev server did not start:\n${output.slice(0, 1500)}`);
     await new Promise((done) => proxy.listen(0, "127.0.0.1", done));
     const { stdout } = await execFileAsync(chrome, [
       "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
+      "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
       "--virtual-time-budget=60000", "--dump-dom", `http://127.0.0.1:${proxy.address().port}/`,
     ], { windowsHide: true, timeout: 180000, maxBuffer: 32 * 1024 * 1024 });
 
@@ -153,6 +144,6 @@ test("every page mounts and the resample chain can be worked without throwing", 
     assert.ok(cards >= 4, `adding a unit left ${cards} stage cards`);
   } finally {
     proxy.close();
-    vite.kill();
+    await rm(profile, { recursive: true, force: true });
   }
 });

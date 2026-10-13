@@ -206,7 +206,13 @@ test("image controls use an accessible unclipped dropdown and page-scoped scroll
     assert.ok(select.includes(anchor), `${anchor} is required for the custom dropdown`);
   }
   assert.match(app, /import WorkspaceSelect from "\.\/WorkspaceSelect"/);
-  for (const label of ['ariaLabel="采样器"', 'ariaLabel={`第 ${index + 1} 个 ADetailer 检测模型`}', 'ariaLabel="RTX VSR 处理质量"']) assert.ok(app.includes(`<WorkspaceSelect ${label}`), `${label} uses the shared dropdown on text-to-image`);
+  // Text-to-image draws these through components it shares with the XYZ rail; each uses the dropdown.
+  const sampling = await read("src/SamplingControls.jsx");
+  const aux = await read("src/PostprocessAuxControls.jsx");
+  for (const element of ["<SamplerPair ", "<ADetailerUnitControls ", "<RTXControls "]) assert.ok(app.includes(element), `${element} renders on text-to-image`);
+  for (const [source, label] of [[sampling, "ariaLabel={`${prefix}采样器`}"], [aux, 'ariaLabel="ADetailer 检测模型"'], [aux, 'ariaLabel="RTX VSR 处理质量"']]) {
+    assert.ok(source.includes(`<WorkspaceSelect ${label}`), `${label} uses the shared dropdown on text-to-image`);
+  }
   // The resample unit's own dropdowns come from the shared chain panel, and use the same component.
   const panel = await read("src/ResampleChainPanel.jsx");
   for (const label of ["Seed 模式", "超分模型", "缩放算法", "采样器", "调度器"]) {
@@ -232,10 +238,14 @@ test("image prompts reuse the text-to-image cards and keep transparency below th
     read("src/TransparentBackgroundControl.jsx"),
     read("src/styles.css"),
   ]);
-  assert.match(page, /className=\{`prompt-field positive-field/);
-  assert.match(page, /className="prompt-field negative-field"/);
-  assert.match(page, /<Sparkles className="field-watermark" size=\{46\}/);
-  assert.match(page, /spellCheck=\{false\}/);
+  // The image page draws its prompt pair with the shared `PromptField` card (positive and negative).
+  const field = await read("src/PromptField.jsx");
+  assert.match(page, /import PromptField from "\.\/PromptField\.jsx"/);
+  assert.match(page, /<PromptField type="positive"/);
+  assert.match(page, /<PromptField type="negative"/);
+  assert.match(field, /prompt-field \$\{positive \? "positive-field" : "negative-field"\}/);
+  assert.match(field, /<Sparkles className="field-watermark" size=\{46\}/);
+  assert.match(field, /spellCheck=\{false\}/);
   assert.match(page, /<TransparentBackgroundControl[\s\S]*?className="i2i-transparent-control"/);
   assert.match(page, /\{positivePromptPresets\}/);
   assert.match(page, /\{negativePromptPresets\}/);

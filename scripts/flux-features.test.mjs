@@ -40,11 +40,12 @@ test("the Flux entry point is open on the main page and mounts four components",
   assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2"\]/);
   assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"\]/);
 
-  const picker = sourceBetween(app, "            {isSplitModel ? <div className={`checkpoint-picker split-model-picker", "            {isSplitModel && !engineAllowsLora");
-  assert.match(picker, /\["textEncoder", isFlux \? "文本编码器 · CLIP-L" : isFlux2 \|\| isKrea2 \? "文本编码器 · 大语言模型" : "文本编码器"/);
-  assert.match(picker, /\.\.\.\(isFlux \? \[\["textEncoder2", "文本编码器 · T5-XXL"/);
+  const picker = sourceBetween(app, "            {isSplitModel ? <ModelAssetPicker", "            {isSplitModel && !engineAllowsLora");
+  // The split engines share one `ModelAssetPicker`; each component is a `{ kind, label, ... }` field.
+  assert.match(picker, /\{ kind: "textEncoder", label: isFlux \? "文本编码器 · CLIP-L" : isFlux2 \|\| isKrea2 \? "文本编码器 · 大语言模型" : "文本编码器"/);
+  assert.match(picker, /\.\.\.\(isFlux \? \[\{ kind: "textEncoder2", label: "文本编码器 · T5-XXL"/);
   // The second encoder is a Flux slot, not a fourth Anima component.
-  assert.doesNotMatch(picker, /\["textEncoder2", "文本编码器 · T5-XXL", textEncoder2, textEncoders2, textEncoderDirectory, textEncoder2Missing\],\n/);
+  assert.doesNotMatch(picker, /\n\s*\{ kind: "textEncoder2"/);
 });
 
 test("a Flux generation is guidance distilled: no negative branch, no enhancement, no preview", async () => {

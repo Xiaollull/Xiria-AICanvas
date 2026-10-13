@@ -234,12 +234,18 @@ test("the preset prompt reaches the request body and never the prompt box", asyn
 });
 
 test("both mounted surfaces render one shared panel and one shared group editor", async () => {
-  const [app, page, panel] = await Promise.all([
+  const [app, page, panel, modal] = await Promise.all([
     readSource("src/App.jsx"),
     readSource("src/LoraManagerPage.jsx"),
     readSource("src/LoraMountPanel.jsx"),
+    readSource("src/LoraManagerModal.jsx"),
   ]);
-  for (const [name, source] of [["App.jsx", app], ["LoraManagerPage.jsx", page]]) {
+  assert.match(app, /<LoraManagerModal/);
+  assert.match(app, /groups: activeLoraGroups,/);
+  assert.match(app, /cards: loraCardControls, onLoras: commitMountedLoras, onGroups: commitLoraGroups/);
+  assert.match(modal, /<LoraMountPanel[^>]*groups=\{c\.groups\}[^>]*cards=\{c\.cards\}[^>]*onUpdateLoras=\{c\.onLoras\}[^>]*onUpdateGroups=\{c\.onGroups\}/);
+  assert.match(modal, /<LoraGroupPanel[^>]*groups=\{c\.groups\}[^>]*cards=\{c\.cards\}[^>]*onUpdateGroups=\{c\.onGroups\}/);
+  for (const [name, source] of [["LoraManagerPage.jsx", page]]) {
     assert.match(source, /<LoraMountPanel[\s\S]*groups=\{activeLoraGroups\}/, `${name} passes groups to the shared panel`);
     assert.match(source, /<LoraGroupPanel/, `${name} exposes the group editor`);
     // One bundle of card controls rather than a prop per capability, and the same
@@ -342,9 +348,11 @@ test("a gallery card records the combinations its image was generated with", asy
   // One composition feeds both the request and the record, so a card can never
   // disagree with what was submitted.
   assert.match(app, /prompt: generationPrompt,/);
-  // Exactly three sites: one actual prompt composition for each generation page, plus the
-  // workspace-built card's derived prefix. The image page reuses its frozen local result.
-  assert.equal([...app.matchAll(/composeGroupPrompt\(/g)].length, 3);
+  // XYZ baseline capture and apply now compose too. Check the real frozen-run
+  // owners rather than counting unrelated compositions across the whole file.
+  assert.match(app, /const generationGroupPrompt = composeGroupPrompt\(generationGroups, ""\)/);
+  assert.match(app, /const runGroupPrompt = composeGroupPrompt\(runGroups, ""\)/);
+  assert.match(app, /loraGroupPrompt: runGroupPrompt/);
   assert.match(app, /loraGroupPrompt: composeGroupPrompt\(enabled, ""\)/);
   // The record is this run's facts; the group library still stays out.
   assert.match(app, /delete source\.loraGroupsByEngine;/);
@@ -422,7 +430,7 @@ test("every path that builds a card carries the group record", async () => {
   // fields only on the first left the other two blank.
   assert.match(app, /const galleryCardSettings = \(source, \{ record \} = \{\}\)/);
   assert.match(app, /currentSettings=\{galleryCardSettings\(workspaceSnapshot\.current\)\}/);
-  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/,
+  assert.match(app, /settings=\{galleryAddSource \? galleryCardSettings\(galleryAddSource\.settings, \{ record: true \}\) : generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/,
     "a result without a frozen record cannot fall back to today's groups");
   // No card-producing path may reach for the raw helper again.
   assert.equal([...app.matchAll(/gallerySettingsWithoutPromptPresets\(/g)].length, 5,

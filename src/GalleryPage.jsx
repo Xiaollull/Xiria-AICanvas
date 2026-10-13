@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { LORA_PUBLICATION_EVENT } from "./lora-library-client.js";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle,
@@ -12,6 +13,7 @@ import {
   ChevronRight,
   FileSearch,
   Copy,
+  FolderArchive,
   FolderPlus,
   FolderOpen,
   ImageIcon,
@@ -33,7 +35,7 @@ import {
 } from "lucide-react";
 import { SAMPLER_NAMES as SAMPLERS, SCHEDULER_NAMES as SCHEDULERS } from "./sampling-options";
 import { normalizeHiresSeed, normalizeUint64Seed, secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
-import { DEFAULT_SETTINGS, GUIDANCE, boundedGalleryImageIndex, clone, displayTitle, distributeGalleryCards, galleryImageSeed, galleryRequest, normalizedSettings, useDialogLifecycle } from "./gallery-core";
+import { DEFAULT_SETTINGS, GUIDANCE, boundedGalleryImageIndex, clone, displayTitle, distributeGalleryCards, galleryImageSeed, galleryRequest, normalizedSettings, useDialogLifecycle, withGalleryLoraRevision } from "./gallery-core";
 import { galleryAutoScrollStep, galleryDropAnchor, galleryOrderChanged, galleryPointerIsCoarse, galleryPressIntent, gallerySlotShifts, resolveDropIndex, spliceGalleryOrder, GALLERY_CLICK_SWALLOW_MS, GALLERY_DRAG_HOLD_MS } from "./gallery-drag.js";
 import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
@@ -42,6 +44,7 @@ import { engineGuidance, isSplitEngine } from "./engine-settings.js";
 import { NATIVE_STEP_ENGINES, adetailerSummary, normalizeADetailerUnits } from "./adetailer-units.js";
 import ResampleChainPanel from "./ResampleChainPanel.jsx";
 import GalleryOutputDrawer from "./GalleryOutputDrawer.jsx";
+import GalleryTransferDialog from "./GalleryTransferDialog.jsx";
 import { GALLERY_IMAGE_INFO_READ_LIMIT, galleryCardFromImageInfo, imageInfoHasGenerationData, imageInfoRecordedSeed } from "./gallery-image-info.js";
 import { extractPromptLoras, modelDisplayName } from "./image-metadata.js";
 import { clipSkipRange, normalizeClipSkip } from "./clip-skip.js";
@@ -1078,12 +1081,13 @@ function GalleryCardEditor({
     const payload = {
       collection_id: selectedCollection,
       title: title.trim() || null,
-      settings: {
+      // An edited card keeps the revision it was read at; a new card is stamped with the current one.
+      settings: withGalleryLoraRevision({
         ...savedSettings,
         imageSeeds: images.map((image) => normalizeUint64Seed(image.seed, "")),
         imageHiresSeedModes: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? firstRedrawUnit?.seedMode, image.hiresSeed ?? firstRedrawUnit?.seed).seedMode),
         imageHiresSeeds: images.map((image) => normalizeHiresSeed(image.hiresSeedMode ?? firstRedrawUnit?.seedMode, image.hiresSeed ?? firstRedrawUnit?.seed).seed),
-      },
+      }),
       // An output picture travels as its `asset_id` only; the server copies the file it names.
       images: images.map((image) => image.kind === "existing"
         ? { gallery_image_id: image.id }
@@ -1486,6 +1490,7 @@ export default function GalleryPage({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [collectionDialog, setCollectionDialog] = useState(null);
+  const [transferOpen, setTransferOpen] = useState(false);
   const [editor, setEditor] = useState(null);
   const [dragState, setDragState] = useState(null);
   const dragGhostRef = useRef(null);
@@ -1538,6 +1543,7 @@ export default function GalleryPage({
     }
   };
   useEffect(() => { void refresh(); void refreshPrompts(); }, []);
+  useEffect(() => { const published = () => { void refresh(); }; window.addEventListener(LORA_PUBLICATION_EVENT, published); return () => window.removeEventListener(LORA_PUBLICATION_EVENT, published); }, []);
   useEffect(() => {
     if (!focus || loading) return;
     if (focus.collectionId) { setActiveSection("gallery"); setSelectedCollection(focus.collectionId); }
@@ -1755,6 +1761,12 @@ export default function GalleryPage({
     setSelectedCard(card);
     onNotice("精选卡片已保存");
   };
+  const transferImported = async (result) => {
+    const first = result.collections?.[0]?.id;
+    await refresh();
+    // The dialog's own receipt reports the result; a toast here would sit on its footer at phone width.
+    if (first) { setActiveSection("gallery"); setSelectedCollection(first); setSelectedCard(null); }
+  };
   const savePromptEntry = async () => {
     setPromptDialog(null);
     await refreshPrompts();
@@ -1827,7 +1839,7 @@ export default function GalleryPage({
           <div className="gallery-room-tools">
             <label ref={searchBoxRef}><Search size={15} /><input type="search" value={gallerySearch} onChange={(event) => setGallerySearch(event.target.value)} placeholder="搜索标题、Prompt、模型或 LoRA" />{gallerySearch && <button type="button" aria-label="清空搜索" onClick={() => setGallerySearch("")}><X size={13} /></button>}</label>
             <div className="gallery-room-filters">{[["all", "全部"], ["single", "单图"], ["multi", "多图"], ["text", "无图卡片"]].map(([id, label]) => <button type="button" className={galleryFilter === id ? "active" : ""} key={id} onClick={() => setGalleryFilter(id)}>{label}</button>)}</div>
-            <div className="gallery-room-actions"><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={14} />新建收藏夹</button>{selectedCollectionRecord && <AddCardTile collectionId={selectedCollectionRecord.id} onAdd={(id, initialImages) => setEditor({ mode: "create", collectionId: id, initialImages })} onDropError={(message) => onNotice(message, true)} />}{selectedCollectionRecord && <button type="button" onClick={() => setCollectionDialog({ mode: "edit", collection: selectedCollectionRecord })}><Pencil size={14} />管理</button>}<button type="button" onClick={() => void refresh()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={14} />刷新</button></div>
+            <div className="gallery-room-actions"><button type="button" onClick={() => setCollectionDialog({ mode: "create" })}><FolderPlus size={14} />新建收藏夹</button>{selectedCollectionRecord && <AddCardTile collectionId={selectedCollectionRecord.id} onAdd={(id, initialImages) => setEditor({ mode: "create", collectionId: id, initialImages })} onDropError={(message) => onNotice(message, true)} />}{selectedCollectionRecord && <button type="button" onClick={() => setCollectionDialog({ mode: "edit", collection: selectedCollectionRecord })}><Pencil size={14} />管理</button>}<button type="button" className="gallery-transfer-entry" onClick={() => setTransferOpen(true)}><FolderArchive size={14} />导入 / 导出</button><button type="button" onClick={() => void refresh()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={14} />刷新</button></div>
           </div>
           <div className="gallery-room-meta"><span>{filteredCards.length} STUDIES</span><i /><span>{visibleImageCount} IMAGES</span><b>按住卡片可拖拽排序 · 右键管理</b></div>
           <div className="gallery-scroll gallery-room-scroll">
@@ -1844,6 +1856,7 @@ export default function GalleryPage({
     {selectedCard && createPortal(<GalleryDetail card={selectedCard} cards={viewerCards} onBack={() => setSelectedCard(null)} onNavigate={setSelectedCard} onEdit={(card) => { setSelectedCard(null); setEditor({ mode: "edit", card }); }} onDelete={deleteCard} onApply={onApplySettings} onNotice={onNotice} />, document.body)}
     {dragState && createPortal(<div ref={dragGhostRef} className="gallery-drag-ghost"><Images size={14} /><span><strong>正在排序</strong><small>{displayTitle(data.cards.find((card) => card.id === dragState.cardId), 42)}</small></span></div>, document.body)}
     {cardMenu && <GalleryCardMenu menu={cardMenu} onClose={() => setCardMenu(null)} onEdit={editFromCardMenu} onDelete={deleteFromCardMenu} />}
+    {transferOpen && createPortal(<GalleryTransferDialog collections={data.collections} cards={data.cards} currentCollection={selectedCollection} onClose={() => setTransferOpen(false)} onImported={transferImported} />, document.body)}
     {collectionDialog && <CollectionDialog collection={collectionDialog.collection} onClose={() => setCollectionDialog(null)} onSaved={saveCollection} onDeleted={collectionDeleted} />}
     {/* Portalled like the detail viewer: the page is a stacking context under the sticky header,
         which otherwise covered the editor's top edge. */}

@@ -163,9 +163,9 @@ from diffusers import (
     StableDiffusionXLPipeline,
     UniPCMultistepScheduler,
 )
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator, model_validator
 from PIL import Image, ImageDraw
 from PIL.PngImagePlugin import PngInfo
 from safetensors import safe_open
@@ -180,7 +180,12 @@ try:
         GalleryValidationError,
     )
 except ImportError:
-    from gallery import (
+    # Run as a script (`python backend/inference_server.py`, how Vite starts the service): the gallery
+    # still loads as `backend.gallery`. It reaches its P10 siblings by relative import
+    # (`.lora_relink_store`, `.lora_library_gate`), which fails in a top-level `gallery` module and
+    # broke every gallery request, and it must share `backend.lora_library_gate` with this module.
+    # PROJECT_ROOT is on sys.path above.
+    from backend.gallery import (
         UNSET as GALLERY_UNSET,
         GalleryConflictError,
         GalleryNotFoundError,
@@ -260,6 +265,7 @@ try:
         DEFAULT_OUTPUT_TEMPLATE,
         OUTPUT_TEMPLATE_PLACEHOLDERS,
         OutputPathError,
+        OutputTarget,
         normalize_output_template,
         output_root_display,
         output_target,
@@ -416,6 +422,7 @@ except ImportError:
         DEFAULT_OUTPUT_TEMPLATE,
         OUTPUT_TEMPLATE_PLACEHOLDERS,
         OutputPathError,
+        OutputTarget,
         normalize_output_template,
         output_root_display,
         output_target,
@@ -797,6 +804,8 @@ async def lifespan(_app):
     yield
     shutdown_requested = True
     gpu_sensor_sampler.stop()
+    for entry in list(globals().get("_xyz_exports_running", {}).values()):
+        entry["cancel"].set()
     with jobs_lock:
         controls = list(job_controls.values())
     for control in controls:
@@ -829,6 +838,39 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="XiriaCanvas AI Inference", docs_url=None, redoc_url=None, lifespan=lifespan)
+try:
+    from . import wd14
+except ImportError:
+    import wd14
+wd14.OUTPUT_ROOT = OUTPUT_DIRECTORY
+app.include_router(wd14.router)
+
+# GPU taggers share the existing single generation executor; CPU taggers do not.
+# Submit under jobs_lock to linearize against a generation admission. A later
+# generation queues behind this bounded disposable worker, never overlaps it.
+_tagger_gpu_admission = threading.Lock()
+
+
+def tagger_generation_busy():
+    with jobs_lock:
+        return any(job["status"] in JOB_ACTIVE_STATUSES for job in jobs.values())
+
+
+def run_tagger_gpu(operation):
+    if not _tagger_gpu_admission.acquire(blocking=False):
+        raise ValueError("已有 GPU 反推请求，请稍后重试")
+    try:
+        with jobs_lock:
+            if shutdown_requested or any(job["status"] in JOB_ACTIVE_STATUSES for job in jobs.values()):
+                raise ValueError("生图任务正在运行/排队；拒绝抢占 GPU，未卸载生图缓存")
+            future = executor.submit(operation)
+        return future.result()
+    finally:
+        _tagger_gpu_admission.release()
+
+
+wd14.tagger_resources.GPU_RUN = run_tagger_gpu
+wd14.tagger_resources.GPU_BUSY = tagger_generation_busy
 INFERENCE_PROTOCOL = 39
 WORKSPACE_ID = os.environ.get("INFERENCE_WORKSPACE_ID")
 
@@ -2322,6 +2364,11 @@ def job_queue_entry(job: dict, running_seen: bool) -> dict:
         "waiting": job["status"] == "queued",
         "active": job["status"] in JOB_ACTIVE_STATUSES,
         "running_ahead": running_seen,
+        # Additive (QPlan2/P1 B): a parent XYZ experiment row and its bounded cell counts.
+        "kind": job.get("kind") or "generation",
+        "xyz": copy.deepcopy(job.get("xyz")) if job.get("kind") == "xyz_plot" else None,
+        # Additive (QPlan2/P2): which workspace owns this parent. Absent means a plain XYZ experiment.
+        "origin": copy.deepcopy(job.get("origin")) if job.get("kind") == "xyz_plot" else None,
     }
 
 
@@ -9913,6 +9960,24 @@ def save_image(
         parameters["output_template"] = request.output_template
     if inline_loras:
         parameters["inline_loras"] = copy.deepcopy(list(inline_loras))
+    job_record = globals().get("jobs", {}).get(job_id, {})
+    execution_audit = job_record.get("lora_library")
+    if execution_audit:
+        parameters["lora_library"] = copy.deepcopy(execution_audit)
+    if job_record.get("xyz_parent"):
+        # One cell of an XYZ experiment; its own settings above stay the single-image record. In a
+        # batch each image names its own cell (image_index is 1-based within the single batch).
+        cells = job_record.get("xyz_cells") or [job_record.get("xyz_cell")]
+        cell_id = cells[image_index - 1] if 0 < image_index <= len(cells) else None
+        parameters["xyz_plot"] = {"experiment_id": job_record["xyz_parent"], "cell_id": cell_id,
+                                  "attempt": (job_record.get("xyz_attempts") or {}).get(cell_id, job_record.get("xyz_attempt")),
+                                  **({"batch_size": len(cells), "batch_index": image_index - 1} if len(cells) > 1 else {})}
+        parameters['xyz_plot'].update((job_record.get('xyz_asset_identity') or {}).get(cell_id) or {})
+        # QPlan2/P2: a search round's cell also records which candidate it is, separately from the ordinary
+        # single-image fields. Global background and tested members are listed apart and never merged.
+        mix_block = mix_cell_provenance(job_record["xyz_parent"], cell_id)
+        if mix_block:
+            parameters["lora_mix_search"] = mix_block
     lora_fusion = getattr(loaded_pipeline, "_xiriai_lora_fusion_report", None)
     if request.engine in {"SD", "iL"} and isinstance(lora_fusion, dict):
         # The report contains only basenames, counts and a digest of the trusted
@@ -10283,6 +10348,8 @@ def run_generation(
     request: GenerateInput,
     audit_request: GenerateInput | None = None,
     inline_lora_audit=None,
+    *,
+    image_seeds=None,
 ):
     global active_attention_backend, active_vae_mode, active_conditioning_cache
     control = job_controls.get(job_id)
@@ -10367,6 +10434,13 @@ def run_generation(
     reset_stage_schedule()
     active_conditioning_cache = StaticConditioningCache()
     try:
+        # Internal only (XYZ Phase C): one batch whose images carry their own frozen seeds instead
+        # of the consecutive `batch_seeds` offsets. Checked before any model work.
+        if image_seeds is not None:
+            if request.batch_count != 1 or len(image_seeds) != request.images_per_batch or any(
+                type(seed) is not int or not 0 <= seed <= 0xFFFFFFFFFFFFFFFF for seed in image_seeds
+            ):
+                raise ValueError("image_seeds must hold one uint64 int per image of a single batch")
         control.checkpoint(job_id, "Preparing model")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU is required for local generation")
@@ -10771,7 +10845,7 @@ def run_generation(
                 update_job(job_id, phase=f"Restoring model · Batch {batch_index + 1}/{request.batch_count}", stage="model_restore")
                 restore_parked_pipeline()
 
-            seeds = batch_seeds(request, batch_index)
+            seeds = list(image_seeds) if image_seeds is not None else batch_seeds(request, batch_index)
             generators = [torch.Generator(device="cpu").manual_seed(seed) for seed in seeds]
             batch_start = 25 + 73 * batch_index / request.batch_count
             batch_end = 25 + 73 * (batch_index + 1) / request.batch_count
@@ -10853,6 +10927,8 @@ def run_generation(
                 anima_batch_size = (active_memory_strategy or {}).get(
                     "sampling_batch_size", request.images_per_batch
                 )
+                # What actually shares one sampling call; a micro-batched run is sequential sampling.
+                update_job(job_id, sampling_batch_size=min(request.images_per_batch, max(1, int(anima_batch_size or request.images_per_batch))))
                 if source_image is not None:
                     anima_chunk_size = max(1, int(anima_batch_size or request.images_per_batch))
                     # `refine_batch` is the same native path Hires.fix and ADetailer refine through,
@@ -10956,6 +11032,7 @@ def run_generation(
                 flux_batch_size = (active_memory_strategy or {}).get(
                     "sampling_batch_size", request.images_per_batch
                 )
+                update_job(job_id, sampling_batch_size=min(request.images_per_batch, max(1, int(flux_batch_size or request.images_per_batch))))
                 if source_image is not None:
                     # Same shape as the Anima branch: `refine_batch` takes one image per generator
                     # and has no subdivision of its own, so the memory strategy's chunk size is
@@ -11022,6 +11099,8 @@ def run_generation(
                 # image-to-image pipeline — the one Hires.fix already derives for its refinement
                 # pass — so the factory is the only difference between the two branches.
                 sampling_factory = AutoPipelineForImage2Image if source_image is not None else None
+                # One Diffusers call samples every image of the batch together.
+                update_job(job_id, sampling_batch_size=request.images_per_batch)
                 pipeline_kwargs = (
                     source_image_pipeline_kwargs(request, source_image, generators, on_step_end, conditioning)
                     if source_image is not None
@@ -11311,6 +11390,8 @@ def run_generation(
                 status="error",
                 phase="Failed",
                 stage="error",
+                # Additive: lets an XYZ batch retry smaller without parsing the message.
+                failure_kind="oom",
                 # A stage AUTO could not place says which stage, on what canvas, needing how much
                 # against how much (QPlan P8 §3.6); a bare allocator failure keeps the old advice.
                 error=(
@@ -11771,14 +11852,160 @@ def hardware():
 
 
 @app.post("/api/inference/jobs", status_code=202)
-def create_job(request: GenerateInput):
-    if shutdown_requested:
-        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+def create_job(request: GenerateInput, http_request: Request = None):
+    from backend.lora_library_gate import library_admission, LibraryGateError
+    try:
+        # Covers the COMPLETE preflight + queued-record/executor admission. Node
+        # commit holds this same lease while checking jobs_lock and publishing;
+        # neither side can pass a check then enter concurrently on the other.
+        uses_loras = bool(request.loras or has_extra_network_tag(request.prompt) or has_extra_network_tag(request.negative_prompt))
+        with library_admission(STATE_DIRECTORY, check_publication=uses_loras) as revision:
+            if revision and uses_loras:
+                if http_request is not None and http_request.headers.get("x-xirai-lora-revision") != str(revision):
+                    raise HTTPException(409, "LoRA published revision changed; refetch before submitting")
+            return _create_job_admitted(request, library_revision=revision if uses_loras else 0, http_request=http_request)
+    except LibraryGateError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+def _validate_library_execution(request, http_request, inline_audit=None, submitted_request=None, *, context=None, sha=None):
+    # `context` is the per-row identity evidence an XYZ cell froze at submit; ordinary jobs
+    # carry it in the X-XirAI-LoRA-Context header instead. `sha` lets one experiment hash an
+    # unchanged file once; every identity/stat check below still runs on every call.
+    try:
+        registry = json.loads((STATE_DIRECTORY / "lora-library" / "registry.json").read_text(encoding="utf-8"))
+    except (ValueError, OSError) as error:
+        raise HTTPException(409, "LoRA identity schema cannot be read safely") from error
+    if not isinstance(registry, dict) or registry.get("schemaVersion") != 1 or not isinstance(registry.get("instances"), dict) or any(not isinstance(item, dict) for item in registry["instances"].values()):
+        raise HTTPException(409, "LoRA identity schema cannot be read safely")
+    sha = sha or file_sha256
+    if context is not None:
+        if not isinstance(context, list) or len(context) > len(request.loras) or len(context) > 16:
+            raise HTTPException(400, "Invalid LoRA execution context")
+    elif http_request is None:
+        context = []
+    else:
+        raw = http_request.headers.get("x-xirai-lora-context", "[]")
+        if len(raw) > 20000:
+            raise HTTPException(400, "LoRA execution context too large")
+        try:
+            context = json.loads(raw)
+        except ValueError as error:
+            raise HTTPException(400, "Invalid LoRA execution context") from error
+        if not isinstance(context, list) or len(context) > len(request.loras) or len(context) > 16:
+            raise HTTPException(400, "Invalid LoRA execution context")
+    root = native_model_roots(request.engine)["lora"] if request.engine in NATIVE_ENGINES else model_roots(request.engine)[1]
+    extensions = ANIMA_LORA_EXTENSIONS if request.engine in NATIVE_ENGINES else LORA_EXTENSIONS
+    audit = []
+    if submitted_request is not None and request.engine in {"SD", "iL"}:
+        from backend.inline_lora import parse_inline_tags
+        for text in [submitted_request.prompt, submitted_request.negative_prompt]:
+            _stripped, tags = parse_inline_tags(text, "submitted")
+            for name, _weight, _source in tags:
+                # A root file's extensionless name also happens to be a valid
+                # exact identifier in the old parser. It still cannot prove
+                # which registered copy a bare user-authored name intended.
+                if "/" not in name and "\\" not in name and not Path(name).suffix:
+                    candidates = [instance for instance in registry["instances"].values() if instance.get("engine") == request.engine
+                                  and Path(instance.get("value", "")).stem.casefold() == name.casefold()]
+                    if len(candidates) > 1:
+                        raise HTTPException(409, "Bare inline LoRA name cannot choose between registered copies; use an exact relative reference")
+    for match in inline_audit or []:
+        if match.get("identical_copies", 0) > 0 and any(instance.get("engine") == request.engine and instance.get("value") == match["id"] for instance in registry["instances"].values()):
+            raise HTTPException(409, "Bare inline LoRA name cannot choose between registered copies; use an exact relative reference")
+    for index, item in enumerate(request.loras):
+        try:
+            actual = resolve_model_path(item.path, root, extensions, "LoRA")
+            before = actual.stat()
+            evidence = context[index] if index < len(context) else None
+            if evidence is not None and not isinstance(evidence, dict):
+                raise ValueError("Invalid execution context row")
+            if evidence and evidence.get("contentHash") and not evidence.get("instanceId") and sha(actual) != evidence["contentHash"]:
+                raise ValueError("LoRA execution content changed")
+            if not evidence or not evidence.get("instanceId"):
+                candidates = [instance for instance in registry.get("instances", {}).values() if instance.get("engine") == request.engine and (instance.get("value") == item.path or item.path in instance.get("history", []))]
+                if len(candidates) > 1 or (candidates and (candidates[0].get("status") != "present" or candidates[0].get("value") != item.path)):
+                    raise ValueError("Historical/path-reused reference requires explicit identity")
+                if candidates:
+                    evidence = {"instanceId": candidates[0]["instanceId"], "contentHash": candidates[0]["contentHash"]}
+            if evidence and evidence.get("instanceId"):
+                instance = registry.get("instances", {}).get(evidence["instanceId"])
+                if not instance or instance.get("engine") != request.engine or instance.get("status") != "present" or instance.get("value") != item.path or instance.get("contentHash") != evidence.get("contentHash"):
+                    raise ValueError("LoRA execution identity changed")
+                if instance.get("fsIdentity"):
+                    from backend.lora_file_identity import file_identity
+                    identity = file_identity(actual)
+                    expected = instance["fsIdentity"]
+                    fingerprint = instance.get("fingerprint", "").split(":")
+                    creation_matches = identity and (identity["creation"] == expected["creation"] or (identity["kind"] == "posix" and identity["creation"] == "0" and len(fingerprint) == 7 and str(before.st_ctime_ns) == fingerprint[4]))
+                    if not identity or identity["key"] != expected["key"] or not creation_matches:
+                        raise ValueError("LoRA execution file instance changed")
+                else:
+                    fingerprint = instance.get("fingerprint", "").split(":")
+                    if len(fingerprint) != 7 or any(str(value) != fingerprint[index] for index, value in [(0, before.st_dev), (1, before.st_ino), (2, before.st_size), (3, before.st_mtime_ns), (4, before.st_ctime_ns), (6, before.st_nlink)]):
+                        raise ValueError("Unverified LoRA instance revision changed")
+                if sha(actual) != instance["contentHash"]:
+                    raise ValueError("LoRA bytes changed since the confirmed identity")
+                audit.append({"engine": request.engine, "instanceId": instance["instanceId"], "contentHash": instance["contentHash"], "contentRevision": instance["contentRevision"], "executedReference": item.path})
+            elif any(instance.get("engine") == request.engine and item.path in instance.get("history", []) for instance in registry.get("instances", {}).values()):
+                raise ValueError("Reused/historical LoRA path needs explicit instance evidence")
+            after = actual.stat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError("LoRA changed during execution admission")
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise HTTPException(409, "LoRA target is missing, changed or identity-conflicted; review the repair") from error
+    return audit
+
+
+@app.post("/api/inference/lora-library/admission")
+def lora_library_admission(payload: dict, http_request: Request):
+    # Private delegated owner observation, not user authentication. Public repair
+    # admission is checked separately in Node. Direct network callers cannot
+    # bypass the actual state-directory lease with a backend identity HMAC.
+    from backend.lora_library_gate import verify_node_lease, LibraryGateError
+    from urllib.parse import urlsplit
+    origin = urlsplit(http_request.headers.get("origin", ""))
+    if not http_request.client or http_request.client.host not in {"127.0.0.1", "::1", "::ffff:127.0.0.1", "testclient"} or origin.netloc != http_request.headers.get("host") or origin.scheme not in {"http", "https"}:
+        raise HTTPException(403, "Local same-origin coordinator request required")
+    try:
+        verify_node_lease(STATE_DIRECTORY, payload.get("leaseToken"))
+    except (LibraryGateError, OSError, ValueError) as error:
+        raise HTTPException(403, "Coordinator does not own the admission lease") from error
+    with jobs_lock:
+        busy = shutdown_requested or any(job["status"] in JOB_ACTIVE_STATUSES for job in jobs.values())
+    if busy:
+        raise HTTPException(409, "Active, queued or recovering generation prevents LoRA repair")
+    return {"idle": True, "protocol": INFERENCE_PROTOCOL}
+
+
+@dataclass
+class AdmittedGeneration:
+    """A request that passed every pre-queue check, with the audit facts the job record keeps."""
+
+    request: "GenerateInput"
+    submitted_request: "GenerateInput"
+    inline_lora_audit: list
+    execution_audit: list | None
+    prompt_encoding_audit: object
+    directives: dict
+
+
+def _admit_generation_request(request: GenerateInput, *, library_revision=0, http_request=None, lora_context=None, sha=None):
+    """Every check an ordinary job passes before it may queue. XYZ cells run the same function.
+
+    `lora_context` (XYZ) forces the complete identity validation with frozen per-row evidence,
+    independent of whether a publication revision exists; ordinary jobs keep the revision rule.
+    """
     submitted_request = request
     try:
         request, inline_lora_audit = preflight_inline_lora_request(request)
     except (InlineLoraError, ValueError, OSError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    # Inline preflight materializes additional adapters. Validate the COMPLETE
+    # executable list under the admission lease, not merely the incoming mounts.
+    execution_audit = None
+    if library_revision or lora_context is not None:
+        execution_audit = _validate_library_execution(request, http_request, inline_lora_audit, submitted_request, context=lora_context, sha=sha)
     try:
         validate_latent_resample_request(request)
         validate_diffusers_postprocess_schedules(request)
@@ -11847,6 +12074,121 @@ def create_job(request: GenerateInput):
             require_background_removal_model(request.background_removal_model)
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+    return AdmittedGeneration(request, submitted_request, inline_lora_audit, execution_audit, prompt_encoding_audit, directives)
+
+
+def generation_job_record(job_id, admitted: AdmittedGeneration, *, sequence, execution_audit=None, gallery_access_token=None):
+    """The queued record of one generation. Ordinary jobs and XYZ cells share it."""
+    request, submitted_request = admitted.request, admitted.submitted_request
+    directives = admitted.directives
+    prompt_encoding_audit, inline_lora_audit = admitted.prompt_encoding_audit, admitted.inline_lora_audit
+    return {
+        "id": job_id,
+        "sequence": sequence,
+        "status": "queued",
+        "phase": "Queued",
+        "stage": "queued",
+        "stage_step": 0,
+        "stage_total": 0,
+        "progress": 0,
+        "step": 0,
+        "total_steps": request.steps,
+        # Carried on the record so the queue list can describe a job that has not started and
+        # has no diagnostics of its own yet.
+        "width": request.width,
+        "height": request.height,
+        "images_per_batch": request.images_per_batch,
+        "batch_count": request.batch_count,
+        "batch_index": 0,
+        "completed_images": 0,
+        "total_images": request.images_per_batch * request.batch_count,
+        "outputs": [],
+        "stage_previews": [],
+        "seed": str(request.seed),
+        "base_seed": str(request.seed),
+        "hires_seed_mode": request.resample_units[0].seed_mode if request.resample_units else "inherit",
+        "hires_seed": None,
+        "transparent_background": directives["transparent_background"],
+        # The picture itself never reaches the job record: it is polled several times a second
+        # by the workspace, and a megabyte of base64 in every response would be the dominant
+        # cost of watching a run.
+        "source_image_enabled": request.source_image.enabled,
+        "source_image_name": request.source_image.name or None,
+        "source_image_resize_mode": request.source_image.resize_mode if request.source_image.enabled else None,
+        "img2img_fix_steps": uses_diffusers_img2img_fix_steps(request),
+        "img2img_schedule_steps": img2img_schedule_steps(request),
+        # The effective layer, never the raw field: an absent SD/iL value records what ran.
+        "clip_skip": effective_clip_skip(request),
+        # Relative to the output root and frozen with the job; `None` is the historical scheme.
+        "output_template": request.output_template,
+        "background_removal_model": request.background_removal_model,
+        "background_removal": None,
+        "resample_units": len(request.active_resample_units),
+        "rtx_enabled": request.rtx.enabled,
+        "rtx_scale": request.rtx.scale if request.rtx.enabled else None,
+        "rtx_quality": request.rtx.quality if request.rtx.enabled else None,
+        "postprocess_chain": [stage.model_dump() for stage in request.postprocess_chain],
+        "postprocess_stages": postprocess_stage_types(request),
+        "postprocess_only": request.postprocess_only,
+        "created_at": time.time(),
+        "error": None,
+        "warning": None,
+        # The submitted source is immutable audit data. Runtime sampling uses
+        # the stripped request produced above, while PNG metadata and failed
+        # jobs retain exactly what the client sent.
+        "prompt": submitted_request.prompt,
+        "negative_prompt": submitted_request.negative_prompt,
+        "prompt_encoding": copy.deepcopy(prompt_encoding_audit),
+        "prompt_tokens": None,
+        "prompt_blocks": None,
+        "prompt_weighted_tokens": None,
+        "negative_prompt_tokens": None,
+        "negative_prompt_blocks": None,
+        "negative_prompt_weighted_tokens": None,
+        "inline_loras": copy.deepcopy(inline_lora_audit),
+        "adetailer_state": None,
+        "elapsed_seconds": 0.0,
+        "paused_seconds": 0.0,
+        "memory_mode": None,
+        "memory_label": None,
+        "memory_reason": None,
+        "attention_backend": None,
+        "compute_dtype": None,
+        "vae_mode": None,
+        "offload_mode": None,
+        "model_resident": False,
+        "model_cached": loaded_pipeline is not None,
+        "model_reused": False,
+        "runtime_metrics": None,
+        "loaded_checkpoint": Path(loaded_checkpoint).name if loaded_checkpoint else None,
+        "loaded_model_assets": loaded_model_asset_references(),
+        "loaded_engine": loaded_engine,
+        "requested_engine": request.engine,
+        "requested_checkpoint": public_model_reference(
+            request.diffusion_model if request.engine in NATIVE_ENGINES else request.checkpoint
+        ),
+        "requested_model_assets": {
+            key: value
+            for key, value in {
+                "diffusion_model": public_model_reference(request.diffusion_model),
+                "text_encoder": public_model_reference(request.text_encoder),
+                "text_encoder_2": public_model_reference(request.text_encoder_2),
+                "vae": public_model_reference(request.vae),
+            }.items()
+            if value is not None
+        } if request.engine in NATIVE_ENGINES else {},
+        "gallery_settings": copy.deepcopy(request.gallery_settings),
+        "lora_library": copy.deepcopy(execution_audit) if execution_audit else None,
+        "gallery_access_token_digest": gallery_access_digest(gallery_access_token) if gallery_access_token else None,
+    }
+
+
+def _create_job_admitted(request: GenerateInput, execution_audit=None, *, library_revision=0, http_request=None):
+    if shutdown_requested:
+        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    admitted = _admit_generation_request(request, library_revision=library_revision, http_request=http_request)
+    if library_revision:
+        execution_audit = admitted.execution_audit
     # This bearer is returned only to the submitting browser. The record holds its digest, so a
     # second LAN client that can list job IDs cannot read another client's saved Prompt snapshot.
     gallery_access_token = secrets.token_urlsafe(32) if request.gallery_settings is not None else None
@@ -11858,117 +12200,25 @@ def create_job(request: GenerateInput):
         job_id = uuid.uuid4().hex
         job_controls[job_id] = JobControl()
         trim_job_history()
-        jobs[job_id] = {
-            "id": job_id,
-            "sequence": next(job_sequence),
-            "status": "queued",
-            "phase": "Queued",
-            "stage": "queued",
-            "stage_step": 0,
-            "stage_total": 0,
-            "progress": 0,
-            "step": 0,
-            "total_steps": request.steps,
-            # Carried on the record so the queue list can describe a job that has not started and
-            # has no diagnostics of its own yet.
-            "width": request.width,
-            "height": request.height,
-            "images_per_batch": request.images_per_batch,
-            "batch_count": request.batch_count,
-            "batch_index": 0,
-            "completed_images": 0,
-            "total_images": request.images_per_batch * request.batch_count,
-            "outputs": [],
-            "stage_previews": [],
-            "seed": str(request.seed),
-            "base_seed": str(request.seed),
-            "hires_seed_mode": request.resample_units[0].seed_mode if request.resample_units else "inherit",
-            "hires_seed": None,
-            "transparent_background": directives["transparent_background"],
-            # The picture itself never reaches the job record: it is polled several times a second
-            # by the workspace, and a megabyte of base64 in every response would be the dominant
-            # cost of watching a run.
-            "source_image_enabled": request.source_image.enabled,
-            "source_image_name": request.source_image.name or None,
-            "source_image_resize_mode": request.source_image.resize_mode if request.source_image.enabled else None,
-            "img2img_fix_steps": uses_diffusers_img2img_fix_steps(request),
-            "img2img_schedule_steps": img2img_schedule_steps(request),
-            # The effective layer, never the raw field: an absent SD/iL value records what ran.
-            "clip_skip": effective_clip_skip(request),
-            # Relative to the output root and frozen with the job; `None` is the historical scheme.
-            "output_template": request.output_template,
-            "background_removal_model": request.background_removal_model,
-            "background_removal": None,
-            "resample_units": len(request.active_resample_units),
-            "rtx_enabled": request.rtx.enabled,
-            "rtx_scale": request.rtx.scale if request.rtx.enabled else None,
-            "rtx_quality": request.rtx.quality if request.rtx.enabled else None,
-            "postprocess_chain": [stage.model_dump() for stage in request.postprocess_chain],
-            "postprocess_stages": postprocess_stage_types(request),
-            "postprocess_only": request.postprocess_only,
-            "created_at": time.time(),
-            "error": None,
-            "warning": None,
-            # The submitted source is immutable audit data. Runtime sampling uses
-            # the stripped request produced above, while PNG metadata and failed
-            # jobs retain exactly what the client sent.
-            "prompt": submitted_request.prompt,
-            "negative_prompt": submitted_request.negative_prompt,
-            "prompt_encoding": copy.deepcopy(prompt_encoding_audit),
-            "prompt_tokens": None,
-            "prompt_blocks": None,
-            "prompt_weighted_tokens": None,
-            "negative_prompt_tokens": None,
-            "negative_prompt_blocks": None,
-            "negative_prompt_weighted_tokens": None,
-            "inline_loras": copy.deepcopy(inline_lora_audit),
-            "adetailer_state": None,
-            "elapsed_seconds": 0.0,
-            "paused_seconds": 0.0,
-            "memory_mode": None,
-            "memory_label": None,
-            "memory_reason": None,
-            "attention_backend": None,
-            "compute_dtype": None,
-            "vae_mode": None,
-            "offload_mode": None,
-            "model_resident": False,
-            "model_cached": loaded_pipeline is not None,
-            "model_reused": False,
-            "runtime_metrics": None,
-            "loaded_checkpoint": Path(loaded_checkpoint).name if loaded_checkpoint else None,
-            "loaded_model_assets": loaded_model_asset_references(),
-            "loaded_engine": loaded_engine,
-            "requested_engine": request.engine,
-            "requested_checkpoint": public_model_reference(
-                request.diffusion_model if request.engine in NATIVE_ENGINES else request.checkpoint
-            ),
-            "requested_model_assets": {
-                key: value
-                for key, value in {
-                    "diffusion_model": public_model_reference(request.diffusion_model),
-                    "text_encoder": public_model_reference(request.text_encoder),
-                    "text_encoder_2": public_model_reference(request.text_encoder_2),
-                    "vae": public_model_reference(request.vae),
-                }.items()
-                if value is not None
-            } if request.engine in NATIVE_ENGINES else {},
-            "gallery_settings": copy.deepcopy(request.gallery_settings),
-            "gallery_access_token_digest": gallery_access_digest(gallery_access_token) if gallery_access_token else None,
-        }
+        jobs[job_id] = generation_job_record(
+            job_id, admitted, sequence=next(job_sequence), execution_audit=execution_audit,
+            gallery_access_token=gallery_access_token,
+        )
         # Snapshot before the worker can write progress fields, so response serialization never
         # races with `update_job()` on the shared record.
         response = public_job_view(jobs[job_id])
         if gallery_access_token:
             response["gallery_access_token"] = gallery_access_token
-    executor.submit(run_generation, job_id, request, submitted_request, inline_lora_audit)
+    executor.submit(run_generation, job_id, admitted.request, admitted.submitted_request, admitted.inline_lora_audit)
     return response
 
 
 @app.get("/api/inference/jobs/active")
 def get_active_job():
     with jobs_lock:
-        active = [job for job in jobs.values() if job["status"] in JOB_ACTIVE_STATUSES]
+        # An XYZ parent and its cells belong to the XYZ workspace, never the ordinary result panel.
+        active = [job for job in jobs.values() if job["status"] in JOB_ACTIVE_STATUSES
+                  and job.get("kind") != "xyz_plot" and not job.get("xyz_parent")]
         if not active:
             return {"job": None}
         # The job being worked on, not the newest submission. With a queue those differ, and a
@@ -11986,11 +12236,12 @@ def list_jobs():
     the package empties it and numbering starts again at one.
     """
     with jobs_lock:
-        ordered = sorted(jobs.values(), key=lambda item: item.get("sequence", 0))
+        # An XYZ cell is shown through its parent row, not as a queue entry of its own.
+        ordered = sorted((job for job in jobs.values() if not job.get("xyz_parent")), key=lambda item: item.get("sequence") or 0)
         entries = []
         running_seen = False
         for job in ordered:
-            entries.append(job_queue_entry(job, running_seen))
+            entries.append(job_queue_entry(xyz_display_job(job) if job.get("kind") == "xyz_plot" else job, running_seen))
             if job["status"] in JOB_ACTIVE_STATUSES and job["status"] != "queued":
                 running_seen = True
         counts = {"queued": 0, "running": 0, "complete": 0, "error": 0, "cancelled": 0}
@@ -12008,7 +12259,7 @@ def get_job(job_id: str, x_xirai_gallery_access: str | None = Header(default=Non
         job = jobs.get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Generation job not found")
-        payload = public_job_view(job)
+        payload = xyz_display_job(job) if job.get("kind") == "xyz_plot" else public_job_view(job)
         control = job_controls.get(job_id)
         completed_gallery_settings = (
             copy.deepcopy(job.get("gallery_settings"))
@@ -12038,6 +12289,8 @@ def get_controllable_job(job_id: str):
 
 @app.post("/api/inference/jobs/{job_id}/pause")
 def pause_job(job_id: str):
+    if is_xyz_parent(job_id):
+        return {"status": xyz_control(job_id, "pause")["status"]}
     control, status = get_controllable_job(job_id)
     if status in {"paused", "pausing"}:
         return {"status": status}
@@ -12048,6 +12301,8 @@ def pause_job(job_id: str):
 
 @app.post("/api/inference/jobs/{job_id}/resume")
 def resume_job(job_id: str):
+    if is_xyz_parent(job_id):
+        return {"status": xyz_control(job_id, "resume")["status"]}
     control, status = get_controllable_job(job_id)
     if status not in {"paused", "pausing"}:
         raise HTTPException(status_code=409, detail="Generation job is not paused")
@@ -12058,6 +12313,8 @@ def resume_job(job_id: str):
 
 @app.post("/api/inference/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
+    if is_xyz_parent(job_id):
+        return {"status": xyz_control(job_id, "stop")["status"]}
     control, status = get_controllable_job(job_id)
     if status == "cancelling":
         return {"status": status}
@@ -12115,6 +12372,1351 @@ def get_job_image_at(job_id: str, image_index: int):
     return FileResponse(output_path, media_type="image/png", filename=Path(output_path).name, headers={"Cache-Control": "no-store"})
 
 
+# ------------------------------------------------------------------------------------------------
+# QPlan2/P1 Phase B · XYZ experiments.
+#
+# A queued, running or decision-paused experiment is ONE parent record in `jobs`, so every busy
+# gate that already reads that registry (LoRA repair admission, model-cache unload, performance
+# changes, the GPU tagger) stays closed for its whole life — between cells too. The parent takes
+# one slot of the single executor and runs each cell through the unchanged `run_generation` /
+# `save_image` path on that same thread: no nested executor submit, no second pipeline. Durable
+# definitions and per-cell results belong to `backend/xyz_experiments.py`.
+# ------------------------------------------------------------------------------------------------
+from backend.xyz_experiments import (  # noqa: E402 - beside the routes that own it
+    EXPERIMENT_ACTIVE as XYZ_ACTIVE,
+    MAX_CONCURRENCY as XYZ_MAX_CONCURRENCY,
+    CellRefused,
+    ExperimentError,
+    ExperimentRunner,
+    ExperimentStopped,
+    ExperimentStore,
+    experiment_id_for,
+    process_owner,
+    project_batches,
+    submission_digest,
+)
+from backend.xyz_planner import CAPABILITIES as XYZ_CAPABILITIES, PlanningError, compile_xyz, plan_record  # noqa: E402
+from backend import lora_mix_search as mix_search  # noqa: E402
+from backend import xyz_task_deletion as task_deletion  # noqa: E402
+from backend.xyz_schema import XYZContinueInput, XYZDecisionInput, XYZExperimentInput, XYZExportInput, XYZSubmitInput  # noqa: E402
+from backend.xyz_grid import ExportCancelled, GridError, axis_text as xyz_grid_axis_text, estimate as xyz_grid_estimate, export_grid as xyz_export_grid  # noqa: E402
+
+XYZ_ISSUE_LIMIT = 200
+XYZ_ADMISSION_WAIT_SECONDS = 10.0
+_xyz_store = None
+_xyz_store_lock = threading.Lock()
+_xyz_executor_refs = set()  # Includes cancelled-but-not-yet-drained executor slots.
+
+
+class XYZJobControl(JobControl):
+    """A parent's control. Pause/resume/cancel reach the cell currently running, under one lock,
+    so a stop that races a cell's start can never miss it."""
+
+    def __init__(self):
+        super().__init__()
+        self.child = None
+
+    def attach(self, child):
+        with self.condition:
+            self.child = child
+            if self.cancelled:
+                child.cancel()
+            elif self.paused:
+                child.request_pause()
+
+    def detach(self):
+        with self.condition:
+            self.child = None
+
+    def request_pause(self):
+        with self.condition:
+            accepted = super().request_pause()
+            if accepted and self.child is not None:
+                self.child.request_pause()
+            return accepted
+
+    def resume(self):
+        with self.condition:
+            accepted = super().resume()
+            if accepted and self.child is not None:
+                self.child.resume()
+            return accepted
+
+    def cancel(self):
+        with self.condition:
+            super().cancel()
+            if self.child is not None:
+                self.child.cancel()
+
+
+def xyz_process_owner():
+    owner = process_owner()
+    psutil = psutil_module()
+    if psutil is not None:
+        with suppress(Exception):
+            owner["started"] = psutil.Process().create_time()
+    return owner
+
+
+def xyz_owner_alive(owner):
+    """True only for a live process that is provably the recorded owner (host, PID and start time)."""
+    if not isinstance(owner, dict) or owner.get("host") != process_owner()["host"]:
+        return False
+    pid, started = owner.get("pid"), owner.get("started")
+    if type(pid) is not int or pid == os.getpid() or not isinstance(started, (int, float)):
+        return False
+    psutil = psutil_module()
+    if psutil is None:
+        return False
+    try:
+        return abs(psutil.Process(pid).create_time() - started) < 1.0
+    except Exception:
+        return False
+
+
+def xyz_asset_exists(relative):
+    if not isinstance(relative, str) or not relative:
+        return False
+    try:
+        path = (OUTPUT_DIRECTORY / relative).resolve()
+    except (OSError, ValueError):
+        return False
+    return OUTPUT_DIRECTORY.resolve() in path.parents and path.is_file()
+
+
+def xyz_asset_url(asset_id):
+    return f"/api/inference/history/assets/{asset_id}"
+
+
+def xyz_verify_asset(definition, planned, current):
+    from backend.xyz_assets import asset_expectation, verify_path
+    output = current.get('output') or {}
+    path = xyz_contained_output(output.get('relative'))
+    if path is None:
+        raise ValueError('原图缺失或不在合法输出目录')
+    expected = asset_expectation(definition, planned, output, current['attempts'])
+    result = verify_path(path, expected, output.get('asset_fingerprint'))
+    return {'status': 'verified', 'assurance': result['assurance'],
+            'limitation': '旧记录仅验证 XYZ 元数据/种子/尺寸，不能证明像素与最初完成时相同；未补写 SHA' if result['assurance'] == 'legacy_metadata_only' else None}
+
+
+def xyz_store():
+    """The experiment owner for the current state directory, loaded (and recovered) once."""
+    global _xyz_store
+    root = STATE_DIRECTORY / "xyz-plots"
+    with _xyz_store_lock:
+        if _xyz_store is None or _xyz_store.root != root:
+            _xyz_store = ExperimentStore(root, owner=xyz_process_owner(), owner_alive=xyz_owner_alive,
+                                         asset_exists=xyz_asset_exists, verify_asset=xyz_verify_asset)
+            xyz_sweep_export_temporaries()
+        store = _xyz_store
+    store.ensure_loaded()
+    return store
+
+
+def xyz_http_error(error):
+    if isinstance(error, ExperimentError):
+        return HTTPException(error.status, {"code": error.code, "message": str(error)})
+    if isinstance(error, PlanningError):
+        return HTTPException(422, {"code": error.code, "message": str(error)})
+    if isinstance(error, ValidationError):
+        return HTTPException(422, {"code": "invalid", "message": "; ".join(
+            f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}" for item in error.errors()[:8])})
+    raise TypeError(error)
+
+
+def xyz_detail_text(detail):
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail)
+    if isinstance(detail, list):
+        return "; ".join(str(item.get("msg", item)) if isinstance(item, dict) else str(item) for item in detail[:8])
+    return str(detail)
+
+
+def xyz_model_reference_valid(engine, field, value):
+    """The same path/containment validators run_generation applies, per (engine, kind, reference)."""
+    try:
+        if engine in {"SD", "iL"}:
+            if field != "checkpoint":
+                return False
+            resolve_model_path(value, model_roots(engine)[0], CHECKPOINT_EXTENSIONS, "Checkpoint")
+        elif engine == "Anima":
+            validate_anima_component(value, anima_model_roots()[field], field)
+        else:
+            roots = native_model_roots(engine)
+            root = roots["text_encoder" if field == "text_encoder_2" else field]
+            (validate_native_diffusion_model if field == "diffusion_model" else validate_native_component)(value, root, field)
+        return True
+    except (ValueError, OSError, KeyError, TypeError):
+        return False
+
+
+def xyz_model_catalog(draft: XYZExperimentInput):
+    """Authoritative (engine, kind, reference) triples for every model the draft names."""
+    fields = XYZ_CAPABILITIES["engines"][draft.engine]["model_fields"]
+    parameters = draft.baseline.parameters.model_dump()
+    candidates = {(field, parameters[field]) for field in fields if isinstance(parameters.get(field), str)}
+    for axis in draft.axes.values():
+        if axis is None:
+            continue
+        for entry in axis.values:
+            if axis.field in fields and isinstance(entry.value, str):
+                candidates.add((axis.field, entry.value))
+            elif axis.field == "components" and isinstance(entry.value, dict):
+                candidates.update((field, entry.value[field]) for field in fields if isinstance(entry.value.get(field), str))
+    return {(draft.engine, field, value) for field, value in candidates if xyz_model_reference_valid(draft.engine, field, value)}
+
+
+def xyz_uses_loras(draft: XYZExperimentInput):
+    return bool(draft.baseline.loras) or any(axis is not None and axis.field.startswith("lora_") for axis in draft.axes.values())
+
+
+def xyz_lora_registry():
+    path = STATE_DIRECTORY / "lora-library" / "registry.json"
+    if not path.exists():
+        return None
+    try:
+        registry = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as error:
+        raise HTTPException(409, "LoRA identity schema cannot be read safely") from error
+    if not isinstance(registry, dict) or registry.get("schemaVersion") != 1 or not isinstance(registry.get("instances"), dict):
+        raise HTTPException(409, "LoRA identity schema cannot be read safely")
+    return registry
+
+
+def xyz_sha_memo():
+    """Hash each unchanged LoRA file once per submission/run. Identity and stat checks still run."""
+    cache = {}
+
+    def sha(path):
+        stat = Path(path).stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+        if key not in cache:
+            cache[key] = file_sha256(path)
+        return cache[key]
+    return sha
+
+
+def xyz_lora_context(cell):
+    return [{"instanceId": reference["instanceId"], "contentHash": reference["contentHash"]} for reference in cell["lora_references"]]
+
+
+def xyz_trial_request(request):
+    """A preview/frozen request in strict wire form: decimal seed strings become the Python int
+    GenerateInput takes; unresolved preview symbols use a legal placeholder (never an RNG draw)."""
+    trial = copy.deepcopy(request)
+    seed = str(trial["seed"])
+    trial["seed"] = 0 if seed.startswith("unresolved:") else int(seed)
+    for stage in trial.get("postprocess_chain") or []:
+        if stage.get("type") == "resample" and stage.get("enabled") is True and "seed" in stage:
+            stage["seed_mode"] = "fixed"
+            stage["seed"] = "0" if str(stage["seed"]).startswith("unresolved:") else str(int(stage["seed"]))
+    return trial
+
+
+def xyz_cell_issue(cell, code, message):
+    return {"code": code, "message": message, "coordinate": cell.coordinate.model_dump(), "cell_id": cell.cell_id, "labels": cell.labels}
+
+
+def xyz_admit_plan(draft: XYZExperimentInput, *, uses_loras):
+    """Planner + the ordinary pre-queue admission for every cell. Caller holds the LoRA lease."""
+    registry = xyz_lora_registry() if uses_loras else None
+    catalog = xyz_model_catalog(draft)
+    plan = compile_xyz(draft, model_catalog=catalog, lora_registry=registry)
+    issues = [issue.model_dump(mode="json") for issue in plan.errors]
+    if not issues:
+        sha = xyz_sha_memo()
+        for cell in plan.cells:
+            try:
+                request = GenerateInput.model_validate(xyz_trial_request(cell.request))
+                _admit_generation_request(request, lora_context=xyz_lora_context(cell.model_dump()) if request.loras else None, sha=sha)
+            except ValidationError as error:
+                issues.append(xyz_cell_issue(cell, "request", xyz_detail_text(xyz_http_error(error).detail)))
+            except HTTPException as error:
+                issues.append(xyz_cell_issue(cell, "admission", xyz_detail_text(error.detail)))
+    return plan, issues, catalog, registry
+
+
+def xyz_plan_preview(plan, issues, group_by_resources=False):
+    switches = {"model": 0, "loras": 0}
+    previous = None
+    for cell in plan.cells:
+        request = cell.request
+        models = tuple(request.get(key) for key in ("checkpoint", "diffusion_model", "text_encoder", "text_encoder_2", "vae"))
+        loras = tuple((item["path"], item["weight"]) for item in request["loras"])
+        if previous is not None:
+            switches["model"] += models != previous[0]
+            switches["loras"] += loras != previous[1]
+        previous = (models, loras)
+    return {
+        "ok": not issues, "engine": plan.engine, "total_cells": plan.total_cells, "dimensions": plan.dimensions,
+        "seed_status": plan.seed_status, "seed_policy": plan.seed_policy, "requested_concurrency": plan.requested_concurrency,
+        "max_concurrency": XYZ_MAX_CONCURRENCY, "switches": switches,
+        "batches": xyz_batch_projection(plan, group_by_resources) if not issues else None,
+        "errors": issues[:XYZ_ISSUE_LIMIT], "error_count": len(issues),
+        "cells": [{"id": cell.cell_id, "labels": cell.labels, "seed": str(cell.request["seed"]),
+                   "loras": len(cell.request["loras"]), "steps": cell.request["steps"], "cfg": cell.request["cfg"]}
+                  for cell in plan.cells],
+    }
+
+
+def xyz_batch_projection(plan, group_by_resources):
+    """How the runner would group this plan: same function, so the preview cannot disagree.
+    Runtime micro-batching or an OOM split may still lower the actual size."""
+    batches = project_batches([cell.model_dump(mode="json") for cell in plan.cells], plan.requested_concurrency,
+                              group_by_resources=group_by_resources)
+    sizes = {}
+    for batch in batches:
+        sizes[batch["size"]] = sizes.get(batch["size"], 0) + 1
+    return {"count": len(batches), "sizes": {str(size): count for size, count in sorted(sizes.items(), reverse=True)},
+            "first_reason": batches[0]["reason"] if batches else None,
+            "reasons": list(dict.fromkeys(batch["reason"] for batch in batches))[:6]}
+
+
+def xyz_concurrency_issue(draft):
+    if draft.requested_concurrency > XYZ_MAX_CONCURRENCY:
+        return {"code": "concurrency", "message": f"服务端最大并发为 {XYZ_MAX_CONCURRENCY}（与普通单批图片数上限一致）；请调低并发，不会自动降低"}
+    return None
+
+
+def xyz_parent_fields(summary):
+    counts, total = summary["counts"], summary["total_cells"]
+    finished = sum(counts[key] for key in ("complete", "error", "skipped", "cancelled", "missing"))
+    status = "cancelled" if summary["status"] == "interrupted" else summary["status"]
+    decision = summary.get("decision")
+    if decision:
+        phase = f"格 {decision['cell_id']} 失败 · 等待选择（重试 / 跳过 / 停止）"
+    elif status == "queued":
+        phase = "XYZ 实验排队中"
+    elif status in {"running", "pausing", "paused", "cancelling"}:
+        current = summary.get("current_cells") or ([summary["current_cell"]] if summary.get("current_cell") else [])
+        phase = {"pausing": "XYZ · 当前步完成后暂停", "cancelling": "XYZ · 正在停止"}.get(
+            status, f"XYZ · 已完成 {finished}/{total} 格" + (f" · 批次 {len(current)} 张：{'、'.join(current[:4])}{'…' if len(current) > 4 else ''}" if len(current) > 1
+                                                       else f" · {current[0]}" if current else ""))
+    elif status == "complete":
+        phase = f"XYZ 完成 · {counts['complete']}/{total} 格" + (f" · {counts['error']} 格失败" if counts["error"] else "")
+    elif summary["status"] == "interrupted":
+        phase = "XYZ 已中断 · 可明确继续"
+    elif status == "cancelled":
+        phase = f"XYZ 已停止 · 保留 {counts['complete']} 格原图"
+    else:
+        phase = "XYZ 编排错误 · 已完成格保留"
+    return {
+        "kind": "xyz_plot", "status": status, "phase": phase, "stage": "xyz", "stage_step": finished, "stage_total": total,
+        "progress": round(100 * finished / total) if total else 0, "step": 0, "total_steps": 0,
+        "requested_engine": summary["engine"], "requested_checkpoint": public_model_reference(summary["model"]) if summary.get("model") else None,
+        "requested_model_assets": {}, "width": summary.get("canvas", [None, None])[0], "height": summary.get("canvas", [None, None])[1],
+        "seed": None, "total_images": total, "completed_images": counts["complete"], "images_per_batch": 1, "batch_count": 1,
+        "batch_index": 0, "outputs": [], "stage_previews": [],
+        "error": (decision or {}).get("error") or summary.get("error"),
+        "started_at": summary.get("started_at"),
+        "completed_at": summary.get("completed_at") if status in JOB_FINISHED_STATUSES else None,
+        "xyz": {"experiment_id": summary["id"], "total": total, "counts": counts, "decision": decision,
+                "current_cells": summary.get("current_cells") or [],
+                "current_cell": summary.get("current_cell"), "dimensions": summary["dimensions"],
+                "requested_concurrency": summary["requested_concurrency"], "effective_concurrency": summary["effective_concurrency"]},
+        "origin": copy.deepcopy(summary.get("origin")),
+    }
+
+
+def mix_cell_provenance(experiment_id, cell_id):
+    """Versioned audit block for one search-round cell, or None for every other experiment."""
+    try:
+        record = (xyz_store().records.get(experiment_id) or {}).get("definition") or {}
+        origin = record.get("origin")
+        if not isinstance(origin, dict) or origin.get("kind") != "lora_mix_search" or origin.get("schema_version") != 1 or not cell_id:
+            return None
+        x_index = int(str(cell_id).split(":")[0])
+        candidate = next((item for item in origin["candidates"] if item["x_index"] == x_index), None)
+        if candidate is None:
+            return None
+        members = origin["rules"]["members"]
+        return {
+            "schema_version": 1, "session_id": origin["session_id"], "round": origin["round"], "context_hash": origin["context_hash"],
+            "candidate_id": candidate["id"], "candidate_key": candidate["key"], "displacement": mix_search.format_units(candidate["displacement"]),
+            "global_loras": [{key: item.get(key) for key in ("instanceId", "contentHash", "contentRevision", "weight", "precision", "enabled", "name") if key in item} for item in origin["global_loras"]],
+            "test_loras": [{"instanceId": member["ref"]["instanceId"], "contentHash": member["ref"]["contentHash"], "contentRevision": member["ref"]["contentRevision"], "name": member["ref"].get("name"),
+                            "weight": mix_search.format_units(candidate["weights"][member["ref"]["instanceId"]]), "locked": member["rule"].get("locked") is True} for member in members],
+            "search_recipe": {"algorithm": origin["algorithm"], "max_displacement": origin["rules"]["max_displacement"], "limit_units": origin["rules"]["limit_units"],
+                              "rules_digest": mix_search.sha256(mix_search.canonical(origin["rules"]))[:16], "seeds": origin["seeds"]},
+        }
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def xyz_publish(experiment_id):
+    """Mirror the durable experiment into its parent record (session queue view)."""
+    fields = xyz_parent_fields(xyz_store().summary(experiment_id, verify_assets=False))
+    with jobs_lock:
+        job = jobs.get(experiment_id)
+        if job is not None:
+            job.update(fields)
+
+
+def xyz_queue(experiment_id):
+    """(Re)create the parent record and take ONE executor slot for the orchestrator."""
+    fields = xyz_parent_fields(xyz_store().summary(experiment_id, verify_assets=False))
+    with jobs_lock:
+        trim_job_history()
+        job = jobs.get(experiment_id) or {"id": experiment_id, "sequence": next(job_sequence), "created_at": time.time()}
+        job.update(fields, xyz_current_job=None)
+        jobs[experiment_id] = job
+        job_controls[experiment_id] = XYZJobControl()
+        _xyz_executor_refs.add(experiment_id)
+        try:
+            executor.submit(run_xyz_experiment, experiment_id)
+        except BaseException:
+            _xyz_executor_refs.discard(experiment_id)
+            raise
+
+
+def xyz_display_job(job):
+    """A parent's public view with the running cell's live progress folded in. Holds jobs_lock."""
+    view = public_job_view(job)
+    child = jobs.get(job.get("xyz_current_job") or "")
+    if child is None:
+        return view
+    total = max(1, job.get("stage_total") or 1)
+    cell_progress = child.get("progress") or 0
+    view.update(
+        phase=f"{job.get('phase') or ''} · {child.get('phase') or ''}".strip(" ·"),
+        progress=min(99, round(100 * ((job.get("stage_step") or 0) + cell_progress / 100) / total)),
+        step=child.get("step") or 0, total_steps=child.get("total_steps") or 0,
+        cell_stage=child.get("stage"), cell_progress=cell_progress,
+        stage_previews=(child.get("stage_previews") or [])[-1:],
+    )
+    if child.get("status") in {"paused", "pausing"} and job.get("status") in {"running", "pausing", "paused"}:
+        view["status"] = child["status"]
+    return view
+
+
+class XYZRuntimeHooks:
+    """inference-service side of ExperimentRunner: admission, one cell, the parent record.
+
+    Bound to the control its own run was queued with, so a decision answered in the instant
+    before this run releases its slot can never have its fresh control popped by the old run.
+    """
+
+    def __init__(self, experiment_id):
+        self.sha = xyz_sha_memo()
+        with jobs_lock:
+            self.control = job_controls.get(experiment_id)
+
+    def checkpoint(self, experiment_id, phase):
+        control = self.control
+        if not isinstance(control, XYZJobControl) or shutdown_requested:
+            raise ExperimentStopped(interrupted=shutdown_requested)
+        try:
+            control.checkpoint(experiment_id, phase)
+        except GenerationCancelled as error:
+            raise ExperimentStopped(interrupted=shutdown_requested) from error
+        if shutdown_requested:
+            raise ExperimentStopped(interrupted=True)
+
+    def admit(self, experiment_id, cell_ids):
+        """Execution-time recheck of the frozen batch: identity/bytes, models, resources.
+
+        Every member's frozen request equals the lead's except its base seed (the runner groups by
+        that signature; checked again here). The batch request is the lead's with
+        images_per_batch = len(cells); each image keeps its own frozen seed via `image_seeds`.
+        """
+        from backend.lora_library_gate import library_admission, LibraryGateError
+        store = xyz_store()
+        frozen = [store.frozen_cell(experiment_id, cell_id)[0] for cell_id in cell_ids]
+        lead = frozen[0]
+        strip = lambda cell: {key: value for key, value in cell["request"].items() if key != "seed"}
+        if any(strip(cell) != strip(lead) or cell["lora_references"] != lead["lora_references"] for cell in frozen[1:]):
+            raise CellRefused("批次成员的冻结请求不一致（除种子外）；拒绝合批")
+        trial = xyz_trial_request(lead["request"])
+        trial.update(images_per_batch=len(frozen), batch_count=1)
+        try:
+            request = GenerateInput.model_validate(trial)
+        except ValidationError as error:
+            raise CellRefused(f"冻结请求不再满足当前严格协议：{xyz_detail_text(xyz_http_error(error).detail)}") from error
+        seeds = [int(str(cell["request"]["seed"])) for cell in frozen]
+        try:
+            with library_admission(STATE_DIRECTORY, check_publication=bool(request.loras), wait=XYZ_ADMISSION_WAIT_SECONDS):
+                admitted = _admit_generation_request(request, lora_context=xyz_lora_context(lead) if request.loras else None, sha=self.sha)
+        except LibraryGateError as error:
+            raise CellRefused(f"LoRA 资料库准入未通过：{error}") from error
+        except HTTPException as error:
+            raise CellRefused(xyz_detail_text(error.detail)) from error
+        return admitted, seeds
+
+    def run(self, experiment_id, cell_ids, attempts, admitted):
+        admitted, seeds = admitted
+        from backend.xyz_assets import asset_expectation, verify_path
+        store = xyz_store()
+        with store.lock:
+            frozen = store.record(experiment_id)
+            definition = copy.deepcopy(frozen['definition'])
+            planned_cells = {cell_id: copy.deepcopy(frozen['cells'][cell_id]) for cell_id in cell_ids}
+        identities = {cell_id: {'coordinate': planned_cells[cell_id]['coordinate'],
+                               'definition_digest': definition['digest'],
+                               'request_sha256': asset_expectation(definition, planned_cells[cell_id], {'width': 0, 'height': 0}, attempts[cell_id])['request_sha256']}
+                      for cell_id in cell_ids}
+        child_id = uuid.uuid4().hex
+        control = self.control
+        with jobs_lock:
+            parent = jobs.get(experiment_id)
+            child_control = JobControl()
+            job_controls[child_id] = child_control
+            record = generation_job_record(child_id, admitted, sequence=(parent or {}).get("sequence"), execution_audit=admitted.execution_audit)
+            record.update(xyz_parent=experiment_id, xyz_cell=cell_ids[0], xyz_cells=list(cell_ids),
+                          xyz_attempt=attempts[cell_ids[0]], xyz_attempts=dict(attempts), xyz_asset_identity=identities)
+            jobs[child_id] = record
+            if parent is not None:
+                parent["xyz_current_job"] = child_id
+        if isinstance(control, XYZJobControl):
+            control.attach(child_control)
+        else:
+            child_control.cancel()
+        try:
+            run_generation(child_id, admitted.request, admitted.submitted_request, admitted.inline_lora_audit,
+                           image_seeds=None if len(seeds) == 1 else seeds)
+        finally:
+            if isinstance(control, XYZJobControl):
+                control.detach()
+            with jobs_lock:
+                if parent is not None and parent.get("xyz_current_job") == child_id:
+                    parent["xyz_current_job"] = None
+                child = jobs.pop(child_id, None) or {}
+                job_controls.pop(child_id, None)
+            cleanup_job_stage_previews(child_id)
+        status = child.get("status")
+        sampling = child.get("sampling_batch_size")
+        outputs = child.get("outputs") or []
+        if status == "complete" and len(outputs) == len(cell_ids):
+            mapped = {}
+            # Output i is image i of the batch, generated from seeds[i] — i.e. cell_ids[i].
+            for cell_id, seed, output in zip(cell_ids, seeds, outputs):
+                if str(output.get("seed")) != str(seed):
+                    return {"status": "error", "job_id": child_id, "sampling_batch_size": sampling,
+                            "error": f"批次输出与格的种子映射不一致（{cell_id}）；未记录任何结果"}
+                mapped[cell_id] = {
+                    "relative": output["output_relative"], "asset_id": output["asset_id"], "name": output["output_name"],
+                    "width": output["width"], "height": output["height"], "seed": output.get("seed"),
+                    "resample_seeds": output.get("resample_seeds"), "elapsed_seconds": child.get("elapsed_seconds"),
+                    "warning": child.get("warning"), "memory_mode": child.get("memory_mode"),
+                    "lora_library": copy.deepcopy(child.get("lora_library")),
+                }
+                # save_image has finished final PNG metadata publication. Capture before the
+                # ExperimentRunner can publish this cell's successful state, never on recovery.
+                try:
+                    path = xyz_contained_output(mapped[cell_id]['relative'])
+                    expected = asset_expectation(definition, planned_cells[cell_id], mapped[cell_id], attempts[cell_id])
+                    mapped[cell_id]['asset_fingerprint'] = verify_path(path, expected, capture=True)
+                except (OSError, ValueError, TypeError) as error:
+                    return {'status': 'error', 'job_id': child_id, 'sampling_batch_size': sampling,
+                            'error': f'完成资产校验失败（{cell_id}）：{error}；作品保留未覆盖'}
+            return {"status": "complete", "job_id": child_id, "outputs": mapped, "sampling_batch_size": sampling}
+        if status == "complete":
+            return {"status": "error", "job_id": child_id, "sampling_batch_size": sampling,
+                    "error": f"批次返回 {len(outputs)} 张，应为 {len(cell_ids)} 张；未记录任何结果"}
+        if status == "cancelled":
+            return {"status": "cancelled", "job_id": child_id, "interrupted": shutdown_requested, "sampling_batch_size": sampling}
+        return {"status": "error", "job_id": child_id, "error": child.get("error") or "生成失败（未保存图片）",
+                "oom": child.get("failure_kind") == "oom", "sampling_batch_size": sampling}
+
+    def publish(self, experiment_id):
+        xyz_publish(experiment_id)
+
+    def finished(self, experiment_id):
+        with jobs_lock:
+            if job_controls.get(experiment_id) is self.control:
+                job_controls.pop(experiment_id, None)
+        xyz_publish(experiment_id)
+
+
+def run_xyz_experiment(experiment_id):
+    try:
+        ExperimentRunner(xyz_store(), XYZRuntimeHooks(experiment_id)).run(experiment_id)
+    finally:
+        with jobs_lock:
+            _xyz_executor_refs.discard(experiment_id)
+
+
+def xyz_control(experiment_id, action):
+    """pause / resume / stop, shared by the XYZ routes and the generic job controls."""
+    store = xyz_store()
+    try:
+        with store.lock:
+            state = store.record(experiment_id)["state"]
+            status, decision = state["status"], state.get("decision")
+            with jobs_lock:
+                control = job_controls.get(experiment_id)
+            save = True
+            if action == "pause":
+                if decision or control is None or status not in {"queued", "running", "pausing"}:
+                    raise ExperimentError("not-pausable", "实验当前不能暂停")
+                control.request_pause()
+                state["status"] = "pausing"
+            elif action == "resume":
+                if decision:
+                    raise ExperimentError("decision-required", "失败格正在等待选择：重试 / 跳过 / 停止")
+                if control is None or status != "pausing":
+                    raise ExperimentError("not-paused", "实验没有处于暂停")
+                control.resume()
+                state["status"] = "running" if state["started_at"] else "queued"
+            elif action == "stop":
+                if decision:
+                    store.decide(experiment_id, "stop")
+                    save = False
+                elif status in {"queued", "pausing"} and control is not None and not state["started_at"]:
+                    # Not started yet (possibly pause-requested): settle it now; the slot exits early.
+                    control.cancel()
+                    store.stop_queued(experiment_id)
+                    save = False
+                elif status in {"queued", "running", "pausing", "cancelling"} and control is not None:
+                    control.cancel()
+                    state["status"] = "cancelling"
+                else:
+                    raise ExperimentError("not-active", "实验没有在运行")
+            else:
+                raise ExperimentError("action", "Unknown XYZ action", 400)
+            if save:
+                store.save(experiment_id)
+            result = state["status"]
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    xyz_publish(experiment_id)
+    return {"status": result, "experiment": store.summary(experiment_id)}
+
+
+def is_xyz_parent(job_id):
+    with jobs_lock:
+        return (jobs.get(job_id) or {}).get("kind") == "xyz_plot"
+
+
+@app.get("/api/inference/xyz-plots/capabilities")
+def xyz_capabilities():
+    return {"phase": "E", "executor_ready": True, "max_concurrency": XYZ_MAX_CONCURRENCY,
+            "limits": XYZ_CAPABILITIES["limits"], "error_policies": ["pause", "continue"],
+            "batching": True, "export": True, "integration": True, "protocol": INFERENCE_PROTOCOL}
+
+
+@app.post("/api/inference/xyz-plots/plan")
+def plan_xyz_experiment(payload: dict, http_request: Request = None):
+    """Authoritative preview: the planner plus every cell's ordinary admission. Draws no RNG,
+    writes no record."""
+    from backend.lora_library_gate import library_admission, LibraryGateError
+    try:
+        draft = XYZExperimentInput.model_validate(payload)
+        uses_loras = xyz_uses_loras(draft)
+        with library_admission(STATE_DIRECTORY, check_publication=uses_loras) as revision:
+            if revision and uses_loras and http_request is not None and http_request.headers.get("x-xirai-lora-revision") != str(revision):
+                raise HTTPException(409, "LoRA published revision changed; refetch before submitting")
+            plan, issues, _catalog, _registry = xyz_admit_plan(draft, uses_loras=uses_loras)
+    except LibraryGateError as error:
+        raise HTTPException(409, str(error)) from error
+    except (PlanningError, ValidationError) as error:
+        raise xyz_http_error(error) from error
+    concurrency = xyz_concurrency_issue(draft)
+    if concurrency:
+        issues.insert(0, concurrency)
+    return xyz_plan_preview(plan, issues, draft.group_by_resources)
+
+
+@app.post("/api/inference/xyz-plots", status_code=202)
+def create_xyz_experiment(payload: dict, http_request: Request = None):
+    """Submit once: validate every cell, THEN draw seeds once, persist, and queue the parent."""
+    from backend.lora_library_gate import library_admission, LibraryGateError
+    if shutdown_requested:
+        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    try:
+        submission = XYZSubmitInput.model_validate(payload)
+        experiment_id = experiment_id_for(submission.submission_id)
+        draft = submission.draft
+        draft_json = draft.model_dump(mode="json")
+        store = xyz_store()
+        with store.lock:
+            existing = store.records.get(experiment_id)
+            if existing is not None:
+                # A replayed click: never a second experiment, never a second RNG draw.
+                if existing["definition"]["digest"] != submission_digest(draft_json, submission.on_error):
+                    raise ExperimentError("submission-conflict", "同一提交编号对应了不同的实验定义；请重新提交（不会合并或覆盖）")
+                return {"experiment": store.summary(experiment_id), "replayed": True}
+        concurrency = xyz_concurrency_issue(draft)
+        if concurrency:
+            raise HTTPException(422, {**concurrency, "errors": [concurrency], "error_count": 1})
+        uses_loras = xyz_uses_loras(draft)
+        with library_admission(STATE_DIRECTORY, check_publication=uses_loras) as revision:
+            if revision and uses_loras and http_request is not None and http_request.headers.get("x-xirai-lora-revision") != str(revision):
+                raise HTTPException(409, "LoRA published revision changed; refetch before submitting")
+            plan, issues, catalog, registry = xyz_admit_plan(draft, uses_loras=uses_loras)
+            if issues:
+                raise HTTPException(422, {"code": "plan", "message": f"{len(issues)} 个问题需要先修正；未创建实验、未抽取种子",
+                                          "errors": issues[:XYZ_ISSUE_LIMIT], "error_count": len(issues)})
+            resolved = compile_xyz(draft, model_catalog=catalog, lora_registry=registry, resolve_seeds=True,
+                                   random_uint64=secure_random_uint64, validate_request=GenerateInput.model_validate)
+            if resolved.errors:
+                raise HTTPException(422, {"code": "plan", "message": "Resolved plan differs from the admitted preview",
+                                          "errors": [issue.model_dump(mode="json") for issue in resolved.errors][:XYZ_ISSUE_LIMIT]})
+            experiment_id, created = store.create(
+                submission_id=submission.submission_id, draft=draft_json, on_error=submission.on_error,
+                plan=plan_record(resolved), library_revision=revision if uses_loras else 0,
+                requested_concurrency=draft.requested_concurrency,
+            )
+            if created:
+                xyz_queue(experiment_id)
+    except LibraryGateError as error:
+        raise HTTPException(409, str(error)) from error
+    except (ExperimentError, PlanningError, ValidationError) as error:
+        raise xyz_http_error(error) from error
+    return {"experiment": store.summary(experiment_id), "replayed": not created}
+
+
+@app.get("/api/inference/xyz-plots")
+def list_xyz_experiments(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None,
+                         origin: Literal["any", "none"] = "any"):
+    # origin=none: only the XYZ workspace's own experiments (no `origin` block); the default stays every experiment.
+    return xyz_store().list(engine, plain_only=origin == "none")
+
+
+def module_tasks(module, *, engine=None, payload=None, committing=False, http_request=None):
+    if payload is not None:
+        # Same trusted-local Node proof/direct local-Origin gate as existing filesystem writes.
+        from backend.wd14 import require_wd14_write
+        if http_request is None:
+            raise HTTPException(403, "任务删除需要本机同源请求")
+        require_wd14_write(http_request)
+    try:
+        # Submission serializes derived search-session membership; export registration uses the same
+        # store -> export order. Recheck ALL statuses/references while publication is locked.
+        store = xyz_store()
+        with _mix_submit_lock, store.lock, _xyz_export_lock, jobs_lock:
+            if payload is not None:
+                run = task_deletion.commit if committing else task_deletion.preview
+                return run(store, module, payload, _xyz_executor_refs, _xyz_exports_running, jobs, job_controls)
+            tasks = list(task_deletion.task_map(store, module, _xyz_executor_refs, _xyz_exports_running, jobs, job_controls).values())
+            visible = sorted((entry for entry in tasks if not engine or entry["engine"] == engine), key=lambda entry: entry["updated_at"], reverse=True)
+            return {"module": module, "tasks": visible, "total": len(visible), "module_total": len(tasks),
+                    "unreadable": [{"id": key, "error": reason} for key, reason in sorted(store.unreadable.items())]}
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+
+
+@app.get("/api/inference/xyz-plots/tasks")
+def list_xyz_tasks(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None):
+    return module_tasks("xyz", engine=engine)
+
+
+@app.post("/api/inference/xyz-plots/task-deletions/preview")
+def preview_xyz_task_deletion(payload: dict, http_request: Request):
+    return module_tasks("xyz", payload=payload, http_request=http_request)
+
+
+@app.post("/api/inference/xyz-plots/task-deletions")
+def delete_xyz_tasks(payload: dict, http_request: Request):
+    return module_tasks("xyz", payload=payload, committing=True, http_request=http_request)
+
+
+@app.get("/api/inference/xyz-plots/{experiment_id}")
+def get_xyz_experiment(experiment_id: str):
+    store = xyz_store()
+    try:
+        detail = store.detail(experiment_id, xyz_asset_url)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    with jobs_lock:
+        job = jobs.get(experiment_id)
+        detail["live"] = xyz_display_job(job) if job is not None else None
+    for cell in detail["cells"]:
+        if cell.get("asset_url"):
+            cell["thumbnail_url"] = f"/api/inference/xyz-plots/{experiment_id}/cells/{cell['id']}/thumbnail"
+    for export in detail.get("exports") or []:
+        if (export.get("output") or {}).get("asset_id"):
+            export["output"]["asset_url"] = xyz_asset_url(export["output"]["asset_id"])
+            export["manifest_url"] = f"/api/inference/xyz-plots/{experiment_id}/exports/{export['id']}/manifest"
+    return detail
+
+
+@app.get("/api/inference/xyz-plots/{experiment_id}/cells/{cell_id}")
+def get_xyz_cell(experiment_id: str, cell_id: str):
+    try:
+        return xyz_store().cell_detail(experiment_id, cell_id, xyz_asset_url)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/decision")
+def decide_xyz_experiment(experiment_id: str, payload: dict):
+    store = xyz_store()
+    try:
+        decision = XYZDecisionInput.model_validate(payload)
+        if store.decide(experiment_id, decision.action):
+            xyz_queue(experiment_id)
+        else:
+            xyz_publish(experiment_id)
+    except (ExperimentError, ValidationError) as error:
+        raise xyz_http_error(error) from error
+    return {"experiment": store.summary(experiment_id)}
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/continue")
+def continue_xyz_experiment(experiment_id: str, payload: dict | None = None):
+    """Explicit continuation after interruption/stop. Frozen requests and seeds are reused; a
+    retried cell publishes a new file and never overwrites a completed original."""
+    if shutdown_requested:
+        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    store = xyz_store()
+    try:
+        options = XYZContinueInput.model_validate(payload or {})
+        store.continue_experiment(experiment_id, options.retry, options.requested_concurrency)
+        xyz_queue(experiment_id)
+    except (ExperimentError, ValidationError) as error:
+        raise xyz_http_error(error) from error
+    return {"experiment": store.summary(experiment_id)}
+
+
+# ------------------------------------------------------------------------------------------------
+# QPlan2/P2 · LoRA mix search. A round is an ordinary XYZ experiment (one `lora_profile` axis over the
+# confirmed candidates) whose definition carries an `origin` block; the session is read back from those
+# records, so a crash or a second tab can never leave a reservation without its experiment.
+# ------------------------------------------------------------------------------------------------
+_mix_submit_lock = threading.RLock()
+
+
+def mix_http_error(error):
+    return HTTPException(error.status, {"code": error.code, "message": str(error), "errors": error.issues[:XYZ_ISSUE_LIMIT], "error_count": len(error.issues)})
+
+
+def mix_prepare(draft, *, require_candidates=True):
+    """Recompute everything from the raw recipe and compile it. The browser's counts/status are never read."""
+    try:
+        recipe = mix_search.validate_recipe(draft, XYZ_CAPABILITIES["limits"], require_candidates=require_candidates)
+        compiled = mix_search.compile_xyz_draft(recipe) if recipe.candidates else None
+        return recipe, (XYZExperimentInput.model_validate(compiled) if compiled else None)
+    except mix_search.MixError as error:
+        raise mix_http_error(error) from error
+    except ValidationError as error:
+        raise xyz_http_error(error) from error
+
+
+def mix_candidate_conflicts(recipe, context):
+    """Candidates whose vector is already tested or reserved under this exact context."""
+    used = {entry["key"]: entry for entry in mix_search.used_candidates(xyz_store().candidate_records(), recipe.engine, context) if entry["state"] in ("tested", "reserved")}
+    conflicts = []
+    for candidate in recipe.candidates:
+        entry = used.get(mix_search.candidate_key(context, recipe, candidate.weights))
+        if entry:
+            conflicts.append({"code": "candidate-used", "candidate": candidate.id, "state": entry["state"], "experiment_id": entry["experiment_id"], "round": entry["round"],
+                              "message": f"{candidate.id}：该向量在同一生成条件下已{'成功测试' if entry['state'] == 'tested' else '被第 %s 轮预留' % entry['round']}；不会重复提交"})
+    return conflicts
+
+
+def mix_resolved_seeds(resolved, repeat_count):
+    seeds = [None] * repeat_count
+    for cell in resolved.cells:
+        seeds[cell.coordinate.sample_index] = str(int(cell.request["seed"]))
+    return seeds
+
+
+def mix_session_view(session_id):
+    store = xyz_store()
+    store.ensure_loaded()
+    rounds = []
+    for number, experiment_id, record in mix_search.session_rounds(store.records, session_id):
+        definition, state = record["definition"], record["state"]
+        origin = definition["origin"]
+        states = mix_search.candidate_states(definition, state)
+        rounds.append({
+            "round": number, "experiment_id": experiment_id, "created_at": definition["created_at"], "status": state["status"],
+            "context_hash": origin["context_hash"], "algorithm": origin["algorithm"], "seeds": origin["seeds"], "rules": origin["rules"],
+            "global_loras": origin["global_loras"], "released": bool(state.get("mix_released")),
+            "candidates": [{**candidate, **states[candidate["id"]]} for candidate in origin["candidates"]],
+        })
+    return {"id": session_id, "revision": len(rounds), "rounds": rounds}
+
+
+@app.get("/api/inference/lora-mix/capabilities")
+def mix_capabilities():
+    return {"phase": "C", "schema_version": mix_search.SCHEMA_VERSION, "executor_ready": True, "max_concurrency": XYZ_MAX_CONCURRENCY, "limits": XYZ_CAPABILITIES["limits"],
+            "algorithm": mix_search.ALGORITHM, "budget_presets": list(mix_search.BUDGET_PRESETS), "protocol": INFERENCE_PROTOCOL}
+
+
+@app.post("/api/inference/lora-mix/used")
+def mix_used(payload: dict):
+    """Vectors already tested/reserved under this draft's exact context. Read-only; asks for no candidates."""
+    draft = payload.get("draft") if isinstance(payload, dict) else None
+    try:
+        recipe = mix_search.validate_recipe(draft, XYZ_CAPABILITIES["limits"], require_candidates=False)
+    except mix_search.MixError as error:
+        return {"context_hash": None, "used": [], "reason": str(error), "errors": error.issues[:20]}
+    seeds = mix_search.explicit_seeds(recipe)
+    if seeds is None:
+        return {"context_hash": None, "used": [], "reason": "图像种子在确认时才抽取；新的一轮总是新的生成条件"}
+    context = mix_search.context_hash(recipe, seeds)
+    xyz_store().ensure_loaded()
+    return {"context_hash": context, "used": [{key: entry[key] for key in ("candidate_id", "state", "weights", "round", "session_id", "experiment_id")}
+                                               for entry in mix_search.used_candidates(xyz_store().candidate_records(), recipe.engine, context)]}
+
+
+@app.post("/api/inference/lora-mix/plan")
+def plan_mix_round(payload: dict, http_request: Request = None):
+    """Authoritative preview: rule recomputation, the XYZ planner and every cell's ordinary admission. No RNG, no reservation."""
+    from backend.lora_library_gate import library_admission, LibraryGateError
+    recipe, xyz_input = mix_prepare(payload.get("draft") if isinstance(payload, dict) else None)
+    try:
+        uses_loras = xyz_uses_loras(xyz_input)
+        with library_admission(STATE_DIRECTORY, check_publication=uses_loras) as revision:
+            if revision and uses_loras and http_request is not None and http_request.headers.get("x-xirai-lora-revision") != str(revision):
+                raise HTTPException(409, "LoRA published revision changed; refetch before submitting")
+            plan, issues, _catalog, _registry = xyz_admit_plan(xyz_input, uses_loras=uses_loras)
+    except LibraryGateError as error:
+        raise HTTPException(409, str(error)) from error
+    except (PlanningError, ValidationError) as error:
+        raise xyz_http_error(error) from error
+    concurrency = xyz_concurrency_issue(xyz_input)
+    if concurrency:
+        issues.insert(0, concurrency)
+    seeds = mix_search.explicit_seeds(recipe)
+    context, duplicates = (mix_search.context_hash(recipe, seeds), []) if seeds else (None, [])
+    if context:
+        xyz_store().ensure_loaded()
+        duplicates = mix_candidate_conflicts(recipe, context)
+        issues.extend(duplicates)
+    preview = xyz_plan_preview(plan, issues, xyz_input.group_by_resources)
+    preview["summary"] = {"profiles": len(recipe.candidates), "samples": recipe.repeat_count, "cells": plan.total_cells, "new": len(recipe.candidates) - len(duplicates),
+                          "duplicates": [{key: item[key] for key in ("candidate", "state", "round")} for item in duplicates], "context_hash": context,
+                          "space": None if recipe.space is None else str(recipe.space), "limit_units": recipe.limit, "images": recipe.images, "slots": recipe.slots}
+    return preview
+
+
+@app.post("/api/inference/lora-mix/sessions", status_code=202)
+def confirm_mix_round(payload: dict, http_request: Request = None):
+    """Confirm once: recompute, admit every cell, re-check the session revision and the vectors, THEN draw seeds, persist and queue."""
+    from backend.lora_library_gate import library_admission, LibraryGateError
+    if shutdown_requested:
+        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    try:
+        submission = mix_search.MixSubmitInput.model_validate(payload)
+    except ValidationError as error:
+        raise xyz_http_error(error) from error
+    recipe, xyz_input = mix_prepare(submission.draft)
+    try:
+        experiment_id = experiment_id_for(submission.submission_id)
+        store = xyz_store()
+        draft_json = xyz_input.model_dump(mode="json")
+        with _mix_submit_lock:
+            store.ensure_loaded()
+            if recipe.session_id in store.deleted_sessions:
+                raise ExperimentError("deleted-session", "该搜索任务已删除；旧草稿不能继续此会话，请明确新建搜索（候选历史仍用于排重）")
+            if experiment_id in store.deleted_records:
+                raise ExperimentError("deleted-submission", "该搜索提交已删除，不会重建或再次执行")
+            existing = store.records.get(experiment_id)
+            if existing is not None:
+                # A replayed click: never a second round, never a second RNG draw.
+                if existing["definition"]["digest"] != submission_digest(draft_json, submission.on_error):
+                    raise ExperimentError("submission-conflict", "同一提交编号对应了不同的搜索回合；请重新确认（不会合并或覆盖）")
+                origin = existing["definition"].get("origin") or {}
+                return {"experiment": store.summary(experiment_id), "session": {"id": origin.get("session_id"), "revision": origin.get("round")}, "replayed": True}
+            concurrency = xyz_concurrency_issue(xyz_input)
+            if concurrency:
+                raise HTTPException(422, {**concurrency, "errors": [concurrency], "error_count": 1})
+            session_id = recipe.session_id or uuid.uuid4().hex
+            revision = len(mix_search.session_rounds(store.records, session_id))
+            if recipe.expected_revision != revision:
+                raise HTTPException(409, {"code": "stale-session", "message": f"搜索会话已有 {revision} 轮，而草稿基于第 {recipe.expected_revision} 轮；请刷新后核对再确认（另一个标签页可能已提交）", "revision": revision})
+            uses_loras = xyz_uses_loras(xyz_input)
+            with library_admission(STATE_DIRECTORY, check_publication=uses_loras) as library_revision:
+                if library_revision and uses_loras and http_request is not None and http_request.headers.get("x-xirai-lora-revision") != str(library_revision):
+                    raise HTTPException(409, "LoRA published revision changed; refetch before submitting")
+                plan, issues, catalog, registry = xyz_admit_plan(xyz_input, uses_loras=uses_loras)
+                if issues:
+                    raise HTTPException(422, {"code": "plan", "message": f"{len(issues)} 个问题需要先修正；未预留向量、未抽取种子", "errors": issues[:XYZ_ISSUE_LIMIT], "error_count": len(issues)})
+                resolved = compile_xyz(xyz_input, model_catalog=catalog, lora_registry=registry, resolve_seeds=True, random_uint64=secure_random_uint64, validate_request=GenerateInput.model_validate)
+                if resolved.errors:
+                    raise HTTPException(422, {"code": "plan", "message": "Resolved plan differs from the admitted preview", "errors": [issue.model_dump(mode="json") for issue in resolved.errors][:XYZ_ISSUE_LIMIT]})
+                seeds = mix_resolved_seeds(resolved, recipe.repeat_count)
+                context = mix_search.context_hash(recipe, seeds)
+                conflicts = mix_candidate_conflicts(recipe, context)
+                if conflicts:
+                    raise HTTPException(409, {"code": "candidate-used", "message": f"{len(conflicts)} 个候选向量在同一生成条件下已测试或已被预留；未创建回合", "errors": conflicts[:XYZ_ISSUE_LIMIT], "error_count": len(conflicts)})
+                origin = mix_search.origin_block(recipe, session_id=session_id, round_number=revision + 1, context=context, seeds=seeds, submission_id=submission.submission_id)
+                experiment_id, created = store.create(
+                    submission_id=submission.submission_id, draft=draft_json, on_error=submission.on_error, plan=plan_record(resolved),
+                    library_revision=library_revision if uses_loras else 0, requested_concurrency=xyz_input.requested_concurrency, origin=origin)
+                if created:
+                    xyz_queue(experiment_id)
+    except LibraryGateError as error:
+        raise HTTPException(409, str(error)) from error
+    except (ExperimentError, PlanningError, ValidationError) as error:
+        raise xyz_http_error(error) from error
+    return {"experiment": store.summary(experiment_id), "session": {"id": session_id, "revision": revision + 1}, "replayed": not created}
+
+
+@app.get("/api/inference/lora-mix/sessions")
+def list_mix_sessions(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None):
+    store = xyz_store()
+    store.ensure_loaded()
+    return {"sessions": mix_search.session_summaries(store.records, engine)}
+
+
+@app.get("/api/inference/lora-mix/tasks")
+def list_mix_tasks(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None):
+    return module_tasks("lora_mix", engine=engine)
+
+
+@app.post("/api/inference/lora-mix/task-deletions/preview")
+def preview_mix_task_deletion(payload: dict, http_request: Request):
+    return module_tasks("lora_mix", payload=payload, http_request=http_request)
+
+
+@app.post("/api/inference/lora-mix/task-deletions")
+def delete_mix_tasks(payload: dict, http_request: Request):
+    return module_tasks("lora_mix", payload=payload, committing=True, http_request=http_request)
+
+
+@app.get("/api/inference/lora-mix/sessions/{session_id}")
+def get_mix_session(session_id: str):
+    if not mix_search.SESSION_ID.match(session_id):
+        raise HTTPException(404, "搜索会话不存在")
+    view = mix_session_view(session_id)
+    if not view["rounds"]:
+        raise HTTPException(404, "搜索会话不存在")
+    return view
+
+
+@app.get("/api/inference/lora-mix/sessions/{session_id}/remaining")
+def mix_remaining(session_id: str, round: int | None = None, format: Literal["json", "csv"] = "json", offset: int = 0, limit: int = 200):
+    """The still-unused legal vectors of one round's rules, in pages. A huge space is paged lazily, never listed whole."""
+    if not mix_search.SESSION_ID.match(session_id) or offset < 0 or not 1 <= limit <= 1000:
+        raise HTTPException(422, "offset / limit 无效")
+    store = xyz_store()
+    store.ensure_loaded()
+    rounds = mix_search.session_rounds(store.records, session_id)
+    if not rounds:
+        raise HTTPException(404, "搜索会话不存在")
+    chosen = next((item for item in rounds if item[0] == round), None) if round is not None else rounds[-1]
+    if chosen is None:
+        raise HTTPException(404, "回合不存在")
+    origin = chosen[2]["definition"]["origin"]
+    used = {entry["key"] for entry in mix_search.used_candidates(store.candidate_records(), chosen[2]["definition"]["engine"], origin["context_hash"]) if entry["state"] in ("tested", "reserved")}
+    try:
+        page = mix_search.remaining_vectors(origin, used, offset, limit)
+    except mix_search.MixError as error:
+        raise mix_http_error(error) from error
+    names = [(member["ref"]["instanceId"], member["ref"].get("name") or member["ref"]["value"]) for member in origin["rules"]["members"]]
+    if format == "csv":
+        def cell(text):
+            text = str(text)
+            return '"' + text.replace('"', '""') + '"' if any(ch in text for ch in ',"\n') else text
+        lines = [",".join(["displacement", *[cell(name) for _id, name in names]])]
+        lines += [",".join([mix_search.format_units(row["displacement"]), *[mix_search.format_units(row["weights"][iid]) for iid, _name in names]]) for row in page["rows"]]
+        return Response("\n".join(lines) + "\n", media_type="text/csv; charset=utf-8", headers={"Cache-Control": "no-store", "X-Total": str(page["total"]) if page["total"] is not None else "unknown"})
+    return {"round": chosen[0], "context_hash": origin["context_hash"], "members": [{"instanceId": iid, "name": name} for iid, name in names],
+            "total": None if page["total"] is None else str(page["total"]), "used": len(used), "complete": page["complete"], "next_offset": page.get("next_offset"), "reason": page.get("reason"),
+            "rows": [{"weights": {iid: mix_search.format_units(units) for iid, units in row["weights"].items()}, "displacement": mix_search.format_units(row["displacement"])} for row in page["rows"]]}
+
+
+@app.post("/api/inference/lora-mix/experiments/{experiment_id}/release")
+def release_mix_round(experiment_id: str):
+    """Explicitly free the unexecuted vectors of a stopped/interrupted round; executed originals are untouched."""
+    store = xyz_store()
+    try:
+        store.release_reservation(experiment_id)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    xyz_publish(experiment_id)
+    return {"experiment": store.summary(experiment_id)}
+
+
+# ------------------------------------------------------------------------------------------------
+# QPlan2/P1 Phase D · whole-grid export. One export at a time on its own worker (CPU and memory
+# only — never the GPU executor, never the generation cache). Sources are the original PNG assets.
+# ------------------------------------------------------------------------------------------------
+XYZ_EXPORT_FOLDER = "XYZ"
+XYZ_EXPORT_PREFIX = "XiriusA-XYZPlot-"
+XYZ_THUMBNAIL_EDGE = 384
+xyz_export_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xyz-export")
+_xyz_export_lock = threading.Lock()
+_xyz_exports_running = {}
+
+
+def xyz_contained_output(relative):
+    if not isinstance(relative, str) or not relative:
+        return None
+    try:
+        path = (OUTPUT_DIRECTORY / relative).resolve()
+    except (OSError, ValueError):
+        return None
+    return path if OUTPUT_DIRECTORY.resolve() in path.parents and path.is_file() else None
+
+
+def xyz_sweep_export_temporaries():
+    """Temporaries of exports a previous process never finished; only our own prefix."""
+    folder = OUTPUT_DIRECTORY / XYZ_EXPORT_FOLDER
+    if folder.is_dir() and not folder.is_symlink():
+        for stale in folder.glob(f".{XYZ_EXPORT_PREFIX}*.tmp"):
+            with suppress(OSError):
+                stale.unlink()
+
+
+def xyz_export_options(payload):
+    try:
+        options = XYZExportInput.model_validate(payload or {}).model_dump()
+    except ValidationError as error:
+        raise xyz_http_error(error) from error
+    if options["mode"] == "original" and options["percent"] != 100:
+        raise HTTPException(422, {"code": "percent", "message": "原始分辨率模式固定为 100%；缩小请选择“等比例缩小”"})
+    if not 1 <= options["percent"] <= 100:
+        raise HTTPException(422, {"code": "percent", "message": "缩小比例必须是 1–100 的整数百分比；不会自动调整"})
+    return options
+
+
+def xyz_grid_snapshot(experiment_id):
+    try:
+        snapshot = xyz_store().grid_snapshot(experiment_id, xyz_contained_output)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    for cell in snapshot["cells"]:
+        if cell.get("path"):
+            try:
+                # Header only: whether the canvas needs alpha. Pixels are decoded at render time.
+                with Image.open(cell["path"]) as handle:
+                    cell["alpha"] = handle.mode in {"RGBA", "LA", "PA"} or (handle.mode == "P" and "transparency" in handle.info)
+                    if handle.size != (cell["width"], cell["height"]):
+                        cell.update(status="missing", path=None, relative=None)
+            except OSError:
+                cell.update(status="missing", path=None, relative=None)
+    baseline, axes = snapshot["baseline"], snapshot["axes"]
+    complete = sum(cell["status"] == "complete" for cell in snapshot["cells"])
+    # LoRA axes are summarised by the LoRAs they vary (read from the frozen draft), the same for X, Y and Z.
+    draft = (xyz_store().record(experiment_id)["definition"].get("draft") or {})
+    draft_axes, draft_loras = draft.get("axes") or {}, (draft.get("baseline") or {}).get("loras") or []
+    snapshot["title"] = f"XYZ 对比 · {snapshot['engine']} · {baseline.get('checkpoint') or baseline.get('diffusion_model') or ''}"
+    snapshot["subtitle"] = " · ".join([xyz_grid_axis_text(key, draft_axes.get(key) or axes[key], draft_loras) for key in ("x", "y", "z") if axes[key].get("field")]
+                                      + [f"{complete}/{len(snapshot['cells'])} 格完成", f"{baseline.get('width')}×{baseline.get('height')} · {baseline.get('steps')} 步 · CFG {baseline.get('cfg')}",
+                                         f"实验 {experiment_id[:8]} · {datetime.fromtimestamp(snapshot['created_at']):%Y-%m-%d %H:%M}"])
+    return snapshot
+
+
+def xyz_grid_http_error(error):
+    return HTTPException(error.status, {"code": error.code, "message": str(error), **error.extra})
+
+
+def run_xyz_export(experiment_id, export_id, options, snapshot):
+    store = xyz_store()
+    entry = _xyz_exports_running.get(export_id) or {"cancel": threading.Event()}
+    last = [0.0]
+
+    def progress(done, total):
+        if time.time() - last[0] >= 0.5 or done == total:
+            last[0] = time.time()
+            with suppress(ExperimentError):
+                store.update_export(experiment_id, export_id, progress={"done": done, "total": total})
+
+    try:
+        if entry["cancel"].is_set():
+            raise ExportCancelled()
+        store.update_export(experiment_id, export_id, status="running", started_at=time.time())
+        moment = datetime.now()
+        directory = output_target(OUTPUT_DIRECTORY, f"{XYZ_EXPORT_FOLDER}/grid", moment=moment, engine=snapshot["engine"], create=True).directory
+        stem = f"{XYZ_EXPORT_PREFIX}{moment:%Y%m%d-%H%M%S}"
+        target = OutputTarget(directory, XYZ_EXPORT_FOLDER, stem, True)
+        result = xyz_export_grid(snapshot, options, directory=directory, stem=stem, export_id=export_id,
+                                 publish=lambda temporary: publish_exclusive(temporary, target),
+                                 cancelled=entry["cancel"].is_set, progress=progress)
+        store.update_export(experiment_id, export_id, status="complete", completed_at=time.time(), progress={"done": result["placed"], "total": result["placed"]},
+                            output={"relative": output_relative_path(result["png"]), "asset_id": history_asset_token(result["png"]), "name": result["png"].name,
+                                    "width": result["width"], "height": result["height"], "bytes": result["bytes"], "percent": result["percent"]},
+                            manifest={"relative": output_relative_path(result["manifest"]), "sha256": result["manifest_sha256"]},
+                            warnings=result["warnings"], metadata_overflow=result["metadata_overflow"], elapsed_seconds=result["elapsed_seconds"])
+    except ExportCancelled:
+        with suppress(ExperimentError):
+            store.update_export(experiment_id, export_id, status="cancelled", completed_at=time.time(), error="已取消；未发布任何文件")
+    except GridError as error:
+        with suppress(ExperimentError):
+            store.update_export(experiment_id, export_id, status="error", completed_at=time.time(), error=str(error))
+    except Exception as error:  # noqa: BLE001 - an export failure must never touch completed originals
+        traceback.print_exc()
+        with suppress(ExperimentError):
+            store.update_export(experiment_id, export_id, status="error", completed_at=time.time(), error=f"{type(error).__name__}: {error}"[:2000])
+    finally:
+        with _xyz_export_lock:
+            _xyz_exports_running.pop(export_id, None)
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/export/estimate")
+def estimate_xyz_export(experiment_id: str, payload: dict | None = None):
+    """Final dimensions, pixels, memory and budget verdict for the chosen options. No pixels decoded."""
+    options = xyz_export_options(payload)
+    try:
+        return xyz_grid_estimate(xyz_grid_snapshot(experiment_id), options)
+    except GridError as error:
+        raise xyz_grid_http_error(error) from error
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/exports", status_code=202)
+def create_xyz_export(experiment_id: str, payload: dict | None = None):
+    if shutdown_requested:
+        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    return start_xyz_export(experiment_id, xyz_export_options(payload), xyz_grid_snapshot(experiment_id))
+
+
+def start_xyz_export(experiment_id, options, snapshot):
+    """Budget verdict, one-at-a-time slot, record and worker for an export. Shared by XYZ grids and search candidate grids."""
+    try:
+        estimate = xyz_grid_estimate(snapshot, options)
+    except GridError as error:
+        raise xyz_grid_http_error(error) from error
+    if not estimate["budget"]["ok"]:
+        # Refused as requested: never auto-shrunk, paginated or trimmed.
+        raise HTTPException(422, {"code": "budget", "message": "；".join(estimate["budget"]["problems"]),
+                                  "suggestions": estimate["suggestions"], "estimate": estimate})
+    store = xyz_store()
+    with store.lock, _xyz_export_lock:
+        try:
+            store.record(experiment_id)  # A snapshot read before deletion cannot re-create its record.
+        except ExperimentError as error:
+            raise xyz_http_error(error) from error
+        if _xyz_exports_running:
+            raise HTTPException(409, {"code": "export-busy", "message": "已有导出在进行；为控制内存一次只运行一个导出"})
+        export_id = uuid.uuid4().hex
+        record = {"id": export_id, "status": "queued", "options": options, "created_at": time.time(),
+                  "estimate": {key: estimate[key] for key in ("width", "height", "percent", "alpha", "blocks", "cells")} | {"memory_bytes": estimate["budget"]["memory_bytes"]},
+                  "progress": {"done": 0, "total": estimate["cells"].get("complete", 0)}, "warnings": estimate["warnings"]}
+        store.add_export(experiment_id, record)
+        _xyz_exports_running[export_id] = {"cancel": threading.Event(), "experiment_id": experiment_id}
+        xyz_export_executor.submit(run_xyz_export, experiment_id, export_id, options, snapshot)
+    return {"export": record}
+
+
+@app.get("/api/inference/xyz-plots/{experiment_id}/exports/{export_id}")
+def get_xyz_export(experiment_id: str, export_id: str):
+    try:
+        record = xyz_store().export_record(experiment_id, export_id)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    if (record.get("output") or {}).get("asset_id"):
+        record["output"]["asset_url"] = xyz_asset_url(record["output"]["asset_id"])
+        record["manifest_url"] = f"/api/inference/xyz-plots/{experiment_id}/exports/{export_id}/manifest"
+    return record
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/exports/{export_id}/cancel")
+def cancel_xyz_export(experiment_id: str, export_id: str):
+    with _xyz_export_lock:
+        entry = _xyz_exports_running.get(export_id)
+    if entry is None or entry.get("experiment_id") != experiment_id:
+        raise HTTPException(409, {"code": "not-running", "message": "该导出没有在进行"})
+    entry["cancel"].set()
+    return {"status": "cancelling"}
+
+
+@app.get("/api/inference/xyz-plots/{experiment_id}/exports/{export_id}/manifest")
+def get_xyz_export_manifest(experiment_id: str, export_id: str):
+    try:
+        record = xyz_store().export_record(experiment_id, export_id)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    path = xyz_contained_output((record.get("manifest") or {}).get("relative"))
+    if path is None or path.suffix.lower() != ".json":
+        raise HTTPException(404, "Export manifest is not available")
+    return FileResponse(path, media_type="application/json", filename=path.name, headers={"Cache-Control": "no-store"})
+
+
+# QPlan2/P2 · candidate-grid export. The same renderer, quality contracts and export records as the XYZ grid; only the
+# presentation mapping differs: candidates are laid out in rows x columns (never as fictional X/Y/Z axes).
+MIX_GRID_MAX_COLUMNS = 16
+
+
+def mix_export_options(payload):
+    payload = dict(payload or {})
+    columns = payload.pop("columns", None)
+    lora_weights = payload.pop("lora_weights", False)
+    if columns is not None and (type(columns) is not int or not 1 <= columns <= MIX_GRID_MAX_COLUMNS):
+        raise HTTPException(422, {"code": "columns", "message": f"列数必须是 1–{MIX_GRID_MAX_COLUMNS} 的整数；不会自动调整"})
+    if type(lora_weights) is not bool:
+        raise HTTPException(422, {"code": "lora_weights", "message": "lora_weights 必须是布尔值"})
+    payload.setdefault("arrangement", "vertical")
+    options = xyz_export_options(payload)
+    # Recorded with the export (record, recipe, manifest); the strict XYZ schema itself is unchanged.
+    options["lora_weights"] = lora_weights
+    return options, columns
+
+
+def mix_grid_snapshot(experiment_id, columns, lora_weights=False):
+    snapshot = xyz_grid_snapshot(experiment_id)
+    definition = xyz_store().record(experiment_id)["definition"]
+    origin = definition.get("origin") or {}
+    if origin.get("kind") != "lora_mix_search" or origin.get("schema_version") != 1:
+        raise HTTPException(422, {"code": "not-search", "message": "该实验不是 LoRA 混合搜索回合"})
+    return mix_search.candidate_grid(snapshot, origin, columns, lora_weights=lora_weights,
+                                     created=f"{datetime.fromtimestamp(snapshot['created_at']):%Y-%m-%d %H:%M}")
+
+
+@app.post("/api/inference/lora-mix/experiments/{experiment_id}/export/estimate")
+def estimate_mix_export(experiment_id: str, payload: dict | None = None):
+    options, columns = mix_export_options(payload)
+    try:
+        return xyz_grid_estimate(mix_grid_snapshot(experiment_id, columns, options["lora_weights"]), options)
+    except GridError as error:
+        raise xyz_grid_http_error(error) from error
+
+
+@app.post("/api/inference/lora-mix/experiments/{experiment_id}/exports", status_code=202)
+def create_mix_export(experiment_id: str, payload: dict | None = None):
+    if shutdown_requested:
+        raise HTTPException(status_code=503, detail="Inference service is shutting down")
+    options, columns = mix_export_options(payload)
+    return start_xyz_export(experiment_id, options, mix_grid_snapshot(experiment_id, columns, options["lora_weights"]))
+
+
+@app.get("/api/inference/xyz-plots/{experiment_id}/cells/{cell_id}/thumbnail")
+def get_xyz_cell_thumbnail(experiment_id: str, cell_id: str):
+    """Screen-only preview of one original (never used by export), cached beside the experiment."""
+    store = xyz_store()
+    try:
+        cell = store.cell_detail(experiment_id, cell_id, xyz_asset_url)
+    except ExperimentError as error:
+        raise xyz_http_error(error) from error
+    source = xyz_contained_output((cell.get("output") or {}).get("relative")) if cell.get("status") == "complete" else None
+    if source is None:
+        raise HTTPException(404, "Cell original is not available")
+    stat = source.stat()
+    key = hashlib.sha256(f"{source}|{stat.st_size}|{stat.st_mtime_ns}|{XYZ_THUMBNAIL_EDGE}".encode("utf-8")).hexdigest()[:32]
+    folder = STATE_DIRECTORY / "xyz-plots" / experiment_id / "thumbs"
+    cached = next((path for path in (folder / f"{key}.png", folder / f"{key}.jpg") if path.is_file()), None)
+    if cached is None:
+        folder.mkdir(parents=True, exist_ok=True)
+        from backend.xyz_assets import asset_expectation, verified_snapshot
+        planned, _ = store.frozen_cell(experiment_id, cell_id)
+        expected = asset_expectation(store.record(experiment_id)['definition'], planned, cell['output'], cell['attempts'])
+        try:
+            with verified_snapshot(source, expected, cell['output'].get('asset_fingerprint')) as original:
+                with Image.open(original) as image:
+                    image.load()
+                    alpha = image.mode in {"RGBA", "LA", "PA"} or "transparency" in image.info
+                    preview = image.convert("RGBA" if alpha else "RGB")
+        except (OSError, ValueError) as error:
+            store.verify_completed(experiment_id, [cell_id])
+            raise HTTPException(409, f'原图校验失败：{error}') from error
+        preview.thumbnail((XYZ_THUMBNAIL_EDGE, XYZ_THUMBNAIL_EDGE), Image.Resampling.LANCZOS)
+        cached = folder / f"{key}.{'png' if alpha else 'jpg'}"
+        temporary = folder / f".{key}-{os.urandom(4).hex()}.tmp"
+        preview.save(temporary, format="PNG" if alpha else "JPEG", quality=88)
+        os.replace(temporary, cached)
+    return FileResponse(cached, media_type="image/png" if cached.suffix == ".png" else "image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/pause")
+def pause_xyz_experiment(experiment_id: str):
+    return xyz_control(experiment_id, "pause")
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/resume")
+def resume_xyz_experiment(experiment_id: str):
+    return xyz_control(experiment_id, "resume")
+
+
+@app.post("/api/inference/xyz-plots/{experiment_id}/stop")
+def stop_xyz_experiment(experiment_id: str):
+    return xyz_control(experiment_id, "stop")
+
+
 @app.get("/api/inference/output-template")
 def get_output_template(template: str | None = None, engine: str = "iL"):
     """What Settings → General shows: the active root, the placeholder legend and a path preview.
@@ -12164,7 +13766,9 @@ def get_history(folder: str | None = None):
 
 
 def gallery_store():
-    return GalleryStore(STATE_DIRECTORY, asset_resolver=history_asset_path)
+    # Initialization also acquires the publication lease; translate that same
+    # owner conflict rather than leaking a transient recovery window as a 500.
+    return gallery_call(GalleryStore, STATE_DIRECTORY, asset_resolver=history_asset_path)
 
 
 def gallery_call(operation, *args, **kwargs):
@@ -12327,9 +13931,163 @@ def get_gallery_image(image_id: str, variant: str = "original"):
     )
 
 
+# Gallery import/export: whole collections to and from a folder under the output root plus a ZIP.
+from backend.gallery_transfer import (  # noqa: E402 - beside the routes that own it
+    MAX_PACKAGE_BYTES as GALLERY_PACKAGE_MAX_BYTES,
+    GalleryTransferConflict,
+    GalleryTransferError,
+    GalleryTransferNotFound,
+    export_collections as gallery_export_collections,
+    import_package as gallery_import_package,
+    write_export_zip as gallery_write_export_zip,
+    zip_source_path as gallery_zip_source_path,
+)
+
+_gallery_transfer_lock = threading.Lock()
+
+
+class GalleryExportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    collection_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class GalleryImportPathInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    zip_path: str = Field(min_length=1, max_length=4096)
+    folder: str | None = Field(default=None, max_length=400)
+
+
+def require_gallery_transfer(http_request: Request, *, local_file=False):
+    # The trusted-local gate the task-deletion writes use: a valid same-Origin page, reached through
+    # Node's per-process proof or directly from a loopback page. Reading a path on this machine is
+    # further limited to a loopback page, which Node has already checked for the proxied request.
+    from backend.wd14 import require_wd14_write
+    try:
+        require_wd14_write(http_request)
+    except HTTPException as error:
+        raise HTTPException(error.status_code, "画廊导入导出须从本服务的同源页面发起") from None
+    if local_file:
+        from urllib.parse import urlsplit
+        try:
+            hostname = urlsplit(http_request.headers.get("origin", "")).hostname
+        except ValueError:
+            hostname = None
+        if hostname not in ("localhost", "127.0.0.1", "::1"):
+            raise HTTPException(403, "按路径导入只能在本机页面使用；远程访问请拖入或选择 ZIP 文件")
+
+
+def gallery_transfer_call(operation, *args, **kwargs):
+    try:
+        return gallery_call(operation, *args, **kwargs)
+    except GalleryTransferNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except GalleryTransferConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except GalleryTransferError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def gallery_transfer_receipt(result):
+    return {**result, "output_root": output_root_display(OUTPUT_DIRECTORY, PROJECT_ROOT)}
+
+
+@app.post("/api/inference/gallery/transfer/export", status_code=201)
+def export_gallery_collections(input_data: GalleryExportInput, http_request: Request):
+    require_gallery_transfer(http_request)
+    with _gallery_transfer_lock:
+        result = gallery_transfer_call(gallery_export_collections, gallery_store(), OUTPUT_DIRECTORY, input_data.collection_ids)
+    return gallery_transfer_receipt({**result, "zip_url": f"/api/inference/gallery/transfer/exports/{result['folder']}.zip"})
+
+
+@app.get("/api/inference/gallery/transfer/exports/{name}.zip")
+def download_gallery_export(name: str):
+    from starlette.background import BackgroundTask
+    scratch = STATE_DIRECTORY / "gallery-transfer"
+    scratch.mkdir(parents=True, exist_ok=True)
+    temporary = scratch / f".{uuid.uuid4().hex}.zip"
+    try:
+        gallery_transfer_call(gallery_write_export_zip, OUTPUT_DIRECTORY, name, temporary)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return FileResponse(temporary, media_type="application/zip", filename=f"{name}.zip",
+                        headers={"Cache-Control": "no-store"}, background=BackgroundTask(temporary.unlink, missing_ok=True))
+
+
+@app.post("/api/inference/gallery/transfer/import", status_code=201)
+def import_gallery_package(input_data: GalleryImportPathInput, http_request: Request):
+    require_gallery_transfer(http_request, local_file=True)
+    path = gallery_transfer_call(gallery_zip_source_path, input_data.zip_path)
+    with _gallery_transfer_lock:
+        return gallery_transfer_receipt(gallery_transfer_call(gallery_import_package, gallery_store(), OUTPUT_DIRECTORY, path, input_data.folder))
+
+
+@app.post("/api/inference/gallery/transfer/import-upload", status_code=201)
+async def import_uploaded_gallery_package(http_request: Request, folder: str | None = None, name: str | None = None):
+    require_gallery_transfer(http_request)
+    if folder is not None and len(folder) > 400:
+        raise HTTPException(422, "目标文件夹名称过长")
+    scratch = STATE_DIRECTORY / "gallery-transfer"
+    scratch.mkdir(parents=True, exist_ok=True)
+    # The page names its file; keep only a safe basename for the import record.
+    upload_name = (name or "upload.zip").replace("\\", "/").rsplit("/", 1)[-1][:200] or "upload.zip"
+    temporary = scratch / f".{uuid.uuid4().hex}-{re.sub(r'[^A-Za-z0-9._-]', '_', upload_name)}"
+    received = 0
+    try:
+        with temporary.open("xb") as target:
+            async for chunk in http_request.stream():
+                received += len(chunk)
+                if received > GALLERY_PACKAGE_MAX_BYTES:
+                    raise HTTPException(413, f"ZIP 超过 {GALLERY_PACKAGE_MAX_BYTES // 1024 ** 3} GiB 上限")
+                target.write(chunk)
+        if not received:
+            raise HTTPException(422, "上传的 ZIP 是空文件")
+
+        def run():
+            with _gallery_transfer_lock:
+                return gallery_transfer_receipt(gallery_transfer_call(
+                    gallery_import_package, gallery_store(), OUTPUT_DIRECTORY, temporary, folder, source_name=upload_name))
+
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(run)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 @app.get("/api/inference/history/assets/{asset_id}")
 def get_history_asset(asset_id: str):
     path = history_asset_path(asset_id)
+    # Ordinary assets retain their existing response path. An XYZ original is checked against
+    # its owner record, including live swaps AFTER completion/recovery, then streamed byte-exact
+    # from an owned verified snapshot (FileResponse would reopen a mutable path later).
+    store = xyz_store()
+    with store.lock:
+        for experiment_id, record in store.candidate_records().items():
+            for cell_id, current in record['state']['cells'].items():
+                output = current.get('output') or {}
+                if output.get('asset_id') != asset_id:
+                    continue
+                archived = experiment_id in store.deleted_records
+                if not archived:
+                    store.verify_completed(experiment_id, [cell_id])
+                if current['status'] != 'complete':
+                    raise HTTPException(409, 'XYZ 原图需要修复；原始作品与记录保留')
+                from backend.xyz_assets import asset_expectation, verified_snapshot
+                from starlette.responses import StreamingResponse
+                from starlette.background import BackgroundTask
+                try:
+                    expected = asset_expectation(record['definition'], record['cells'][cell_id], output, current['attempts'])
+                    snapshot = verified_snapshot(path, expected, output.get('asset_fingerprint'))
+                except (OSError, ValueError) as error:
+                    if not archived:
+                        store.verify_completed(experiment_id, [cell_id])
+                    raise HTTPException(409, f'XYZ 原图校验失败：{error}') from error
+                def chunks():
+                    try:
+                        yield from iter(lambda: snapshot.read(1024 * 1024), b'')
+                    finally:
+                        snapshot.close()
+                return StreamingResponse(chunks(), media_type='image/png', headers={'Cache-Control': 'no-store'}, background=BackgroundTask(snapshot.close))
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Image asset is missing")
     return FileResponse(path, media_type="image/gif" if path.suffix.lower() == ".gif" else "image/png", filename=path.name, headers={"Cache-Control": "no-store"})

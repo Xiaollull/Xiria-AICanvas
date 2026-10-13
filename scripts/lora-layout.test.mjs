@@ -59,6 +59,7 @@ test("local Chromium fixture keeps LoRA modal cards in flow across 1100/800/600 
       const screenshot = join(folder, `lora-${width}.png`);
       const { stdout } = await execFileAsync(chrome, [
         "--headless=new", "--disable-gpu", "--hide-scrollbars", `--window-size=${width},1200`, `--screenshot=${screenshot}`, "--dump-dom", pathToFileURL(htmlPath).href,
+        "--no-first-run", "--no-default-browser-check", `--user-data-dir=${join(folder, "profile-" + width)}`,
       ], { windowsHide: true, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
       const documentMatch = stdout.match(/data-geometry="([^"]+)"/);
       assert.ok(documentMatch, `geometry result missing at ${width}`);

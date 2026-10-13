@@ -1,3 +1,5 @@
+import { inspectLoraIdentity } from "./lora-identity.js";
+
 export const LORA_SYNC_CHANNEL = "xirai-lora-workspace-v1";
 
 export function normalizeMountedLoras(value) {
@@ -10,10 +12,15 @@ export function normalizeMountedLoras(value) {
 export function inspectMountedLoras(value) {
   if (!Array.isArray(value)) return { items: [], rejected: value === undefined ? 0 : 1 };
   const seen = new Set();
+  const identityPaths = new Set();
   let rejected = 0;
+  let fatal = false;
   const items = [];
   for (const item of value) {
+    const identity = inspectLoraIdentity(item);
+    fatal ||= identity.fatal;
     const path = item?.value;
+    if (seen.has(path) && (item?.instanceId || identityPaths.has(path))) fatal = true;
     if (typeof path !== "string" || !path.trim() || path.length > 500 || path.includes("\0") || seen.has(path)) {
       rejected += 1;
       continue;
@@ -23,6 +30,7 @@ export function inspectMountedLoras(value) {
       continue;
     }
     seen.add(path);
+    if (item?.instanceId) identityPaths.add(path);
     const weight = Number(item.weight);
     // A mounted entry may name the group it came from. The mounted list stays
     // the single source of truth for generation; the tag only says which group
@@ -37,11 +45,22 @@ export function inspectMountedLoras(value) {
       precision: [1, 2, 4].includes(item.precision) ? item.precision : 1,
       enabled: item.enabled !== false,
       ...(groupId ? { groupId } : {}),
+      ...identity.fields,
     });
   }
-  return { items, rejected };
+  return { items, rejected, fatal };
 }
 
 export function sameMountedLoras(first, second) {
   return JSON.stringify(normalizeMountedLoras(first)) === JSON.stringify(normalizeMountedLoras(second));
+}
+
+export function mountedLoraResourcesReady(loras, categories, { loading = false, error = "", identitySupported = true } = {}) {
+  if (!identitySupported) return false;
+  const enabled = normalizeMountedLoras(loras).filter((item) => item.enabled !== false);
+  if (!enabled.length) return true;
+  const models = (categories || []).flatMap((category) => category.models || []);
+  return !loading && !error && enabled.every((item) => item.instanceId
+    ? models.some((model) => model.instanceId === item.instanceId && (!item.contentHash || item.contentHash === model.contentHash))
+    : models.some((model) => model.value === item.value && !model.bindingConflict));
 }

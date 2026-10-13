@@ -8,6 +8,7 @@ const loraPage = await readSource("src/LoraManagerPage.jsx");
 const downloader = await readSource("src/ModelDownloader.jsx");
 const settings = await readSource("src/SharedModelDirectories.jsx");
 const app = await readSource("src/App.jsx");
+const modal = await readSource("src/LoraManagerModal.jsx");
 const styles = await readSource("src/styles.css");
 
 test("the shared category renders the folder tree instead of a flat list", () => {
@@ -44,11 +45,15 @@ test("the nested grid is content, not a second scrollport", () => {
 });
 
 test("the floating LoRA manager renders the same shared folder hierarchy", () => {
-  assert.match(app, /activeLoraCategory\?\.shared \? <div className="lora-modal-shared-view">/);
-  assert.match(app, /collapsedModalSharedFolders\[folderKey\] !== false/);
-  assert.match(app, /lora-modal-shared-folder/);
-  assert.match(app, /folder\.models\.map\(\(item\) => renderModalLoraCard/);
-  assert.match(app, /const matchesLoraSearch = /);
+  assert.match(app, /<LoraManagerModal/);
+  assert.match(app, /collapsedFolders: collapsedModalSharedFolders, onCollapsedFolders: setCollapsedModalSharedFolders/);
+  assert.match(app, /renderCard: renderModalLoraCard/);
+  assert.match(modal, /category\?\.shared \? <div className="lora-modal-shared-view">/);
+  assert.match(modal, /c\.collapsedFolders\[key\] !== false/);
+  assert.match(modal, /lora-modal-shared-folder/);
+  assert.match(modal, /folder\.models\.map\(\(item\) => c\.renderCard/);
+  assert.match(modal, /const matches = /);
+  assert.match(modal, /folder\.models\.filter\(matches\)/);
   assert.match(styles, /\.lora-modal-shared-folder > button strong \{[^}]*font-size: 12px/);
   assert.match(styles, /\.lora-modal-shared-folder > button b \{[^}]*font: 9px "DM Mono"/);
   assert.match(styles, /\.lora-shared-folder > button strong \{[^}]*font-size: 12px/);

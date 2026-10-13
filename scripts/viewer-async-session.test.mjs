@@ -311,5 +311,7 @@ test("App uses the gate and unified close contract", () => {
   assert.match(source, /viewerSession\.current\.isCurrent\(token\)[\s\S]{0,120}setViewerZoom/);
   assert.match(source, /const snapToken = viewerSession\.current\.request\("snap", \{ latest: true \}\)/);
   assert.match(source, /viewerSession\.current\.mount\(\)/);
-  assert.match(source, /const plan = viewerOpenPlan\(generatedImage\);\s*if \(plan\.empty\) return/);
+  assert.match(source, /const plan = viewerOpenPlan\(explicit \? explicit\.assetId : generatedImage\);\s*if \(plan\.empty\) return/);
+  assert.match(source, /const explicit = source && typeof source === "object" && typeof source\.assetId === "string" && source\.assetId \? source : null/);
+  assert.match(source, /url: `\/api\/inference\/history\/assets\/\$\{explicit\.assetId\}`/);
 });

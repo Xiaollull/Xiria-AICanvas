@@ -241,7 +241,7 @@ function a1111Adetailer(parameters, hasMainControlNet) {
   return { units, issues, notes };
 }
 
-function backendChainToFrontend(chain) {
+export function backendChainToFrontend(chain) {
   // The PNG holds the request's own chain in wire shape; this is `resampleChainPayload` read back.
   return chain.filter(isPlainObject).map((stage) => {
     if (stage.type === "resample") {

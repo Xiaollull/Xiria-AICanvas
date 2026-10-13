@@ -182,12 +182,13 @@ test("handle activation keys never establish or commit a reorder", () => {
 });
 
 test("one shared panel wires native source, exact-transfer drop and a11y through drag handles", async () => {
-  const [app, page, panel, styles, helper] = await Promise.all([
+  const [app, page, panel, styles, helper, modal] = await Promise.all([
     readFile(join(projectRoot, "src", "App.jsx"), "utf8"),
     readFile(join(projectRoot, "src", "LoraManagerPage.jsx"), "utf8"),
     readFile(join(projectRoot, "src", "LoraMountPanel.jsx"), "utf8"),
     readFile(join(projectRoot, "src", "styles.css"), "utf8"),
     readFile(join(projectRoot, "src", "lora-drag-handle.js"), "utf8"),
+    readFile(join(projectRoot, "src", "LoraManagerModal.jsx"), "utf8"),
   ]);
   assert.match(helper, /application\/x-xiria-lora-sort/);
   assert.match(helper, /target\.closest\?\.\("\[data-lora-drag-handle\]"\)/);
@@ -198,7 +199,11 @@ test("one shared panel wires native source, exact-transfer drop and a11y through
   // The gesture lives in exactly one place now. Both mounted queues used to
   // carry their own copy, which is how a fix to one silently left the other
   // behind; a second implementation reappearing must fail this test.
-  for (const [name, source] of [["App.jsx", app], ["LoraManagerPage.jsx", page]]) {
+  assert.match(app, /<LoraManagerModal/);
+  assert.doesNotMatch(app, /data-drag-kind=|onDragStart=\{startMounted/, "App does not duplicate drag ownership");
+  assert.match(app, /locked: loraDragLocked, cards: loraCardControls, onLoras: commitMountedLoras/);
+  assert.match(modal, /<LoraMountPanel[^>]*locked=\{c\.locked\}[^>]*onUpdateLoras=\{c\.onLoras\}/);
+  for (const [name, source] of [["LoraManagerModal.jsx", modal], ["LoraManagerPage.jsx", page]]) {
     assert.match(source, /<LoraMountPanel\b/, `${name} must render the shared panel`);
     assert.ok(!source.includes("data-lora-drag-handle"), `${name} must not re-implement the drag handle`);
     assert.ok(!source.includes("establishLoraDragSession"), `${name} must not own a drag session`);
@@ -281,7 +286,7 @@ test("local Chromium fixture admits only nested six-dot path transfers and rejec
     const fixturePath = join(folder, "fixture.html");
     await writeFile(fixturePath, browserFixture(pathToFileURL(join(projectRoot, "src", "lora-drag-handle.js")).href), "utf8");
     for (const width of [1100, 800, 600]) {
-      const { stdout } = await execFileAsync(chrome, ["--headless=new", "--disable-gpu", "--allow-file-access-from-files", "--dump-dom", `--window-size=${width},820`, pathToFileURL(fixturePath).href], { windowsHide: true, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
+      const { stdout } = await execFileAsync(chrome, ["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${join(folder, 'profile-' + width)}`, "--allow-file-access-from-files", "--dump-dom", `--window-size=${width},820`, pathToFileURL(fixturePath).href], { windowsHide: true, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
       const match = stdout.match(/data-result="([^"]+)"/);
       assert.ok(match, `fixture result missing at ${width}`);
       const result = JSON.parse(match[1].replace(/&quot;/g, '"'));

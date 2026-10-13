@@ -60,6 +60,7 @@ test("local Chromium fully contains extreme panoramic and portrait originals", {
     await writeFile(htmlPath, fixture(pathToFileURL(join(projectRoot, "src", "styles.css")).href), "utf8");
     const { stdout } = await execFileAsync(chrome, [
       "--headless=new", "--disable-gpu", "--hide-scrollbars", "--window-size=1800,820",
+      "--no-first-run", "--no-default-browser-check", `--user-data-dir=${join(folder, "profile")}`,
       `--screenshot=${screenshot}`, "--dump-dom", pathToFileURL(htmlPath).href,
     ], { windowsHide: true, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
     const match = stdout.match(/data-geometry="([^"]+)"/);

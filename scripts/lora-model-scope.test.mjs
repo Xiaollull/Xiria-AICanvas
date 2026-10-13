@@ -133,8 +133,10 @@ test("mounted-map revision advances exactly once only for semantic SD/iL/Anima c
     requestToken: 6, latestToken: 6, capturedRevision: revision, latestRevision: revision,
     responseEngine: "iL", activeEngine: "iL",
   });
-  assert.equal(pruned.changed, true);
-  assert.equal(nextMountedLoraRevision(revision, pruneMap, pruned.container), revision + 1, "real scan prune");
+  assert.equal(pruned.applied, true);
+  assert.equal(pruned.changed, false, "a listing no longer authorizes unmounting a missing path");
+  assert.deepEqual(pruned.loras.map((item) => item.value), ["shared", "removed"]);
+  assert.equal(nextMountedLoraRevision(revision, pruneMap, pruned.container), revision, "only explicit edits or repair change membership");
 
   const noPrune = reconcileMountedLoraScan({
     container: map, categories: [{ id: "character", models: [lora("shared")] }], scanScopeKey: "SD",
@@ -182,7 +184,9 @@ test("App wiring uses named engine transition fields and keeps next-run LoRA dra
   assert.match(app, /sourceEngine: activeLoraScopeRef\.current,\s+sourceLoras: lorasRef\.current,\s+targetEngine: targetScopeKey/);
   assert.doesNotMatch(app, /sourceScopeKey:|targetScopeKey:/);
   assert.match(app, /const refreshLoras = async \(\) => \{\s+if \(lorasRefreshing \|\| !canStartMountedLoraScan\(loraScanGate\.current\)\) return;/);
-  assert.match(app, /disabled=\{lorasRefreshing \|\| modelSwitching \|\| loraWorkspaceLocked \|\| !shouldPersistMountedLoras\}/);
+  assert.match(app, /<LoraManagerModal[\s\S]*refreshLocked: modelSwitching \|\| loraWorkspaceLocked \|\| !shouldPersistMountedLoras/);
+  const modal = await readFile(new URL("../src/LoraManagerModal.jsx", import.meta.url), "utf8");
+  assert.match(modal, /disabled=\{c\.refreshing \|\| \(c\.refreshLocked \?\? c\.locked\)\}/);
   assert.match(app, /if \(!canStartMountedLoraScan\(\{ uiStateReady, \.\.\.loraScanGate\.current \}\)\) \{\s+setLoraLoading\(false\);\s+setLorasRefreshing\(false\);\s+return undefined;/);
   assert.match(app, /const \[activeJobRecoveryPending, setActiveJobRecoveryPending\] = useState\(true\);/);
   assert.match(app, /loraScanGate\.current = \{ activeJobRecoveryPending,/);
@@ -192,7 +196,7 @@ test("App wiring uses named engine transition fields and keeps next-run LoRA dra
   assert.match(app, /const gate = loraScanGate\.current;/);
   assert.match(app, /\.\.\.loraScanGate\.current/);
   assert.match(app, /shouldPersistMountedLoras: !mountedLoraMap\.fatal/);
-  assert.match(app, /if \(\(promptPresetLibraryError && !shouldPersistPromptPresets\) \|\| !shouldPersistMountedLoras\) return;/);
+  assert.match(app, /if \(\(promptPresetLibraryError && !shouldPersistPromptPresets\) \|\| !shouldPersistMountedLoras \|\| xyzPersistenceBlockedRef\.current\) return;/);
 });
 test("scan race, sync engine and Gallery target list are engine keyed", () => {
   let map = withMountedLorasForScope(emptyMountedLoraMap(), "SD", [lora("sd")]);
@@ -234,7 +238,7 @@ test("deferred automatic and manual scans cannot roll back newer local or cross-
   assert.equal(manual.categories, null, "stale refresh cannot replace library UI");
 });
 
-test("same-revision scan prunes only its engine, while newest token and revision must both match", () => {
+test("same-revision scan publishes its catalog without unmounting either engine; token and revision must both match", () => {
   let map = withMountedLorasForScope(emptyMountedLoraMap(), "SD", [lora("sd-keep")]);
   map = withMountedLorasForScope(map, "iL", [lora("existing"), lora("removed")]);
   const categories = [{ id: "character", models: [lora("existing")] }];
@@ -243,8 +247,9 @@ test("same-revision scan prunes only its engine, while newest token and revision
     capturedRevision: 7, latestRevision: 7, responseEngine: "iL", activeEngine: "iL",
   });
   assert.equal(current.applied, true);
-  assert.equal(current.changed, true);
-  assert.deepEqual(mountedLorasForScope(current.container, "iL").map((item) => item.value), ["existing"]);
+  assert.equal(current.changed, false);
+  assert.deepEqual(current.categories, categories);
+  assert.deepEqual(mountedLorasForScope(current.container, "iL").map((item) => item.value), ["existing", "removed"]);
   assert.deepEqual(mountedLorasForScope(current.container, "SD").map((item) => item.value), ["sd-keep"]);
   assert.equal(reconcileMountedLoraScan({ container: map, categories, scanScopeKey: "iL", requestToken: 11, latestToken: 12, capturedRevision: 7, latestRevision: 7, responseEngine: "iL", activeEngine: "iL" }).applied, false, "older token loses even at the current revision");
   assert.equal(reconcileMountedLoraScan({ container: map, categories, scanScopeKey: "iL", requestToken: 12, latestToken: 12, capturedRevision: 6, latestRevision: 7, responseEngine: "iL", activeEngine: "iL" }).applied, false, "latest token loses after a mutation");

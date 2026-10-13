@@ -58,8 +58,12 @@ test("a unit card carries its own ordering and deletion, and the add button is b
   assert.match(panel, /aria-label=\{`上移\$\{/);
   assert.match(panel, /aria-label=\{`下移\$\{/);
   assert.match(panel, /aria-label=\{`删除重采样 \$\{resampleUnitNumber\(chain, stage\)\}`\}/);
-  assert.match(panel, /disabled=\{locked \|\| index === 0\}/);
-  assert.match(panel, /disabled=\{locked \|\| index === chain\.length - 1\}/);
+  assert.match(panel, /actionsLocked = locked/);
+  assert.match(panel, /const canMoveUp = !actionsLocked && index > 0/);
+  assert.match(panel, /const canMoveDown = !actionsLocked && index < chain\.length - 1/);
+  assert.match(panel, /disabled=\{!canMoveUp\}[\s\S]{0,100}if \(!canMoveUp\) return/);
+  assert.match(panel, /disabled=\{!canMoveDown\}[\s\S]{0,100}if \(!canMoveDown\) return/);
+  assert.match(panel, /disabled=\{actionsLocked\}[\s\S]{0,100}if \(actionsLocked\) return/);
   assert.match(panel, /units\.length < RESAMPLE_UNIT_LIMIT/);
   // The one fact no single card can show: what the whole chain does to the picture.
   assert.match(panel, /chainSizeLine\(baseSize, chain, engine\)/);

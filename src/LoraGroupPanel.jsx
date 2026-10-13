@@ -47,14 +47,14 @@ function GroupTextArea({ label, icon, rows, limit, placeholder, hint, disabled, 
   </label>;
 }
 
-export default function LoraGroupPanel({ groups = [], loras = [], locked = false, cards, onUpdateGroups, onUpdateLoras, onNotice }) {
+export default function LoraGroupPanel({ groups = [], loras = [], locked = false, cards, onUpdateGroups, onUpdateLoras, onNotice, preserveSnapshot = false, libraryCopy, onToggleGroup, onCollectGroup, onCreateGroup }) {
   const [renaming, setRenaming] = useState("");
   const [nameDraft, setNameDraft] = useState("");
   const [expanded, setExpanded] = useState("");
   const [creating, setCreating] = useState(false);
   const createRef = useRef(null);
 
-  const mounted = normalizeMountedLoras(loras);
+  const mounted = preserveSnapshot ? loras : normalizeMountedLoras(loras);
   const standalone = mounted.filter((item) => !groupIdOfMountedLora(item, groups));
   const collecting = collectingGroupId(groups);
 
@@ -80,9 +80,10 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
    * untouched, rather than switching on and silently mounting nothing.
    */
   const toggleGroup = (group) => {
+    if (onToggleGroup) { onToggleGroup(group); return; }
     const next = applyGroupEnabled(mounted, group, !group.enabled);
     if (next.overflow) {
-      onNotice?.(`启用「${group.name}」会超过 16 个挂载上限，请先停用其它组或卸载部分 LoRA`);
+      onNotice?.(`启用「${group.name}」会超过 16 个挂载上限，请先停用其它组或卸载部分 LoRA`, "error");
       return;
     }
     onUpdateLoras?.(() => next.loras);
@@ -97,7 +98,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
   const createGroup = ({ fromMounted }) => {
     setCreating(false);
     if (groups.length >= MAXIMUM_GROUPS) {
-      onNotice?.(`最多只能保存 ${MAXIMUM_GROUPS} 个 LoRA 组合`);
+      onNotice?.(`最多只能保存 ${MAXIMUM_GROUPS} 个 LoRA 组合`, "error");
       return;
     }
     const members = fromMounted ? standalone.map(({ groupId: _groupId, ...member }) => member) : [];
@@ -109,8 +110,10 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
       enabled: fromMounted,
       collecting: !fromMounted,
     }, groups.length);
-    onUpdateGroups?.((current) => [...current, group]);
-    if (fromMounted) {
+    if (onCreateGroup) {
+      if (!onCreateGroup({ group, members, fromMounted })) return;
+    } else onUpdateGroups?.((current) => [...current, group]);
+    if (fromMounted && !onCreateGroup) {
       // The captured entries are already mounted; tagging them makes the group a
       // live view of them rather than a detached copy.
       const values = new Set(members.map((member) => member.value));
@@ -121,17 +124,18 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
     setExpanded(group.id);
     onNotice?.(fromMounted
       ? `已用 ${members.length} 个未分组 LoRA 新建组合，可继续重命名`
-      : `已新建「${group.name}」，现在挂载的 LoRA 都会进入这个组合`);
+      : `已新建「${group.name}」，现在挂载的 LoRA 都会进入这个组合`, "success");
   };
 
   const toggleCollecting = (group) => {
     const next = collecting === group.id ? "" : group.id;
+    if (onCollectGroup) { onCollectGroup(group, next); return; }
     if (next) {
       // Collecting implies mounted: the group needs a block for new entries to
       // appear in, so switching it on also enables it.
       const mount = applyGroupEnabled(mounted, group, true);
       if (mount.overflow) {
-        onNotice?.(`启用「${group.name}」会超过 16 个挂载上限，请先停用其它组或卸载部分 LoRA`);
+        onNotice?.(`启用「${group.name}」会超过 16 个挂载上限，请先停用其它组或卸载部分 LoRA`, "error");
         return;
       }
       if (mount.changed) onUpdateLoras?.(() => mount.loras);
@@ -148,7 +152,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
     // Group ids are never reused, so a card left behind would keep its effect
     // images alive under an id nothing can reach or delete.
     cards?.onRemoveGroup?.(group.id);
-    onNotice?.(`已删除组合「${group.name}」`);
+    onNotice?.(`已删除组合「${group.name}」`, "success");
   };
 
   const addStandaloneTo = (group) => {
@@ -161,7 +165,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
       const values = new Set(standalone.map((item) => item.value));
       onUpdateLoras?.((current) => current.map((item) => values.has(item.value) ? { ...item, groupId: group.id } : item));
     }
-    onNotice?.(`已将 ${standalone.length} 个 LoRA 加入「${group.name}」`);
+    onNotice?.(`已将 ${standalone.length} 个 LoRA 加入「${group.name}」`, "success");
   };
 
   const removeMember = (group, value) => {
@@ -179,13 +183,13 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
     <div className="lora-group-panel">
       <div className="lora-group-head">
         <div>
-          <h3>LoRA 组合</h3>
-          <p>保存常用的 LoRA 搭配与预设提示词，启用后会挂载到挂载区，可同时启用多个组合。</p>
+          <h3>{libraryCopy ? "组合库 · 复制快照" : "LoRA 组合"}</h3>
+          <p>{libraryCopy ? "复制到 XYZ 后再编辑；不会修改组合库的启用状态、成员与权重。" : "保存常用的 LoRA 搭配与预设提示词，启用后会挂载到挂载区，可同时启用多个组合。"}</p>
         </div>
         <div className="lora-group-create-wrap" ref={createRef}>
-          <button type="button" className="lora-group-create" disabled={locked} aria-expanded={creating} aria-haspopup="menu" onClick={() => setCreating((current) => !current)}>
-            <FolderPlus size={14} />新建组合
-          </button>
+            {!libraryCopy && <button type="button" className="lora-group-create" disabled={locked} aria-expanded={creating} aria-haspopup="menu" onClick={() => setCreating((current) => !current)}>
+              <FolderPlus size={14} />新建组合
+            </button>}
           {creating && (
             <div className="lora-group-create-menu" role="menu">
               <button type="button" role="menuitem" disabled={!standalone.length} onClick={() => createGroup({ fromMounted: true })}>
@@ -234,11 +238,12 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
               <button
                 type="button"
                 className={`mounted-toggle ${group.enabled ? "active" : ""}`}
-                role="switch"
+                role={libraryCopy ? undefined : "switch"}
                 aria-checked={group.enabled}
                 disabled={locked}
-                title={group.enabled ? "停用该组合" : "启用该组合"}
-                onClick={() => toggleGroup(group)}
+                title={libraryCopy ? "复制到 XYZ 独立快照" : group.enabled ? "停用该组合" : "启用该组合"}
+                aria-label={libraryCopy ? `复制 ${group.name} 到 XYZ` : undefined}
+                onClick={() => libraryCopy ? libraryCopy(group) : toggleGroup(group)}
               ><i /></button>
               {renaming === group.id ? (
                 <input
@@ -259,7 +264,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
               )}
               <small>{group.members.length} 个 LoRA{group.presetPrompt ? " · 含预设提示词" : ""}{presentation?.showcase.length ? ` · ${presentation.showcase.length} 张效果图` : ""}</small>
               <span className="lora-mount-spacer" />
-              <button
+              {!libraryCopy && <button
                 type="button"
                 className={`lora-group-collect ${collecting === group.id ? "active" : ""}`}
                 disabled={locked}
@@ -267,7 +272,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
                 title={collecting === group.id ? "停止收集新挂载的 LoRA" : "把之后挂载的 LoRA 收集到该组合"}
                 aria-label={collecting === group.id ? `停止向 ${group.name} 收集` : `向 ${group.name} 收集新挂载的 LoRA`}
                 onClick={() => toggleCollecting(group)}
-              >{collecting === group.id ? <CircleStop size={13} /> : <Target size={13} />}</button>
+              >{collecting === group.id ? <CircleStop size={13} /> : <Target size={13} />}</button>}
               {cards?.onPatchGroup && (
                 // The effect images used to be reachable only by opening the
                 // body first, which made the group cover impossible to find.
@@ -280,9 +285,9 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
                   onClick={() => setExpanded(group.id)}
                 ><Images size={13} /></button>
               )}
-              <button type="button" disabled={locked} title="重命名" aria-label={`重命名 ${group.name}`} onClick={() => { setRenaming(group.id); setNameDraft(group.name); }}><Pencil size={13} /></button>
+              {!libraryCopy && <button type="button" disabled={locked} title="重命名" aria-label={`重命名 ${group.name}`} onClick={() => { setRenaming(group.id); setNameDraft(group.name); }}><Pencil size={13} /></button>}
               <button type="button" disabled={locked} title="编辑内容" aria-expanded={expanded === group.id} aria-label={`编辑 ${group.name}`} onClick={() => setExpanded((current) => current === group.id ? "" : group.id)}>{expanded === group.id ? <Check size={13} /> : <Layers3 size={13} />}</button>
-              <button type="button" className="remove" disabled={locked} title="删除组合" aria-label={`删除 ${group.name}`} onClick={() => removeGroup(group)}><Trash2 size={13} /></button>
+              {!libraryCopy && <button type="button" className="remove" disabled={locked} title="删除组合" aria-label={`删除 ${group.name}`} onClick={() => removeGroup(group)}><Trash2 size={13} /></button>}
             </header>
 
             {expanded === group.id && (
@@ -316,7 +321,7 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
                   label="预设正向提示词"
                   icon={<MessageSquareText size={12} />}
                   rows={3}
-                  disabled={locked}
+                  disabled={locked || Boolean(libraryCopy)}
                   value={group.presetPrompt}
                   placeholder="启用该组合时，这段提示词会加在正向提示词最前面"
                   hint="生成页的提示词输入框不会被改写；多个组合按此列表顺序依次拼接。"
@@ -330,14 +335,14 @@ export default function LoraGroupPanel({ groups = [], loras = [], locked = false
                       <strong title={member.name}>{member.name}</strong>
                       <small>{member.category}</small>
                       <b>{member.weight}</b>
-                      <button type="button" disabled={locked} title="从组合中移除" aria-label={`从 ${group.name} 中移除 ${member.name}`} onClick={() => removeMember(group, member.value)}><X size={12} /></button>
+                      {!libraryCopy && <button type="button" disabled={locked} title="从组合中移除" aria-label={`从 ${group.name} 中移除 ${member.name}`} onClick={() => removeMember(group, member.value)}><X size={12} /></button>}
                     </div>
                   ))}
                 </div>
 
-                <button type="button" className="lora-group-add" disabled={locked || !standalone.length} onClick={() => addStandaloneTo(group)}>
+                {!libraryCopy && <button type="button" className="lora-group-add" disabled={locked || !standalone.length} onClick={() => addStandaloneTo(group)}>
                   <Plus size={13} />加入当前未分组的 {standalone.length} 个 LoRA
-                </button>
+                </button>}
               </div>
             )}
           </article>

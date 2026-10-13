@@ -37,10 +37,10 @@ test("the Flux2 entry point is open on the main page and mounts three components
   assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2"\]/);
   assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"\]/);
 
-  const picker = sourceBetween(app, "            {isSplitModel ? <div className={`checkpoint-picker split-model-picker", "            {isSplitModel && !engineAllowsLora");
+  const picker = sourceBetween(app, "            {isSplitModel ? <ModelAssetPicker", "            {isSplitModel && !engineAllowsLora");
   // The second encoder row stays a FLUX.1 slot: FLUX.2's whole conditioning is one language model.
-  assert.match(picker, /\.\.\.\(isFlux \? \[\["textEncoder2", "文本编码器 · T5-XXL"/);
-  assert.doesNotMatch(picker, /isFlux2 \? \[\["textEncoder2"/);
+  assert.match(picker, /\.\.\.\(isFlux \? \[\{ kind: "textEncoder2", label: "文本编码器 · T5-XXL"/);
+  assert.doesNotMatch(picker, /isFlux2 \? \[\{ kind: "textEncoder2"/);
 });
 
 test("a Flux2 generation is guidance distilled: no negative branch, no enhancement, no preview", async () => {
@@ -161,5 +161,8 @@ test("the image-to-image page opens its split picker and negative-prompt lock fo
   const page = await readSource("src/ImageToImagePage.jsx");
   assert.match(page, /\["Anima", "Flux", "Flux2", "Krea2"\]\.includes\(engine\.name\)/);
   assert.match(page, /const distilledPageLabel = engine\.name === "Flux2" \? "FLUX\.2" : "FLUX\.1"/);
-  assert.match(page, /disabled=\{editingLocked \|\| !pageAllowsNegativePrompt\}/);
+  // The prompt pair is the shared `PromptField`: the page hands it the edit lock and the engine
+  // gate separately, and the field disables its textarea on either.
+  assert.match(page, /<PromptField type="negative" value=\{config\.negative\} disabled=\{editingLocked\} supported=\{pageAllowsNegativePrompt\}/);
+  assert.match(await readSource("src/PromptField.jsx"), /<textarea \{\.\.\.textareaProps\} value=\{value\} disabled=\{disabled \|\| !supported\}/);
 });

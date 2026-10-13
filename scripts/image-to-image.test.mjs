@@ -369,15 +369,18 @@ test("the LoRA block is the text-to-image one, not a second spelling of it", asy
   // Two substitutions, and only two: the array each page reads the mounts from, and how each opens
   // the manager — a prop here, App's own setters there. Everything that decides how a mount *looks*
   // has to survive them and match byte for byte.
-  const block = (source, mounts) => source
-    .slice(source.indexOf("<h2>LoRA 挂载</h2>"), source.indexOf("</div>}", source.indexOf("<h2>LoRA 挂载</h2>")))
+  // The heading is written on each page; the list itself is one shared component.
+  const header = (source, mounts) => source
+    .slice(source.indexOf("<h2>LoRA 挂载</h2>"), source.indexOf("</div>", source.indexOf("<h2>LoRA 挂载</h2>")))
     .replace(new RegExp(mounts, "g"), "MOUNTS")
     .replace(/onClick=\{(?:onOpenLoraManager|\(\) => \{? ?set[^}]*\}?)\}/g, "onClick={OPEN}")
     .replace(/\s+/g, " ")
     .trim();
-  assert.equal(block(page, "engine\\.loras"), block(app, "loras"));
+  assert.equal(header(page, "engine\\.loras"), header(app, "loras"));
   assert.match(page, /className="section-heading lora-title"/);
-  assert.match(page, /className="lora-summary-table"/);
+  assert.match(page, /<MountedLoraSummary loras=\{engine\.loras\} presentationFor=\{loraPresentationFor\} bindHover=\{loraSummaryHover\.bind\}/);
+  assert.match(app, /<MountedLoraSummary loras=\{loras\} presentationFor=\{loraPresentationFor\} bindHover=\{loraSummaryHover\.bind\}/);
+  assert.match(await readSource("src/MountedLoraSummary.jsx"), /className="lora-summary-table"/);
 });
 
 test("the drop stage stays keyboard reachable instead of being a clickable div", async () => {

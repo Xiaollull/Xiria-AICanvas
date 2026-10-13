@@ -54,7 +54,8 @@ test("the queue is read from the service rather than assembled in the page", asy
 test("the panel follows the job the service is working on", async () => {
   const app = await readSource("src/App.jsx");
   // When the watched job ends the next one is picked up, or the queue would drain unobserved.
-  assert.match(app, /const next = queue\.find\(\(job\) => job\.active && job\.id !== generationJob\);/);
+  // An XYZ experiment is watched by its own workspace, not by this preview panel.
+  assert.match(app, /const next = queue\.find\(\(job\) => job\.active && job\.id !== generationJob && job\.kind !== "xyz_plot"\);/);
   assert.match(app, /setStagePreviews\(\[\]\);/);
 });
 
@@ -133,5 +134,5 @@ test("gallery additions use the completed job snapshot instead of the current dr
   assert.match(app, /sessionStorage\.setItem\(`\$\{GALLERY_JOB_ACCESS_STORAGE_PREFIX\}\$\{jobId\}`, token\)/);
   assert.match(app, /const gallerySettings = galleryJobSnapshotPayload\(submittedSettings\);/);
   assert.match(app, /const canAddGeneratedToGallery = Boolean\(generatedSettings\)/);
-  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/);
+  assert.match(app, /settings=\{galleryAddSource \? galleryCardSettings\(galleryAddSource\.settings, \{ record: true \}\) : generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/);
 });

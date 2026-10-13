@@ -57,7 +57,7 @@ async function withState(run) {
 test("an empty store has a scope for every engine that can mount a LoRA", () => {
   const store = emptyLoraCardStore();
   for (const engine of ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]) {
-    assert.deepEqual(store.byEngine[engine], { loras: {}, groups: {} });
+    assert.deepEqual(store.byEngine[engine], { loras: {}, groups: {}, byInstance: {} });
   }
 });
 
@@ -137,14 +137,19 @@ test("deleting a combination takes its card with it", () => {
   assert.equal(referencedCardAssets(store).size, 0);
 });
 
-test("a damaged store is dropped rather than treated as fatal", () => {
+test("malformed legacy decoration resets, but future identity stores remain fail-closed", () => {
   // Unlike the mounted map, nothing here is on the generation path: everything a
   // reset loses can be typed again, so refusing to save would be the worse harm.
-  for (const bad of ["nope", 5, [], { schemaVersion: "1" }, { schemaVersion: 99, byEngine: {} }]) {
+  for (const bad of ["nope", 5, [], { schemaVersion: "1" }]) {
     const result = normalizeLoraCardStore(bad);
     assert.equal(result.reset, true);
     assert.deepEqual(result.store, emptyLoraCardStore());
   }
+  const future = { schemaVersion: 99, byEngine: {} };
+  const refused = normalizeLoraCardStore(future);
+  assert.equal(refused.fatal, true);
+  assert.equal(refused.reset, false, "future identity data is never eligible for a destructive reset");
+  assert.strictEqual(refused.raw, future);
   const partial = normalizeLoraCardStore({
     schemaVersion: 1,
     byEngine: { SD: { loras: { "a.safetensors": { title: "留下" }, "": { title: "丢掉" } }, groups: { "bad id": { note: "丢掉" } } } },
@@ -301,8 +306,13 @@ test("the store lives in state-cache, where an update preserves it and a metadat
   assert.equal(path.basename(path.dirname(paths.directory)), "state-cache");
   assert.equal(path.basename(paths.indexPath), "cards.json");
   const config = await readFile(new URL("../vite.config.js", import.meta.url), "utf8");
-  assert.match(config, /readLoraCardStore\(stateDirectory\)/);
-  assert.match(config, /writeLoraCardStore\(stateDirectory, payload\?\.store\)/);
+  assert.match(config, /new LoraPublishedStore\(\{ stateDirectory,/);
+  assert.match(config, /loraPublishedStore\.read\("cards"\)/);
+  assert.match(config, /loraPublishedStore\.save\("cards", payload\?\.store, requestPublication\(request\)/);
+  const owner = await readFile(new URL("./lora-published-store.mjs", import.meta.url), "utf8");
+  assert.match(owner, /path\.join\(this\.stateDirectory, kind === "cards" \? "lora-cards\/cards\.json"/);
+  assert.match(owner, /normalizeLoraCardStore\(current\)\.fatal/);
+  assert.match(owner, /await durableJson\(this\.file\(kind\), next\)/);
   // The lookup cache is rewritten wholesale by "重新解析"; the card store is a
   // different directory entirely so that cannot touch it.
   assert.match(config, /const loraCacheDirectory = path\.join\(cacheDirectory, "lora-metadata"\)/);

@@ -21,7 +21,7 @@ export function ModelName({ match, fallback = "", className = "", lora = false }
     // recorded name beside it, rather than as a warning on every row of a borrowed picture.
     if (lora) {
       return <span className={`model-name-unselected ${className}`} title={`本地模型目录与共享目录中都没有这个 LoRA：${name}`}>
-        无选择<small className="model-name-recorded">{name}</small>
+        无选择<small className="model-name-recorded">{name}</small>{match.explanation && <small className="model-name-relink">{match.explanation}</small>}
       </span>;
     }
     return <span className={`model-name-missing ${className}`} title="本地模型目录与共享目录中都没有这个模型">
@@ -29,13 +29,14 @@ export function ModelName({ match, fallback = "", className = "", lora = false }
     </span>;
   }
   if (match.status === "ambiguous") {
-    const candidates = (match.candidates || []).map((item) => `${item.display}${item.engine ? ` · ${item.engine}` : ""}${item.origin === "shared" ? " · 共享" : ""}`);
+    const candidates = (match.candidates || []).map((item) => `${item.display || item.value || item.name}${item.engine ? ` · ${item.engine}` : ""}${item.origin === "shared" ? " · 共享" : ""}`);
     const more = (match.count || candidates.length) > candidates.length ? `\n另有 ${(match.count || 0) - candidates.length} 个` : "";
-    return <span className={`model-name-ambiguous ${className}`} title={`有歧义：本地有 ${match.count || candidates.length} 个同名文件，无法确定是哪一个${match.hashChecked ? "（记录的哈希也无法区分）" : ""}\n${candidates.join("\n")}${more}`}>
-      <AlertTriangle size={12} />{name}<i>有歧义 · {match.count || candidates.length} 个同名</i>
+    return <span className={`model-name-ambiguous ${className}`} title={match.explanation || `有歧义：本地有 ${match.count || candidates.length} 个同名文件，无法确定是哪一个${match.hashChecked ? "（记录的哈希也无法区分）" : ""}\n${candidates.join("\n")}${more}`}>
+      <AlertTriangle size={12} />{name}<i>有歧义 · {match.count || candidates.length} 个候选</i>{match.explanation && <small className="model-name-relink">{match.explanation}</small>}
+      {match.auditKind === "path-reuse" && candidates.map((candidate, index) => <small className="model-name-relink" key={index}>候选：{candidate}</small>)}
     </span>;
   }
-  const display = match.display || match.match?.display || name;
+  const display = match.relink?.currentValue || match.display || match.match?.display || name;
   const detail = [
     match.match?.label || "",
     match.precision ? `匹配方式 ${match.precision}` : "",
@@ -51,6 +52,8 @@ export function ModelName({ match, fallback = "", className = "", lora = false }
   return <span className={`model-name-found ${match.status} ${className}`} title={display !== name ? `图片记录：${name}` : undefined}>
     {display}
     {display !== name && <small className="model-name-recorded">{name}</small>}
+    {match.relink?.kind === "relocate" && <small className="model-name-relink">原位置 → 当前位置：{match.relink.originalValue || name} → {match.relink.currentValue}</small>}
+    {match.relink?.kind === "replace" && <small className="model-name-relink">原文件缺失，使用指定替代：{match.relink.originalValue || name} → {match.relink.currentValue}</small>}
     {choice && <em className="model-name-choice" title={choice.title}>{choice.label}</em>}
     <i title={detail}>{match.status === "shared" ? <><Share2 size={10} />共享</> : <><Check size={10} />本地</>}</i>
   </span>;

@@ -96,6 +96,7 @@ test("the mounted row keeps its columns aligned once the card button is added", 
       const screenshot = join(folder, `card-${width}.png`);
       const { stdout } = await execFileAsync(chrome, [
         "--headless=new", "--disable-gpu", "--hide-scrollbars", `--window-size=${width},900`, `--screenshot=${screenshot}`, "--dump-dom", pathToFileURL(htmlPath).href,
+        "--no-first-run", "--no-default-browser-check", `--user-data-dir=${join(folder, "profile-" + width)}`,
       ], { windowsHide: true, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
       const match = stdout.match(/data-geometry="([^"]+)"/);
       assert.ok(match, `geometry result missing at ${width}`);

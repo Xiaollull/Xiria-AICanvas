@@ -64,7 +64,9 @@ class RegistryTestCase(unittest.TestCase):
 
 class QueueListingTests(RegistryTestCase):
     def test_submit_snapshots_the_response_before_starting_the_worker(self):
-        source = inspect.getsource(inference_server.create_job)
+        # The route admits the LoRA library first and then creates the job in one helper.
+        self.assertIn("return _create_job_admitted(", inspect.getsource(inference_server.create_job))
+        source = inspect.getsource(inference_server._create_job_admitted)
         self.assertLess(source.index("response = public_job_view"), source.index("executor.submit"))
 
     def test_the_list_is_oldest_first_and_counts_every_state(self):

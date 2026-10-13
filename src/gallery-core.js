@@ -146,6 +146,18 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS) {
   return normalized;
 }
 
+/**
+ * Card settings written to the gallery carry the LoRA publication their writer has seen: the gallery
+ * refuses a write whose `loraLibraryRevision` is not the current one, so a LoRA repair can never be
+ * overwritten by a stale editor (P10). A card read from the gallery already carries the revision it was
+ * read at and keeps it; new content — a generated output, an XYZ cell, a new card — is stamped with the
+ * revision this client knows. Before any publication there is nothing to stamp.
+ */
+export function withGalleryLoraRevision(settings, revision = currentLoraRevision()) {
+  if (!settings || typeof settings !== "object" || Number.isSafeInteger(settings.loraLibraryRevision)) return settings;
+  return Number.isSafeInteger(revision) && revision > 0 ? { ...settings, loraLibraryRevision: revision } : settings;
+}
+
 export async function galleryRequest(path = "", options = {}) {
   const response = await fetch(`/api/inference/gallery${path}`, {
     cache: "no-store",
@@ -254,3 +266,4 @@ export function useDialogLifecycle(open, onClose, focusReturnSelector = "", canC
   }, [open]);
   return dialogRef;
 }
+import { currentLoraRevision, loraFetch as fetch } from "./lora-library-client.js";

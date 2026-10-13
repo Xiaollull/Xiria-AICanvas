@@ -63,6 +63,9 @@ function v1Winner(value, engine, activeEngine, activeModelIdentity, legacy) {
 export function normalizeMountedLoraMap(value, { fieldMissing = false, legacyLoras = [], activeEngine = null, activeModelIdentity = null } = {}) {
   const engine = engineScopeKey(activeEngine);
   const legacy = inspectMountedLoras(legacyLoras);
+  if (legacy.fatal || Object.values(value?.byEngine || {}).some((list) => inspectMountedLoras(list).fatal)) {
+    return { container: emptyMountedLoraMap(), activeLoras: [], warning: "LoRA 身份格式无法识别，已停止自动保存以保护原始数据。", fatal: true, raw: value, migrated: false, rejected: 0 };
+  }
   if (fieldMissing) {
     const container = emptyMountedLoraMap();
     if (engine) container.byEngine[engine] = legacy.items;
@@ -98,7 +101,7 @@ export function sameMountedLoraMap(first, second) {
 }
 /**
  * Which files are mounted, ignoring how they are tuned.  A scan exists only to
- * prune entries whose file has left the directory, which depends on the set of
+ * observe entries whose file has left the directory, which depends on the set of
  * paths and on nothing else — not their order, weight, precision or enabled
  * flag.
  */
@@ -127,7 +130,7 @@ export function canStartMountedLoraScan({ uiStateReady = true, activeJobRecovery
 }
 /**
  * Response admission is deliberately stricter than request admission.  A
- * directory listing is allowed to prune only the exact mounted-map generation
+ * directory listing is allowed to observe only the exact mounted-map generation
  * it observed before its request was sent.
  */
 export function shouldApplyMountedLoraScan({ requestToken, latestToken, capturedRevision, latestRevision, responseEngine, activeEngine, activeJobRecoveryPending = false, status = "idle", modelSwitching = false, workspaceLocked = false, shouldPersist = true } = {}) {
@@ -154,9 +157,13 @@ export function reconcileMountedLoraScan({ container, getCurrentContainer, categ
   // current mounted map in its completion path.
   const currentContainer = typeof getCurrentContainer === "function" ? getCurrentContainer() : container;
   const scannedCategories = Array.isArray(categories) ? categories : [];
-  const available = new Set(scannedCategories.flatMap((category) => (category?.models || []).map((item) => item?.value)));
   const current = mountedLorasForScope(currentContainer, scopeKey);
-  const loras = current.filter((item) => available.has(item.value));
+  // A directory listing is not a user-authorized unmount. Incomplete/shared
+  // scans are particularly not proof of deletion. Keep definitions and their
+  // parameters intact; App's existing loraResourcesReady gate blocks enabled
+  // missing members and Python rechecks actual paths during inference. Repair
+  // is an explicit separate transaction.
+  const loras = current;
   const changed = !sameMountedLoras(current, loras);
   return {
     applied: true,
@@ -183,4 +190,4 @@ export function transitionMountedLoraScope(container, { sourceEngine = null, sou
     scopeChanged: source !== target,
   };
 }
-export function applyMountedLoraSync(container, { engine, loras } = {}, { activeEngine = null, locked = false } = {}) { if (locked || !engineScopeKey(engine)) return { container: clonedMap(container), activeLoras: mountedLorasForScope(container, activeEngine), applied: false }; const next = withMountedLorasForScope(container, engine, loras); return { container: next, activeLoras: mountedLorasForScope(next, activeEngine), applied: true }; }
+export function applyMountedLoraSync(container, { engine, loras } = {}, { activeEngine = null, locked = false } = {}) { if (locked || !engineScopeKey(engine) || inspectMountedLoras(loras).fatal) return { container: clonedMap(container), activeLoras: mountedLorasForScope(container, activeEngine), applied: false }; const next = withMountedLorasForScope(container, engine, loras); return { container: next, activeLoras: mountedLorasForScope(next, activeEngine), applied: true }; }

@@ -1,5 +1,6 @@
 import { PROMPT_BLOCK_SEPARATOR } from "./prompt-presets.js";
 import { normalizeMountedLoras } from "./lora-state.js";
+import { inspectLoraIdentity } from "./lora-identity.js";
 import { READY_LORA_ENGINES, engineScopeKey } from "./lora-model-scope.js";
 
 // User-defined LoRA combinations.
@@ -102,6 +103,10 @@ export function normalizeLoraGroupList(value) {
  */
 export function normalizeLoraGroupMap(value, { fieldMissing = false } = {}) {
   if (fieldMissing || value === undefined || value === null) return { container: emptyLoraGroupMap(), warning: "", rejected: 0 };
+  if (Number.isInteger(value?.schemaVersion) && value.schemaVersion > LORA_GROUPS_SCHEMA_VERSION) return { container: emptyLoraGroupMap(), warning: "LoRA 组合来自较新版本，已停止保存并保留原始数据。", rejected: 0, fatal: true, raw: value };
+  if (Object.values(value?.byEngine || {}).some((list) => Array.isArray(list) && list.some((group) => Array.isArray(group?.members) && group.members.some((member) => inspectLoraIdentity(member).fatal)))) {
+    return { container: emptyLoraGroupMap(), warning: "LoRA 组合身份格式无法识别，已停止保存以保护原始数据。", rejected: 0, fatal: true, raw: value };
+  }
   if (!isPlainObject(value) || !Number.isInteger(value.schemaVersion) || value.schemaVersion > LORA_GROUPS_SCHEMA_VERSION || !isPlainObject(value.byEngine)) {
     return { container: emptyLoraGroupMap(), warning: "LoRA 组合格式无法识别，已重置为空；挂载库未受影响。", rejected: 0 };
   }

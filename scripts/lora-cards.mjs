@@ -99,7 +99,10 @@ export async function readLoraCardStore(stateDirectory) {
 
 export async function writeLoraCardStore(stateDirectory, store) {
   const { directory, indexPath } = loraCardPaths(stateDirectory);
-  const normalized = normalizeLoraCardStore(store).store;
+  const existing = await readLoraCardStore(stateDirectory);
+  const inspected = normalizeLoraCardStore(store);
+  if (existing.fatal || inspected.fatal || existing.reset) throw Object.assign(new Error("LoRA card schema is unreadable; original data retained, saving disabled"), { statusCode: 409 });
+  const normalized = inspected.store;
   await writeFileAtomically(directory, indexPath, `${JSON.stringify(normalized, null, 2)}\n`);
   return normalized;
 }

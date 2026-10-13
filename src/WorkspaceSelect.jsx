@@ -12,6 +12,10 @@ export default function WorkspaceSelect({
   ariaInvalid,
   ariaDescribedBy,
   className = "",
+  // Optional: align the menu to a wider element (e.g. a framed control around this select) instead of the trigger.
+  anchorRef = null,
+  // Optional: a second chevron before the label, for a centred, symmetric trigger.
+  mirrorChevron = false,
 }) {
   const isGroupHeading = (option) => option?.type === "group" || option?.groupHeading === true;
   const id = useId();
@@ -71,7 +75,7 @@ export default function WorkspaceSelect({
   useEffect(() => {
     if (!open) return undefined;
     const positionMenu = () => {
-      const rect = rootRef.current?.getBoundingClientRect();
+      const rect = (anchorRef?.current || rootRef.current)?.getBoundingClientRect();
       if (!rect) return;
       const width = Math.min(Math.max(rect.width, 180), window.innerWidth - 16);
       const estimatedHeight = Math.min(options.length * 35 + 10, 248);
@@ -99,7 +103,7 @@ export default function WorkspaceSelect({
       document.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", positionMenu);
     };
-  }, [open, options.length]);
+  }, [open, options.length, anchorRef]);
 
   useEffect(() => {
     if (!open || activeIndex < 0) return;
@@ -112,7 +116,7 @@ export default function WorkspaceSelect({
 
   return <div ref={rootRef} className={`workspace-select ${open ? "open" : ""}${className ? ` ${className}` : ""}`}>
     <button ref={triggerRef} type="button" className="workspace-select-trigger" aria-label={ariaLabel} aria-haspopup="listbox" aria-expanded={open} aria-controls={`${id}-menu`} aria-activedescendant={open && activeIndex >= 0 ? `${id}-option-${activeIndex}` : undefined} aria-invalid={ariaInvalid} aria-describedby={ariaDescribedBy} disabled={disabled || !enabledIndexes.length} onClick={() => open ? closeMenu() : openMenu()} onKeyDown={onKeyDown}>
-      <span title={selected?.label || placeholder}>{selected?.label || placeholder}</span><ChevronDown size={14} />
+      {mirrorChevron && <ChevronDown size={14} aria-hidden="true" />}<span title={selected?.label || placeholder}>{selected?.label || placeholder}</span><ChevronDown size={14} aria-hidden={mirrorChevron || undefined} />
     </button>
     {open && createPortal(<div ref={menuRef} id={`${id}-menu`} className="workspace-select-menu" role="listbox" aria-label={ariaLabel} style={menuStyle || { visibility: "hidden" }}>
        {(() => {

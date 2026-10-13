@@ -10,7 +10,6 @@ import {
   FolderOpen,
   Key,
   RefreshCw,
-  Sparkles,
   X,
 } from "lucide-react";
 import { formatFileSize } from "./format-size";
@@ -394,12 +393,11 @@ export default function ModelDownloader({ onDownloaded }) {
 
   return <section className="model-downloader-page">
     <header className="downloader-hero">
-      <div><span className="eyebrow">LOCAL MODEL ACQUISITION</span><p>从 Civitai、Hugging Face 或 ModelScope 解析模型文件，并根据线路测速自动选择可用来源进行多线程续传。</p></div>
       <div className="downloader-source-list"><span>Civitai</span><span>Hugging Face</span><span>ModelScope</span><span>GitHub Release</span></div>
     </header>
     <form className="downloader-form" onSubmit={startDownload}>
       <section className="downloader-card credentials-card">
-        <div className="downloader-section-head"><span>01</span><div><strong>API Key 管理</strong><small>可选，为 Civitai、Hugging Face 或 ModelScope 分别配置密钥</small></div></div>
+        <div className="downloader-section-head"><div><strong>API 密钥</strong><small>可选，为 Civitai、Hugging Face 或 ModelScope 分别配置</small></div></div>
         <button type="button" className="key-manager-trigger" onClick={() => setKeyManagerOpen(true)}>
           <Key size={15} />
           <span>管理 API 密钥<small>{configuredCredentialCount ? `${configuredCredentialCount} 个已配置` : "未配置"}</small></span>
@@ -407,21 +405,21 @@ export default function ModelDownloader({ onDownloaded }) {
         </button>
         <p className="downloader-security-note"><i />密钥保存在当前浏览器本地存储，下载时仅发送给对应站点，不会写入模型目录或运行日志。</p>
       </section>
-      <section className="downloader-card link-card">
-        <div className="downloader-section-head"><span>02</span><div><strong>模型链接</strong><small>优先粘贴文件详情页或直接下载链接；仓库存在多个文件时需提供具体文件链接</small></div></div>
-        <label className="model-link-field"><span>MODEL URLS · 每行一个链接</span><textarea value={modelUrls} onChange={(event) => setModelUrls(event.target.value)} placeholder={"https://civitai.com/models/...\nhttps://huggingface.co/owner/repository/blob/main/model.safetensors\nhttps://modelscope.cn/models/..."} required spellCheck="false" /></label>
-      </section>
       <section className="downloader-card recommended-card">
-        <div className="downloader-section-head"><span>04</span><div><strong>推荐模型专区</strong><small>按类别浏览精选模型、版本和配套组件</small></div></div>
+        <div className="downloader-section-head"><div><strong>推荐模型</strong><small>浏览精选模型、版本和配套组件</small></div></div>
         <button className="recommended-zone-trigger" type="button" onClick={() => { setRecommendedCategoryId(""); setRecommendedFamilyId(""); setRecommendedZoneOpen(true); }}>
-          <span><Sparkles size={18} /><i /></span>
-          <div><strong>打开推荐模型专区</strong><small>SD · iL · Anima · Flux · Krea 2 · 超分</small></div>
+          <span><Download size={17} /></span>
+          <div><strong>浏览推荐模型</strong><small>SD · iL · Anima · Flux · Krea 2 · 超分</small></div>
           <b>{recommended.loading ? "正在检索" : `${recommendedFamilyCount} 个系列 · ${recommendedVersionCount} 个版本`}<ChevronDown size={13} /></b>
         </button>
         {recommended.error && <p className="recommended-model-error">{recommended.error}</p>}
       </section>
+      <section className="downloader-card link-card">
+        <div className="downloader-section-head"><div><strong>模型链接</strong><small>粘贴文件详情页或直链；仓库含多个文件时，请使用具体文件链接</small></div></div>
+        <label className="model-link-field"><span>每行一个链接</span><textarea value={modelUrls} onChange={(event) => setModelUrls(event.target.value)} placeholder={"https://civitai.com/models/...\nhttps://huggingface.co/owner/repository/blob/main/model.safetensors\nhttps://modelscope.cn/models/..."} required spellCheck="false" /></label>
+      </section>
       <section className="downloader-card type-card">
-        <div className="downloader-section-head"><span>03</span><div><strong>保存类型</strong><small>类型决定可用格式和本地模型目录，不能由链接覆盖</small></div></div>
+        <div className="downloader-section-head"><div><strong>保存类型与目录</strong><small>类型决定可用格式和本地保存位置</small></div></div>
         <div className="download-kind-grid" role="radiogroup" aria-label="模型类型">{kindOptions.map((item) => <button key={item.id} type="button" role="radio" aria-checked={kind === item.id} className={kind === item.id ? "active" : ""} onClick={() => { setKind(item.id); if (item.id !== "lora" && ["Anima", "Flux", "Flux2"].includes(engine)) setEngine("SD"); }}><strong>{item.label}</strong><small>{item.detail}</small></button>)}</div>
         <div className="download-options">
           {requiresEngine && <label>兼容底模<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="SD">Stable Diffusion</option><option value="iL">Illustrious / SDXL</option>{kind === "lora" && <option value="Anima">Anima</option>}{kind === "lora" && <option value="Flux">Flux</option>}{kind === "lora" && <option value="Flux2">Flux 2</option>}{kind === "lora" && <option value="Krea2">Krea 2</option>}</select></label>}
@@ -436,7 +434,7 @@ export default function ModelDownloader({ onDownloaded }) {
         <div className="download-destination"><FolderOpen size={15} /><span>下载位置</span><code>{targetLabel}</code>{selectedKind && <small>{selectedKind.label}</small>}</div>
       </section>
       {showDownloadNotice && <section className={`download-progress-card ${download.status}`} aria-live="polite">
-        <div className="download-progress-head"><div><span>{download.status === "complete" ? "READY" : download.status === "error" ? "DOWNLOAD ERROR" : download.status === "idle" ? "WAITING" : download.provider?.toUpperCase() || "PREPARING"}</span><strong>{download.filename || "等待模型链接"}</strong><small>{download.destination || "选择类型后自动确定本地保存位置"}</small></div>{isDownloading && <RefreshCw className="spin" size={19} />}{download.status === "complete" && <Check size={19} />}{download.status === "error" && <X size={19} />}</div>
+        <div className="download-progress-head"><div><span>{download.status === "complete" ? "已完成" : download.status === "error" ? "下载出错" : download.status === "idle" ? "等待下载" : download.provider || "准备中"}</span><strong>{download.filename || "等待模型链接"}</strong><small>{download.destination || "选择类型后自动确定本地保存位置"}</small></div>{isDownloading && <RefreshCw className="spin" size={19} />}{download.status === "complete" && <Check size={19} />}{download.status === "error" && <X size={19} />}</div>
         <div className="download-progress-track"><i style={{ width: `${progress}%` }} /></div>
         <div className="download-progress-meta"><span>{download.message}</span><b>{download.totalBytes ? `${formatFileSize(download.currentBytes)} / ${formatFileSize(download.totalBytes)}` : download.verified ? "SHA-256 将校验" : "等待远程文件信息"}</b></div>
         {(download.speedBps > 0 || download.connections > 0 || download.route) && <div className="download-transfer-meta"><span>{download.route || "正在测速"}</span>{download.speedBps > 0 && <span>{formatFileSize(download.speedBps)}/s</span>}{download.connections > 1 && <span>{download.connections} 路分片</span>}</div>}
@@ -450,7 +448,7 @@ export default function ModelDownloader({ onDownloaded }) {
       <section className="recommended-zone-dialog" role="dialog" aria-modal="true" aria-label="推荐模型专区">
         <header className="recommended-zone-head">
           <div>
-            <span className="eyebrow">RECOMMENDED MODEL ZONE</span>
+            <span className="eyebrow">推荐模型</span>
             <h2>推荐模型专区</h2>
             <p>按类别浏览推荐模型，查看模型介绍、可下载版本、来源和配套组件。</p>
           </div>
@@ -484,13 +482,13 @@ export default function ModelDownloader({ onDownloaded }) {
                   {selectedRequiresCivitaiKey && <div className="recommended-civitai-warning"><Key size={16} /><span><strong>Civitai 下载提示</strong>需要开启可访问 Civitai 的 VPN 代理，并填写对应 API Key。</span><button type="button" onClick={() => setKeyManagerOpen(true)}>{credentials.civitai ? "API Key 已配置" : "填写 API Key"}</button></div>}
                   {selectedRequiresHuggingfaceKey && <div className="recommended-civitai-warning"><Key size={16} /><span><strong>Hugging Face 授权仓库</strong>请先在模型主页接受许可协议，再填写 Hugging Face Token。</span><button type="button" onClick={() => setKeyManagerOpen(true)}>{credentials.huggingface ? "Token 已配置" : "填写 Token"}</button></div>}
                 </div>
-                <section className="recommended-artifact-section"><header><div><strong>可下载模型</strong><small>选择一个模型版本或精度</small></div><b>{selectedRecommendedFamily.models.length} OPTIONS</b></header><div className="recommended-artifact-grid">
+                  <section className="recommended-artifact-section"><header><div><strong>可下载模型</strong><small>选择一个模型版本或精度</small></div><b>{selectedRecommendedFamily.models.length} 个选项</b></header><div className="recommended-artifact-grid">
                   {selectedRecommendedFamily.models.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.modelId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-model" value={item.id} checked={recommendedSelection.modelId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, modelId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>{item.provider || selectedRecommendedFamily.provider}</span><strong>{item.label}</strong><small>{item.filename || `Civitai Version ${item.versionId}`}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : item.installationCached ? "缓存待复核" : formatFileSize(item.size)}</b></label>)}
                 </div></section>
-                {selectedRecommendedFamily.textEncoders.length > 0 && <section className="recommended-artifact-section"><header><div><strong>Text Encoders</strong><small>选择一个兼容文本编码器</small></div><b>{selectedRecommendedFamily.textEncoders.length} OPTIONS</b></header><div className="recommended-artifact-grid dependencies">
+                {selectedRecommendedFamily.textEncoders.length > 0 && <section className="recommended-artifact-section"><header><div><strong>文本编码器</strong><small>选择一个兼容文本编码器</small></div><b>{selectedRecommendedFamily.textEncoders.length} 个选项</b></header><div className="recommended-artifact-grid dependencies">
                   {selectedRecommendedFamily.textEncoders.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.textEncoderId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-encoder" value={item.id} checked={recommendedSelection.textEncoderId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, textEncoderId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>TEXT ENCODER</span><strong>{item.label}</strong><small>{item.filename}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : item.installationCached ? "缓存待复核" : formatFileSize(item.size)}</b></label>)}
                 </div></section>}
-                {selectedRecommendedFamily.vaes.length > 0 && <section className="recommended-artifact-section"><header><div><strong>VAE</strong><small>共享 VAE 会按 SHA-256 检测和复用</small></div><b>{selectedRecommendedFamily.vaes.length} OPTIONS</b></header><div className="recommended-artifact-grid dependencies">
+                {selectedRecommendedFamily.vaes.length > 0 && <section className="recommended-artifact-section"><header><div><strong>VAE</strong><small>共享 VAE 会按 SHA-256 检测和复用</small></div><b>{selectedRecommendedFamily.vaes.length} 个选项</b></header><div className="recommended-artifact-grid dependencies">
                   {selectedRecommendedFamily.vaes.map((item) => <label className={`recommended-artifact-card ${recommendedSelection.vaeId === item.id ? "selected" : ""} ${item.installed ? "installed" : ""}`} key={item.id}><input type="radio" name="recommended-vae" value={item.id} checked={recommendedSelection.vaeId === item.id} onChange={() => setRecommendedSelection((current) => ({ ...current, vaeId: item.id }))} /><span className="recommended-artifact-radio"><i /></span><div><span>VAE</span><strong>{item.label}</strong><small>{item.filename}</small>{item.detail && <p>{item.detail}</p>}</div><b>{item.installed ? <><Check size={13} />已下载</> : item.installationCached ? "缓存待复核" : formatFileSize(item.size)}</b></label>)}
                 </div></section>}
               </> : !selectedRecommendedCategory ? <div className="recommended-category-grid">
@@ -518,7 +516,7 @@ export default function ModelDownloader({ onDownloaded }) {
     {keyManagerOpen && <div className="key-manager-backdrop" onMouseDown={(event) => event.target === event.currentTarget && setKeyManagerOpen(false)}>
       <section className="key-manager-dialog" role="dialog" aria-modal="true" aria-label="API 密钥管理">
         <header className="key-manager-head">
-          <div><span className="eyebrow">API KEY MANAGER</span><h2>API 密钥管理</h2><p>分别为三个站点填写密钥后可保存；留空表示不发送认证头。</p></div>
+          <div><span className="eyebrow">API 密钥</span><h2>密钥管理</h2><p>分别为三个站点填写密钥后可保存；留空表示不发送认证头。</p></div>
           <button className="modal-close" onClick={() => setKeyManagerOpen(false)}><X size={20} /></button>
         </header>
         <div className="key-manager-body">

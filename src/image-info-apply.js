@@ -121,6 +121,7 @@ export function imageInfoCanvas(info, maximumEdge = DEFAULT_MAXIMUM_EDGE) {
 function loraRows(info) {
   return (info?.loras || []).map((item) => ({
     name: textOf(item?.name),
+    ...inspectLoraIdentity(item).fields,
     weight: Number.isFinite(Number(item?.weight)) ? Math.max(-5, Math.min(5, Number(item.weight))) : 1,
     match: item?.match || null,
   }));
@@ -196,7 +197,9 @@ function postprocessSummary(candidate) {
 }
 
 export function imageInfoApplyFields(info) {
-  if (!info || info.status !== "ok") return [];
+  // An XYZ grid is a comparison sheet, never one picture's settings: nothing of it is applied, and a
+  // cell is reached only by choosing one (QPlan2/P1 Phase E).
+  if (!info || info.status !== "ok" || info.source === "xyz_grid") return [];
   const fields = [];
   if (info.positive || info.negative) {
     fields.push({
@@ -380,6 +383,10 @@ export function buildImageInfoApplyPlan(info, fieldIds, target = "t2i", { engine
       const carried = [];
       for (const item of rows) {
         if (tagged.has(loraStem(item.name)) && resolvedValue(item.match)) {
+          if (item.match.relink?.originalValue && item.match.relink.originalValue !== item.match.relink.currentValue) {
+            if (item.match.relink.promptRewriteAllowed) retargeted.push({ exactSource: item.match.relink.originalValue, reference: item.match.relink.currentValue });
+            else { missing.push({ kind: "lora", name: item.name, reasonKind: "missing", reason: "旧精确标签尚未授权改写；请在修复表明确确认或手动修改，未自动更改 Prompt。" }); continue; }
+          }
           carried.push(matchLabel(item.match, item.name));
           // A file chosen among same-named ones by the folder rule is named exactly in the tag.
           if (item.match.chosenBy) retargeted.push({ stem: loraStem(item.name), reference: resolvedValue(item.match) });
@@ -399,6 +406,7 @@ export function buildImageInfoApplyPlan(info, fieldIds, target = "t2i", { engine
       if (usable.length) {
         overlay.loras = usable.map((item) => ({
           value: resolvedValue(item.match),
+          ...inspectLoraIdentity(item).fields,
           name: item.name,
           weight: item.weight,
           enabled: true,
@@ -412,11 +420,11 @@ export function buildImageInfoApplyPlan(info, fieldIds, target = "t2i", { engine
       }
       const prompts = toImageToImage ? imageToImage : overlay;
       let rewritten = 0;
-      for (const { stem, reference } of retargeted) {
+      for (const { stem, reference, exactSource } of retargeted) {
         let changed = false;
         for (const key of ["positive", "negative"]) {
           if (typeof prompts[key] !== "string") continue;
-          const next = retargetPromptLora(prompts[key], stem, reference);
+          const next = exactSource ? rewriteExactLoraTags(prompts[key], exactSource, reference).text : retargetPromptLora(prompts[key], stem, reference);
           changed ||= next !== prompts[key];
           prompts[key] = next;
         }
@@ -463,3 +471,5 @@ export function imageInfoApplySummary(plan) {
   if (plan.skipped.length) parts.push(`${plan.skipped.length} 项本工作区不支持`);
   return parts.join(" · ");
 }
+import { inspectLoraIdentity } from "./lora-identity.js";
+import { rewriteExactLoraTags } from "./lora-relink.js";

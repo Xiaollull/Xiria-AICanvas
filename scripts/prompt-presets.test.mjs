@@ -233,7 +233,8 @@ test("App source pairs every state setter and enforces queued editing, persisten
   assert.match(presetWindow, /const \[menuId, setMenuId\] = useState\(""\)/, "card menu state/setter pairing");
   assert.match(app, /loadWorkspaceState[\s\S]{0,7000}normalizePromptPresetContainer/);
   assert.equal((app.match(/normalizePromptPresetContainer\(/g) || []).length, 1, "loadWorkspaceState is the only App normalization call");
-  assert.match(app, /workspaceSnapshot\.current = \{[\s\S]{0,500}promptPresets/);
+  // The XYZ / mix draft fields now open the snapshot; the library is still one of its fields.
+  assert.match(app, /workspaceSnapshot\.current = \{[\s\S]{0,1500}promptPresets: persistedPromptPresets,/);
   assert.match(app, /\[theme,[\s\S]{0,500}promptPresets[\s\S]{0,1200}uiStateReady\]/);
   assert.match(app, /const saveBeforeExit = \(\) => persistUiState\(true\)[\s\S]{0,120}pagehide/);
   assert.match(app, /promptPresetLibraryError[\s\S]{0,400}shouldPersistPromptPresets/);
@@ -244,8 +245,12 @@ test("App source pairs every state setter and enforces queued editing, persisten
   assert.match(app, /onKeyUp=\{\(event\) => recordPromptSelection/);
   assert.match(app, /onFocus=\{\(event\) => recordPromptSelection/);
   assert.match(app, /revision/);
-  assert.match(app, /const applyPreset[\s\S]{0,320}setActivePromptPresets\(\(current\) => \(\{ \.\.\.current, \[record\.type\]: togglePromptPresetId\(current\[record\.type\], record\.id\) \}\)\);/);
-  assert.doesNotMatch(app, /const applyPreset[\s\S]{0,200}status === "running"/);
+  const apply = app.slice(app.indexOf("const applyPreset ="), app.indexOf("const commitPromptPresets ="));
+  assert.match(apply, /promptPresets\.records\.find\(\(candidate\) => candidate\.id === requestedRecord\?\.id\)/);
+  assert.match(apply, /setActivePromptPresets\(\(current\) => \(\{ \.\.\.current, \[record\.type\]: togglePromptPresetId\(current\[record\.type\], record\.id\) \}\)\);/);
+  assert.match(apply, /selectedGenerationMode === "xyz_plot"[\s\S]*setXYZByEngine[\s\S]*toggleXYZPreset\(draft, record, promptPresets\.records\)/);
+  assert.match(apply, /isMixMode[\s\S]*setLoraMixByEngine[\s\S]*toggleXYZPreset\(draft, record, promptPresets\.records\)/);
+  assert.doesNotMatch(apply, /status === "running"|setPositive\(|setNegative\(/);
   // Switching a preset on must never write into the prompt box: the box holds what was typed, and
   // the preset's words join it only on their way to the job.
   assert.ok(!/setPositive\([^)]*(?:record\.content|applyPreset)/.test(app), "a preset never rewrites the positive box");
@@ -282,7 +287,7 @@ test("App source pairs every state setter and enforces queued editing, persisten
   // calls the stripping helper — the exclusion is unchanged, its caller is not.
   assert.match(app, /const galleryCardSettings = [\s\S]{0,240}gallerySettingsWithoutPromptPresets\(source\)/);
   assert.match(app, /currentSettings=\{galleryCardSettings\(workspaceSnapshot\.current\)\}/);
-  assert.match(app, /settings=\{generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/);
+  assert.match(app, /settings=\{galleryAddSource \? galleryCardSettings\(galleryAddSource\.settings, \{ record: true \}\) : generatedSettings \? galleryCardSettings\(generatedSettings, \{ record: true \}\) : null\}/);
   assert.ok(!/(?:currentSettings|settings)=\{gallerySettingsWithoutPromptPresets\(/.test(app),
     "no card-producing prop may bypass galleryCardSettings");
   for (const selector of [".preset-strip", ".preset-window", ".preset-card", ".preset-card-menu", ".prompt-preset-backdrop", ".prompt-preset-editor", ".prompt-preset-segmented", ".prompt-preset-error"]) assert.match(css, new RegExp(selector.replace(".", "\\.")));

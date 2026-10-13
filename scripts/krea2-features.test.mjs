@@ -40,11 +40,11 @@ test("the Krea2 entry point is open on the main page and mounts three components
   assert.match(app, /const KREA2_SAMPLERS = samplerNames/);
   assert.match(app, /const KREA2_SCHEDULERS = schedulerNames/);
 
-  const picker = sourceBetween(app, "            {isSplitModel ? <div className={`checkpoint-picker split-model-picker", "            {isSplitModel && !engineAllowsLora");
+  const picker = sourceBetween(app, "            {isSplitModel ? <ModelAssetPicker", "            {isSplitModel && !engineAllowsLora");
   // Krea 2's whole conditioning is one language model, so it shares FLUX.2's label and never
   // opens the second encoder row.
   assert.match(picker, /isFlux2 \|\| isKrea2 \? "文本编码器 · 大语言模型"/);
-  assert.doesNotMatch(picker, /isKrea2 \? \[\["textEncoder2"/);
+  assert.doesNotMatch(picker, /isKrea2 \? \[\{ kind: "textEncoder2"/);
 });
 
 test("a Krea2 generation keeps its unconditional branch, unlike either Flux", async () => {

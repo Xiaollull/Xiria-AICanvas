@@ -171,7 +171,8 @@ test("workspace and Gallery resample seeds freeze per job while the next queued 
 
   // Gallery routes every persisted and per-image resample seed through the lossless helpers.
   assert.match(gallery, /import \{[^}]*\bgalleryOutputSeedSettings\b[^}]*\} from "\.\/hires-settings"/);
-  assert.match(gallery, /return galleryOutputSeedSettings\(normalized, output, selectedItems, combined, firstUnit\)/);
+  // New cards are also stamped with the current LoRA library revision (P10), around the same settings.
+  assert.match(gallery, /return withGalleryLoraRevision\(galleryOutputSeedSettings\(normalized, output, selectedItems, combined, firstUnit\)\)/);
   assert.match(galleryPage, /imageHiresSeedModes: images\.map\(\(image\) => normalizeHiresSeed\(/);
   assert.match(galleryPage, /imageHiresSeeds: images\.map\(\(image\) => normalizeHiresSeed\(/);
   for (const source of [gallery, galleryPage]) assert.doesNotMatch(source, /Number\(image\.hiresSeed\)|parseInt\(image\.hiresSeed/);

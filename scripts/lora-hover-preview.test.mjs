@@ -123,7 +123,11 @@ test("the card editor is reachable without having to guess where it is", async (
   // which hid the whole feature from anyone not already looking for it.
   const customize = styles.slice(styles.indexOf(".lora-card-customize {"));
   assert.doesNotMatch(customize.slice(0, customize.indexOf("}")), /opacity: 0/);
-  for (const source of [app, page]) assert.match(source, /<Palette size=\{13\} \/>自定义/);
+  assert.match(app, /<LoraLibraryCard[\s\S]{0,1000}onCustomize=\{\(\) => setLoraCardEdit/);
+  assert.match(page, /<Palette size=\{13\} \/>自定义/);
+  const card = await readSource("src/LoraLibraryCard.jsx");
+  assert.match(card, /className="lora-card-customize"[\s\S]{0,400}event\.stopPropagation\(\); onCustomize\?\.\(\)/);
+  assert.match(card, /<Palette size=\{13\} \/>自定义/);
   // And the group's effect images needed the body expanded first, so the cover
   // could not be found at all from the group list.
   assert.match(group, /className=\{`lora-group-artwork-open/);

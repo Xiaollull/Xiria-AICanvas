@@ -15,12 +15,11 @@ const readSource = (file) => readFile(new URL(`../${file}`, import.meta.url), "u
 const PROMPT_FIELD_ANCHORS = [
   ["src/App.jsx", "ref={positivePromptRef}"],
   ["src/App.jsx", "ref={negativePromptRef}"],
-  ["src/App.jsx", 'updateADetailerUnit(unit.id, { prompt: event.target.value })'],
-  ["src/App.jsx", 'updateADetailerUnit(unit.id, { negativePrompt: event.target.value })'],
+  ["src/PostprocessAuxControls.jsx", 'update({ prompt: event.target.value })'],
+  ["src/PostprocessAuxControls.jsx", 'update({ negativePrompt: event.target.value })'],
   // The preset card editor lives in the floating preset window.
   ["src/PromptPresetWindow.jsx", 'update("content", event.target.value)'],
-  ["src/ImageToImagePage.jsx", 'update({ positive: event.target.value })'],
-  ["src/ImageToImagePage.jsx", 'update({ negative: event.target.value })'],
+  ["src/PromptField.jsx", 'spellCheck={false}'],
   ["src/ImageToImagePage.jsx", 'updateUnit(unit.id, { prompt: event.target.value })'],
   ["src/ImageToImagePage.jsx", 'updateUnit(unit.id, { negativePrompt: event.target.value })'],
   ["src/GalleryPage.jsx", "setPositivePrompt(event.target.value)"],
@@ -41,6 +40,14 @@ function elementAround(source, anchor, file) {
 }
 
 test("no prompt field caps what can be typed into it", async () => {
+  const app = await readSource("src/App.jsx");
+  assert.match(app, /<ADetailerUnitControls[\s\S]{0,1000}update=\{\(patch\) => updateADetailerUnit\(unit\.id, patch\)\}/);
+  const image = await readSource("src/ImageToImagePage.jsx");
+  for (const type of ["positive", "negative"]) {
+    const field = elementAround(image, `update({ ${type}: event.target.value })`, "src/ImageToImagePage.jsx");
+    assert.match(field, new RegExp(`^<PromptField type="${type}" value=\\{config\\.${type}\\}`));
+    assert.doesNotMatch(field, /maxLength|textareaProps/i, "i2i must not inject a cap into the shared textarea");
+  }
   const sources = new Map();
   for (const [file] of PROMPT_FIELD_ANCHORS) {
     if (!sources.has(file)) sources.set(file, await readSource(file));

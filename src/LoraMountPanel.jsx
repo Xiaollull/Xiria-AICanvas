@@ -61,12 +61,14 @@ function writePreviewPreference(enabled) {
  * replacement immediately writes the old value back, so the caret fights every
  * keystroke and the box looks like it rejects input.
  */
-function WeightField({ item, disabled, onCommit }) {
+function WeightField({ item, disabled, onCommit, preserveInvalid = false }) {
   const [draft, setDraft] = useState(null);
   const text = draft === null ? formatWeight(item.weight) : draft;
+  const invalid = parseWeightInput(text).state !== "valid" || Math.abs(Number(text)) > 5;
 
   const commit = (value) => {
     const parsed = parseWeightInput(value);
+    if (preserveInvalid && (parsed.state !== "valid" || Math.abs(Number(value)) > 5)) return;
     setDraft(null);
     if (parsed.state === "valid" && parsed.weight !== item.weight) onCommit({ weight: parsed.weight, precision: 4 });
   };
@@ -79,13 +81,14 @@ function WeightField({ item, disabled, onCommit }) {
         inputMode="decimal"
         spellCheck={false}
         aria-label={`${item.name} 权重`}
+        aria-invalid={preserveInvalid && draft !== null && invalid}
         value={text}
         disabled={disabled}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={(event) => commit(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter") { event.preventDefault(); commit(event.currentTarget.value); event.currentTarget.blur(); }
-          if (event.key === "Escape") { event.preventDefault(); setDraft(null); }
+          if (event.key === "Escape") { event.preventDefault(); if (preserveInvalid) event.stopPropagation(); setDraft(null); }
         }}
       />
       <span className="mounted-weight-steppers">
@@ -149,6 +152,7 @@ export default function LoraMountPanel({
   onUpdateGroups,
   onNotice,
   variant = "modal",
+  preserveSnapshot = false,
 }) {
   const [dragIndex, setDragIndex] = useState(null);
   const [dropTarget, setDropTarget] = useState(null);
@@ -195,11 +199,11 @@ export default function LoraMountPanel({
   const editMounted = useCallback((updater) => {
     let next = null;
     onUpdateLoras?.((current) => {
-      next = normalizeMountedLoras(updater(current));
+      next = preserveSnapshot ? updater(current) : normalizeMountedLoras(updater(current));
       return next;
     });
-    if (next) onUpdateGroups?.((current) => syncMountedIntoGroups(current, next));
-  }, [onUpdateGroups, onUpdateLoras]);
+    if (next && !preserveSnapshot) onUpdateGroups?.((current) => syncMountedIntoGroups(current, next));
+  }, [onUpdateGroups, onUpdateLoras, preserveSnapshot]);
 
   const patchLora = useCallback((value, changes) => {
     editMounted((current) => current.map((item) => item.value === value ? { ...item, ...changes } : item));
@@ -207,13 +211,16 @@ export default function LoraMountPanel({
 
   const togglePreviews = () => {
     setShowPreviews((current) => {
-      writePreviewPreference(!current);
+      if (!preserveSnapshot) writePreviewPreference(!current);
       return !current;
     });
   };
 
-  const mounted = normalizeMountedLoras(loras);
-  const partitioned = partitionMountedByGroup(mounted, groups);
+  const mounted = preserveSnapshot ? loras : normalizeMountedLoras(loras);
+  const partitioned = preserveSnapshot ? {
+    standalone: mounted.filter((item) => !groups.some((group) => group.id === item.groupId)),
+    blocks: groups.map((group) => ({ group, items: mounted.filter((item) => item.groupId === group.id) })).filter((block) => block.items.length),
+  } : partitionMountedByGroup(mounted, groups);
   const collecting = collectingGroupId(groups);
   const standalone = partitioned.standalone;
   // A collector with nothing in it yet still gets a block: it is the drop zone
@@ -230,7 +237,7 @@ export default function LoraMountPanel({
 
   const renderRow = (item) => {
     const index = indexOf(item.value);
-    const position = ((item.weight + 5) / 10) * 100;
+    const position = ((Number(item.weight) + 5) / 10) * 100;
     const grouped = Boolean(groupIdOfMountedLora(item, groups));
     const presentation = cards?.presentationFor?.(item) || null;
     return (
@@ -294,7 +301,7 @@ export default function LoraMountPanel({
             <strong title={presentation?.renamed ? `${presentation.title}（${item.name}）` : item.name}>{presentation?.title || item.name}</strong>
             <small>{item.category} · {weightPrecisionLabel(item, shiftPressed)}</small>
           </div>
-          <WeightField item={item} disabled={locked} onCommit={(changes) => patchLora(item.value, changes)} />
+          <WeightField item={item} disabled={locked} preserveInvalid={preserveSnapshot} onCommit={(changes) => patchLora(item.value, changes)} />
           {cards?.onEditLora && (
             <button
               type="button"

@@ -1,6 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +11,9 @@ import { createHttpFetch, viteInvocation } from "./node-tools.mjs";
 import { serviceRestartDecision, serviceRestartMessage } from "./service-supervisor.js";
 import { acquireOfflineUpdateLock } from "./offline-update-lock.mjs";
 import { requireBundledAnimaTokenizers } from "./anima-models.mjs";
+import { openBrowser } from "./browser-url.mjs";
+import { APPLICATION_PROTOCOL, isApplicationReady } from "./service-readiness.js";
+import { assertStartupPortsFree, startupDisposition } from "./startup-admission.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 Object.assign(process.env, loadLocalEnv(projectRoot));
@@ -20,12 +22,11 @@ const noOpen = process.argv.includes("--no-open");
 const exitAfterReady = process.argv.includes("--exit-after-ready");
 const webPort = Number(process.env.WEB_PORT || 7709);
 const mainUrl = `http://localhost:${webPort}/`;
-const browserProfile = path.resolve(projectRoot, process.env.XIRAI_BROWSER_PROFILE || "state-cache/browser-profile");
 const stateDirectory = path.resolve(projectRoot, process.env.XIRAI_STATE_DIR || "state-cache");
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 39;
+const inferenceProtocol = APPLICATION_PROTOCOL;
 
 function fail(message) {
   writeDiagnosticLog(projectRoot, {
@@ -36,36 +37,6 @@ function fail(message) {
   console.error(`\n启动失败：${message}`);
   console.error("请先双击 Setup-XirAI 配置环境，或运行：npm run setup\n");
   process.exit(1);
-}
-
-function openBrowser(url) {
-  let command;
-  let args;
-  if (process.platform === "win32") {
-    const candidates = [
-      process.env["PROGRAMFILES(X86)"] && path.join(process.env["PROGRAMFILES(X86)"], "Microsoft", "Edge", "Application", "msedge.exe"),
-      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Microsoft", "Edge", "Application", "msedge.exe"),
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Microsoft", "Edge", "Application", "msedge.exe"),
-      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, "Google", "Chrome", "Application", "chrome.exe"),
-    ].filter(Boolean);
-    command = candidates.find((candidate) => existsSync(candidate));
-    if (command) {
-      mkdirSync(browserProfile, { recursive: true });
-      args = [`--app=${url}`, `--user-data-dir=${browserProfile}`, "--disable-extensions", "--no-first-run", "--no-default-browser-check"];
-    } else {
-      command = "cmd.exe";
-      args = ["/d", "/s", "/c", "start", "", url];
-    }
-  } else if (process.platform === "darwin") {
-    command = "open";
-    args = [url];
-  } else {
-    command = "xdg-open";
-    args = [url];
-  }
-  const browser = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
-  browser.on("error", () => console.log(`请在浏览器打开：${url}`));
-  browser.unref();
 }
 
 function lanUrls() {
@@ -99,11 +70,15 @@ async function getHealth(timeout = 1500) {
 const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
 if (nodeMajor < 22 || (nodeMajor === 22 && nodeMinor < 21)) fail("需要 Node.js 22.21 或更高版本");
 const existingHealth = await getHealth();
-if (existingHealth?.status === "ready" && existingHealth.protocol === inferenceProtocol && existingHealth.workspace_id === workspaceId) {
+if (startupDisposition(existingHealth, workspaceId) === "reuse") {
   console.log(`XiriaCanvas AI 已经运行：${mainUrl}`);
   if (!noOpen) openBrowser(mainUrl);
   process.exit(0);
 }
+if (startupDisposition(existingHealth, workspaceId) === "blocked") fail("已有服务尚未准备就绪或属于其他工作区／协议；未停止任何服务。请手动核对后重试。");
+try {
+  await assertStartupPortsFree([{ port: webPort, host: process.env.WEB_HOST || "0.0.0.0" }, { port: Number(process.env.INFERENCE_PORT || 8718), host: "127.0.0.1" }]);
+} catch (error) { fail(error.message); }
 let recoveryLock;
 try {
   recoveryLock = await acquireOfflineUpdateLock({ stateDirectory, projectRoot, operation: "startup-recovery" });
@@ -185,7 +160,7 @@ async function runMainService(openOnReady) {
     if (child.exitCode != null || child.signalCode != null) break;
     await new Promise((resolve) => setTimeout(resolve, 500));
     const health = await getHealth();
-    if (health?.status === "ready" && health.protocol === inferenceProtocol && health.workspace_id === workspaceId) {
+    if (isApplicationReady(health, workspaceId)) {
       ready = true;
       console.log(`\n启动完成：${mainUrl}`);
       if (openOnReady && !noOpen) openBrowser(mainUrl);

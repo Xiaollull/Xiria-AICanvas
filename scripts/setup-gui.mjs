@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -12,8 +13,10 @@ import { detectNvidiaDriverApi, detectNvidiaSmi, mergeNvidiaDetection } from "./
 import { buildSetupArguments, parseCudaVariants, parseTorchWheelVersions, buildSetupCatalog, recommendRepairPlan, validateSetupConfiguration } from "./setup-options.mjs";
 import { parseInstallerProgress } from "./install-progress.mjs";
 import { applyInstallerProxyPolicy, createInstallerFetch } from "./proxy-policy.mjs";
+import { openBrowser } from "./browser-url.mjs";
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const workspaceId = createHash("sha256").update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot)).digest("hex");
 Object.assign(process.env, loadLocalEnv(projectRoot));
 // Captured before the policy strips this process: the direct-connection rule covers installer
 // downloads, not the application the wizard hands over to. XiriaCanvas AI has its own proxy
@@ -55,6 +58,7 @@ const diagnoseOnly = forwardedArguments.includes("--diagnose");
 
 const existingSetupMarker = readSetupMarker(projectRoot);
 const state = {
+  workspaceId,
   status: "awaiting-choice",
   phase: "选择环境配置方式",
   message: "配置器不会在确认前安装或修改环境",
@@ -550,24 +554,6 @@ function startRecommendedRepair() {
   return startSetup(buildSetupArguments(configuration), configuration);
 }
 
-function openBrowser(url) {
-  let command;
-  let args;
-  if (process.platform === "win32") {
-    command = "cmd.exe";
-    args = ["/d", "/s", "/c", "start", "", url];
-  } else if (process.platform === "darwin") {
-    command = "open";
-    args = [url];
-  } else {
-    command = "xdg-open";
-    args = [url];
-  }
-  const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
-  child.on("error", () => console.log(`请在浏览器打开：${url}`));
-  child.unref();
-}
-
 function startMainService() {
   if (!state.configured || (appProcess && appProcess.exitCode == null)) return false;
   state.restarting = true;
@@ -622,6 +608,11 @@ const setupStateReady = restoreSetupState();
 server = createServer(async (request, response) => {
   await setupStateReady;
   const url = new URL(request.url, "http://127.0.0.1");
+  if (request.method === "GET" && url.pathname === "/setup-readiness.js") {
+    response.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "no-store" });
+    response.end(await readFile(path.join(projectRoot, "scripts/service-readiness.js"), "utf8"));
+    return;
+  }
   if (request.method === "POST" && request.headers.origin) {
     try {
       if (new URL(request.headers.origin).host !== request.headers.host) {

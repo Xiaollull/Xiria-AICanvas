@@ -155,7 +155,10 @@ test("the panel is resizable and collapsible from the gutter, and the grid keeps
   const styles = await readFile(path.join(projectDirectory, "src", "styles.css"), "utf8");
 
   // The handle lives between the two panels it separates, not inside either of them.
-  const gutter = app.slice(app.indexOf('<aside className="left-panel panel"'), app.indexOf('<section className="center-panel panel">'));
+  const left = app.indexOf('className={`left-panel panel');
+  const center = app.indexOf('<section className="center-panel panel">', left);
+  assert.ok(left >= 0 && center > left, "both adjacent panels remain identifiable");
+  const gutter = app.slice(left, center);
   assert.match(gutter, /className="panel-resizer"/);
   assert.match(gutter, /onPointerDown=\{beginPanelResize\}/);
   assert.match(gutter, /onPointerMove=\{continuePanelResize\}/);

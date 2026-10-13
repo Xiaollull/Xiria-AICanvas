@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { StagePreviewLive, StageStrip } from "./StagePreviews.jsx";
+import PromptField from "./PromptField.jsx";
 import {
   ArrowDown,
   ArrowLeft,
@@ -14,6 +15,7 @@ import {
   ImageIcon,
   ImagePlus,
   Layers3,
+  ListChecks,
   ListPlus,
   Maximize2,
   Pause,
@@ -47,7 +49,7 @@ import ResampleChainPanel from "./ResampleChainPanel.jsx";
 import { chainStage, enabledChainStages, resampleChainIssue, resampleChainPlan, resampleUnitTitle, resampleUnits, updateChainStage } from "./resample-chain.js";
 import WorkspaceSelect from "./WorkspaceSelect";
 import { secureRandomUint64Seed, supportsUsduTiled } from "./hires-settings";
-import { formatWeight } from "./lora-weight";
+import MountedLoraSummary from "./MountedLoraSummary.jsx";
 import LoraHoverPreview, { useLoraHoverPreview } from "./LoraHoverPreview.jsx";
 import { loraCardPresentation } from "./lora-cards.js";
 import TransparentBackgroundControl from "./TransparentBackgroundControl.jsx";
@@ -161,7 +163,7 @@ function ChainNumberInput({ className = "bounded-number", ...props }) {
   return <NumberInput className={className} {...props} />;
 }
 
-function PostprocessControls({ config, engine, postprocess, running, canvas, dimensions, setChain, postprocessOnly }) {
+function PostprocessControls({ config, engine, postprocess, running, actionsLocked, canvas, dimensions, setChain, postprocessOnly }) {
   // Which unit the ADetailer pager is showing. View state, not configuration: it
   // is never persisted, because where the user last paged to says nothing about
   // the render.
@@ -240,6 +242,7 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
         onDownloadUpscaler={postprocess.onDownloadUpscaler}
         onRetryUpscaler={postprocess.onRetryUpscaler}
         locked={running}
+        actionsLocked={actionsLocked || running}
         addDisabled={postprocess.ultraLow === true}
         unitUnavailableReason={stageReason("hires")}
         Slider={PostprocessSlider}
@@ -262,7 +265,7 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
         )}
         renderStage={(stage, index, actions) => (stage.type === "adetailer" ? (
           <section className={`i2i-stage-card ${adetailerStage.enabled ? "enabled" : ""} ${expandedStages.adetailer ? "expanded" : ""}`}>
-            <StageHeader title="ADetailer" detail={adetailerStage.enabled ? adetailerSummary(config.adetailer) : stageReason("adetailer") || "关闭"} enabled={adetailerStage.enabled} disabled={stageLocked("adetailer") || (!adetailerRuntime && !adetailerStage.enabled)} expanded={expandedStages.adetailer} onToggle={() => updateStage("adetailer", { enabled: !adetailerStage.enabled })} onToggleExpanded={() => toggleStageExpanded("adetailer")} />
+            <StageHeader title="ADetailer" detail={adetailerStage.enabled ? adetailerSummary(config.adetailer) : stageReason("adetailer") || "关闭"} enabled={adetailerStage.enabled} disabled={stageLocked("adetailer") || (!adetailerRuntime && !adetailerStage.enabled)} expanded={expandedStages.adetailer} onToggle={() => updateStage("adetailer", { enabled: !adetailerStage.enabled })} onToggleExpanded={() => toggleStageExpanded("adetailer")}>{actions}</StageHeader>
             {expandedStages.adetailer && <div className="adetailer-parameters">
               <p className="postprocess-stage-description">按所选后处理顺序修复面部、手部或人物区域。</p>
               {stageReason("adetailer") && <p className="adetailer-unavailable">{stageReason("adetailer")}</p>}
@@ -325,7 +328,7 @@ function PostprocessControls({ config, engine, postprocess, running, canvas, dim
           </section>
         ) : (
           <section className={`i2i-stage-card ${rtxStage.enabled ? "enabled" : ""} ${expandedStages.rtx ? "expanded" : ""}`}>
-            <StageHeader title="RTX VSR" detail={rtxStage.enabled ? `${rtxStage.scale.toFixed(2)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("rtx") || "关闭"} enabled={rtxStage.enabled} disabled={stageLocked("rtx") || (!rtxAvailable && !rtxStage.enabled)} expanded={expandedStages.rtx} onToggle={() => updateStage("rtx", { enabled: !rtxStage.enabled })} onToggleExpanded={() => toggleStageExpanded("rtx")} />
+            <StageHeader title="RTX VSR" detail={rtxStage.enabled ? `${rtxStage.scale.toFixed(2)}× · ${dimensions.width} × ${dimensions.height}` : stageReason("rtx") || "关闭"} enabled={rtxStage.enabled} disabled={stageLocked("rtx") || (!rtxAvailable && !rtxStage.enabled)} expanded={expandedStages.rtx} onToggle={() => updateStage("rtx", { enabled: !rtxStage.enabled })} onToggleExpanded={() => toggleStageExpanded("rtx")}>{actions}</StageHeader>
             {expandedStages.rtx && <div className="rtx-parameters">
               <p className="postprocess-stage-description">执行最终或中间像素超分。</p>
               {stageReason("rtx") && <p className={`rtx-unavailable ${rtxHealth.probing ? "probing" : ""}`}>{stageReason("rtx")}</p>}
@@ -382,6 +385,8 @@ export default function ImageToImagePage({
   negativePromptPresets = null,
   queueBusy = false,
   queuePendingCount = 0,
+  // The session task queue, same window and state as the text-to-image OUTPUT header's 队列 button.
+  queueControl = null,
   // The same generation publishes the same stage pictures whichever page started it, so this page
   // shows them the same way rather than sitting on a placeholder until the final image lands.
   stagePreviews = [],
@@ -590,18 +595,11 @@ export default function ImageToImagePage({
         <div className="i2i-prompt-deck">
           <div className="section-heading"><span>01</span><h2>提示词</h2><small className="i2i-section-kicker">{postprocessOnly ? "供各阶段重绘继承" : "描述改变方向"}</small></div>
           <div className="i2i-prompt-column">
-            <label className={`prompt-field positive-field ${transparentPromptEnabled ? "transparent-enabled" : ""}`}>
-              <div><span>正向提示词{transparentPromptEnabled && <b className="special-tag-mark">TRANSPARENT PNG</b>}</span><small>{config.positive.length} 字符</small></div>
-              <textarea value={config.positive} disabled={editingLocked} placeholder="描述你希望这张图变成什么样" spellCheck={false} onChange={(event) => update({ positive: event.target.value })} />
-              <Sparkles className="field-watermark" size={46} />
-            </label>
+            <PromptField type="positive" value={config.positive} disabled={editingLocked} transparent={transparentPromptEnabled} placeholder="描述你希望这张图变成什么样" onChange={(event) => update({ positive: event.target.value })} />
             {positivePromptPresets}
           </div>
           <div className="i2i-prompt-column">
-            <label className="prompt-field negative-field">
-              <div><span>反向提示词</span><small>{pageAllowsNegativePrompt ? `${config.negative.length} 字符` : "当前引擎不使用"}</small></div>
-              <textarea value={config.negative} disabled={editingLocked || !pageAllowsNegativePrompt} placeholder={pageAllowsNegativePrompt ? "不希望出现的内容" : `${distilledPageLabel} 没有无条件分支，负向提示词不会参与生成`} spellCheck={false} onChange={(event) => update({ negative: event.target.value })} />
-            </label>
+            <PromptField type="negative" value={config.negative} disabled={editingLocked} supported={pageAllowsNegativePrompt} placeholder={pageAllowsNegativePrompt ? "不希望出现的内容" : `${distilledPageLabel} 没有无条件分支，负向提示词不会参与生成`} onChange={(event) => update({ negative: event.target.value })} />
             {negativePromptPresets}
           </div>
           <TransparentBackgroundControl
@@ -650,6 +648,7 @@ export default function ImageToImagePage({
             <header className="i2i-compare-head">
               <div><span className="eyebrow">RESULT</span><h2>生成结果</h2></div>
               <div className="i2i-compare-actions">
+                {queueControl && <div className="queue-control"><button ref={queueControl.buttonRef} type="button" className={`i2i-queue-button${queueControl.outstanding ? " busy" : ""}`} aria-expanded={queueControl.open} title="查看本次会话的任务队列" onClick={queueControl.onToggle}><ListChecks size={15} /><span>队列</span>{queueControl.badge && <b className="queue-badge">{queueControl.badge}</b>}</button>{queueControl.window}</div>}
                 <button type="button" className={`i2i-run-info-toggle ${runInfoVisible ? "active" : ""}`} aria-pressed={runInfoVisible} aria-controls="generation-run-info" aria-label={runInfoVisible ? "隐藏显存、缓存与条件信息" : "显示显存、缓存与条件信息"} title={runInfoVisible ? "隐藏显存、缓存与条件信息" : "显示显存、缓存与条件信息"} onClick={onToggleRunInfo}>{runInfoVisible ? <Eye size={15} /> : <EyeOff size={15} />}</button>
                 <button type="button" title={canAddToGallery ? "把结果加入画廊" : "该旧任务没有可验证的参数快照"} aria-label="把结果加入画廊" disabled={!canAddToGallery} onClick={onAddToGallery}><ImagePlus size={15} /></button>
                 <button type="button" title="打开图片预览与拼图工作区" aria-label="打开图片预览与拼图工作区" onClick={onOpenViewer}><Maximize2 size={15} /></button>
@@ -800,27 +799,10 @@ export default function ImageToImagePage({
               pages — the two share one mounted library, and two spellings of it would invite the
               two to drift. */}
           <div className="section-heading lora-title"><span>05</span><h2>LoRA 挂载</h2><small className="lora-count">已挂载 {engine.loras.length}</small><button onClick={onOpenLoraManager}><Layers3 size={14} />管理</button></div>
-          {engine.loras.length === 0 ? <button className="empty-lora" onClick={onOpenLoraManager}><Layers3 size={16} /><span>尚未挂载 LoRA<small>点击管理，从分类库中选择</small></span></button> : <div className="lora-summary">
-            <div className="lora-summary-table">
-              {engine.loras.map((lora) => {
-                const presentation = loraPresentationFor(lora);
-                return (
-                <div
-                  key={lora.value}
-                  className={`lora-summary-row ${lora.enabled === false ? "disabled" : ""} ${presentation.coverUrl ? "has-cover" : ""}`}
-                  title={`${lora.name} · 分类 ${lora.category}`}
-                  {...loraSummaryHover.bind(presentation)}
-                >
-                  <span className="lora-summary-name">{lora.enabled === false && <Square size={8} />}{presentation.title}</span>
-                  <b>{formatWeight(lora.weight)}</b>
-                </div>
-                );
-              })}
-            </div>
-          </div>}
+          <MountedLoraSummary loras={engine.loras} presentationFor={loraPresentationFor} bindHover={loraSummaryHover.bind} onOpenManager={onOpenLoraManager} />
           <p className="i2i-note">切换引擎或底模会同步到文生图；LoRA 挂载按引擎隔离并随之切换。</p>
 
-          <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={editingLocked} canvas={canvas} dimensions={dimensions} setChain={setChain} postprocessOnly={postprocessOnly} />
+          <PostprocessControls config={config} engine={engine} postprocess={postprocess} running={editingLocked} actionsLocked={running} canvas={canvas} dimensions={dimensions} setChain={setChain} postprocessOnly={postprocessOnly} />
         </div>
       </aside>
       <LoraHoverPreview preview={loraSummaryHover.preview} />

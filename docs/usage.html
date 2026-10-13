@@ -39,6 +39,7 @@
       <li><a href="#lora-cards">LoRA cards</a></li>
       <li><a href="#samplers">Samplers and schedulers</a></li>
       <li><a href="#batches">Image batches</a></li>
+      <li><a href="#xyz">XYZ comparison</a></li>
       <li><a href="#postprocess">Post-processing chain</a></li>
       <li><a href="#workspace">Image viewer workspace</a></li>
     </ul>
@@ -173,6 +174,53 @@
       active batch; zoom and download always use the selected image. Cancelling or failing a
       multi-batch job removes partial outputs, while completed PNG files include their batch, image,
       seed and total batch settings in metadata.</p>
+
+    <h2 id="xyz">XYZ comparison</h2>
+    <p>Below the engine buttons, <strong>生成模式</strong> switches between 基础生图 and XYZ 对比生成 with
+      the arrows or the dropdown. Switching never unloads a model, edits the LoRA mounts or cancels a
+      job. Each engine keeps its own XYZ draft: <strong>从基础生图同步基线</strong> copies the current
+      models, the composed prompt (combination words and switched-on presets included), sampling,
+      canvas and LoRA mounts into it, and nothing changed there is written back to Basic.</p>
+    <p><strong>配置</strong> is the selected engine's independent XYZ draft. In XYZ mode the left rail edits its models, ordered background LoRAs, actual prompt, sampling, seed and original canvas directly — never Basic or image-to-image. XYZ engine selection restores that engine's draft without swapping Basic's engine or settings. Sync from Basic is an optional, selected-field import and leaves axes unchanged. Library combinations are copied as snapshots, not switched or edited in the library.</p>
+    <p>All active X/Y/Z lists can collapse. Expected quantity (1–256, Enter or confirmation) retains the first N entries and adds genuinely undefined cards; pending cards block preflight/start. Reducing quantity requires confirmation. Numeric fields offer Custom values or exact Staircase values: steps 12..20/2 gives five, CFG 4.0..6.5/0.5 gives six. Staircase automatically counts and read-only previews without manual cards. Field/mode/profile changes ask first; choosing the old field/mode restores its definition in this editing session. Labels/order/JSON remain under More.</p>
+    <p>Guidance uses the same always-visible Basic controls and conditional PAG settings. Four seed modes project fixed/±1 to exact uint64 per-repeat lists (modulo 2^64); each sample shares its seed across all combinations, with seed axes taking precedence. Random is drawn/frozen only by the server. Legacy fixed/random drafts retain their rules until an explicit mode click.</p>
+    <p>The LoRA instance weight axis picks its one target from the same full-catalog manager with a private temporary selection: close/cancel discards, confirm freezes the chosen instance. A target that is not mounted is added to each cell only, never to the global mounts. The weights take custom or staircase values without modifying global mounts, groups or prompts; testing several LoRAs together belongs to the LoRA mix search module, not to an axis.</p>
+    <p><strong>Original generation canvas.</strong> The always-visible right-side canvas uses the same drag grid, arrow-key controls and presets as Basic. Its width and height are fixed for every original cell when the experiment is submitted: a 2×2 experiment at 1024×1408 produces four 1024×1408 originals when post-processing is off. Canvas overrides inside an axis, a component set or a saved LoRA profile are refused, not ignored. Inheriting the frozen post-processing chain is off by default; enabling it can change final output sizes without changing this original canvas.</p>
+    <p><strong>结果</strong> shows the selected server-frozen experiment, not the draft on the left. Its footer controls only that experiment; there is no new-draft Start button. Z/sample paging and screen cell size are separate from generation dimensions. Export opens only from the grid toolbar, and scaling an export never changes the original images or draft canvas. On phone the baseline rail collapses; expanding it uses page scrolling rather than a second small scroll pane.</p>
+    <p>Numeric ranges remain decimal text and seeds remain uint64 strings. A prompt is one literal value — commas are not split. Exact replacement has separate find, replace and expected-match fields. A draft saved with a retired LoRA swap, profile or multiplier axis keeps that axis's frozen definition and runs it as saved, but its values cannot be edited and the field cannot be chosen for a new axis. Advanced JSON parses on blur and retains invalid raw text. Repeat samples and concurrency are separate; only the configuration footer counts and starts a new draft. Invalid numeric/product values stay raw and block requests locally, separately from counts; server admission remains authoritative.</p>
+    <ul>
+      <li><strong>Axes.</strong> X is columns, Y rows and Z separate sub-grids; an unused axis counts
+        as one value, so the image count is X × Y × Z × repeat samples. Axes are typed — steps, CFG or
+        distilled guidance, sampler, scheduler, seed, guidance, PAG scale, CLIP skip, checkpoint or
+        model components, positive and negative prompts, exact replacements and LoRA instance weight
+        — and only those the engine really supports are offered, with X, Y and Z chosen independently.
+        A saved LoRA model, profile or multiplier axis keeps its original definition but cannot be
+        newly selected.
+        <strong>服务端预检</strong> checks every cell the way an ordinary job is checked before
+        anything runs.</li>
+      <li><strong>Running.</strong> The experiment runs in the service, so closing the browser does
+        not stop it, and by default it finishes one cell at a time. Concurrent images 2–10 only merges
+        cells that differ in nothing but the seed into one real batch; the requested and actual
+        concurrency are shown with the reason. A failing cell pauses the experiment for retry, skip or
+        stop, and after a restart unfinished cells continue only when you choose to.</li>
+      <li><strong>Results.</strong> The grid shows server-made thumbnails at stable coordinates, with
+        placeholders for failed, cancelled and pending cells; the on-screen cell size never affects an
+        export. Each cell opens in the image viewer workspace, downloads, joins the gallery as a card
+        with that cell's own settings, or is applied to Basic.</li>
+      <li><strong>Apply to Basic.</strong> Choose which groups to write; only the prompt is selected
+        by default. The prompt box receives the cell's own text — combination words and switched-on
+        preset text are left out, because Basic adds them again at generation time — and the dialog
+        says whether Basic, as it stands, would send exactly the cell's prompt.</li>
+      <li><strong>Whole-grid export.</strong> <strong>导出整网格 PNG</strong> composes the whole
+        experiment — every Z sub-grid and sample — into one PNG under <code>outputs/XYZ/</code>, at
+        original resolution or a 1–100 % downscale made once from the originals (Lanczos3, linear
+        light, premultiplied alpha), labelled with a bundled Chinese font and accompanied by a JSON
+        manifest. A size over budget is refused with suggested percentages; nothing is shrunk or
+        paginated automatically.</li>
+      <li><strong>Reading a grid.</strong> The image reader recognises an XYZ grid PNG as a
+        comparison sheet: it applies nothing by itself, can reopen the experiment, and lets you choose
+        one cell to inspect and apply.</li>
+    </ul>
 
     <h2 id="postprocess">Post-processing chain</h2>
     <p>The <strong>后处理增强</strong> panel is one ordered list of stages, run top to bottom after

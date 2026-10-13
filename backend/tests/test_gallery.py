@@ -24,8 +24,12 @@ try:
         GalleryValidationError,
     )
 except ImportError:
-    import gallery
-    from gallery import (
+    # Discovered as top-level tests (`-s backend/tests`): the gallery still loads as `backend.gallery`,
+    # because it reaches its P10 siblings (`.lora_relink_store`, `.lora_library_gate`) by relative
+    # import, which fails in a top-level `gallery` module.
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from backend import gallery
+    from backend.gallery import (
         GALLERY_SCHEMA_VERSION,
         GalleryConflictError,
         GalleryNotFoundError,
@@ -451,7 +455,17 @@ class GalleryStoreTests(unittest.TestCase):
         self.create_collection()
         asset_id, _, _ = self.add_output()
         card = self.store.create_card("Favorites", images=[{"asset_id": asset_id}])
-        with patch.object(Path, "unlink", side_effect=PermissionError("locked")):
+        real_unlink = Path.unlink
+        assets = self.store.assets_directory
+
+        # Only the gallery's own files are locked: closing the connection also releases the LoRA
+        # library admission lease through `Path.unlink`, and that must keep working.
+        def unlink(path, *args, **kwargs):
+            if path.parent == assets:
+                raise PermissionError("locked")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", autospec=True, side_effect=unlink):
             with self.assertWarnsRegex(RuntimeWarning, "orphaned gallery image"):
                 self.store.delete_card(card["id"])
         self.assertEqual(self.store.list_gallery()["cards"], [])

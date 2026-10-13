@@ -162,21 +162,23 @@ def _safe_name(value, fallback):
 
 
 class GalleryStore:
-    def __init__(self, state_directory, asset_resolver=None):
+    def __init__(self, state_directory, asset_resolver=None, *, relink_token=None):
         self.state_directory = Path(state_directory).resolve()
         self.database_path = self.state_directory / "gallery.sqlite3"
         self.assets_directory = self.state_directory / "gallery-assets"
         self.asset_resolver = asset_resolver
+        self._relink_token = relink_token
         self.state_directory.mkdir(parents=True, exist_ok=True)
         self.assets_directory.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
 
     def _connect(self):
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 30000")
-        return connection
+        from .lora_relink_store import connect_gallery
+        return connect_gallery(self)
+
+    def relink_transaction(self, action, operation_id, patches):
+        from .lora_relink_store import gallery_relink
+        return gallery_relink(self, action, operation_id, patches)
 
     def _initialize_schema(self):
         connection = self._connect()
@@ -487,11 +489,14 @@ class GalleryStore:
             (row["id"],),
         ).fetchall()
         images = [self._image_record(image) for image in image_rows]
+        settings = json.loads(row["settings_json"])
+        if connection.library_revision is not None:
+            settings["loraLibraryRevision"] = connection.library_revision
         return {
             "id": row["id"],
             "collection_id": row["collection_id"],
             "title": row["title"],
-            "settings": json.loads(row["settings_json"]),
+            "settings": settings,
             "sort_index": row["sort_index"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -773,6 +778,8 @@ class GalleryStore:
         connection = self._connect()
         try:
             self._begin(connection)
+            from .lora_relink_store import require_settings_revision
+            require_settings_revision(self, {} if settings is None else settings)
             if connection.execute("SELECT 1 FROM collections WHERE id = ?", (collection_id,)).fetchone() is None:
                 raise GalleryNotFoundError("Gallery collection was not found")
             connection.execute(
@@ -837,6 +844,9 @@ class GalleryStore:
         connection = self._connect()
         try:
             self._begin(connection)
+            from .lora_relink_store import require_settings_revision
+            for card in cards:
+                require_settings_revision(self, card.get("settings", {}))
             if connection.execute("SELECT 1 FROM collections WHERE id = ?", (collection_id,)).fetchone() is None:
                 raise GalleryNotFoundError("Gallery collection was not found")
             now = _timestamp()
@@ -903,6 +913,9 @@ class GalleryStore:
             card = connection.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
             if card is None:
                 raise GalleryNotFoundError("Gallery card was not found")
+            if settings is not UNSET:
+                from .lora_relink_store import require_settings_revision
+                require_settings_revision(self, settings, json.loads(card["settings_json"]))
             if target_collection is not UNSET and connection.execute(
                 "SELECT 1 FROM collections WHERE id = ?", (target_collection,)
             ).fetchone() is None:
@@ -1147,3 +1160,125 @@ class GalleryStore:
             "path": path,
             "variant": "original",
         }
+
+    def image_files(self, image_ids):
+        """Original files for many images through one connection: {id: {"path", "mime_type"}}.
+
+        An id with no record is simply absent; a record whose file is gone keeps its path, so the
+        caller decides how to report it.
+        """
+        found = {}
+        connection = self._connect()
+        try:
+            for image_id in image_ids:
+                row = connection.execute(
+                    "SELECT id, mime_type, storage_name FROM card_images WHERE id = ?", (image_id,)
+                ).fetchone()
+                if row is not None:
+                    found[row["id"]] = {"path": self._asset_path(row["storage_name"]), "mime_type": row["mime_type"]}
+        finally:
+            connection.close()
+        return found
+
+    def _free_collection_id(self, connection, requested, taken):
+        for index in range(1, 10_000):
+            suffix = "" if index == 1 else f" ({index})"
+            candidate = f"{requested[:64 - len(suffix)].rstrip() or requested[:64 - len(suffix)]}{suffix}"
+            if candidate in taken:
+                continue
+            if connection.execute("SELECT 1 FROM collections WHERE id = ?", (candidate,)).fetchone() is None:
+                return candidate
+        raise GalleryConflictError(f"No free collection id for '{requested}'")
+
+    def import_collections(self, collections):
+        """Create whole collections from local image files in one transaction.
+
+        Each entry is {"id", "description", "cards": [{"title", "settings", "images": [{"path",
+        "name", "mime_type"}]}]}. An id already in use takes the first free " (n)" suffix rather than
+        merging into the existing collection. Settings are stamped with the current LoRA library
+        revision: they come from another snapshot of the library, never from a stale page.
+        """
+        if not isinstance(collections, list) or not collections:
+            raise GalleryValidationError("collections must contain at least one collection")
+        prepared = []
+        for collection in collections:
+            requested = _collection_id(collection.get("id"))
+            description = _description(collection.get("description"))
+            cards = []
+            for card in collection.get("cards") or []:
+                settings = dict(card.get("settings") or {})
+                _settings_json(settings)
+                images = []
+                for image in card.get("images") or []:
+                    mime_type = image.get("mime_type")
+                    suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(mime_type)
+                    if suffix is None:
+                        raise GalleryValidationError("Imported image must be PNG, JPEG, WebP, or GIF")
+                    images.append((Path(image["path"]), _safe_name(image.get("name"), f"image{suffix}"), mime_type, suffix))
+                cards.append((_title(card.get("title")), settings, images))
+            prepared.append((requested, description, cards))
+
+        staged = []
+        committed = False
+        connection = self._connect()
+        try:
+            self._begin(connection)
+            from .lora_relink_store import require_settings_revision
+            revision = connection.library_revision
+            now = _timestamp()
+            taken = set()
+            created = []
+            for requested, description, cards in prepared:
+                collection_id = self._free_collection_id(connection, requested, taken)
+                taken.add(collection_id)
+                connection.execute(
+                    "INSERT INTO collections(id, description, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (collection_id, description, now, now),
+                )
+                image_count = 0
+                for card_sort_index, (title, settings, images) in enumerate(cards):
+                    if revision is None:
+                        settings.pop("loraLibraryRevision", None)
+                    else:
+                        settings["loraLibraryRevision"] = revision
+                    require_settings_revision(self, settings)
+                    card_id = str(uuid.uuid4())
+                    connection.execute(
+                        """
+                        INSERT INTO cards(id, collection_id, title, settings_json, sort_index, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (card_id, collection_id, title, _settings_json(settings), card_sort_index, now, now),
+                    )
+                    for sort_index, (source, name, mime_type, suffix) in enumerate(images):
+                        def copy_source(target, source=source):
+                            with source.open("rb") as source_file:
+                                shutil.copyfileobj(source_file, target, length=1024 * 1024)
+
+                        temporary_path = self._write_temporary(copy_source)
+                        image_id = str(uuid.uuid4())
+                        storage_name = f"{image_id}{suffix}"
+                        staged.append(_StagedImage(image_id, temporary_path, self._asset_path(storage_name), storage_name, name, mime_type))
+                        self._validate_image_file(temporary_path, mime_type)
+                        connection.execute(
+                            """
+                            INSERT INTO card_images(
+                                id, card_id, sort_index, original_name, mime_type, storage_name, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (image_id, card_id, sort_index, name, mime_type, storage_name, now),
+                        )
+                        image_count += 1
+                created.append({"id": collection_id, "requested_id": requested, "renamed": collection_id != requested,
+                                "card_count": len(cards), "image_count": image_count})
+            self._install_staged(staged)
+            connection.commit()
+            committed = True
+            return created
+        except Exception:
+            self._rollback(connection)
+            raise
+        finally:
+            connection.close()
+            if not committed:
+                self._cleanup_staged(staged)

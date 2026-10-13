@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Check, ImageIcon, Images, Plus, RefreshCw, Sparkles, X } from "lucide-react";
 import { galleryOutputSeedSettings } from "./hires-settings";
 import { resampleUnits } from "./resample-chain";
-import { displayTitle, galleryRequest, normalizedSettings, useDialogLifecycle } from "./gallery-core";
+import { displayTitle, galleryRequest, normalizedSettings, useDialogLifecycle, withGalleryLoraRevision } from "./gallery-core";
 
 export function AddToGalleryDialog({ outputs, selectedOutputIndex, settings, onClose, onSaved }) {
   const dialogRef = useDialogLifecycle(true, onClose);
@@ -45,7 +45,7 @@ export function AddToGalleryDialog({ outputs, selectedOutputIndex, settings, onC
     // An output records one resample seed: the first unit that redrew. That is the unit the card
     // pins, so reopening it reproduces the picture rather than drawing a fresh random one.
     const firstUnit = resampleUnits(normalized.postprocessChain).find((unit) => unit.enabled && unit.denoise > 0) || null;
-    return galleryOutputSeedSettings(normalized, output, selectedItems, combined, firstUnit);
+    return withGalleryLoraRevision(galleryOutputSeedSettings(normalized, output, selectedItems, combined, firstUnit));
   };
   const save = async () => {
     if (!selectedOutputs.length || busy) return;

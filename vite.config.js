@@ -1,6 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -34,6 +34,7 @@ import { createOfflineUpdateTemp, removeOfflineUpdateTemp } from "./scripts/offl
 import { configuredModelDirectory, defaultLoraCategories, groupLoraModels, mergeModelPaths } from "./scripts/model-paths.mjs";
 import { readPngMetadataChunks } from "./scripts/png-text-chunks.mjs";
 import { interpretImageMetadata, matchModelName, modelDisplayName, modelFolderAffinity, publicMatch, rankByFolder, settleAmbiguousMatch, settleByFolder, stripImageInfoMatches } from "./src/image-metadata.js";
+import { recordedImageLoraReference, resolvedImageLoraIdentity } from "./src/image-info-lora-reference.js";
 import {
   formatSharedRef,
   inspectSharedDirectory,
@@ -52,11 +53,24 @@ import { discoverFlux2Models } from "./scripts/flux2-models.mjs";
 import { discoverKrea2Models } from "./scripts/krea2-models.mjs";
 import { createConfiguratorHandoff } from "./scripts/configurator-handoff.mjs";
 import { guardedInferenceResponse, inferenceIdentityGate } from "./scripts/inference-identity-gate.mjs";
+import { wd14Admission } from "./scripts/wd14-access.mjs";
+import { isTaskDeletionRequest, taskDeletionAdmission } from "./scripts/task-deletion-access.mjs";
+import { galleryTransferAdmission, isGalleryTransferRequest } from "./scripts/gallery-transfer-access.mjs";
 import { PLUGIN_DIAGNOSTIC_CODES, createPluginRegistry, pluginsRootFor, servesPluginContent } from "./scripts/plugin-registry.mjs";
 import { applyPluginEnabled, pluginStatePathFor, pluginToggleAdmission, readPluginState, writePluginState } from "./scripts/plugin-state.mjs";
 import { removePluginFolder, revealPluginFolder } from "./scripts/plugin-actions.mjs";
 import { descriptionNeedsVersionIdentity, loraMetadataCacheValid, plainTextFromHtml, readLoraFileMetadata, reviewLoraPrompts, TRIGGER_REVIEW_SCHEMA } from "./scripts/lora-metadata.mjs";
 import { pruneCardAssets, readCardAsset, readLoraCardStore, writeCardAsset, writeLoraCardStore } from "./scripts/lora-cards.mjs";
+import { LoraPublishedStore } from "./scripts/lora-published-store.mjs";
+import { LoraRelinkService } from "./scripts/lora-relink-service.mjs";
+import { galleryOwnerParticipant } from "./scripts/lora-gallery-owner.mjs";
+import { loraRelinkMiddleware } from "./scripts/lora-relink-http.mjs";
+import { loraJobMiddleware } from "./scripts/lora-job-http.mjs";
+import { xyzPlotMiddleware } from "./scripts/xyz-plot-http.mjs";
+import { loraMixMiddleware } from "./scripts/lora-mix-http.mjs";
+import { normalizeLoraCardStore } from "./src/lora-cards.js";
+import { reuseVerifiedLoraCaches } from "./scripts/lora-relink-cache.mjs";
+import { readLoraRegistry, fingerprint } from "./scripts/lora-library.mjs";
 import { pruneToolboxAssets, readToolboxAsset, readToolboxState, writeToolboxAsset, writeToolboxState } from "./scripts/toolbox-state.mjs";
 import { prunePromptPresetPreviews, readPromptPresetPreview, referencedPreviewsInUiState, writePromptPresetPreview } from "./scripts/prompt-preset-previews.mjs";
 import { appendDownloadQueueState, filterPendingRecommendedArtifacts, itemStatusIsTerminal } from "./scripts/model-download-queue.mjs";
@@ -223,6 +237,9 @@ const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
 const inferenceProtocol = 39;
+// Per-process proof that the WD14 request passed this Node server's Origin and
+// loopback gates. Not a user credential; never accept a client-supplied proof.
+const wd14ProxyProof = randomBytes(32).toString("hex");
 export const inferenceWorkspaceId = workspaceId;
 const maximumUpdateArchiveBytes = 4 * 1024 ** 3;
 // The saved workspace carries the prompt, the negative prompt and every prompt preset, none of
@@ -686,6 +703,19 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
 
   const registerInferenceIdentityGate = (server) => {
     server.middlewares.use(async (request, response, next) => {
+      const admission = wd14Admission(request);
+      const taskAdmission = taskDeletionAdmission(request);
+      const galleryAdmission = galleryTransferAdmission(request);
+      if (!admission.allowed || !taskAdmission.allowed || !galleryAdmission.allowed) {
+        const refused = [admission, taskAdmission, galleryAdmission].find((item) => !item.allowed);
+        response.statusCode = refused.status;
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.setHeader("Cache-Control", "no-store");
+        const detail = refused !== galleryAdmission ? "此写操作须从本机回环地址的同源页面发起"
+          : refused.local ? "按路径导入只能在本机页面使用；远程访问请拖入或选择 ZIP 文件" : "画廊导入导出须从本服务的同源页面发起";
+        response.end(JSON.stringify({ detail }));
+        return;
+      }
       const url = new URL(request.url, "http://localhost");
       // Health is Vite's aggregate/direct probe endpoint and must never route
       // through this gate, otherwise identity verification deadlocks itself.
@@ -711,6 +741,51 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
       response.setHeader("Cache-Control", "no-store");
       response.end(JSON.stringify(blocked.body));
     });
+    server.middlewares.use(loraJobMiddleware({ service: loraRelinkService,
+      // SourceImageInput already admits 200M data-URL characters. Do not apply
+      // the ordinary 64 KiB management-body default to image-to-image jobs.
+      readJson: (request) => readJsonRequest(request, 256 * 1024 * 1024), admit: requireSameOrigin,
+      submit: async (payload, headers, request, response) => {
+        // The request body is consumed by admission, so this bounded JSON route
+        // forwards explicitly instead of replaying an exhausted proxy stream.
+        for (const key of ["host", "content-length", "connection", "transfer-encoding", "expect", "x-xirai-wd14-proxy-proof"]) delete headers[key];
+        headers["content-type"] = "application/json";
+        const controller = new AbortController();
+        response.once("close", () => { if (!response.writableEnded) controller.abort(); });
+        const result = await undiciFetch(`${inferenceTarget}/api/inference/jobs`, { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal });
+        response.statusCode = result.status;
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.setHeader("Cache-Control", "no-store");
+        response.end(await result.text());
+      } }));
+    // QPlan2/P2: LoRA mix-search confirmation/preview get the same Node LoRA admission (globals + every test member).
+    server.middlewares.use(loraMixMiddleware({ service: loraRelinkService,
+      readJson: (request) => readJsonRequest(request, 2 * 1024 * 1024), admit: requireSameOrigin,
+      forward: async (pathname, payload, headers, request, response) => {
+        for (const key of ["host", "content-length", "connection", "transfer-encoding", "expect", "x-xirai-wd14-proxy-proof"]) delete headers[key];
+        headers["content-type"] = "application/json";
+        const controller = new AbortController();
+        response.once("close", () => { if (!response.writableEnded) controller.abort(); });
+        const result = await undiciFetch(`${inferenceTarget}${pathname}`, { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal });
+        response.statusCode = result.status;
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.setHeader("Cache-Control", "no-store");
+        response.end(await result.text());
+      } }));
+    // QPlan2/P1 B: XYZ preview/submission get the same Node LoRA admission before Python.
+    server.middlewares.use(xyzPlotMiddleware({ service: loraRelinkService,
+      readJson: (request) => readJsonRequest(request, 2 * 1024 * 1024), admit: requireSameOrigin,
+      forward: async (pathname, payload, headers, request, response) => {
+        for (const key of ["host", "content-length", "connection", "transfer-encoding", "expect", "x-xirai-wd14-proxy-proof"]) delete headers[key];
+        headers["content-type"] = "application/json";
+        const controller = new AbortController();
+        response.once("close", () => { if (!response.writableEnded) controller.abort(); });
+        const result = await undiciFetch(`${inferenceTarget}${pathname}`, { method: "POST", headers, body: JSON.stringify(payload), signal: controller.signal });
+        response.statusCode = result.status;
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.setHeader("Cache-Control", "no-store");
+        response.end(await result.text());
+      } }));
   };
 
   const terminate = () => {
@@ -764,6 +839,7 @@ export function inferenceBackendPlugin({ testOnly = false, probeBackend: injecte
       INFERENCE_PORT: String(inferencePort),
       INFERENCE_SHUTDOWN_TOKEN: shutdownToken,
       INFERENCE_WORKSPACE_ID: workspaceId,
+      XIRAI_WD14_PROXY_PROOF: wd14ProxyProof,
       PYTHONUNBUFFERED: "1",
       // Piped, Python encodes stdout with the system code page — gbk on a Chinese Windows — while
       // this end decodes every chunk as UTF-8. Anything outside ASCII then arrives as replacement
@@ -2034,6 +2110,51 @@ function logApiPlugin() {
   };
 }
 
+// Constructing these owners performs no state/DB writes. Explicit management
+// operations and all participating API reads/writes acquire the same gate.
+const loraGalleryOwner = galleryOwnerParticipant(stateDirectory, path.join(projectRoot, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python"));
+async function loraRegisteredRoots() {
+  const config = JSON.parse(await readFile(modelPathConfig, "utf8"));
+  const roots = Object.entries(loraEnginePathKeys).map(([engine, key]) => ({ engine, id: `local-${engine}`,
+    directory: configuredModelDirectory(config, "loras", projectRoot, key), enabled: true }));
+  const shared = await readSharedRoots(projectRoot);
+  for (const root of shared) {
+    if (!["loras", "auto"].includes(root.kind)) continue;
+    const scopes = root.enabled ? await sharedKindDirectories(root, "loras") : [];
+    for (const engine of root.engines) roots.push({ engine, id: root.id, directory: root.path, shared: true, label: root.label, enabled: root.enabled && scopes.length > 0,
+      scopeDirectories: scopes.map(({ directory }) => path.relative(root.path, directory).split(path.sep).join("/")) });
+  }
+  return roots;
+}
+const loraRelinkService = new LoraRelinkService({ stateDirectory, projectRoot, gallery: loraGalleryOwner, getRoots: loraRegisteredRoots,
+  validatePath: validateLoraPath,
+  onPublished: async (plan) => { modelCatalogCache = null; return reuseVerifiedLoraCaches(plan.results, await loraRegisteredRoots(), getLoraCachePath, reviewedLoraMetadata); },
+  admitIdle: async (leaseToken) => {
+    let result;
+    try { result = await undiciFetch(`${inferenceTarget}/api/inference/lora-library/admission`, { method: "POST",
+      headers: { "Content-Type": "application/json", Origin: inferenceTarget }, body: JSON.stringify({ leaseToken }), signal: AbortSignal.timeout(5000) }); }
+    catch { throw Object.assign(new Error("Inference owner unavailable; repair cannot safely admit a commit"), { statusCode: 503 }); }
+    if (!result.ok) throw Object.assign(new Error(result.status === 409 ? "活动、排队或恢复中的任务阻止确认；草稿可保留。" : "Inference owner must support the current LoRA admission gate before repair"), { statusCode: result.status === 409 ? 409 : 503 });
+    const payload = await result.json();
+    if (payload.idle !== true || payload.protocol !== 39) throw Object.assign(new Error("Inference admission/protocol mismatch"), { statusCode: 503 });
+  },
+});
+const loraPublishedStore = new LoraPublishedStore({ stateDirectory, ensureRecovered: () => loraRelinkService.ensureRecovered() });
+function publishedHeaders(response, value) {
+  response.setHeader("X-XirAI-LoRA-Revision", String(value.revision));
+  response.setHeader("X-XirAI-Document-Version", value.version);
+}
+function requestPublication(request) {
+  return { revision: Number(request.headers["x-xirai-lora-revision"] || 0), version: request.headers["x-xirai-document-version"] };
+}
+function loraRelinkApiPlugin() {
+  const middleware = loraRelinkMiddleware({ service: loraRelinkService, readJson: readJsonRequest,
+    admit: (request, action) => { if (["resolve", "state", "status"].includes(action)) requireSameOrigin(request); else requireLocalRequest(request, "LoRA repair requires the trusted local same-origin entry");
+      if (request.headers["sec-fetch-site"] === "cross-site") throw Object.assign(new Error("Cross-site repair denied"), { statusCode: 403 }); } });
+  const install = (server) => { server.middlewares.use(middleware); void loraRelinkService.ensureRecovered().catch(() => {}); };
+  return { name: "lora-relink-owner-api", configureServer: install, configurePreviewServer: install };
+}
+
 async function uiStateApi(request, response, next) {
   const url = new URL(request.url, "http://localhost");
   if (url.pathname !== "/api/ui-state") {
@@ -2045,15 +2166,11 @@ async function uiStateApi(request, response, next) {
   try {
     requireSameOrigin(request);
     if (request.method === "GET") {
-      let state = null;
-      try {
-        const saved = JSON.parse(await readFile(uiStatePath, "utf8"));
-        if (saved && typeof saved === "object" && !Array.isArray(saved)) state = saved;
-      } catch (error) {
-        if (error.code !== "ENOENT") throw Object.assign(new Error("Saved interface state is invalid"), { statusCode: 500 });
-      }
+      const saved = await loraPublishedStore.read("uiState");
+      const state = saved.value;
+      publishedHeaders(response, saved);
       response.statusCode = 200;
-      response.end(JSON.stringify({ state }));
+      response.end(JSON.stringify({ state, exists: saved.exists }));
       return;
     }
     if (request.method === "PUT") {
@@ -2061,17 +2178,10 @@ async function uiStateApi(request, response, next) {
       if (!state || typeof state !== "object" || Array.isArray(state)) {
         throw Object.assign(new Error("Saved interface state must be an object"), { statusCode: 400 });
       }
-      await mkdir(stateDirectory, { recursive: true });
-      const temporaryPath = path.join(stateDirectory, `${randomUUID()}.tmp`);
-      try {
-        await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
-        await rename(temporaryPath, uiStatePath);
-      } finally {
-        await rm(temporaryPath, { force: true });
-      }
-      schedulePromptPresetPreviewPrune(state);
-      response.statusCode = 204;
-      response.end();
+      const saved = await loraPublishedStore.save("uiState", state, requestPublication(request), async (latest) => schedulePromptPresetPreviewPrune(latest));
+      publishedHeaders(response, saved);
+      if (request.headers.prefer === "return=representation") { response.statusCode = 200; response.end(JSON.stringify({ state: saved.value })); }
+      else { response.statusCode = 204; response.end(); }
       return;
     }
     throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
@@ -2178,17 +2288,21 @@ async function loraCardsApi(request, response, next) {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.setHeader("Cache-Control", "no-store");
     if (request.method === "GET") {
-      const { store, rejected, reset } = await readLoraCardStore(stateDirectory);
+      const saved = await loraPublishedStore.read("cards");
+      publishedHeaders(response, saved);
+      const { store, rejected, reset, fatal } = normalizeLoraCardStore(saved.value);
       response.statusCode = 200;
-      response.end(JSON.stringify({ store, rejected, reset }));
+      response.end(JSON.stringify({ store, rejected, reset, ...(fatal ? { fatal: true } : {}) }));
       return;
     }
     if (request.method === "PUT") {
       // The whole store is small — a few hundred bytes per customised card — and
       // sending it whole keeps the two windows from having to merge patches.
       const payload = await readJsonRequest(request, 512 * 1024);
-      const store = await writeLoraCardStore(stateDirectory, payload?.store);
-      const removed = await pruneCardAssets(stateDirectory, store);
+      let removed = [];
+      const saved = await loraPublishedStore.save("cards", payload?.store, requestPublication(request), async (store) => { removed = await pruneCardAssets(stateDirectory, store); });
+      const store = saved.value;
+      publishedHeaders(response, saved);
       response.statusCode = 200;
       response.end(JSON.stringify({ store, removed: removed.length }));
       return;
@@ -2206,6 +2320,7 @@ async function loraCardsApi(request, response, next) {
 }
 
 async function loraCardAssetRequest(request, response, url) {
+  return loraPublishedStore.access(async ({ revision }) => {
   if (request.method === "GET") {
     const asset = await readCardAsset(stateDirectory, url.searchParams.get("id"));
     response.statusCode = 200;
@@ -2219,6 +2334,7 @@ async function loraCardAssetRequest(request, response, url) {
   response.setHeader("Content-Type", "application/json; charset=utf-8");
   response.setHeader("Cache-Control", "no-store");
   if (request.method === "POST") {
+    if (requestPublication(request).revision !== revision) throw Object.assign(new Error("Published LoRA revision changed before cover upload"), { statusCode: 409 });
     const payload = await readJsonRequest(request, 8 * 1024 * 1024);
     const asset = await writeCardAsset(stateDirectory, payload?.dataUrl);
     response.statusCode = 200;
@@ -2226,6 +2342,7 @@ async function loraCardAssetRequest(request, response, url) {
     return;
   }
   throw Object.assign(new Error("Method not allowed"), { statusCode: 405 });
+  });
 }
 
 function loraCardsApiPlugin() {
@@ -4835,7 +4952,32 @@ async function resolveImageInfoModels(info) {
   // the set is where an ambiguous name is looked for first.
   const affinity = modelFolderAffinity(first.map(({ match }) => match));
   const loras = [];
+  const registry = await readLoraRegistry(stateDirectory).catch(() => null);
+  const managed = Object.values(registry?.instances || {}).some((instance) => instance.engine === loraEngine);
   for (const { item, match } of first) {
+    if (managed) {
+      const exact = item.path || item.instanceId;
+      if (!exact) {
+        const candidates = match?.candidates || (match?.match ? [match.match] : []);
+        loras.push({ ...item, match: { status: "ambiguous", candidates: candidates.map((candidate) => ({ name: candidate.name, value: candidate.value, engine: candidate.engine })), explanation: "旧记录只有名称/短哈希，不能证明具体实例；请明确选择。" } });
+        continue;
+      }
+      try {
+        const resolved = await loraRelinkService.resolve(loraEngine, [recordedImageLoraReference(item)], { history: true });
+        const reference = resolved.references[0];
+        const target = catalogs.loras.find((candidate) => candidate.engine === loraEngine && candidate.value === reference.value);
+        if (!target) throw new Error("Target not catalogued");
+        loras.push({ ...resolvedImageLoraIdentity(item, reference),
+          match: { status: parseSharedRef(reference.value) ? "shared" : "local", match: { name: target.name, value: reference.value, engine: loraEngine },
+             relink: { kind: reference.kind, auditKind: reference.auditKind, originalValue: item.path, currentValue: reference.value, promptRewriteAllowed: reference.promptRewriteAllowed }, explanation: reference.kind === "replace" ? "原引用使用用户确认的指定替代" : reference.kind === "relocate" ? "原位置 → 已确认当前位置" : "实例与当前文件已核对" } });
+       } catch (error) {
+         const resolution = error.resolution;
+         loras.push({ ...item, match: { status: resolution?.status === "ambiguous-path" ? "ambiguous" : "missing",
+           ...(resolution ? { auditKind: resolution.auditKind, candidates: resolution.candidates } : {}),
+           explanation: "实例缺失、路径复用或内容证据冲突；未自动选择副本，请明确选择。" } });
+      }
+      continue;
+    }
     // A recorded hash decides first; what it cannot decide goes to the folder rule, so a LoRA with a
     // file of its name here is always shown with one — only an absent one has none.
     const settled = settleByFolder(await settleByHash(match, item.hash, affinity), affinity);
@@ -5210,6 +5352,9 @@ async function modelApi(request, response, next) {
     const directory = await getConfiguredDirectory(engine, isLoraRequest ? "loras" : "checkpoints");
 
     if (isLoraRequest) {
+      // Await within this route's try/catch: a lease/read failure must become an
+      // HTTP error, never an unhandled Connect-middleware rejection/process exit.
+      return await loraPublishedStore.access(async () => {
       const extensions = nativeEngines.has(engine) ? animaLoraExtensions : loraExtensions;
       const models = await findModels(directory, directory, true, extensions, directory);
       // A local folder literally named `shared:` would collide with the shared
@@ -5222,9 +5367,22 @@ async function modelApi(request, response, next) {
       // The shared category sits after the four defaults, exactly where the
       // user expects a fifth folder to appear.
       if (sharedListings.length) categories.push(shapeSharedLoraCategory(sharedListings));
+      const registry = await readLoraRegistry(stateDirectory).catch(() => null);
+      for (const category of categories) for (const item of category.models) {
+        const records = Object.values(registry?.instances || {}).filter((record) => record.engine === engine && (record.value === item.value || record.history.includes(item.value)));
+        const current = records.find((record) => record.value === item.value && record.status === "present");
+        item.bindingConflict = records.length > 1 || Boolean(records.length && !current);
+        if (current) {
+          const file = parseSharedRef(item.value) ? await validateLoraPath(engine, item.value) : path.join(directory, item.value);
+          const observed = await lstat(file, { bigint: true }).catch(() => null);
+          if (observed && fingerprint(observed) === current.fingerprint) Object.assign(item, { identitySchema: 1, instanceId: current.instanceId, contentHash: current.contentHash, contentRevision: current.contentRevision });
+          else item.bindingConflict = true;
+        }
+      }
       response.statusCode = 200;
       response.end(JSON.stringify({ engine, directory: path.relative(projectRoot, directory).split(path.sep).join("/"), categories }));
       return;
+      });
     }
 
     const models = await findModels(directory, directory, false, checkpointExtensions);
@@ -6124,7 +6282,7 @@ function systemApiPlugin() {
 }
 
 export default defineConfig({
-  plugins: [connectionResiliencePlugin(), setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), uiStateApiPlugin(), promptPresetPreviewApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
+  plugins: [connectionResiliencePlugin(), setupGatePlugin(), themedLogoPlugin(), react(), ...(setupComplete ? [logApiPlugin(), loraRelinkApiPlugin(), uiStateApiPlugin(), promptPresetPreviewApiPlugin(), loraCardsApiPlugin(), toolboxApiPlugin(), assistantApiPlugin(), pluginRegistryApiPlugin(), modelApiPlugin(), updateApiPlugin(), systemApiPlugin(), inferenceBackendPlugin()] : [])],
   cacheDir: path.join(cacheDirectory, "vite"),
   define: {
     // The browser may be on a different machine than the folders the user is
@@ -6163,7 +6321,14 @@ export default defineConfig({
       ignored: ignoreRuntimeWatchPath,
     },
     proxy: {
-      "/api/inference": { target: inferenceTarget, changeOrigin: true },
+      "/api/inference": { target: inferenceTarget, changeOrigin: true, configure(proxy) {
+        proxy.on("proxyReq", (forward, request) => {
+          forward.removeHeader("x-xirai-wd14-proxy-proof");
+          if (isTaskDeletionRequest(request) || isGalleryTransferRequest(request) || new URL(request.url, "http://localhost").pathname.startsWith("/api/inference/wd14/")) {
+            forward.setHeader("x-xirai-wd14-proxy-proof", wd14ProxyProof);
+          }
+        });
+      } },
     },
   },
   preview: {
@@ -6172,7 +6337,14 @@ export default defineConfig({
     strictPort: true,
     headers: webSecurityHeaders,
     proxy: {
-      "/api/inference": { target: inferenceTarget, changeOrigin: true },
+      "/api/inference": { target: inferenceTarget, changeOrigin: true, configure(proxy) {
+        proxy.on("proxyReq", (forward, request) => {
+          forward.removeHeader("x-xirai-wd14-proxy-proof");
+          if (isTaskDeletionRequest(request) || isGalleryTransferRequest(request) || new URL(request.url, "http://localhost").pathname.startsWith("/api/inference/wd14/")) {
+            forward.setHeader("x-xirai-wd14-proxy-proof", wd14ProxyProof);
+          }
+        });
+      } },
     },
   },
 });

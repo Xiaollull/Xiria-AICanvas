@@ -32,6 +32,8 @@ import LoraGroupPanel from "./LoraGroupPanel.jsx";
 import LoraCardEditor from "./LoraCardEditor.jsx";
 import { groupCardFor, loraCardFor, loraCardPresentation } from "./lora-cards.js";
 import { useLoraCards } from "./use-lora-cards.js";
+import { loraFetch as fetch, LORA_PUBLICATION_EVENT, startLoraPublicationWatch } from "./lora-library-client.js";
+import { LoraRepairEntry } from "./LoraRepairPanel.jsx";
 import {
   emptyLoraGroupMap,
   loraGroupsForScope,
@@ -135,6 +137,25 @@ export default function LoraManagerPage() {
   const parentSeenRef = useRef(false);
   const pendingEngineSwitchRef = useRef(new Map());
   const loraCards = useLoraCards();
+  useEffect(() => {
+    startLoraPublicationWatch(); let epoch = 0;
+    const refresh = async () => {
+      const captured = ++epoch; persistenceEpochRef.current.invalidate(); localChangeRef.current = false;
+      try {
+        const response = await fetch("/api/ui-state", { cache: "no-store" }); const payload = await response.json();
+        if (!response.ok || captured !== epoch) return;
+        const workspace = payload.state?.workspace || {};
+        const mounts = normalizeMountedLoraMap(workspace.mountedLorasByEngine, { fieldMissing: !workspace.mountedLorasByEngine, legacyLoras: workspace.loras, activeEngine: workspace.model });
+        const groups = normalizeLoraGroupMap(workspace.loraGroupsByEngine);
+        if (mounts.fatal || groups.fatal) throw new Error("新发布身份无法安全读取，已保留原始资料。");
+        mountedLorasMapRef.current = mounts.container; setMountedLorasByEngine(mounts.container);
+        loraGroupsMapRef.current = groups.container; setLoraGroupsByEngine(groups.container);
+        setLoras(mountedLorasForScope(mounts.container, scopeKeyRef.current)); void loadLibraries(true);
+      } catch (error) { setNotice(error.message); }
+    };
+    window.addEventListener(LORA_PUBLICATION_EVENT, refresh);
+    return () => { ++epoch; window.removeEventListener(LORA_PUBLICATION_EVENT, refresh); };
+  }, []);
   modelRef.current = model;
   lorasRef.current = loras;
   workspaceLockedRef.current = workspaceLocked;
@@ -211,11 +232,12 @@ export default function LoraManagerPage() {
         setLoraGroupsByEngine(groupMap.container);
         mountedLorasMapRef.current = map;
         scopeKeyRef.current = scopeKey;
-        canPersistRef.current = !normalized.fatal;
+        canPersistRef.current = !normalized.fatal && !groupMap.fatal;
         setMountedLorasByEngine(map);
         setModel(engine);
         setLoras(initialLoras);
         if (normalized.warning) setNotice(normalized.warning);
+        if (groupMap.fatal) setNotice(groupMap.warning);
       })
       .catch((loadError) => !cancelled && setError(loadError.message))
       .finally(() => {
@@ -336,9 +358,11 @@ export default function LoraManagerPage() {
           const map = withMountedLorasForScope(normalized.container, scopeKey, lorasRef.current);
           // Groups ride the same write. They are never fatal, so a damaged
           // stored value is replaced rather than blocking the mounted map.
-          const groupMap = normalizeLoraGroupMap(workspace.loraGroupsByEngine, {
+          const inspectedGroups = normalizeLoraGroupMap(workspace.loraGroupsByEngine, {
             fieldMissing: !Object.prototype.hasOwnProperty.call(workspace, "loraGroupsByEngine"),
-          }).container;
+          });
+          if (inspectedGroups.fatal) throw new Error(inspectedGroups.warning);
+          const groupMap = inspectedGroups.container;
           const groups = withLoraGroupsForScope(groupMap, scopeKey, loraGroupsForScope(loraGroupsMapRef.current, scopeKey));
           return { ...payload.state, workspace: { ...workspace, mountedLorasByEngine: map, loraGroupsByEngine: groups, loras: mountedLorasForScope(map, serverScopeKey) } };
         },
@@ -524,7 +548,7 @@ export default function LoraManagerPage() {
   const loraPresentationFor = (item) => loraCardPresentation({
     engine: model,
     item,
-    card: loraCardFor(loraCards.store, model, item.value),
+    card: loraCardFor(loraCards.store, model, item),
     metadata: loraMetadataFor(item.value),
   });
   const loraCardControls = {
@@ -671,6 +695,7 @@ export default function LoraManagerPage() {
         <div><span>{activeView === "manager" ? `${loras.length} / 16 MOUNTED` : `${analytics.files.length} FILES · ${formatBytes(analytics.totalBytes)}`}</span><button type="button" disabled={refreshing || workspaceLocked} onClick={() => void loadLibraries(true)}><RefreshCw className={refreshing ? "spin" : ""} size={15} />刷新目录</button></div>
       </header>
 
+      <LoraRepairEntry engine={model} locked={workspaceLocked} />
       <div className="lora-page-stage">
         <LoraEngineBar
           engines={ENGINES}
@@ -785,7 +810,7 @@ export default function LoraManagerPage() {
       return <LoraCardEditor
         engine={model}
         item={item}
-        card={loraCardFor(loraCards.store, model, cardEdit.value)}
+        card={loraCardFor(loraCards.store, model, cardEdit)}
         metadata={item.metadata}
         loading={lookups[cardEdit.value]?.loading}
         onPatch={(patch) => loraCards.patchLoraCard(model, cardEdit.value, patch)}

@@ -109,11 +109,16 @@ test("every surface writes the weight that will actually be sent", async () => {
   // The formatter is the only way a weight reaches the screen, on every surface
   // that shows one — the manager's own field included, which is what makes the
   // generate page and the manager agree by construction rather than by review.
-  const sources = await Promise.all(["src/App.jsx", "src/GalleryPage.jsx", "src/ImageToImagePage.jsx", "src/LoraMountPanel.jsx"]
+  const app = await readFile(new URL("../src/App.jsx", import.meta.url), "utf8");
+  assert.match(app, /<MountedLoraSummary\s+loras=\{loras\}/);
+  const image = await readFile(new URL("../src/ImageToImagePage.jsx", import.meta.url), "utf8");
+  assert.match(image, /<MountedLoraSummary\s+loras=\{engine\.loras\}/);
+  assert.doesNotMatch(app + image, /toFixed\((?:lora|item)\.precision/);
+  const sources = await Promise.all(["src/MountedLoraSummary.jsx", "src/GalleryPage.jsx", "src/LoraMountPanel.jsx"]
     .map((path) => readFile(new URL(`../${path}`, import.meta.url), "utf8")));
   for (const [index, source] of sources.entries()) {
     assert.doesNotMatch(source, /toFixed\((?:lora|item)\.precision/, `surface ${index} must not format a weight by its input precision`);
     assert.match(source, /formatWeight\(/, `surface ${index} must render weights through the shared formatter`);
   }
-  assert.match(sources[3], /const text = draft === null \? formatWeight\(item\.weight\) : draft;/);
+  assert.match(sources[2], /const text = draft === null \? formatWeight\(item\.weight\) : draft;/);
 });

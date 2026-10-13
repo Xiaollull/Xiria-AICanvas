@@ -148,6 +148,7 @@ class BenchmarkLeaseTests(unittest.TestCase):
     def test_windows_venv_child_direct_parent_identity_validates_then_lease_deletes(self):
         parent = self.root / "state-cache" / "benchmark" / "parent.py"
         repo = Path(__file__).resolve().parents[2]
+        child_code = f"import json,os,sys; from pathlib import Path; sys.path.insert(0,{str(repo)!r}); from backend.benchmark_lease import validate_lease; root,path,nonce,state,output=sys.argv[1:]; print(json.dumps({{'pid':os.getpid(),'ppid':os.getppid(),'result':validate_lease(path,nonce,state,output,'workspace',root)}}))"
         parent.write_text(f'''import json, os, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, {str(repo)!r})
@@ -155,13 +156,15 @@ from backend.benchmark_lease import create_lease, _default_inspector
 root = Path({str(self.root)!r}); state=root / "state"; output=root / "output"
 identity = _default_inspector(os.getpid())
 lease, nonce = create_lease(state, output, "workspace", Path(__file__), 60, parent_pid=os.getpid(), parent_executable=identity['executable'])
-child = """import json,os,sys; from pathlib import Path; sys.path.insert(0,{str(repo)!r}); from backend.benchmark_lease import validate_lease; root,path,nonce,state,output=sys.argv[1:]; print(json.dumps({{'pid':os.getpid(),'ppid':os.getppid(),'result':validate_lease(path,nonce,state,output,'workspace',root)}}))"""
+child = {child_code!r}
 env=os.environ.copy(); env["__PYVENV_LAUNCHER__"] = sys.executable
 base = getattr(sys, "_base_executable", sys.executable)
-child_result = subprocess.run([base, "-c", child, str(root), str(lease), nonce, str(state), str(output)], env=env, capture_output=True, text=True, check=True)
+child_result = subprocess.run([base, "-c", child, str(root), str(lease), nonce, str(state), str(output)], env=env, capture_output=True, text=True, check=False)
+assert child_result.returncode == 0, child_result.stderr
 record=json.loads(child_result.stdout); print(json.dumps({{'stored_parent_pid':json.loads(lease.read_text())['parent_pid'],'stored_parent_executable':json.loads(lease.read_text())['parent_executable'],'parent_identity':identity,'child':record,'lease_path':str(lease)}})); lease.unlink()
 ''', encoding="utf-8")
-        completed = subprocess.run([sys.executable, str(parent)], capture_output=True, text=True, check=True)
+        completed = subprocess.run([sys.executable, str(parent)], capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         result = json.loads(completed.stdout)
         self.assertTrue(result["child"]["result"]["valid"], result)
         self.assertEqual(result["child"]["ppid"], result["stored_parent_pid"])

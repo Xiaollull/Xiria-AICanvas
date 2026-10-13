@@ -15,6 +15,7 @@ export const METADATA_SOURCES = {
   comfyui: "ComfyUI",
   a1111: "SD-WebUI / A1111",
   novelai: "NovelAI",
+  xyz_grid: "XiriaCanvas AI · XYZ 对比网格",
   unknown: "未知来源",
 };
 
@@ -596,14 +597,30 @@ export function parseXiria(parameters, chunks = {}) {
     // stays the label.
     loras: Array.isArray(parameters.loras) ? parameters.loras.map((item) => {
       const path = textOf(item.path) || auditedLoraId(parameters.inline_loras, item.name);
+      const audit = Array.isArray(parameters.lora_library) ? parameters.lora_library.find((entry) => entry.executedReference === path) : null;
       return {
         name: textOf(item.name),
         ...(path ? { path } : {}),
+        ...(audit?.instanceId && /^[0-9a-f-]{36}$/.test(audit.instanceId) && /^[0-9a-f]{64}$/.test(audit.contentHash || "") ? { identitySchema: 1, instanceId: audit.instanceId, contentHash: audit.contentHash, contentRevision: audit.contentRevision } : {}),
         weight: Number(item.weight),
       };
     }) : [],
     flags,
     animaAssets: anima ? { text_encoder: textOf(parameters.text_encoder), vae: textOf(parameters.vae) } : null,
+    // One cell of an XYZ experiment. Its own settings above stay the single-image record; this only
+    // says where it came from, so the reader can offer the experiment beside the ordinary apply.
+    xyzCell: parameters.xyz_plot && typeof parameters.xyz_plot === "object" && /^[0-9a-f]{32}$/.test(textOf(parameters.xyz_plot.experiment_id))
+      ? { experimentId: parameters.xyz_plot.experiment_id, cellId: textOf(parameters.xyz_plot.cell_id) }
+      : null,
+    // QPlan2/P2: the same cell is one candidate of a LoRA mix-search round. Only schema 1 is read; anything
+    // else stays in the raw record and is never interpreted.
+    mixCell: parameters.lora_mix_search && typeof parameters.lora_mix_search === "object" && parameters.lora_mix_search.schema_version === 1
+      && /^[0-9a-f]{32}$/.test(textOf(parameters.lora_mix_search.session_id))
+      ? { sessionId: parameters.lora_mix_search.session_id, round: Number(parameters.lora_mix_search.round) || null, candidateId: textOf(parameters.lora_mix_search.candidate_id),
+        displacement: textOf(parameters.lora_mix_search.displacement), contextHash: textOf(parameters.lora_mix_search.context_hash),
+        testLoras: Array.isArray(parameters.lora_mix_search.test_loras) ? parameters.lora_mix_search.test_loras.filter((item) => item && typeof item === "object").map((item) => ({ name: textOf(item.name), weight: textOf(item.weight), locked: item.locked === true })) : [],
+        globalCount: Array.isArray(parameters.lora_mix_search.global_loras) ? parameters.lora_mix_search.global_loras.length : 0 }
+      : null,
     // The run's own post-processing record, kept whole so Apply can rebuild the chain from what
     // ran rather than from the flags above. Old pictures carry `hires`/`adetailer` instead.
     postprocess: {
@@ -636,11 +653,59 @@ function mergeComfySidecar(comfy, parametersText) {
   };
 }
 
+// An XYZ grid export (QPlan2/P1 Phase D) carries its own `xyz_plot` record and nothing that describes
+// one picture's generation. It is read as what it is — a comparison sheet pointing at an experiment —
+// with no prompt, model or LoRA to apply; choosing a cell is the user's step (Phase E).
+export function parseXYZGrid(record) {
+  const recipe = record.recipe && typeof record.recipe === "object" ? record.recipe : {};
+  const canvas = recipe.canvas && typeof recipe.canvas === "object" ? recipe.canvas : {};
+  const cells = Array.isArray(record.cells) ? record.cells.filter((cell) => cell && typeof cell.id === "string") : [];
+  const list = [];
+  pushParameter(list, "Experiment", record.experiment_id);
+  pushParameter(list, "Export", recipe.mode === "original" ? "original 1:1" : recipe.percent ? `${recipe.percent}% · ${textOf(recipe.algorithm)}` : "");
+  pushParameter(list, "Grid size", canvas.width && canvas.height ? `${canvas.width}x${canvas.height}` : "");
+  pushParameter(list, "Cells", cells.length || (record.metadata_overflow ? "see manifest" : ""));
+  pushParameter(list, "Scope", recipe.scope);
+  pushParameter(list, "Manifest SHA-256", record.manifest?.sha256);
+  return {
+    source: "xyz_grid",
+    engine: "",
+    checkpoint: "",
+    checkpointHash: "",
+    positive: "",
+    negative: "",
+    parameters: list,
+    loras: [],
+    flags: [],
+    xyzGrid: {
+      experimentId: /^[0-9a-f]{32}$/.test(textOf(record.experiment_id)) ? record.experiment_id : "",
+      definitionDigest: textOf(record.definition_digest),
+      exportId: textOf(record.export_id),
+      manifestSha256: textOf(record.manifest?.sha256),
+      mode: textOf(recipe.mode),
+      percent: Number.isFinite(Number(recipe.percent)) ? Number(recipe.percent) : null,
+      width: canvas.width ?? null,
+      height: canvas.height ?? null,
+      cellIds: cells.map((cell) => cell.id),
+      overflow: Boolean(record.metadata_overflow),
+      // A candidate grid from a LoRA mix-search round: rows x columns, not axes.
+      search: record.search && typeof record.search === "object" && /^[0-9a-f]{32}$/.test(textOf(record.search.session_id))
+        ? { sessionId: record.search.session_id, round: Number(record.search.round) || null, columns: Number(record.search.columns) || null, rows: Number(record.search.rows) || null, candidates: Number(record.search.candidates_count) || null }
+        : null,
+    },
+  };
+}
+
 // One place decides which producer wrote the file, by shape rather than by key.
 export function interpretImageMetadata(chunks) {
   const entries = chunks && typeof chunks === "object" ? chunks : {};
   const keys = Object.keys(entries);
   if (!keys.length) return { status: IMAGE_INFO_STATUS.empty, source: "unknown", sourceLabel: METADATA_SOURCES.unknown, raw: {} };
+
+  const xyzGrid = parseJsonObject(entries.xyz_plot);
+  if (xyzGrid && xyzGrid.kind === "xyz_plot_grid" && entries.parameters === undefined) {
+    return { status: IMAGE_INFO_STATUS.ok, ...parseXYZGrid(xyzGrid), sourceLabel: METADATA_SOURCES.xyz_grid, raw: entries };
+  }
 
   const parametersJson = parseJsonObject(entries.parameters);
   if (parametersJson && (parametersJson.job_id !== undefined || parametersJson.engine !== undefined)) {

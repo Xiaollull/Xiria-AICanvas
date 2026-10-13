@@ -8,17 +8,19 @@ import { loraFileLabel } from "./lora-folders.js";
 
 export const LORA_ENGINE_LABELS = Object.freeze({ SD: "SD", iL: "iL", Anima: "Anima", Flux: "FLUX.1", Flux2: "FLUX.2", Krea2: "Krea 2" });
 
-export function LoraEngineBar({ engines, engine, blockedReason = "", onSelectEngine, pathValue, onPathChange, onLocate, busy = false, placeholder = "粘贴或输入 LoRA 文件夹路径，例如 models/loras/illustrious/style" }) {
+export function LoraEngineBar({ engines, engine, blockedReason = "", onSelectEngine, pathValue, onPathChange, onLocate, busy = false, independent = false, placeholder = "粘贴或输入 LoRA 文件夹路径，例如 models/loras/illustrious/style" }) {
   return <div className="lora-engine-bar">
-    <div className="lora-engine-switch" role="radiogroup" aria-label="LoRA 所属引擎（同时切换生图引擎）">
+    <div className="lora-engine-switch" role="radiogroup" aria-label={independent ? "XYZ LoRA 所属引擎（只切换独立草稿）" : "LoRA 所属引擎（同时切换生图引擎）"}>
       {engines.map((name) => <button
         type="button"
         key={name}
         role="radio"
-        aria-checked={engine === name}
-        className={engine === name ? "active" : ""}
-        title={engine === name ? `当前生图引擎：${name}` : blockedReason || `切换到 ${name}（文生图与图生图同步切换）`}
-        onClick={() => onSelectEngine(name)}
+         aria-checked={engine === name}
+         disabled={Boolean(blockedReason) || typeof onSelectEngine !== "function"}
+         aria-disabled={Boolean(blockedReason) || typeof onSelectEngine !== "function"}
+         className={engine === name ? "active" : ""}
+         title={blockedReason || (engine === name ? `当前${independent ? "XYZ" : "生图"}引擎：${name}` : `切换到 ${name}（${independent ? "只切换 XYZ 独立草稿" : "文生图与图生图同步切换"}）`)}
+         onClick={() => { if (!blockedReason && typeof onSelectEngine === "function") onSelectEngine(name); }}
       >{LORA_ENGINE_LABELS[name] || name}</button>)}
     </div>
     <form className="lora-path-field" onSubmit={(event) => { event.preventDefault(); onLocate(); }}>
@@ -30,7 +32,7 @@ export function LoraEngineBar({ engines, engine, blockedReason = "", onSelectEng
         placeholder={placeholder}
         onChange={(event) => onPathChange(event.target.value)}
       />
-      <button type="submit" disabled={busy || !String(pathValue || "").trim()} title="定位到该文件夹（属于其他引擎时会同步切换生图引擎）">
+      <button type="submit" disabled={busy || !String(pathValue || "").trim()} title={independent ? "定位到该文件夹（只切换 XYZ 独立草稿）" : "定位到该文件夹（属于其他引擎时会同步切换生图引擎）"}>
         {busy ? <RefreshCw className="spin" size={13} /> : <CornerDownLeft size={13} />}定位
       </button>
     </form>

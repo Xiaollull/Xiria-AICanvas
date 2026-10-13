@@ -53,7 +53,10 @@ test("LoRA asset page is lazy, opens in a new tab, and shares one sync channel",
   ]);
 
   assert.match(app, /window\.open\("\/lora", "_blank", "noopener,noreferrer"\)/);
-  assert.match(app, /lora-modal \$\{loraManagerMaximized \? "maximized" : ""\}/);
+  assert.match(app, /<LoraManagerModal/);
+  assert.match(app, /maximized: loraManagerMaximized, onMaximize: setLoraManagerMaximized/);
+  const modal = await readSource("src/LoraManagerModal.jsx");
+  assert.match(modal, /lora-modal \$\{maximized \? "maximized" : ""\}/);
   assert.match(main, /lazy\(\(\) => import\("\.\/LoraManagerPage"\)\)/);
   assert.match(main, /const path = window\.location\.pathname/);
   assert.match(main, /path === "\/lora"/);
@@ -140,7 +143,9 @@ test("LoRA cards open a shared layered metadata and trigger-word dialog", async 
     readSource("src/styles.css"),
     readSource("vite.config.js"),
   ]);
-  assert.match(app, /className="lora-card-detail"/);
+  assert.match(app, /<LoraLibraryCard[\s\S]{0,1400}onDetails=\{\(\) => openLoraDetails\(item,/);
+  const libraryCard = await readSource("src/LoraLibraryCard.jsx");
+  assert.match(libraryCard, /className="lora-card-detail"[\s\S]{0,100}onDetails\(\)/);
   assert.match(page, /className="lora-card-detail"/);
   assert.match(app, /<LoraDetailsDialog/);
   assert.match(page, /<LoraDetailsDialog/);
@@ -195,10 +200,15 @@ test("both LoRA surfaces compose a card the same way, from one shared presentati
   // hand; that expression now exists once, in `lora-cards.js`.
   for (const source of [app, page]) {
     assert.match(source, /loraCardPresentation\(\{\s*engine: model,/);
-    assert.match(source, /card: loraCardFor\(loraCards\.store, model, item\.value\)/);
+    assert.match(source, /card: loraCardFor\(loraCards\.store, model, item\)/,
+      "card lookup retains the instance identity rather than collapsing it to a relative path");
     assert.doesNotMatch(source, /`\/api\/lora-preview\?engine=/);
-    assert.match(source, /cards=\{loraCardControls\}/);
   }
+  assert.match(app, /<LoraManagerModal[\s\S]*cards: loraCardControls/);
+  assert.match(page, /cards=\{loraCardControls\}/);
+  const modal = await readSource("src/LoraManagerModal.jsx");
+  assert.match(modal, /<LoraMountPanel[^>]*cards=\{c\.cards\}/);
+  assert.match(modal, /<LoraGroupPanel[^>]*cards=\{c\.cards\}/);
   // The shared panels read the card through the host's controls rather than
   // holding their own copy of the store.
   assert.match(mount, /cards\?\.presentationFor\?\.\(item\)/);

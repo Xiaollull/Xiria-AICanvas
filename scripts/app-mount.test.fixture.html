@@ -1,0 +1,7 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><div id="root"></div><script type="module">
+await import("/scripts/xyz-full-ui-stage2.fixture.jsx");
+const base = window.__appFetch;
+window.__appFetch = async (url, method, body) => url.startsWith("/api/inference/gallery")
+  ? new Response(JSON.stringify({ collections: [], cards: [], prompts: [] }), { headers: { "Content-Type": "application/json" } })
+  : base(url, method, body);
+</script></body></html>

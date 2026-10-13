@@ -96,7 +96,8 @@
     </section>
   </main>
 
-  <script>
+  <script type="module">
+    import { isApplicationReady } from "/setup-readiness.js";
     const $ = (id) => document.getElementById(id);
     const elements = {
       shell: $("shell"), setupView: $("setupView"), progressView: $("progressView"), stepChoice: $("stepChoice"), stepProgress: $("stepProgress"),
@@ -417,16 +418,27 @@
       try { await fetchJson("/api/retry", { method: "POST" }); } catch (error) { setNotice(error.message, "error"); } finally { requestBusy = false; }
     }
 
+    async function waitForApplication() {
+      const expectedWorkspaceId = state?.workspaceId;
+      for (let attempt = 0; attempt < 128; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        try {
+          const response = await fetch("/api/inference/health", { cache: "no-store", signal: AbortSignal.timeout(1500) });
+          if (response.ok && isApplicationReady(await response.json(), expectedWorkspaceId)) {
+            window.location.replace("/"); return;
+          }
+        } catch {}
+      }
+      throw new Error("主页面尚未确认准备就绪／工作区不匹配；未跳转。请检查启动日志后重试。");
+    }
+
     async function closeConfigurator() {
       try {
         const result = await fetchJson("/api/close", { method: "POST" });
         if (result.status === "restarting") {
-          for (;;) {
-            await new Promise((resolve) => setTimeout(resolve, 700));
-            try { if ((await fetch("/api/inference/health", { cache: "no-store" })).ok) { window.location.replace("/"); return; } } catch {}
-          }
+          await waitForApplication(); return;
         }
-      } catch {}
+      } catch (error) { setNotice(error.message, "error"); return; }
       window.close();
     }
 
@@ -435,10 +447,7 @@
       renderProgress();
       try {
         await fetchJson("/api/restart", { method: "POST" });
-        for (;;) {
-          await new Promise((resolve) => setTimeout(resolve, 700));
-          try { if ((await fetch("/api/inference/health", { cache: "no-store" })).ok) { window.location.replace("/"); return; } } catch {}
-        }
+        await waitForApplication();
       } catch (error) {
         requestBusy = false;
         setNotice(error.message, "error");

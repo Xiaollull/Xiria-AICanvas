@@ -124,16 +124,24 @@ test("ADetailer request controls stay editable for the next queued task", async 
   // control therefore follows only an actual model-switch transaction through `unitLocked`.
   assert.match(adetailer, /const unitLocked = adetailerLocked;/);
   assert.doesNotMatch(adetailer, /const unitLocked = !adetailer\.enabled/);
+  // The unit's fields are drawn by the component Basic shares with the XYZ chain owner; Basic hands
+  // it the same lock and negative-prompt gate, and keeps the stage and unit switches itself.
+  assert.match(adetailer, /<ADetailerUnitControls unit=\{unit\} unitLocked=\{unitLocked\} models=\{adetailerModels\} engineAllowsNegativePrompt=\{engineAllowsNegativePrompt\}/);
   for (const control of [
     "switchDisabled=\\{adetailerLocked",
+    // A unit's own switch is a request control too. There is nothing to add or
+    // remove: every slot exists from the start, so the switch is the whole gate.
+    "aria-label=\\{`启用第 \\$\\{index \\+ 1\\} 个 ADetailer 单元`\\}[\\s\\S]*?disabled=\\{unitLocked\\}",
+  ]) assert.match(adetailer, new RegExp(control));
+  const unitControls = sourceBetween(await readSource("src/PostprocessAuxControls.jsx"), "export function ADetailerUnitControls", "export function RTXControls");
+  for (const control of [
     "value=\\{unit\\.detector\\} disabled=\\{unitLocked\\}",
     "label=\"检测置信度\"[\\s\\S]*?disabled=\\{unitLocked\\}",
     "label=\"最多处理区域\"[\\s\\S]*?disabled=\\{unitLocked\\}",
     "label=\"最小区域比例\"[\\s\\S]*?disabled=\\{unitLocked\\}",
     "label=\"最大区域比例\"[\\s\\S]*?disabled=\\{unitLocked\\}",
-    "value=\\{unit\\.dilateErode\\}[\\s\\S]*?disabled=\\{unitLocked\\}",
-    "value=\\{unit\\.maskBlur\\}[\\s\\S]*?disabled=\\{unitLocked\\}",
-    "value=\\{unit\\.padding\\}[\\s\\S]*?disabled=\\{unitLocked\\}",
+    // Dilate/erode, mask blur and padding are one mapped row of number inputs.
+    "\\[\"dilateErode\", \"膨胀 / 腐蚀\", -128, 128\\], \\[\"maskBlur\", \"蒙版模糊\", 0, 64\\], \\[\"padding\", \"局部边距\", 0, 256\\]\\][\\s\\S]*?value=\\{unit\\[field\\]\\}[\\s\\S]*?disabled=\\{unitLocked\\}",
     "label=\"重绘强度\"[\\s\\S]*?disabled=\\{unitLocked\\}",
     "checked=\\{unit\\.useSteps\\} disabled=\\{unitLocked\\}",
     "value=\\{unit\\.steps\\}[\\s\\S]*?unitLocked",
@@ -143,10 +151,7 @@ test("ADetailer request controls stay editable for the next queued task", async 
     // The negative prompt carries a second gate: a guidance-distilled engine has no branch to
     // encode one into. The model-switch lock is still the first term.
     "value=\\{unit\\.negativePrompt\\} disabled=\\{unitLocked \\|\\| !engineAllowsNegativePrompt\\}",
-    // A unit's own switch is a request control too. There is nothing to add or
-    // remove: every slot exists from the start, so the switch is the whole gate.
-    "aria-label=\\{`启用第 \\$\\{index \\+ 1\\} 个 ADetailer 单元`\\}[\\s\\S]*?disabled=\\{unitLocked\\}",
-  ]) assert.match(adetailer, new RegExp(control));
+  ]) assert.match(unitControls, new RegExp(control));
   assert.doesNotMatch(adetailer, /添加检测单元|删除第/);
   assert.doesNotMatch(adetailer, /cancel|取消任务/i);
   // The resample unit's own controls follow the same lock, from the shared panel.
@@ -172,9 +177,18 @@ test("Anima controls and PAG fail closed from per-engine health without intrinsi
   const pagHealth = sourceBetween(app, "function pagAvailableForEngine", "const MAX_SEED");
   const readiness = sourceBetween(app, "  const selectedEngineHealth =", "  const loaderProgress =");
 
-  assert.match(pagHealth, /pagHealth\?\.available === true/);
-  assert.match(pagHealth, /\(pagHealth\.engines \|\| \[\]\)\.includes\(engine\)/);
-  assert.match(pagHealth, /health\?\.engines\?\.\[engine\]\?\.features\?\.pag === true/);
+  // Basic and XYZ read PAG through one helper; only an explicit "available" enables it.
+  assert.match(pagHealth, /return runtimeGuidanceHealthStatus\(health, engine, "pag"\)\.status === "available";/);
+  const runtime = sourceBetween(await readSource("src/xyz-axis-editor.js"), "export function runtimeGuidanceHealthStatus", "function guidanceHealthStatus");
+  assert.match(runtime, /if \(!capability \|\| typeof capability\.available !== "boolean"\) \{\s*return \{ status: "unknown"/);
+  assert.match(runtime, /if \(capability\.available === false\) return \{ status: "unavailable"/);
+  assert.match(runtime, /if \(!Array\.isArray\(capability\.engines\)\) return \{ status: "unknown"/);
+  assert.match(runtime, /if \(!capability\.engines\.includes\(engine\)\) return \{ status: "unavailable"/);
+  // The engine must still prove PAG: its own feature flag or the runtime's named implementation.
+  assert.match(runtime, /const feature = health\?\.engines\?\.\[engine\]\?\.features\?\.pag;/);
+  assert.match(runtime, /if \(feature === false\) return \{ status: "unavailable"/);
+  assert.match(runtime, /if \(feature === true \|\| capability\.implementations\?\.\[engine\] === PAG_IMPLEMENTATIONS\[engine\]\) return \{ status: "available"/);
+  assert.match(runtime, /return \{ status: "unknown", reason: `当前引擎 \$\{engine\} 缺少明确 PAG 实现或特性证明` \};/);
 
   // A split-model engine must be told a capability is present; a checkpoint engine only has to not
   // be told it is absent. That asymmetry is the fail-closed rule, and it now covers Flux as well.

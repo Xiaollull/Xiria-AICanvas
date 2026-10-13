@@ -8,13 +8,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-echo Cleaning existing XiriaCanvas AI processes...
-node "scripts\cleanup-processes.mjs"
-if errorlevel 1 (
-  echo Startup stopped because existing processes could not be cleaned.
-  pause
-  exit /b 1
-)
 node "scripts\start.mjs"
 set "EXIT_CODE=%ERRORLEVEL%"
 echo.

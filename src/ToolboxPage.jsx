@@ -1,5 +1,5 @@
 import { Suspense, lazy } from "react";
-import { Activity, ArrowUpRight, Download, FileSearch, RefreshCw, ScanLine } from "lucide-react";
+import { Activity, ArrowUpRight, Download, FileSearch, RefreshCw } from "lucide-react";
 
 const ModelDownloader = lazy(() => import("./ModelDownloader"));
 const ImageInfoReader = lazy(() => import("./ImageInfoReader"));
@@ -14,7 +14,7 @@ export const TOOLBOX_TOOLS = [
   { id: "image-info", label: "图片信息读取", detail: "读取 PNG 生成信息 · 单张或整个文件夹", Icon: FileSearch },
 ];
 
-export default function ToolboxPage({ onDownloaded, onApplyImageParameters, imageApplyContext = null }) {
+export default function ToolboxPage({ onDownloaded, onApplyImageParameters, imageApplyContext = null, xyzIntegration = null }) {
   // The selected tool and the reader's working state are project state, not component state: this
   // page is lazily mounted and is unmounted as soon as the user navigates away, so anything held
   // in `useState` here was being thrown away on every visit.
@@ -25,12 +25,10 @@ export default function ToolboxPage({ onDownloaded, onApplyImageParameters, imag
   return <section className="toolbox-page">
     <nav className="toolbox-rail" aria-label="工具箱">
       <header className="toolbox-rail-head">
-        <div className="toolbox-rail-kicker"><span className="toolbox-status-dot" /><span>UTILITY DECK</span><code>02 TOOLS</code></div>
-        <h1>工具箱</h1>
-        <p>模型获取与图像诊断</p>
+        <div className="toolbox-rail-kicker"><span className="toolbox-status-dot" /><span>本地工具</span></div>
       </header>
-      <div className="toolbox-rail-label"><span>WORKBENCH</span><i /></div>
-      {TOOLBOX_TOOLS.map((tool, index) => <button
+      <div className="toolbox-rail-label"><span>工具</span></div>
+      {TOOLBOX_TOOLS.map((tool) => <button
         type="button"
         key={tool.id}
         className={activeTool === tool.id ? "active" : ""}
@@ -38,24 +36,26 @@ export default function ToolboxPage({ onDownloaded, onApplyImageParameters, imag
         onClick={() => setActiveTool(tool.id)}
       >
         <span className="toolbox-tool-icon"><tool.Icon size={17} /></span>
-        <span className="toolbox-tool-copy"><small>0{index + 1} / TOOL</small><strong>{tool.label}</strong><em>{tool.detail}</em></span>
+        <span className="toolbox-tool-copy"><strong>{tool.label}</strong><em>{tool.detail}</em></span>
         <ArrowUpRight className="toolbox-tool-arrow" size={14} />
       </button>)}
       <footer className="toolbox-rail-foot">
-        <div><Activity size={13} /><span>WORKSPACE STATUS</span><b>{ready ? "READY" : "LOADING"}</b></div>
-        {error ? <p className="toolbox-rail-error">{error}</p> : <p>工具之间独立运行，切换时保留当前工作区。</p>}
-        <code><ScanLine size={11} /> LOCAL CONTROL PLANE</code>
+        <div><Activity size={13} /><span>工作区</span><b>{ready ? "就绪" : "读取中"}</b></div>
+        <p>工具之间独立运行，切换时保留当前工作区。</p>
       </footer>
     </nav>
-    <div className="toolbox-stage">
-      <Suspense fallback={<div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在加载{current.label}</span></div>}>
-        {/* Nothing mounts until the snapshot is in. A tool that mounted empty and was handed its
-            state afterwards would flash the empty view and then have to reconcile the restore
-            against whatever the user had already started typing. */}
-        {!ready ? <div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在读取工作区</span></div>
-          : activeTool === "image-info" ? <ImageInfoReader onApplyParameters={onApplyImageParameters} savedState={state.imageInfo} onStateChange={setImageInfo} applyContext={imageApplyContext} />
-            : <ModelDownloader onDownloaded={onDownloaded} />}
-      </Suspense>
+    <div className={`toolbox-stage${error ? " has-error" : ""}`}>
+      {error && <p className="toolbox-save-error" role="alert">{error}</p>}
+      <div className="toolbox-stage-content">
+        <Suspense fallback={<div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在加载{current.label}</span></div>}>
+          {/* Nothing mounts until the snapshot is in. A tool that mounted empty and was handed its
+              state afterwards would flash the empty view and then have to reconcile the restore
+              against whatever the user had already started typing. */}
+          {!ready ? <div className="toolbox-loading"><RefreshCw className="spin" size={22} /><span>正在读取工作区</span></div>
+            : activeTool === "image-info" ? <ImageInfoReader onApplyParameters={onApplyImageParameters} savedState={state.imageInfo} onStateChange={setImageInfo} applyContext={imageApplyContext} xyzIntegration={xyzIntegration} />
+              : <ModelDownloader onDownloaded={onDownloaded} />}
+        </Suspense>
+      </div>
     </div>
   </section>;
 }

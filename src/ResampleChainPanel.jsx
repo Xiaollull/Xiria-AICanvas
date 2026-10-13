@@ -204,6 +204,7 @@ function ResampleUnitBody({
   NumberInput,
   update,
   randomSeed,
+  preserveRawInputs = false,
 }) {
   const number = resampleUnitNumber(chain, unit);
   const catalog = upscalerCatalogParts(upscalers);
@@ -331,7 +332,7 @@ function ResampleUnitBody({
       </label>
 
       <div className="resample-scale">
-        <Slider label="放大倍率" value={unit.scale} min={1} max={4} step={0.1} inputStep={0.1} fixed={1} suffix="×" disabled={locked} onChange={(value) => update({ scale: Math.round(value * 10) / 10 })} />
+        <Slider label="放大倍率" value={unit.scale} min={1} max={4} step={0.1} inputStep={0.1} fixed={1} suffix="×" disabled={locked} onChange={(value) => update({ scale: preserveRawInputs && typeof value !== "number" ? value : Math.round(value * 10) / 10 })} />
         <p>
           <span>INPUT {sizeText(inputSize)}</span>
           <b>OUTPUT {sizeText(entry?.output)}</b>
@@ -343,7 +344,7 @@ function ResampleUnitBody({
       </div>
 
       <div className="resample-sliders">
-        <Slider label="重绘强度" value={unit.denoise} min={0} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={locked} onChange={(value) => update({ denoise: Math.round(value * 100) / 100 })} />
+        <Slider label="重绘强度" value={unit.denoise} min={0} max={1} step={0.05} inputStep={0.01} fixed={2} disabled={locked} onChange={(value) => update({ denoise: preserveRawInputs && typeof value !== "number" ? value : Math.round(value * 100) / 100 })} />
       </div>
       {unit.denoise === 0 && <p className="resample-hint">重绘强度为 0：本单元只放大，不调用扩散模型。</p>}
 
@@ -370,7 +371,7 @@ function ResampleUnitBody({
           {unit.seedMode === "fixed" && <label className="resample-seed-field">
             Seed
             <span>
-              <input inputMode="numeric" maxLength={20} value={unit.seed} disabled={locked} aria-label={`重采样 ${number} Seed`} onChange={(event) => update({ seed: event.target.value.replace(/\D/g, "") })} placeholder="0–18446744073709551615" />
+              <input inputMode="numeric" maxLength={20} value={unit.seed} disabled={locked} aria-label={`重采样 ${number} Seed`} onChange={(event) => update({ seed: preserveRawInputs ? event.target.value : event.target.value.replace(/\D/g, "") })} placeholder="0–18446744073709551615" />
               {randomSeed && <button type="button" title="生成固定 Seed" disabled={locked} onClick={() => update({ seed: randomSeed() })}><RefreshCw size={13} /></button>}
             </span>
           </label>}
@@ -432,6 +433,7 @@ export default function ResampleChainPanel({
   onDownloadUpscaler = null,
   onRetryUpscaler = null,
   locked = false,
+  actionsLocked = locked,
   addDisabled = false,
   unitUnavailableReason = "",
   Slider,
@@ -440,26 +442,54 @@ export default function ResampleChainPanel({
   chainIssue = "",
   renderCard,
   renderStage,
+  preserveRawInputs = false,
+  sizeLineLabel = "尺寸链",
 }) {
-  const plan = resampleChainPlan(baseSize, chain, engine);
+  let plan, sizeLine;
+  try { plan = resampleChainPlan(baseSize, chain, engine); sizeLine = chainSizeLine(baseSize, chain, engine); }
+  catch (error) {
+    if (!preserveRawInputs) throw error;
+    plan = { trace: [], valid: false, reason: "后处理链数值无效；原值保留，请修正后预检。" };
+    sizeLine = `${baseSize.width} × ${baseSize.height} → 待修正`;
+  }
   const entries = new Map(plan.trace.map((entry) => [entry.id, entry]));
   const units = resampleUnits(chain);
   const catalog = upscalerCatalogParts(upscalers);
-  const canAdd = !locked && !addDisabled && units.length < RESAMPLE_UNIT_LIMIT;
+  const canAdd = !actionsLocked && !addDisabled && units.length < RESAMPLE_UNIT_LIMIT;
+  const addUnit = () => {
+    if (!canAdd) return;
+    onChange(addResampleUnit(chain, {}, { engine }));
+  };
 
-  const stageControls = (stage, index) => (
-    <div className="resample-stage-actions">
-      <button type="button" aria-label={`上移${stage.type === "resample" ? `重采样 ${resampleUnitNumber(chain, stage)}` : "该阶段"}`} title="上移" disabled={locked || index === 0} onClick={() => onChange(moveChainStage(chain, stage.id, -1))}><ArrowUp size={13} /></button>
-      <button type="button" aria-label={`下移${stage.type === "resample" ? `重采样 ${resampleUnitNumber(chain, stage)}` : "该阶段"}`} title="下移" disabled={locked || index === chain.length - 1} onClick={() => onChange(moveChainStage(chain, stage.id, 1))}><ArrowDown size={13} /></button>
-      {stage.type === "resample" && <button type="button" className="resample-stage-remove" aria-label={`删除重采样 ${resampleUnitNumber(chain, stage)}`} title="删除该单元" disabled={locked} onClick={() => onChange(removeChainStage(chain, stage.id))}><Trash2 size={13} /></button>}
-    </div>
-  );
+  const stageControls = (stage, index) => {
+    const name = stage.type === "resample"
+      ? `重采样 ${resampleUnitNumber(chain, stage)}`
+      : stage.type === "adetailer" ? "ADetailer" : stage.type === "rtx" ? "RTX VSR" : "该阶段";
+    const canMoveUp = !actionsLocked && index > 0;
+    const canMoveDown = !actionsLocked && index < chain.length - 1;
+    return (
+      <div className="resample-stage-actions">
+        <button type="button" aria-label={`上移${name}`} title="上移" disabled={!canMoveUp} onClick={() => {
+          if (!canMoveUp) return;
+          onChange(moveChainStage(chain, stage.id, -1));
+        }}><ArrowUp size={13} /></button>
+        <button type="button" aria-label={`下移${name}`} title="下移" disabled={!canMoveDown} onClick={() => {
+          if (!canMoveDown) return;
+          onChange(moveChainStage(chain, stage.id, 1));
+        }}><ArrowDown size={13} /></button>
+        {stage.type === "resample" && <button type="button" className="resample-stage-remove" aria-label={`删除重采样 ${resampleUnitNumber(chain, stage)}`} title="删除该单元" disabled={actionsLocked} onClick={() => {
+          if (actionsLocked) return;
+          onChange(removeChainStage(chain, stage.id));
+        }}><Trash2 size={13} /></button>}
+      </div>
+    );
+  };
 
   return (
     <div className="resample-chain">
       <div className="resample-chain-line" aria-live="polite">
-        <span>尺寸链</span>
-        <b>{chainSizeLine(baseSize, chain, engine)}</b>
+        <span>{sizeLineLabel}</span>
+        <b>{sizeLine}</b>
       </div>
       {chainIssue && <p className="resample-chain-error" role="alert">{chainIssue}</p>}
       {!chainIssue && !plan.valid && <p className="resample-chain-error">{plan.reason}</p>}
@@ -473,8 +503,8 @@ export default function ResampleChainPanel({
           return <div key={stage.id} className="resample-chain-item">
             {renderCard({
               stage,
-              title: resampleUnitTitle(chain, stage),
-              detail: stage.enabled ? `${resampleUnitSummary(stage)} · ${sizeText(entry?.output)}` : "关闭",
+              title: preserveRawInputs && typeof stage.name !== "string" ? `重采样 ${resampleUnitNumber(chain, stage)} · 保存名称待修正` : resampleUnitTitle(chain, stage),
+              detail: stage.enabled ? preserveRawInputs && (typeof stage.scale !== "number" || typeof stage.denoise !== "number") ? "保存数值待修正 · 原值保留" : `${resampleUnitSummary(stage)} · ${sizeText(entry?.output)}` : "关闭",
               enabled: stage.enabled,
               expanded: stage.expanded,
               onToggleEnabled: () => update({ enabled: !stage.enabled }),
@@ -499,6 +529,7 @@ export default function ResampleChainPanel({
                 NumberInput={NumberInput}
                 update={update}
                 randomSeed={randomSeed}
+                preserveRawInputs={preserveRawInputs}
               /> : null,
             })}
           </div>;
@@ -517,7 +548,7 @@ export default function ResampleChainPanel({
       />}
 
       <div className="resample-chain-add">
-        <button type="button" aria-label="添加重采样单元" title={canAdd ? "添加重采样单元" : "已达到重采样单元上限或当前已锁定"} disabled={!canAdd} onClick={() => onChange(addResampleUnit(chain, {}, { engine }))}>
+        <button type="button" aria-label="添加重采样单元" title={canAdd ? "添加重采样单元" : "已达到重采样单元上限或当前已锁定"} disabled={!canAdd} onClick={addUnit}>
           <Plus size={14} />添加重采样单元
         </button>
         <small>{units.length} / {RESAMPLE_UNIT_LIMIT} 个单元 · 按上下箭头调整执行顺序，可与 ADetailer、RTX VSR 交错</small>

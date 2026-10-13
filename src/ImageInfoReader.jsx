@@ -16,6 +16,7 @@ import { hostPathExample } from "./host-platform";
 import ImageInfoDetails from "./ImageInfoDetails";
 import ImageInfoApply from "./ImageInfoApply";
 import { CopyField, ModelName, ParameterModules } from "./ImageInfoFields";
+import { XYZCellApplyDialog, XYZGridRecordPanel } from "./XYZCellActions.jsx";
 import { imageInfoApplyFields } from "./image-info-apply";
 import { emptyImageInfoState, toolboxImageUrl } from "./toolbox-state";
 
@@ -69,7 +70,7 @@ async function readJsonResponse(response, operation) {
   return payload;
 }
 
-export default function ImageInfoReader({ onApplyParameters, applyContext = null, savedState = null, onStateChange = null }) {
+export default function ImageInfoReader({ onApplyParameters, applyContext = null, savedState = null, onStateChange = null, xyzIntegration = null }) {
   // Seeded from the saved snapshot rather than restored into afterwards, so the first paint is
   // already the restored view and there is no empty flash to reconcile against.
   const restored = savedState || emptyImageInfoState();
@@ -90,6 +91,11 @@ export default function ImageInfoReader({ onApplyParameters, applyContext = null
   const [dragActive, setDragActive] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [applyOpen, setApplyOpen] = useState(false);
+  // An XYZ cell's own experiment: opened, or its frozen request applied through the XYZ rules.
+  const [xyzCellApply, setXYZCellApply] = useState(false);
+  const [xyzOpenError, setXYZOpenError] = useState("");
+  const xyzPictureKey = [info?.name, info?.xyzCell?.cellId, info?.xyzGrid?.exportId].join("\u0000");
+  useEffect(() => { setXYZCellApply(false); setXYZOpenError(""); }, [xyzPictureKey]);
   const objectUrlRef = useRef("");
   const requestRef = useRef(0);
   const dragDepthRef = useRef(0);
@@ -395,12 +401,24 @@ export default function ImageInfoReader({ onApplyParameters, applyContext = null
               <div className="info-section info-identity">
                 <div><span>来源</span><strong>{info.sourceLabel}</strong></div>
                 {info.engine && <div><span>引擎</span><strong>{info.engine}</strong></div>}
-                <div className="info-identity-model">
+                {!info.xyzGrid && <div className="info-identity-model">
                   <span>底模</span>
                   <ModelName match={info.checkpointMatch} fallback={info.checkpoint} className="info-identity-model-name" />
-                </div>
+                </div>}
                 {info.checkpointHash && <div><span>模型哈希</span><code>{info.checkpointHash.slice(0, 16)}</code></div>}
+                {info.xyzCell && <div className="info-xyz-cell"><span>{info.mixCell ? "LoRA 混合搜索候选" : "XYZ 实验格"}</span><strong title={info.xyzCell.experimentId}>{info.mixCell ? `${info.mixCell.candidateId || "—"} · 第 ${info.mixCell.round ?? "?"} 轮 · Δ${info.mixCell.displacement || "?"}` : info.xyzCell.cellId || "—"}</strong>
+                  {info.mixCell && info.mixCell.testLoras.length > 0 && <small className="info-mix-tests">测试：{info.mixCell.testLoras.map((item) => `${item.name || "?"} ${item.weight}${item.locked ? "（锁定）" : ""}`).join(" · ")} · 全局 {info.mixCell.globalCount} 个</small>}
+                  {xyzIntegration && <div className="info-xyz-cell-actions">
+                    <button type="button" onClick={() => setXYZOpenError(xyzIntegration.onOpenExperiment({ id: info.xyzCell.experimentId, engine: info.engine, origin: info.mixCell ? "lora_mix_search" : undefined }) || "")}>{info.mixCell ? "打开所属搜索回合" : "打开所属实验"}</button>
+                    <button type="button" disabled={!info.xyzCell.cellId} title="按实验冻结请求逐组应用；不会把组合预设词再写进提示词框" onClick={() => setXYZCellApply(true)}>按实验记录应用…</button>
+                  </div>}
+                </div>}
               </div>
+              {xyzOpenError && <p className="info-missing-warning" role="alert"><AlertTriangle size={13} />{xyzOpenError}</p>}
+              {info.xyzGrid && <XYZGridRecordPanel record={info.xyzGrid} onOpenExperiment={xyzIntegration?.onOpenExperiment} promptContext={xyzIntegration?.promptContext}
+                onApply={xyzIntegration?.onApplyToBasic} onGoBasic={xyzIntegration?.onGoBasic} />}
+              {xyzCellApply && info.xyzCell && xyzIntegration && <XYZCellApplyDialog experimentId={info.xyzCell.experimentId} cellId={info.xyzCell.cellId}
+                promptContext={xyzIntegration.promptContext} onApply={xyzIntegration.onApplyToBasic} onGoBasic={xyzIntegration.onGoBasic} onClose={() => setXYZCellApply(false)} />}
 
               {applyOpen && onApplyParameters && <ImageInfoApply info={info} context={applyContext} onApply={onApplyParameters} onRefresh={() => resolveMatches(info)} onClose={() => setApplyOpen(false)} />}
 
@@ -419,10 +437,10 @@ export default function ImageInfoReader({ onApplyParameters, applyContext = null
                 <div className="info-asset-row"><span>VAE</span><ModelName match={info.animaAssets.vae.match} fallback={info.animaAssets.vae.name} /></div>
               </div>}
 
-              <div className="info-section">
+              {!info.xyzGrid && <div className="info-section">
                 <CopyField label="正向提示词" value={info.positive} empty="未记录正向提示词" />
                 <CopyField label="负向提示词" value={info.negative} empty="未记录负向提示词" />
-              </div>
+              </div>}
 
               {info.parameters?.length > 0 && <div className="info-section">
                 <h3>生成参数</h3>

@@ -5,6 +5,9 @@
 # requires be conveyed with every copy, and the release declaration is parsed by the workflow.
 LICENSE text eol=lf
 .github/full-package-release text eol=lf
+# The bundled XYZ-export font travels with its OFL text; both stay byte-identical to the recorded hashes.
+*.otf binary
+backend/resources/fonts/*.txt text eol=lf
 
 *.css text eol=lf
 *.html text eol=lf

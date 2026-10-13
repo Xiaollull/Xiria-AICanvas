@@ -1,4 +1,5 @@
 import { READY_LORA_ENGINES, engineScopeKey } from "./lora-model-scope.js";
+import { inspectLoraIdentity, INSTANCE_ID } from "./lora-identity.js";
 
 // User-owned presentation for LoRA files and LoRA combinations.
 //
@@ -16,7 +17,7 @@ import { READY_LORA_ENGINES, engineScopeKey } from "./lora-model-scope.js";
 // relative path only names a file together with the engine directory it is
 // resolved against.
 
-export const LORA_CARDS_SCHEMA_VERSION = 1;
+export const LORA_CARDS_SCHEMA_VERSION = 2;
 export const MAXIMUM_CARD_TITLE = 80;
 export const MAXIMUM_CARD_PROMPT = 2000;
 export const MAXIMUM_CARD_NOTE = 600;
@@ -86,6 +87,7 @@ export function normalizeLoraCard(value) {
     note: cleanText(value.note, MAXIMUM_CARD_NOTE),
     tags: cleanTags(value.tags),
     cover: cleanAsset(value.cover),
+    ...inspectLoraIdentity(value).fields,
   };
 }
 
@@ -113,12 +115,12 @@ export function isBlankGroupCard(card) {
 export function emptyLoraCardStore() {
   return {
     schemaVersion: LORA_CARDS_SCHEMA_VERSION,
-    byEngine: Object.fromEntries(READY_LORA_ENGINES.map((engine) => [engine, { loras: {}, groups: {} }])),
+    byEngine: Object.fromEntries(READY_LORA_ENGINES.map((engine) => [engine, { loras: {}, groups: {}, byInstance: {} }])),
   };
 }
 
 function normalizeScope(value) {
-  const scope = { loras: {}, groups: {} };
+  const scope = { loras: {}, groups: {}, byInstance: {} };
   let rejected = 0;
   const loras = isPlainObject(value?.loras) ? value.loras : {};
   for (const [key, entry] of Object.entries(loras)) {
@@ -131,6 +133,12 @@ function normalizeScope(value) {
     // the file grow by one row every time a dialog is opened and closed.
     if (isBlankLoraCard(card)) continue;
     scope.loras[key] = card;
+    if (card.instanceId) scope.byInstance[card.instanceId] = card;
+  }
+  for (const [id, entry] of Object.entries(value?.byInstance || {})) {
+    if (!INSTANCE_ID.test(id) || entry.instanceId !== id) { rejected += 1; continue; }
+    const card = normalizeLoraCard(entry);
+    if (!isBlankLoraCard(card)) scope.byInstance[id] = card;
   }
   const groups = isPlainObject(value?.groups) ? value.groups : {};
   for (const [key, entry] of Object.entries(groups)) {
@@ -152,6 +160,11 @@ function normalizeScope(value) {
  */
 export function normalizeLoraCardStore(value) {
   if (value === undefined || value === null) return { store: emptyLoraCardStore(), rejected: 0, reset: false };
+  if ((isPlainObject(value) && value.schemaVersion > LORA_CARDS_SCHEMA_VERSION)
+    || Object.values(value?.byEngine || {}).some((scope) => [...Object.values(scope?.loras || {}), ...Object.values(scope?.byInstance || {})].some((entry) => inspectLoraIdentity(entry).fatal)
+      || Object.entries(scope?.byInstance || {}).some(([id, entry]) => !INSTANCE_ID.test(id) || entry?.instanceId !== id))) {
+    return { store: emptyLoraCardStore(), rejected: 0, reset: false, fatal: true, raw: value };
+  }
   if (!isPlainObject(value) || !Number.isInteger(value.schemaVersion) || value.schemaVersion > LORA_CARDS_SCHEMA_VERSION || !isPlainObject(value.byEngine)) {
     return { store: emptyLoraCardStore(), rejected: 0, reset: true };
   }
@@ -167,7 +180,12 @@ export function normalizeLoraCardStore(value) {
 
 export function loraCardFor(store, engine, value) {
   const scope = engineScopeKey(engine);
-  return normalizeLoraCard(scope && typeof value === "string" ? store?.byEngine?.[scope]?.loras?.[value] : null);
+  const reference = typeof value === "object" ? value : { value };
+  const container = scope && store?.byEngine?.[scope];
+  const identified = reference?.instanceId && container?.byInstance?.[reference.instanceId];
+  const legacy = container?.loras?.[reference?.value];
+  const allowed = !reference?.instanceId || (legacy?.instanceId ? legacy.instanceId === reference.instanceId : !reference.bindingConflict);
+  return normalizeLoraCard(identified || (allowed ? legacy : null));
 }
 
 export function groupCardFor(store, engine, groupId) {
@@ -191,9 +209,15 @@ function withScopeEntry(store, engine, kind, key, card, blank) {
  * dialog that edits the title cannot silently clear a cover it never showed.
  */
 export function withLoraCard(store, engine, value, patch) {
-  const current = loraCardFor(store, engine, value);
+  const reference = { value, ...(patch?.instanceId ? { instanceId: patch.instanceId } : {}) };
+  const current = loraCardFor(store, engine, reference);
   const card = normalizeLoraCard({ ...current, ...(isPlainObject(patch) ? patch : {}) });
-  return withScopeEntry(store, engine, "loras", value, card, isBlankLoraCard(card));
+  const next = withScopeEntry(store, engine, "loras", value, card, isBlankLoraCard(card));
+  if (card.instanceId && next.byEngine[engine]) {
+    if (isBlankLoraCard(card)) delete next.byEngine[engine].byInstance[card.instanceId];
+    else next.byEngine[engine].byInstance[card.instanceId] = card;
+  }
+  return next;
 }
 
 export function withGroupCard(store, engine, groupId, patch) {
@@ -217,7 +241,7 @@ export function referencedCardAssets(store) {
   const normalized = normalizeLoraCardStore(store).store;
   const referenced = new Set();
   for (const engine of READY_LORA_ENGINES) {
-    for (const card of Object.values(normalized.byEngine[engine].loras)) {
+    for (const card of [...Object.values(normalized.byEngine[engine].loras), ...Object.values(normalized.byEngine[engine].byInstance)]) {
       if (card.cover) referenced.add(card.cover);
     }
     for (const card of Object.values(normalized.byEngine[engine].groups)) {
