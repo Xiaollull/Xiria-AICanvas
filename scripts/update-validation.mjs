@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync } from "node:fs";
-import { cp, link, mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { cp, link, mkdir, mkdtemp, readdir, readFile, realpath, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -533,12 +533,16 @@ export async function mirrorEnvironmentTree(source, destination, { linkFile = li
 }
 
 export async function repairUpdatedEnvironment({
-  projectRoot,
+  projectRoot: requestedRoot,
   environment = process.env,
   runCommand = runValidationCommand,
   report,
   onBackup,
 } = {}) {
+  // The backup's ownership check compares its path with that path's realpath, and startup recovery
+  // reads the journal against the canonical root. A root reached through a link or an 8.3 short name
+  // (GitHub's Windows runners export TEMP that way) failed both, so every path here is canonical.
+  const projectRoot = await realpath(requestedRoot);
   const marker = readSetupMarker(projectRoot, environment);
   const previousMarker = marker ? structuredClone(marker) : null;
   const markerPath = getSetupMarkerPath(projectRoot, environment);
