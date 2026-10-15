@@ -26,7 +26,7 @@ import {
 import { getLogsDirectory, writeDiagnosticLog } from "./scripts/diagnostics.mjs";
 import { findPython, isolatedPythonEnv, loadLocalEnv, verifyProjectVenv } from "./scripts/python.mjs";
 import { getSetupMarkerPath, readSetupMarker } from "./scripts/setup-state.mjs";
-import { ensureUpdatedProjectReady, repairUpdatedEnvironment, validateUpdatedProject } from "./scripts/update-validation.mjs";
+import { ensureUpdatedProjectReady, repairUpdatedEnvironment, validateProjectTree } from "./scripts/update-validation.mjs";
 import { createUpdateRestartHandoff } from "./scripts/update-restart.mjs";
 import { updateBusy } from "./src/update-navigation.js";
 import { acquireOfflineUpdateLock } from "./scripts/offline-update-lock.mjs";
@@ -2148,8 +2148,12 @@ function requestPublication(request) {
   return { revision: Number(request.headers["x-xirai-lora-revision"] || 0), version: request.headers["x-xirai-document-version"] };
 }
 function loraRelinkApiPlugin() {
+  // Same-origin, like the XYZ, LoRA-mix and workspace-state routes that edit the same records. The
+  // scan/commit actions used to require a loopback socket, which made LoRA registration impossible
+  // on every remote instance (the cloud boxes are only ever used from another machine's browser),
+  // and without registration nothing can be mounted in XYZ or LoRA mix. Cross-site stays refused.
   const middleware = loraRelinkMiddleware({ service: loraRelinkService, readJson: readJsonRequest,
-    admit: (request, action) => { if (["resolve", "state", "status"].includes(action)) requireSameOrigin(request); else requireLocalRequest(request, "LoRA repair requires the trusted local same-origin entry");
+    admit: (request) => { requireSameOrigin(request);
       if (request.headers["sec-fetch-site"] === "cross-site") throw Object.assign(new Error("Cross-site repair denied"), { statusCode: 403 }); } });
   const install = (server) => { server.middlewares.use(middleware); void loraRelinkService.ensureRecovered().catch(() => {}); };
   return { name: "lora-relink-owner-api", configureServer: install, configurePreviewServer: install };
@@ -5744,10 +5748,13 @@ export function updateApiPlugin({
     ...event,
     progress: Math.min(99, 92 + Math.round((event.progress || 0) * 0.07)),
   });
+  // Always the validator shipped in the tree on disk, never this process's copy: right after an
+  // apply that tree is the new release, and this process is still the old one.
+  const validateInstalledTree = () => validateProjectTree({ projectRoot, environment: process.env, report: validationReport });
   const validateAndRepair = ({ forceRepair = false, setEnvironmentBackup } = {}) => ensureUpdatedProjectReady({
     forceRepair,
     report: validationReport,
-    validate: () => validateUpdatedProject({ projectRoot, environment: process.env, report: validationReport }),
+    validate: validateInstalledTree,
     repair: () => repairUpdatedEnvironment({ projectRoot, environment: process.env, report: validationReport, onBackup: setEnvironmentBackup }),
   });
   const writeRepairTransaction = async (transaction) => {
@@ -5875,7 +5882,7 @@ export function updateApiPlugin({
           if (updateState.source !== "online") requireManualUpdateControl();
           if (activeTask || operationLock || updateBusy(updateState.status)) throw Object.assign(new Error("更新任务正在运行，暂时不能离开"), { statusCode: 409 });
           await cleanupPrepared();
-          setState({ status: "idle", phase: "idle", source: undefined, progress: 0, message: "请选择更新归档", filename: undefined, bytes: undefined, restart_required: false, environment_ready: false, repair_available: false });
+          setState({ status: "idle", phase: "idle", source: undefined, progress: 0, message: "请选择更新归档", filename: undefined, bytes: undefined, restart_required: false, environment_ready: false, environment_warnings: undefined, repair_available: false });
           response.statusCode = 200;
           response.end(JSON.stringify(publicState()));
           return;
@@ -5915,6 +5922,7 @@ export function updateApiPlugin({
             bytes: 0,
             restart_required: false,
             environment_ready: false,
+            environment_warnings: undefined,
             repair_available: false,
           });
           activeTask = (async () => {
@@ -5993,7 +6001,7 @@ export function updateApiPlugin({
           const archivePath = path.join(uploadDirectory, filename);
           const destination = await open(archivePath, "wx");
           let bytes = 0;
-          setState({ status: "uploading", phase: "upload", source: "local", progress: 0, message: "正在接收更新包", filename, bytes: 0, restart_required: false, environment_ready: false, repair_available: false });
+          setState({ status: "uploading", phase: "upload", source: "local", progress: 0, message: "正在接收更新包", filename, bytes: 0, restart_required: false, environment_ready: false, environment_warnings: undefined, repair_available: false });
           try {
             for await (const chunk of request) {
               if (request.aborted) throw new Error("更新包上传中断，请重新选择归档");
@@ -6050,9 +6058,8 @@ export function updateApiPlugin({
           if (activeTask || operationLock || updateState.status !== "ready" || !preparedUpdate) throw Object.assign(new Error("更新包尚未准备完成"), { statusCode: 409 });
           await acquireTaskLock("archive-apply");
           acquiredTaskLock = true;
-          setState({ status: "applying", phase: "shutdown", progress: 0, message: "正在停止推理服务" });
+          setState({ status: "applying", phase: "shutdown", progress: 0, message: "正在停止推理服务", environment_warnings: undefined });
           activeTask = (async () => {
-            const rollbackEnvironmentRepairRequired = Boolean(preparedUpdate.environmentRepairRequired);
             await stopInferenceForUpdate();
             setState({ restart_required: false, environment_ready: false, repair_available: false });
             await server.watcher?.close();
@@ -6071,18 +6078,22 @@ export function updateApiPlugin({
             if (completedUploadDirectory && completedUploadOwnership) {
               await removeOfflineUpdateTemp({ projectRoot, record: completedUploadOwnership, prefix: "xirai-update-upload-", kind: "upload" }).catch(() => {});
             }
+            const environmentWarnings = result.validation?.warnings || [];
             await setState({
               status: "complete",
               phase: "complete",
               progress: 100,
               message: result.validation?.repaired
                 ? "程序文件更新完成，环境已自动修复并验证通过"
-                : "程序文件更新完成，环境与后端验证通过",
+                : environmentWarnings.length
+                  ? "程序文件更新完成，后端与前端验证通过；以下环境提示与本次更新无关"
+                  : "程序文件更新完成，环境与后端验证通过",
               updated_items: result.plan.map((item) => item.relativePath),
               removed_items: result.plan.filter((item) => item.action === "remove").map((item) => item.relativePath),
               restart_required: true,
               environment_ready: true,
               environment_repaired: Boolean(result.validation?.repaired),
+              environment_warnings: environmentWarnings,
               repair_available: false,
             }, true);
           })().catch(async (error) => {
@@ -6105,18 +6116,24 @@ export function updateApiPlugin({
               return;
             }
             try {
-              await setState({ status: "repairing", phase: "environment", progress: 92, message: "更新已回滚，正在检查原环境", restart_required: false, environment_ready: false }, true);
-              const recovery = await validateAndRepairStandalone({ forceRepair: rollbackEnvironmentRepairRequired });
+              // The rollback restored the program files and, if a repair ran, renamed the original
+              // `.venv` back, so this is the tree that was running before. It is verified, never
+              // repaired: an automatic repair here cloned and rebuilt the environment a second time
+              // for every failed update, to "fix" whatever the first attempt could not. A real
+              // problem leaves the explicit repair action available instead.
+              await setState({ status: "repairing", phase: "environment", progress: 92, message: "更新已回滚，正在验证原程序", restart_required: false, environment_ready: false }, true);
+              const recovery = await validateInstalledTree();
               if (!readSetupMarker(projectRoot)) throw new Error("原环境验证完成后配置标记失效");
               if (await unsafeUpdateTransactionPending()) throw new Error("回滚事务尚未完成，拒绝标记为可重启");
               await setState({
                 status: "error",
                 phase: "error",
                 progress: 0,
-                message: `${error.message}；原程序环境${recovery.repaired ? "已自动修复并" : "已"}验证通过，可安全重启返回`,
+                message: `${error.message}；原程序已恢复并验证通过，可安全重启返回`,
                 restart_required: true,
                 environment_ready: true,
-                environment_repaired: recovery.repaired,
+                environment_repaired: false,
+                environment_warnings: recovery.warnings || [],
                 repair_available: false,
               }, true);
             } catch (recoveryError) {
@@ -6146,7 +6163,7 @@ export function updateApiPlugin({
           acquiredTaskLock = true;
           setState({ status: "repairing", phase: "repair", progress: 92, message: "正在重新自动修复环境", repair_available: false });
           activeTask = validateAndRepairStandalone({ forceRepair: true })
-            .then(async () => {
+            .then(async (result) => {
               if (!readSetupMarker(projectRoot)) throw new Error("环境修复后配置标记无效");
               return setState({
                 status: "error",
@@ -6156,6 +6173,7 @@ export function updateApiPlugin({
                 restart_required: true,
                 environment_ready: true,
                 environment_repaired: true,
+                environment_warnings: result.warnings || [],
                 repair_available: false,
               }, true);
             })
@@ -6197,6 +6215,7 @@ export function updateApiPlugin({
             restart_required: false,
             environment_ready: false,
             environment_repaired: undefined,
+            environment_warnings: undefined,
             repair_available: false,
           });
           await persistUpdateState(true);

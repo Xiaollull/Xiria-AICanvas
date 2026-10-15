@@ -16,6 +16,7 @@ import { analyzeXYZGroupCopy } from "./xyz-group-resolution.js";
 import { useXYZGroupCopy } from "./use-xyz-group-copy.js";
 import { patchXYZPrompt, xyzPromptSource } from "./xyz-prompt-source.js";
 import { xyzStrongLora } from "./xyz-sidebar-context.js";
+import { registerEngineLoraIdentities } from "./xyz-lora-identity.js";
 
 export default function XYZLoraManager({ draft, onChange, catalog, libraryGroups, engines, onEngine, onClose, cardsStore, libraryLocked, transaction = false, single = false, axisMarks = {}, title = '全局 LoRA', onConfirm }) {
   const [category, setCategory] = useState("mounted"), [search, setSearch] = useState(""), [folderPath, setFolderPath] = useState("");
@@ -27,6 +28,29 @@ export default function XYZLoraManager({ draft, onChange, catalog, libraryGroups
   current.current = draft; engineRef.current = draft.engine;
   // Severity comes from the operation that produced the message; a bare string is information.
   const notify = (message, kind = "info") => setNotice(loraNotice(message, kind));
+  // Cards without a registered identity are locked here; say why, and offer the registration that
+  // unlocks them instead of leaving the user to find the four-step repair panel on their own.
+  const [registering, setRegistering] = useState("");
+  const unregistered = (catalog.loras || []).filter((item) => !xyzStrongLora(item)).length;
+  const register = async () => {
+    if (registering) return;
+    const engine = draft.engine;
+    setRegistering("正在准备…");
+    try {
+      const result = await registerEngineLoraIdentities(engine, { onProgress: (text) => { if (mounted.current) setRegistering(text); } });
+      if (!mounted.current) return;
+      await catalog.refresh();
+      if (mounted.current) notify(`已登记 ${engine} 的 ${result.files} 个 LoRA 身份，现在可以挂载`, "success");
+    } catch (error) {
+      if (mounted.current) notify(error.message, "error");
+    } finally {
+      if (mounted.current) setRegistering("");
+    }
+  };
+  const identityEntry = unregistered > 0 && !catalog.loading && <section className="lora-repair-entry xyz-identity-entry" aria-label="LoRA 身份登记">
+    <div><strong>{unregistered} 个 LoRA 尚未登记身份</strong><span>XYZ 与混合搜索只能使用已登记身份的 LoRA，未登记的卡片显示为灰色。登记会完整读取 {draft.engine} 的 LoRA 文件并记录身份，不移动文件、不改变任何挂载。</span></div>
+    <button type="button" className="lora-repair-primary" disabled={Boolean(registering)} onClick={() => void register()}>{registering || `登记 ${draft.engine} 的 LoRA 身份`}</button>
+  </section>;
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; for (const controller of controllers.current) controller.abort(); controllers.current.clear(); };
@@ -104,7 +128,7 @@ export default function XYZLoraManager({ draft, onChange, catalog, libraryGroups
   const snapshotIds = new Set(draft.baseline.group_snapshots.map((group) => group.id));
   const availableGroups = libraryGroups.filter((group) => !snapshotIds.has(group.id)).map((group) => ({ ...group, enabled: false, collecting: false }));
   return <>
-    <LoraManagerModal title={title} className="xyz-owned-lora-manager" repairEntry={!transaction && <LoraRepairEntry engine={draft.engine} locked={libraryLocked} />} context={{
+    <LoraManagerModal title={title} className="xyz-owned-lora-manager" repairEntry={<>{!transaction && <LoraRepairEntry engine={draft.engine} locked={libraryLocked} />}{identityEntry}</>} context={{
       independent: true, engine: draft.engine, engines, onEngine: transaction ? undefined : onEngine, library, category, onCategory: (value) => { setCategory(value); setFolderPath(""); },
       engineBlockedReason: transaction ? '轴选择仅属于当前引擎；取消后可在 XYZ 切换引擎' : '',
       loras: draft.baseline.loras, groups: draft.baseline.group_snapshots, directory: catalog.loraDirectory || "", loading: catalog.loading, refreshing: catalog.refreshing,

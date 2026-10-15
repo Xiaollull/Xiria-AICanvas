@@ -1,5 +1,8 @@
 import { createRelinkDraft, editRelinkRow, selectedRelinkRows, restoreRelinkSuggestion } from "./lora-relink.js";
 import { loraFetch, announceLoraPublication } from "./lora-library-client.js";
+// `crypto.randomUUID` exists only in secure contexts; the cloud instances are opened over plain
+// HTTP, where commit and undo threw before reaching the server. This helper uses getRandomValues.
+import { xyzSubmissionId as operationUuid } from "./xyz-client.js";
 
 export const initialRepairState = () => ({ phase: "idle", scan: null, draft: null, preview: null, error: "", receipt: null, available: false, registerBaseline: false,
   params: null, scannedParams: null, staleParams: false, directories: null, scopeCheck: null });
@@ -90,7 +93,7 @@ export function createLoraRepairController({ request = loraFetch, changed = () =
     },
     async commit() {
       if (!state.available || !state.scan?.complete || state.staleParams || !state.preview || state.preview.conflicts?.length || state.draft.rows.some((row) => !row.skipped && row.needsReview)) return;
-      pendingCommit ||= { ...payload(), operationId: crypto.randomUUID() };
+      pendingCommit ||= { ...payload(), operationId: operationUuid() };
       publish({ phase: "committing", error: "" });
       try { const receipt = await call("commit", pendingCommit); publish({ receipt: { ...receipt, affected: state.preview.affected }, phase: "result", error: "" }); announceLoraPublication(receipt.revision); }
       catch (error) { publish({ phase: "editing", error: `${error.message} 可保留选择后复核或用相同操作重试。`, preview: error.conflicts ? { conflicts: error.conflicts } : state.preview }); }
@@ -98,7 +101,7 @@ export function createLoraRepairController({ request = loraFetch, changed = () =
     async undo() {
       if (!state.receipt?.operationId) return;
       publish({ phase: "undoing", error: "" });
-      try { const receipt = await call("undo", { operationId: state.receipt.operationId, undoOperationId: crypto.randomUUID() }); publish({ receipt: { ...receipt, undone: true }, phase: "result" }); announceLoraPublication(receipt.revision); }
+      try { const receipt = await call("undo", { operationId: state.receipt.operationId, undoOperationId: operationUuid() }); publish({ receipt: { ...receipt, undone: true }, phase: "result" }); announceLoraPublication(receipt.revision); }
       catch (error) { publish({ phase: "result", error: error.message }); }
     },
   };

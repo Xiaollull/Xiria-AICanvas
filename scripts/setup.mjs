@@ -642,10 +642,18 @@ if (!diagnoseOnly && existsSync(venvRoot)) {
   const currentVenv = verifyProjectVenv(projectRoot);
   if (recreateVenv || !currentVenv.ok) {
     if (lstatSync(venvRoot).isSymbolicLink()) fail(".venv 是外部链接，为保护其他软件环境，请手动移除该链接");
-    const backupPath = path.join(projectRoot, `.venv.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`);
-    renameSync(venvRoot, backupPath);
-    console.warn(`旧环境已安全保留为 ${path.basename(backupPath)}`);
-    emit("warning", { message: `旧环境已备份为 ${path.basename(backupPath)}` });
+    if (updateRepair) {
+      // During an update repair `.venv` is the updater's working copy; the original environment is
+      // already held as `.venv.update-backup-*` under the update journal. A second, permanent
+      // `.venv.backup-*` here was never cleaned up by anything.
+      rmSync(venvRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+      console.warn("更新修复副本无效，已移除；原环境由更新器保留，失败时会自动还原");
+    } else {
+      const backupPath = path.join(projectRoot, `.venv.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+      renameSync(venvRoot, backupPath);
+      console.warn(`旧环境已安全保留为 ${path.basename(backupPath)}`);
+      emit("warning", { message: `旧环境已备份为 ${path.basename(backupPath)}` });
+    }
   }
 }
 
@@ -692,7 +700,9 @@ if (!diagnoseOnly) {
   const seededPython = existsSync(venvPythonPath) ? findPython(projectRoot) : null;
   if (!seededPython || seededPython.source !== ".venv" || !pythonCheck(seededPython, "import ensurepip,pip", isolatedPythonEnv(process.env))) {
     emit("warning", { message: "项目 Python 环境缺少 pip（Linux 上通常是未安装 python3-venv），正在使用项目内 uv 重建完整环境" });
-    if (existsSync(venvRoot)) {
+    if (existsSync(venvRoot) && updateRepair) {
+      rmSync(venvRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    } else if (existsSync(venvRoot)) {
       const backupPath = path.join(projectRoot, `.venv.backup-${new Date().toISOString().replace(/[:.]/g, "-")}`);
       renameSync(venvRoot, backupPath);
       console.warn(`不完整的环境已保留为 ${path.basename(backupPath)}`);

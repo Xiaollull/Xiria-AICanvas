@@ -394,6 +394,7 @@ jobs:
           import { createReleaseManifest } from "./scripts/release-package.mjs";
           import { removeOfflineUpdateTemp } from "./scripts/offline-update-temp.mjs";
           import { assertFullPackageJustified } from "./scripts/full-package-release.mjs";
+          import { previousUpdaterAccepts } from "./scripts/update-compatibility.mjs";
 
           // Files the updater deliberately keeps from the installed project. The release ships a
           // default copy, so they are excluded from the byte comparison below and asserted to be
@@ -498,6 +499,16 @@ jobs:
             // in-place upgrade from the previous release, which is exactly what the declaration
             // says is impossible.
             if (process.env.PREVIOUS_FOUND === "true" && !fullPackage) {
+              // The apply below runs this tree's updater, but an installed user's update is applied
+              // and validated by the previous release's code. Check that code can accept this release.
+              const compatibility = previousUpdaterAccepts({
+                previousValidatorSource: execFileSync("git", ["show", `v${process.env.PREVIOUS_VERSION}:scripts/update-validation.mjs`], { encoding: "utf8", maxBuffer: 1 << 26 }),
+                backendSource: await readFile(path.join(process.env.CURRENT_PACKAGE_ROOT, "backend", "inference_server.py"), "utf8"),
+              });
+              if (!compatibility.ok) throw new Error(compatibility.reason);
+              console.log(compatibility.delegated
+                ? `The ${process.env.PREVIOUS_VERSION} updater validates with this release's own validator.`
+                : `The ${process.env.PREVIOUS_VERSION} updater validates in-process; its inference protocol matches this release.`);
               // prepareUpdate performs the security-aware extraction of the authenticated old archive.
               // Only its extracted tree is wanted here, as the baseline a real user is upgrading from.
               // Nothing is ever installed into it, so its environment-repair flag says nothing about

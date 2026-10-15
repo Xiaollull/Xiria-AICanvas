@@ -317,7 +317,8 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
       a running process is not safe on Windows; such a version is delivered as a full package to
       install fresh, and its release notes say so above everything else. A changed
       <code>backend/requirements.txt</code> is supported: the files are replaced and the Python
-      environment is then repaired automatically.</p>
+      environment is then repaired automatically. The repair keeps the original <code>.venv</code> as
+      a hard-link snapshot, which takes almost no disk space, and restores it if the repair fails.</p>
 
     <p>Only program files are replaced. <code>.venv</code>, <code>node_modules</code>,
       <code>models</code>, <code>outputs</code>, <code>logs</code>, <code>state-cache</code>,
@@ -325,6 +326,15 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
       does your own <code>models/model-paths.json</code>. Before replacement, managed files are
       backed up outside the project. Copy failures, Python validation failures and production build
       failures are rolled back automatically.</p>
+
+    <h3>What decides whether an update is kept</h3>
+    <p>After the files are replaced, the new version is checked by the validator it ships, not by
+      the version being replaced. An update is rolled back only when the new program cannot run:
+      its backend sources, manifests, backend import, backend start-up or frontend build fail.
+      Conditions of the machine that an update cannot change — missing local runtime configs for an
+      installed checkpoint family, <code>pip check</code> advisories, PyTorch or CUDA problems, an
+      unavailable RTX VSR runtime — are listed as warnings on the completion page and do not undo the
+      update. Re-run the environment configurator to resolve them.</p>
 
     <p>Publishing a release is intentionally strict; that procedure is documented in the
       <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Release-process">wiki</a>.</p>

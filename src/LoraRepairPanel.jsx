@@ -330,6 +330,9 @@ export default function LoraRepairPanel({ engine, locked, onClose }) {
           <label className="lora-repair-check"><input type="checkbox" checked={allChecked} ref={(element) => { if (element) element.indeterminate = someChecked && !allChecked; }}
             disabled={busy || !visible.length} onChange={(event) => api.skipRows(visible.map((row) => row.sourceId), !event.target.checked)} aria-label={text ? "选择全部筛选结果" : "选择全部来源"} /></label>
           <span aria-hidden="true">原位置</span><span aria-hidden="true" /><span aria-hidden="true">目标</span><span aria-hidden="true">依据 · 范围</span><span aria-hidden="true">操作</span></div>}
+        {/* The error stage below exists only once a scan has returned, so a refused first scan used
+            to fall back to this empty state silently, as if the click had done nothing. */}
+        {!state.scan && state.phase !== "scanning" && state.error && <div className="lora-repair-error" role="alert"><strong>扫描未完成</strong><p>{state.error}</p></div>}
         {!state.scan && state.phase !== "scanning" && <div className="lora-repair-empty"><strong>选择引擎、问题来源目录和目标目录，然后扫描并匹配</strong><p>扫描只读取文件内容，不移动权重、不改变任何挂载、组或画廊关联；确认前都可以修改或跳过。</p></div>}
         {state.phase === "scanning" && !state.draft && <div className="lora-repair-empty"><strong>正在扫描…</strong><p>首次扫描会读取所选范围内的完整文件内容；可随时取消，不会留下关联变更。</p></div>}
         {state.draft && rows.length === 0 && <div className="lora-repair-empty"><strong>没有待处理的 LoRA 位置</strong><p>{processed.length ? "已处理或仅剩历史记录的来源列在下方，不再计为待修复。" : "所选范围内的已登记与使用中引用都在原位置。"}</p></div>}

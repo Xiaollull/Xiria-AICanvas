@@ -232,12 +232,17 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
     <h3>更新可以改什么、不可以改什么</h3>
     <p>更新包必须与已安装环境使用相同的 Node 依赖。改变了 Node 依赖的归档会被拒绝而不是应用，因为在 Windows 上替换正在运行进程使用的
       <code>node_modules</code> 并不安全；这类版本会以完整安装包的形式发布，供全新安装，其发行说明也会在最上方注明这一点。<code>backend/requirements.txt</code>
-      发生变化则受支持：先替换文件，随后自动修复 Python 环境。</p>
+      发生变化则受支持：先替换文件，随后自动修复 Python 环境。修复时原 <code>.venv</code>
+      以硬链接快照保留，几乎不占额外磁盘空间；修复失败会原样还原。</p>
 
     <p>只替换程序文件。<code>.venv</code>、<code>node_modules</code>、<code>models</code>、<code>outputs</code>、
       <code>logs</code>、<code>state-cache</code>、<code>.cache</code>、<code>.env</code> 与已安装的
       <code>plugins</code> 保持原样，你自己的 <code>models/model-paths.json</code>
       同样保留。替换前，受管理的文件会备份到项目外部。复制失败、Python 校验失败和生产构建失败都会自动回滚。</p>
+
+    <h3>什么决定更新是否保留</h3>
+    <p>文件替换后，由新版本自带的验证器检查新版本，而不是由被替换的旧版本检查。只有新程序无法运行时才会回滚：后端源码、清单、后端加载、后端启动或前端构建失败。更新无法改变的本机状况——已安装底模缺少本地运行配置、<code>pip check</code>
+      提示、PyTorch 或 CUDA 问题、RTX VSR 运行时不可用——会在完成页列为环境提示，不会撤销更新。重新运行环境配置器即可处理。</p>
 
     <p>发布新版本时规则是严格的；该流程记录在
       <a href="https://github.com/Xiaollull/Xiria-AICanvas/wiki/Release-process">Wiki</a> 中。</p>

@@ -245,7 +245,7 @@ export default function ManualUpdatePage() {
         <p>{online
           ? `正在获取并安装 ${updateState.online_release?.version || "新"} 版本的程序文件。已有环境、模型、输出、日志和创作状态不会被覆盖。`
           : "使用打包好的干净项目归档更新程序文件。已有环境、模型、输出、日志和创作状态不会被覆盖。"}</p>
-        <div className="update-safety-list"><span><Check size={13} />新版镜像删除旧文件</span><span><Check size={13} />环境异常自动修复</span><span><Check size={13} />失败自动回滚</span></div>
+        <div className="update-safety-list"><span><Check size={13} />新版镜像删除旧文件</span><span><Check size={13} />依赖变化自动修复</span><span><Check size={13} />失败自动回滚</span></div>
       </div>
       <div className="update-workspace">
         <header><span>UPDATE WORKSPACE</span><strong>{updateState.status === "complete" ? "更新已完成" : updateState.status === "ready" ? "等待确认" : updateState.status === "downloading" ? "正在下载更新包" : busy ? "正在处理" : "选择本地更新包"}</strong></header>
@@ -279,7 +279,11 @@ export default function ManualUpdatePage() {
           <span>将替换以下程序项</span>
           <div>{replacementPlan.map((item) => <code key={item.relativePath}>{item.relativePath}</code>)}</div>
           {removalPlan.length > 0 && <><span className="update-remove-title">新版已删除，将从旧项目移除</span><div>{removalPlan.map((item) => <code className="remove" key={item.relativePath}>{item.relativePath}</code>)}</div></>}
-          <p>{updateState.environment_repair_required ? "检测到依赖清单变化。替换完成后会自动修复 Python、后端和前端环境，并重新验证。" : "更新包已完成安全检查。替换完成后会重新检查 Python、后端、CUDA 与前端构建。"}验证成功前不会删除回滚备份，也不能重启返回主页面。</p>
+          <p>{updateState.environment_repair_required ? "检测到依赖清单变化。替换完成后会自动修复 Python 环境（原环境以硬链接快照保留，不复制文件内容），并重新验证。" : "更新包已完成安全检查。替换完成后会用新版自带的验证器检查后端能否加载并启动、前端能否构建；运行配置、CUDA 等与本次更新无关的环境状况只作提示，不会导致回滚。"}验证成功前不会删除回滚备份，也不能重启返回主页面。</p>
+        </div>}
+        {updateState.environment_warnings?.length > 0 && <div className="update-warning">
+          <strong>环境提示 · 不影响本次更新</strong>
+          {updateState.environment_warnings.map((warning) => <p key={warning.check}>{warning.message}</p>)}
         </div>}
         {(error || updateState.status === "error") && <div className="update-error"><strong>更新未完成</strong><p>{error || updateState.message}</p></div>}
         <footer className="update-actions">

@@ -6,6 +6,24 @@ import path from "node:path";
 
 export const OFFLINE_UPDATE_OWNER_FILE = ".xirai-offline-update-owner.json";
 const PRODUCT = "XiriaCanvas AI";
+// A Python environment that exited a moment ago is still briefly locked on Windows (the loader,
+// antivirus and the indexer all hold fresh handles), so the first delete or rename of `.venv`
+// fails with EPERM/EBUSY. Without a retry that turned a clean rollback into "rollback incomplete",
+// which keeps both the repaired copy and the backup on disk until the next start recovers them.
+const REMOVE_RETRIES = { recursive: true, force: true, maxRetries: 10, retryDelay: 200 };
+const RENAME_RETRY_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+
+export async function renameWithRetry(from, to, { attempts = 10, delayMs = 200 } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= attempts || process.platform !== "win32" || !RENAME_RETRY_CODES.has(error.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
 
 function pathsEqual(first, second) {
   const left = path.resolve(first);
@@ -122,7 +140,8 @@ export async function assertOfflineUpdateTemp({ projectRoot, record, prefix, kin
 
 export async function removeOfflineUpdateTemp(options) {
   const target = await assertOfflineUpdateTemp({ ...options, requireExists: false });
-  await rm(target, { recursive: true, force: true });
+  // Freshly extracted files are what antivirus scans first, so the same retry applies here.
+  await rm(target, REMOVE_RETRIES);
 }
 
 export function createEnvironmentBackupOwnership(projectRoot) {
@@ -184,14 +203,14 @@ export async function assertEnvironmentBackup({ projectRoot, record, requireExis
 
 export async function removeEnvironmentBackup({ projectRoot, record } = {}) {
   const target = await assertEnvironmentBackup({ projectRoot, record, requireExists: false });
-  if (target) await rm(target, { recursive: true, force: true });
+  if (target) await rm(target, REMOVE_RETRIES);
 }
 
 export async function restoreEnvironmentBackup({ projectRoot, record, venvRoot } = {}) {
   const target = await assertEnvironmentBackup({ projectRoot, record, requireExists: false });
   if (!target) return false;
-  await rm(venvRoot, { recursive: true, force: true });
-  await rename(target, venvRoot);
+  await rm(venvRoot, REMOVE_RETRIES);
+  await renameWithRetry(target, venvRoot);
   await removeEnvironmentOwnershipMarker({ projectRoot, record, directory: venvRoot });
   return true;
 }

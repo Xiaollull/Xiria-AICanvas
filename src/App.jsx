@@ -176,6 +176,7 @@ import { XYZ_CELL_STATUS_TEXT } from "./xyz-client.js";
 import XYZBaselineSidebar from "./XYZBaselineSidebar.jsx";
 import XYZLoraManager from "./XYZLoraManager.jsx";
 import { createLoraMixDraft, emptyLoraMixDrafts, inspectLoraMixDrafts, withLoraMixDraft } from "./lora-mix-draft.js";
+import { pathOnlyFamilyLoras, resolveFamilyLoraIdentities, withFamilyLoraIdentities } from "./xyz-lora-identity.js";
 import XYZPromptDeck from "./XYZPromptDeck.jsx";
 import { SamplerPair, SeedControls, GuidanceControls } from "./SamplingControls.jsx";
 import { captureXYZPostprocessSource } from "./xyz-postprocess-source.js";
@@ -1381,6 +1382,40 @@ function App() {
     else setXYZByEngine((old) => withXYZDraft(old, activeXYZEngine, draft));
   };
   const xyzCatalog = useXYZCatalog(activeXYZEngine, isXYZFamily && uiStateReady, fetch);
+  // Path-only LoRAs saved in an XYZ / mix draft (synced from the workspace before the library was
+  // registered) were refused by the planner forever, because registration never revisits drafts.
+  // Once the library has a revision, ask it about each such path and add the identity it proves.
+  // The upgrade is applied to whatever the draft is when the answer arrives, never to a stale copy.
+  const [loraLibraryRevision, setLoraLibraryRevision] = useState(() => currentLoraRevision());
+  const xyzCatalogRefresh = useRef(null);
+  xyzCatalogRefresh.current = xyzCatalog.refresh;
+  useEffect(() => {
+    // A publication (registration in the repair panel included) changes which cards carry an
+    // identity, so the XYZ catalog is re-read rather than left showing them locked.
+    const onPublication = () => { setLoraLibraryRevision(currentLoraRevision()); void xyzCatalogRefresh.current?.(); };
+    window.addEventListener(LORA_PUBLICATION_EVENT, onPublication);
+    return () => window.removeEventListener(LORA_PUBLICATION_EVENT, onPublication);
+  }, []);
+  const familyPathOnlyLoras = isXYZFamily && uiStateReady && familyDraft && !familyDraftError && loraLibraryRevision > 0 ? pathOnlyFamilyLoras(familyDraft) : [];
+  const familyIdentityKey = familyPathOnlyLoras.length ? JSON.stringify([isMixMode, activeXYZEngine, loraLibraryRevision, familyPathOnlyLoras.map((item) => item.value)]) : "";
+  const familyIdentityAttempt = useRef(""), familyDraftErrors = useRef({});
+  familyDraftErrors.current = { xyz: xyzDraftError, mix: loraMixDraftError };
+  useEffect(() => {
+    if (!familyIdentityKey || familyIdentityAttempt.current === familyIdentityKey) return;
+    familyIdentityAttempt.current = familyIdentityKey;
+    const mix = isMixMode, engine = activeXYZEngine;
+    void resolveFamilyLoraIdentities(engine, familyPathOnlyLoras).then((identities) => {
+      if (!identities.size) return;
+      const upgrade = (container, error, wrap) => {
+        const current = container.by_engine[engine];
+        if (error || !current) return container;
+        const next = withFamilyLoraIdentities(current, identities);
+        return next === current ? container : wrap(container, engine, next);
+      };
+      if (mix) setLoraMixByEngine((old) => upgrade(old, familyDraftErrors.current.mix, withLoraMixDraft));
+      else setXYZByEngine((old) => upgrade(old, familyDraftErrors.current.xyz, withXYZDraft));
+    }).catch(() => {});
+  }, [familyIdentityKey]);
   const [loras, setLoras] = useState([]);
   const [mountedLorasByEngine, setMountedLorasByEngine] = useState(emptyMountedLoraMap);
   const [loraGroupsByEngine, setLoraGroupsByEngine] = useState(emptyLoraGroupMap);
