@@ -227,8 +227,8 @@ test("the config drops damaged entries, dedupes by id and stays capped", async (
     assert.deepEqual(roots[0].engines, ["SD"]);
     // An empty engine list would hide the folder the user just added, so it
     // reads as "not configured" rather than "attached to nothing".
-    // An unset list is every engine, which now includes both Flux generations and Krea 2.
-    assert.deepEqual(roots[1].engines, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+    // An unset list is every engine, which now includes both Flux generations, Krea 2 and MOSS.
+    assert.deepEqual(roots[1].engines, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
     assert.equal(roots[1].label, "models");
 
     await writeSharedRoots(base, roots);

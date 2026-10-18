@@ -434,6 +434,56 @@
       "detail": "推荐的低占用文本编码器"
     },
     {
+      "id": "moss-sft-int8",
+      "role": "diffusion_model",
+      "label": "MOSS-Image SFT · INT8 ConvRot",
+      "filename": "moss_image_sft_int8_convrot_attn.safetensors",
+      "size": 5413698958,
+      "sha256": "b4d1475bc7eeffd7b809e82ea13a1fba1fb85c4e18365af3813722faa5c0fe4f",
+      "url": "https://huggingface.co/Comfy-Org/MOSS-Image/blob/82920903fb96adfcc6f6f406c2a0287baf1846cd/diffusion_models/moss_image_sft_int8_convrot_attn.safetensors",
+      "detail": "推荐：SFT 版 ConvRot INT8，量化权重常驻；注意力 INT8 标记在本机回退为 SDPA"
+    },
+    {
+      "id": "moss-base-int8",
+      "role": "diffusion_model",
+      "label": "MOSS-Image Base · INT8 ConvRot",
+      "filename": "moss_image_base_int8_convrot_attn.safetensors",
+      "size": 5413698958,
+      "sha256": "f601c1e1161915fb3fea003da0c1782e374dd960fbb3978bc0e4e3fa1f2d8e6f",
+      "url": "https://huggingface.co/Comfy-Org/MOSS-Image/blob/82920903fb96adfcc6f6f406c2a0287baf1846cd/diffusion_models/moss_image_base_int8_convrot_attn.safetensors",
+      "detail": "Base 版 ConvRot INT8；与 SFT 同结构，加载时按张量内容识别版本"
+    },
+    {
+      "id": "moss-sft-bf16",
+      "role": "diffusion_model",
+      "label": "MOSS-Image SFT · BF16",
+      "filename": "moss_image_sft_bf16.safetensors",
+      "size": 10164655808,
+      "sha256": "f96738d8116d78b7316b57c663d8c98591ddafab7488f48e3099b7655e34ab6f",
+      "url": "https://huggingface.co/Comfy-Org/MOSS-Image/blob/82920903fb96adfcc6f6f406c2a0287baf1846cd/diffusion_models/moss_image_sft_bf16.safetensors",
+      "detail": "SFT 版 BF16 全精度；本版本尚未完成真实模型验证"
+    },
+    {
+      "id": "moss-base-bf16",
+      "role": "diffusion_model",
+      "label": "MOSS-Image Base · BF16",
+      "filename": "moss_image_base_bf16.safetensors",
+      "size": 10164655808,
+      "sha256": "cacd158728a1fb9e57c408a922b54752ec71fceb566b3821269927964e62b41f",
+      "url": "https://huggingface.co/Comfy-Org/MOSS-Image/blob/82920903fb96adfcc6f6f406c2a0287baf1846cd/diffusion_models/moss_image_base_bf16.safetensors",
+      "detail": "Base 版 BF16 全精度；本版本尚未完成真实模型验证"
+    },
+    {
+      "id": "moss-qwen35-9b-int8",
+      "role": "text_encoder",
+      "label": "Qwen3.5 9B · INT8 ConvRot",
+      "filename": "qwen3.5_9b_int8_convrot.safetensors",
+      "size": 9748121532,
+      "sha256": "32e3787472f708fa5f83624acbf5ef23f7fc89c439e05065ea57cfe5a97f025a",
+      "url": "https://huggingface.co/Comfy-Org/MOSS-Image/blob/82920903fb96adfcc6f6f406c2a0287baf1846cd/text_encoders/qwen3.5_9b_int8_convrot.safetensors",
+      "detail": "MOSS 文本编码器；只加载语言部分，视觉塔与 MTP 头按白名单丢弃"
+    },
+    {
       "id": "realesrgan-x4plus",
       "role": "upscaler",
       "label": "Real-ESRGAN x4plus · 通用",
@@ -501,6 +551,17 @@
       "models": ["krea2-raw-fp8", "krea2-raw-bf16", "krea2-raw-int8", "krea2-turbo-fp8", "krea2-turbo-bf16", "krea2-turbo-int8", "krea2-turbo-mxfp8", "krea2-turbo-nvfp4"],
       "textEncoders": ["krea2-text-fp8", "krea2-text-bf16"],
       "vaes": ["qwen-image-vae"]
+    },
+    {
+      "id": "moss-image",
+      "group": "MOSS",
+      "name": "MOSS-Image",
+      "description": "5B 单流 DiT（Apache-2.0）；可选 SFT/Base 与 INT8/BF16，搭配 Qwen3.5 9B INT8 文本编码器，VAE 与 FLUX.2 共用。Comfy-Org 融合 QKV 版本，按固定修订下载。",
+      "provider": "Hugging Face",
+      "sourceUrl": "https://huggingface.co/Comfy-Org/MOSS-Image/tree/82920903fb96adfcc6f6f406c2a0287baf1846cd",
+      "models": ["moss-sft-int8", "moss-base-int8", "moss-sft-bf16", "moss-base-bf16"],
+      "textEncoders": ["moss-qwen35-9b-int8"],
+      "vaes": ["flux2-vae"]
     },
     {
       "id": "hires-upscalers",

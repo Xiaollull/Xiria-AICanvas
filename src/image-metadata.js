@@ -556,6 +556,18 @@ export function parseXiria(parameters, chunks = {}) {
   // Protocol 39 records the effective layer SD/iL read. An older record has none, which means
   // the family default ran (SD 1, iL 2) — it is left unstated rather than invented here.
   if (Number.isInteger(parameters.clip_skip)) pushParameter(list, "Clip skip", parameters.clip_skip);
+  // MOSS's own block (protocol 40): the flow shift and the negative-branch block skipping it ran, and
+  // which checkpoint variant the loader identified from tensor content.
+  const mossBlock = parameters.engine === "MOSS" && parameters.moss && typeof parameters.moss === "object" && parameters.moss.version === 1
+    ? parameters.moss
+    : null;
+  if (mossBlock) {
+    pushParameter(list, "Shift", mossBlock.shift);
+    pushParameter(list, "Uncond skip layers", Array.isArray(mossBlock.uncond_skip_layers)
+      ? (mossBlock.uncond_skip_layers.length ? `${mossBlock.uncond_skip_layers.join(", ")} (${mossBlock.uncond_skip_start}–${mossBlock.uncond_skip_end})` : "none")
+      : "");
+    pushParameter(list, "MOSS variant", mossBlock.variant);
+  }
   pushParameter(list, "Elapsed", parameters.elapsed_seconds ? `${parameters.elapsed_seconds}s` : "");
   pushParameter(list, "Job", parameters.job_id);
 
@@ -607,6 +619,15 @@ export function parseXiria(parameters, chunks = {}) {
     }) : [],
     flags,
     animaAssets: anima ? { text_encoder: textOf(parameters.text_encoder), vae: textOf(parameters.vae) } : null,
+    // The wire block as written; `image-info-apply.js` coerces it before anything is applied.
+    mossSampling: mossBlock
+      ? { version: 1, shift: mossBlock.shift, uncond_skip_layers: mossBlock.uncond_skip_layers, uncond_skip_start: mossBlock.uncond_skip_start, uncond_skip_end: mossBlock.uncond_skip_end }
+      : null,
+    // QPlan2/MOSS/P2: the coordinate layout the prompt was compiled from (`{version, prefix, draft, stages}`),
+    // as written; `image-info-apply.js` restores it into layout mode.
+    mossLayout: parameters.engine === "MOSS" && parameters.moss_layout && typeof parameters.moss_layout === "object" && parameters.moss_layout.version === 1
+      ? parameters.moss_layout
+      : null,
     // One cell of an XYZ experiment. Its own settings above stay the single-image record; this only
     // says where it came from, so the reader can offer the experiment beside the ordinary apply.
     xyzCell: parameters.xyz_plot && typeof parameters.xyz_plot === "object" && /^[0-9a-f]{32}$/.test(textOf(parameters.xyz_plot.experiment_id))

@@ -213,7 +213,9 @@ test("the preset prompt reaches the request body and never the prompt box", asyn
   // The request body carries the composed prompt; the groups are resolved once
   // per generation and reused for the gallery record.
   assert.match(app, /prompt: generationPrompt,/);
-  assert.match(app, /const generationPrompt = composeGenerationPrompt\(\{ groupPrompt: generationGroupPrompt,[\s\S]{0,200}prompt: positive \}\);/);
+  assert.match(app, /const generationPrompt = generationLayout\s+\? compileMossLayout\(generationLayout, generationLayoutPrefix\)\.prompt\s+: composeGenerationPrompt\(\{ groupPrompt: generationGroupPrompt,[\s\S]{0,200}prompt: positive \}\);/);
+  // A MOSS layout takes the same groups and presets as its prefix line, composed onto nothing typed.
+  assert.match(app, /const generationLayoutPrefix = generationLayout\s+\? composeGenerationPrompt\(\{ groupPrompt: generationGroupPrompt,[\s\S]{0,200}prompt: "" \}\)/);
   // Rewriting the box, or storing the composed text as the generated settings,
   // would prepend the presets a second time when the item is restored.
   assert.ok(!/setPositive\([^)]*composeGroupPrompt/.test(app), "the prompt box is never rewritten");

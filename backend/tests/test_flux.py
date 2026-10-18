@@ -119,7 +119,7 @@ class FluxRequestContractTests(unittest.TestCase):
 
 class FluxEngineWiringTests(unittest.TestCase):
     def test_flux_is_a_native_family_alongside_anima(self):
-        self.assertEqual(inference_server.NATIVE_ENGINES, ("Anima", "Flux", "Flux2", "Krea2"))
+        self.assertEqual(inference_server.NATIVE_ENGINES, ("Anima", "Flux", "Flux2", "Krea2", "MOSS"))
         self.assertTrue(inference_server.is_native_family("flux"))
         self.assertTrue(inference_server.is_native_family("anima"))
         self.assertFalse(inference_server.is_native_family("sdxl"))

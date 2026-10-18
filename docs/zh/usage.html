@@ -34,6 +34,7 @@
     <ul>
       <li><a href="#prompt">提示词权重</a></li>
       <li><a href="#prompt-length">提示词长度</a></li>
+      <li><a href="#moss-layout">MOSS 坐标布局</a></li>
       <li><a href="#guidance">引导</a></li>
       <li><a href="#adapters">适配器融合</a></li>
       <li><a href="#lora-cards">LoRA 卡片</a></li>
@@ -47,10 +48,10 @@
 
   <main>
     <h1>生成图像</h1>
-    <p class="lede">六个引擎共用同一套提示词语法、同一套采样器名称与同一个图库。不同之处在于哪种引导方式适用，以及采样器名称背后真正的调度是什么。</p>
+    <p class="lede">七个引擎共用同一套采样器名称与同一个图库，除 MOSS 外共用同一套提示词语法。不同之处在于哪种引导方式适用，以及采样器名称背后真正的调度是什么。</p>
 
     <h2 id="prompt">提示词权重</h2>
-    <p>六个引擎共享核心的 ComfyUI 括号语法：</p>
+    <p>除 MOSS 外，各引擎共享核心的 ComfyUI 括号语法。MOSS 按原样读取提示词，下表中的括号会作为字面文本进入它的文本编码器：</p>
     <div class="scroller">
       <table>
         <thead><tr><th>语法</th><th>效果</th></tr></thead>
@@ -67,7 +68,7 @@
       调度语法<strong>不由</strong>此语法解释。Anima 独立解析 Qwen 与 T5 的 token 边界，并将权重应用于 T5 对齐的 LLM 适配器输出。</p>
 
     <h2 id="prompt-length">提示词长度</h2>
-    <p>任何引擎都不对提示词长度设上限。提示词按它实际分词出的长度编码：写得长只是在文本编码器上多花一点时间，除此之外没有代价。它不会被截断，不会被拒绝，也不会成为生成无法开始的理由。</p>
+    <p>除 MOSS 外，任何引擎都不对提示词长度设上限。提示词按它实际分词出的长度编码：写得长只是在文本编码器上多花一点时间，除此之外没有代价。它不会被截断，不会被拒绝，也不会成为生成无法开始的理由。MOSS 的编码器以 4096 token 为止，超出后的处理见下表中的 MOSS 一行与<a href="#moss-layout">布局的限制</a>。</p>
     <div class="scroller">
       <table>
         <thead><tr><th>引擎</th><th>长提示词的处理方式</th></tr></thead>
@@ -76,6 +77,7 @@
           <tr><td>Anima</td><td>Qwen 与 T5 都按提示词自身长度运行。不足 512 token 时补齐到该长度，补位部分被注意力掩码屏蔽。</td></tr>
           <tr><td>FLUX.1</td><td>承载条件的是 T5-XXL，按提示词自身长度运行。CLIP-L 只贡献一个池化向量，读取前 77 个 token——因为它只有这么多位置嵌入，这与 ComfyUI 从首块取出的向量相同。</td></tr>
           <tr><td>FLUX.2、Krea 2</td><td>语言模型按提示词自身长度运行。FLUX.2 会补齐到其 512 token 的训练上下文；Krea 2 不做任何补齐。</td></tr>
+          <tr><td>MOSS</td><td>Qwen3.5-9B 在聊天模板中按提示词自身长度读取，含模板最多 4096 token；更长的提示词会被截断，并在运行结果中说明。<code>(word:1.2)</code> 之类的权重语法按字面文本传入。</td></tr>
         </tbody>
       </table>
     </div>
@@ -85,6 +87,35 @@
       <strong>LOW_VRAM</strong> 而非最初的模式。重试会从相同的噪声重新开始，因此种子不受影响。在 24 GB 显卡、1024&#215;1472 下实测，Krea 2
       在约七千 token 以内保持常驻；13,849 token 的提示词走动态装入路径约需两分半，而常驻路径约为四十秒。</p>
 
+    <h2 id="moss-layout">MOSS 坐标布局</h2>
+    <p>除了普通文本，MOSS-Image 还能读取<em>布局</em>：一段 JSON 提示词，包含整张图的描述和一组框，每个框有类型、描述和它在画布上的位置，格式见官方 README。在 MOSS 引擎下，提示词标题栏有一个
+      <strong>文本 | 布局</strong> 切换。布局模式下，正向提示词变为一张卡片，显示各框的预览、每类框的数量、token 数以及布局是否有效；<strong>编辑布局</strong>
+      打开布局编辑器。文本提示词会保留，切回文本模式即可恢复；<strong>转为文本</strong>会把布局转成普通的文本提示词。</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>类型</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td>物体 <code>object</code></td><td>画面中的物品。</td></tr>
+          <tr><td>人物 <code>character</code></td><td>人或角色。</td></tr>
+          <tr><td>文字 <code>text</code></td><td>文字。它的“精确文本”（包括换行）就是要求模型渲染出来的内容。</td></tr>
+          <tr><td>画面 <code>panel</code></td><td>框架：漫画分格、背景区域或整张画布。以虚线绘制；其中的框仍可直接操作，画面本身靠标签拖动。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>编辑器。</strong>在空白画布上拖动即可画框；可以移动框、用八个手柄缩放（按住 Shift 保持比例），并吸附到画布边缘、中心、三分线和其他框；按住 Ctrl
+      可自由放置。左侧列表即阅读顺序和 JSON 顺序：拖动可重新排序，也可以隐藏（隐藏的框不会发送）或锁定框。检查器用于编辑整张图的描述（画面）、选中的框（元素：类型、描述、精确文本、坐标、标签、配色）以及可读 JSON。坐标为生成画布上的左上角像素。可以在框下方显示一张参考图，它只留在浏览器中，不会上传。模板（官方
+      README 示例与空白画布）、导入可读草稿或官方编译后的布局、导出、撤销/重做以及快捷键（V/B/H、Ctrl+Z、Ctrl+D、Delete、方向键、空格平移）位于标题栏和工具栏。窗口宽度小于 900 像素时，画布、列表和检查器变为三个标签页。</p>
+    <p><strong>发送的内容。</strong>布局按官方 <code>compile_prompt.py</code> 的方式编译——居中的 <code>abs_centralized</code> /
+      <code>yxyx</code> 框，紧凑 JSON——服务器会拒绝与自己编译结果不一致的提示词。LoRA 组提示词和已启用的正向预设写在 JSON 之前的一行。布局跟随基础页的画布尺寸：修改尺寸会按比例缩放所有框，并可撤销。每次 Hires
+      重绘都会按该次重绘的尺寸重新编译布局。提示词为空的 ADetailer 单元会得到与其裁切区域重叠的框，并映射到裁切区域上（若没有重叠的框，则使用整张图的描述）；单元提示词中的
+      <code>[PROMPT]</code> 会替换为这段文本，其他单元提示词按原样使用。</p>
+    <p><strong>限制。</strong>布局提示词绝不截断：首轮生成和每次 Hires 重绘都必须在 MOSS 的 4096 token（含聊天模板）以内，否则阻止生成并说明超出多少。超过 3,600
+      时计量条变为琥珀色。本版本中透明背景、XYZ 对比与 LoRA 混合搜索不接受布局。布局会写入 PNG 和画廊卡片，<strong>应用参数</strong>可以恢复它；不认识布局的程序仍能读到编译后的提示词。</p>
+    <div class="note">
+      <span class="label">1.4 新增</span>
+      <p>编译后的提示词已与官方 README 示例和编译器逐字节对照。用真实权重确定前缀行与 ADetailer 裁切布局效果的测试尚未完成，因此这两条规则可能调整。</p>
+    </div>
+
     <h2 id="guidance">引导</h2>
     <div class="scroller">
       <table>
@@ -92,7 +123,8 @@
         <tbody>
           <tr><td>PAG</td><td>SD、iL、原生 Anima</td><td>scale 范围 <code>0..5</code>，scope 为 <code>mid|all</code>。</td></tr>
           <tr><td>CFG-Zero*</td><td>原生 Anima、Krea 2</td><td>—</td></tr>
-          <tr><td>负面提示词</td><td>SD、iL、Anima、Krea 2</td><td>两代 FLUX 为蒸馏引导，不发送负面提示词。</td></tr>
+          <tr><td>负面提示词</td><td>SD、iL、Anima、Krea 2、MOSS</td><td>两代 FLUX 为蒸馏引导，不发送负面提示词。</td></tr>
+          <tr><td>负向分支跳层</td><td>MOSS</td><td>在一个 sigma 区间内，无条件分支跳过 <code>0..41</code> 中指定的块（默认 22）；只在 CFG &#8800; 1 时生效，不增加前向次数。不提供标准 SLG。</td></tr>
         </tbody>
       </table>
     </div>
@@ -124,10 +156,11 @@
       因此重新解析来源不会覆盖它，原地更新也会保留它。不再被任何卡片引用的图片会在下一次保存时删除。</p>
 
     <h2 id="samplers">采样器与调度器</h2>
-    <p>四个原生引擎在 Generate 与 Gallery 中都提供相同的 44 个采样器名称和 9 个调度器名称。名称是共用的，其背后的调度并不相同：</p>
+    <p>Anima、FLUX.1、FLUX.2 与 Krea 2 在 Generate 与 Gallery 中都提供相同的 44 个采样器名称和 9 个调度器名称。名称是共用的，其背后的调度并不相同；MOSS 只提供其中三个采样器：</p>
     <ul>
       <li>Anima 的 9 个调度器都是原生的 Flow-shift-3 轨迹。</li>
       <li>两代 FLUX 与 Krea 2 运行同一张 ModelSamplingFlux 表，FLUX.2 的 shift 取自模型，Krea 2 取自其模型配置声明的静态 shift。</li>
+      <li>MOSS 提供 <code>euler</code>、<code>euler_ancestral</code> 与 <code>heun</code>，配合 9 个调度器，使用 ComfyUI 的离散 flow 表（multiplier 1000）和它自己的 shift（默认 5，可在采样面板调整）；<code>sgm_uniform</code> 与 <code>normal</code> 复现 ComfyUI 对最后一步的二次偏移。</li>
     </ul>
     <p>具名的兼容性求解器映射会在任务警告和 PNG 采样元数据中报告，而不是静默地伪装成另一种实现。</p>
 
@@ -187,14 +220,14 @@
     </div>
 
     <p><strong>尺寸是精确的。</strong>每个单元的目标尺寸是它收到的图像的 <code>round(边长 × 倍率)</code>，与 ComfyUI 的
-      <code>ImageScaleBy</code> 算法一致，不会向上取整到 64。重绘仍然必须落在引擎的潜空间网格上——SD 与 Illustrious 为 8 像素，FLUX.1、FLUX.2 与
-      Krea 2 为 16，Anima 为 32——因此面板会在目标尺寸旁显示重绘实际使用的尺寸；勾选<strong>精确输出尺寸</strong>会在重绘后再缩放回精确的目标尺寸，代价是多一次缩放。重绘的边长上限在
+      <code>ImageScaleBy</code> 算法一致，不会向上取整到 64。重绘仍然必须落在引擎的潜空间网格上——SD 与 Illustrious 为 8 像素，FLUX.1、FLUX.2、
+      Krea 2 与 MOSS 为 16，Anima 为 32——因此面板会在目标尺寸旁显示重绘实际使用的尺寸；勾选<strong>精确输出尺寸</strong>会在重绘后再缩放回精确的目标尺寸，代价是多一次缩放。重绘的边长上限在
       SD 与 Illustrious 上为 8192 像素，其他引擎为 4096；不重绘的单元不受这两个限制。</p>
     <p>缩放算法是 ComfyUI <code>ImageScale</code> 的算法集合，去掉了只适用于潜空间的 <code>bislerp</code>：Lanczos（默认，放大时最锐利）、Bicubic、Bilinear、Area（缩小时最佳）和
       Nearest。</p>
     <p>重绘默认继承主设置的步数、CFG、采样器和调度器，也可以用<strong>独立步数</strong>、<strong>独立 CFG</strong>
       及单元自己的选择器单独设置。它的 Seed 默认跟随每张图的首轮 Seed，也可以让所有图使用同一个固定 Seed，或每张图各取一个安全随机
-      Seed。Anima 与 Krea 2 还可以用 USDU 分块重绘代替整图重绘。</p>
+      Seed。Anima 与 Krea 2 还可以用 USDU 分块重绘代替整图重绘。MOSS 只能整图重绘（不支持 USDU 分块），本版本的图生图页面也不接受 MOSS。</p>
     <p>在后处理链出现之前保存的设置——工作区、各引擎设置、画廊卡片和 PNG 元数据——打开时会把原来的 Hires.fix
       作为第一个重采样单元，并保留原来的阶段顺序，因此旧工作区仍会跑出与以前相同的流程。</p>
 

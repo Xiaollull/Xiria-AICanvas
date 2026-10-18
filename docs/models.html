@@ -37,6 +37,7 @@
       <li><a href="#paths">model-paths.json</a></li>
       <li><a href="#catalog">Recommended-model browser</a></li>
       <li><a href="#file-formats">File formats</a></li>
+      <li><a href="#moss">MOSS-Image</a></li>
       <li><a href="#quantization">Quantization, honestly</a></li>
     </ul>
   </aside>
@@ -84,7 +85,7 @@
           <tr><td><code>checkpoints/illustrious</code></td><td>Illustrious / Illustrious XL checkpoints. They must live here so the correct SDXL pipeline is selected.</td></tr>
           <tr><td><code>loras/sd</code>, <code>loras/illustrious</code></td><td>LoRA roots. The four default categories remain available, while custom folders and arbitrary nesting are discovered automatically.</td></tr>
           <tr><td><code>vae</code></td><td>Standalone and shared VAEs used by split model pipelines.</td></tr>
-          <tr><td><code>diffusion_models</code></td><td>Anima, FLUX.1, FLUX.2, Krea 2 and other split diffusion weights. <code>.safetensors</code> throughout, plus <code>.gguf</code> for the three engines that read it.</td></tr>
+          <tr><td><code>diffusion_models</code></td><td>Anima, FLUX.1, FLUX.2, Krea 2, MOSS and other split diffusion weights. <code>.safetensors</code> throughout, plus <code>.gguf</code> for the three engines that read it.</td></tr>
           <tr><td><code>text_encoders</code></td><td>Standalone text encoders required by split model pipelines.</td></tr>
           <tr><td><code>embeddings</code></td><td>Reserved for future textual inversion support.</td></tr>
           <tr><td><code>yolo</code></td><td>Ultralytics <code>.pt</code> detection or segmentation models for local ADetailer passes. Community models may be placed here, including in subdirectories.</td></tr>
@@ -127,6 +128,8 @@
         Hugging Face token. Both pair with a Qwen 3 8B text encoder and the FLUX.2 VAE.</li>
       <li><strong>Krea 2</strong> — the 12B model in Raw and Turbo variants, with a separately
         chosen 4B text encoder precision. Its VAE is shared with Anima.</li>
+      <li><strong>MOSS</strong> — MOSS-Image SFT and Base as ConvRot INT8 or BF16 from the pinned
+        Comfy-Org repackage, with the Qwen3.5 9B INT8 text encoder. Its VAE is FLUX.2's full decoder.</li>
       <li><strong>Upscalers</strong> — the official Real-ESRGAN models a resample unit can enlarge
         with before it resizes and redraws.</li>
     </ul>
@@ -145,7 +148,7 @@
     <h2 id="file-formats">File formats</h2>
     <p>Every component loads from <code>.safetensors</code>. For FLUX.1, FLUX.2 and Krea 2 every
       component — diffusion model, text encoder and VAE — also loads from <code>.gguf</code>, which
-      is the only form some quantizations are published in. Anima's components stay
+      is the only form some quantizations are published in. Anima's and MOSS's components stay
       <code>.safetensors</code>.</p>
 
     <p>A GGUF diffusion model or VAE keeps the checkpoint's own tensor names, the way ComfyUI-GGUF
@@ -184,6 +187,47 @@
     <p>A file using anything else is left out of the picker rather than offered and then refused at
       load.</p>
 
+    <h2 id="moss">MOSS-Image</h2>
+    <p>MOSS-Image (OpenMOSS, Apache-2.0) is a 5B single-stream DiT. The <strong>MOSS</strong> engine
+      mounts three files:</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Component</th><th>File</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Diffusion model</td><td><code>moss_image_sft_int8_convrot_attn.safetensors</code> and its Base / BF16 siblings from the Comfy-Org repackage, or the original Hugging Face shards</td><td>SFT and Base are told apart by their weights, not their names, and the run reports which one loaded.</td></tr>
+          <tr><td>Text encoder</td><td><code>qwen3.5_9b_int8_convrot.safetensors</code></td><td>Only the language model is loaded. The vision tower and MTP head in the same file are set aside by an exact list.</td></tr>
+          <tr><td>VAE</td><td><code>flux2-vae.safetensors</code></td><td>The FLUX.2 full decoder, decoded in FP32. The small decoder in the Hugging Face bundle is refused.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The tokenizer ships with the program and is checked when the engine loads. Defaults follow the
+      official workflow: 1024&#215;1024, 50 steps, CFG 3, shift 5, <code>euler</code> /
+      <code>sgm_uniform</code>, an empty negative prompt, and block 22 skipped in the unconditional pass.</p>
+    <p><strong>Quantization.</strong> ConvRot INT8 runs as stored, integer matrix multiplications
+      included, and the INT8 embedding table is never expanded. The files' INT8-attention marker is read
+      and reported. Without comfy-kitchen, attention runs on PyTorch SDPA, as ComfyUI does when the kernel
+      is unavailable. FP8 files (raw or scaled, mixed with BF16) are read, but no MOSS FP8 model has been
+      published yet. GGUF, NVFP4, MXFP8 and INT4 are refused for MOSS.</p>
+    <p><strong>LoRA.</strong> Standard DiT LoRA (<code>lora_A/B</code> or <code>lora_down/up</code> with
+      <code>alpha</code>) and LyCORIS LoKr (a full <code>lokr_w1</code> with a full or low-rank second
+      factor) under <code>models/loras/moss</code>; q, k and v targets map onto the fused projection. On a
+      quantised layer both ride beside the stored weight, and the layer's matmul then runs at full
+      precision, as in ComfyUI. Text-encoder LoRA, LoHa, DoRA and LoKr with a decomposed first factor or
+      Tucker factors are refused.</p>
+    <p><strong>Coordinate layouts.</strong> Instead of a text prompt, MOSS can take a layout of
+      labelled boxes on the canvas. The layout editor and what it sends are described under
+      <a href="usage.html#moss-layout">MOSS coordinate layouts</a>.</p>
+    <p><strong>Not yet available for MOSS:</strong> image-to-image, USDU, PAG, CFG-Zero* and standard SLG. The ComfyUI workflow written into a MOSS PNG
+      needs ComfyUI with MOSS core support (pull request #17095). The official MOSS plugin cannot read
+      the Comfy-Org files.</p>
+    <div class="note">
+      <span class="label">Status</span>
+      <p>Tested with the real weights on a 24 GB RTX 3090: SFT INT8 with the Qwen3.5 INT8 encoder, for
+        text-to-image, Hires, ADetailer, LoRA and LoKr — 1024&#215;1024 at 50 steps takes about 66 s
+        once loaded. The BF16 files and the Base model run the same code but have not been run with
+        real weights. Coordinate layouts are new in 1.4 and not yet run on a GPU.</p>
+    </div>
+
     <h2 id="quantization">Quantization, honestly</h2>
     <p>Quantized variants are offered where the publisher ships them, so the same model can be taken
       at bf16, fp8, mxfp8, nvfp4, int4/int8 or GGUF Q4–Q8. Each of ComfyUI's quantized layouts is read
@@ -195,16 +239,16 @@
 
     <div class="scroller">
       <table>
-        <thead><tr><th>Layout</th><th>Krea 2</th><th>FLUX.1 / FLUX.2</th><th>Native kernel</th></tr></thead>
+        <thead><tr><th>Layout</th><th>Krea 2</th><th>FLUX.1 / FLUX.2</th><th>MOSS</th><th>Native kernel</th></tr></thead>
         <tbody>
-          <tr><td>FP8 (<code>float8_e4m3fn</code>, <code>float8_e5m2</code>)</td><td>Stays fp8, dequantized per layer</td><td>Expanded at load</td><td>—</td></tr>
-          <tr><td>ConvRot INT8 (<code>int8_tensorwise</code> + <code>convrot</code>)</td><td>Stays int8; the activation is rotated and quantized per row, then an integer matmul — ComfyUI's W8A8 path</td><td>Rotation undone, expanded at load</td><td>INT8 tensor cores, SM 7.5+</td></tr>
-          <tr><td>INT8 (<code>int8_tensorwise</code>, per tensor or per row)</td><td>Stays int8, W8A8 integer matmul</td><td>Expanded at load</td><td>SM 7.5+</td></tr>
-          <tr><td>ConvRot W4A4 INT4 (<code>convrot_w4a4</code>)</td><td>Stays packed; W4A4 on SM 8.x, W4A8 elsewhere, as the pinned CUDA backend chooses</td><td>Rotation undone, expanded at load</td><td>SM 7.5+</td></tr>
-          <tr><td>MXFP8</td><td>Stays fp8, dequantized per layer</td><td>Expanded at load</td><td>SM 10.0+ and PyTorch 2.10+; below that ComfyUI dequantizes too</td></tr>
-          <tr><td>NVFP4</td><td>Stays packed, dequantized per layer</td><td>Expanded at load</td><td>SM 10.0+; below that ComfyUI dequantizes too</td></tr>
-          <tr><td>GGUF</td><td colspan="2">Expanded at load, for all three components</td><td>—</td></tr>
-          <tr><td>ConvRot W4A8 (<code>asym_w4a8_int8</code>), SVDQuant, ComfyUI-INT8-Fast's format-less marker</td><td colspan="3">Refused by name</td></tr>
+          <tr><td>FP8 (<code>float8_e4m3fn</code>, <code>float8_e5m2</code>)</td><td>Stays fp8, dequantized per layer</td><td>Expanded at load</td><td>Stays fp8, scaled or cast per use</td><td>—</td></tr>
+          <tr><td>ConvRot INT8 (<code>int8_tensorwise</code> + <code>convrot</code>)</td><td>Stays int8; the activation is rotated and quantized per row, then an integer matmul — ComfyUI's W8A8 path</td><td>Rotation undone, expanded at load</td><td>Stays int8, the same W8A8 path; the text encoder's INT8 embedding table is dequantized only for the rows a prompt uses</td><td>INT8 tensor cores, SM 7.5+</td></tr>
+          <tr><td>INT8 (<code>int8_tensorwise</code>, per tensor or per row)</td><td>Stays int8, W8A8 integer matmul</td><td>Expanded at load</td><td>Stays int8, W8A8</td><td>SM 7.5+</td></tr>
+          <tr><td>ConvRot W4A4 INT4 (<code>convrot_w4a4</code>)</td><td>Stays packed; W4A4 on SM 8.x, W4A8 elsewhere, as the pinned CUDA backend chooses</td><td>Rotation undone, expanded at load</td><td>Refused</td><td>SM 7.5+</td></tr>
+          <tr><td>MXFP8</td><td>Stays fp8, dequantized per layer</td><td>Expanded at load</td><td>Refused</td><td>SM 10.0+ and PyTorch 2.10+; below that ComfyUI dequantizes too</td></tr>
+          <tr><td>NVFP4</td><td>Stays packed, dequantized per layer</td><td>Expanded at load</td><td>Refused</td><td>SM 10.0+; below that ComfyUI dequantizes too</td></tr>
+          <tr><td>GGUF</td><td colspan="2">Expanded at load, for all three components</td><td>Refused</td><td>—</td></tr>
+          <tr><td>ConvRot W4A8 (<code>asym_w4a8_int8</code>), SVDQuant, ComfyUI-INT8-Fast's format-less marker</td><td colspan="4">Refused by name</td></tr>
         </tbody>
       </table>
     </div>
@@ -233,6 +277,12 @@
               checkpoint's own type and the scale is applied inside the linear, so an fp8 diffusion
               model occupies about 12 GB rather than the 24 GB it expands to — the difference between
               resident on a 24 GB card and not — and an NVFP4 one about 7 GB.</td>
+          </tr>
+          <tr>
+            <td>MOSS</td>
+            <td>Its stored size for INT8 and FP8, as on Krea 2: the weight stays in its own type and the
+              scale is applied inside the linear, so the SFT INT8 diffusion model stays about 5 GB.
+              The text encoder's INT8 embedding table is never expanded either.</td>
           </tr>
           <tr>
             <td>Anima, FLUX.1, FLUX.2</td>

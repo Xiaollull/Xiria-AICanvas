@@ -33,6 +33,12 @@ DEFAULT_PERFORMANCE_SETTINGS = {
     "vram_limit_gb": 0.0,
 }
 
+# MOSS-Image's Qwen3.5-9B encoder: `auto` keeps it on the GPU when it fits and streams it one layer
+# at a time when it does not; `cpu` encodes on the CPU and is never chosen automatically. Sparse on
+# purpose: it is not in the table above, so a settings file written before MOSS reads back item for
+# item, and an absent key means `auto` (`MOSS_TEXT_ENCODER_PLACEMENT_DEFAULT`) wherever it is read.
+MOSS_TEXT_ENCODER_PLACEMENT_DEFAULT = "auto"
+
 SETTING_CHOICES = {
     "memory_mode": {"auto", "high_vram", "sdxl_balanced", "normal_vram", "low_vram", "ultra_low_vram"},
     # `sage` is Anima-only and is applied by the native attention processor rather
@@ -42,6 +48,7 @@ SETTING_CHOICES = {
     "compute_dtype": {"fp16", "bf16"},
     "vae_mode": {"auto", "full", "sliced", "tiled"},
     "cuda_math": {"balanced", "strict"},
+    "moss_text_encoder_placement": {"auto", "gpu_resident", "gpu_streamed", "cpu"},
 }
 
 

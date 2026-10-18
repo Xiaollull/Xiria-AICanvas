@@ -133,7 +133,7 @@ export function activeADetailerUnits(stage) {
 // without shrinking the retained updates. This helper keeps the engine argument because it is part
 // of the stable call shape shared by both pages, while the schedule cap remains engine-specific in
 // `adetailerStageIssue` below.
-export const NATIVE_STEP_ENGINES = ["Anima", "Flux", "Flux2", "Krea2"];
+export const NATIVE_STEP_ENGINES = ["Anima", "Flux", "Flux2", "Krea2", "MOSS"];
 
 export function adetailerUnitSteps(unit, baseSteps, engine) {
   if (!(unit?.denoise > 0)) return 0;

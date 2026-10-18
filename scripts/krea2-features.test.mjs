@@ -35,8 +35,8 @@ test("the Krea2 entry point is open on the main page and mounts three components
   assert.doesNotMatch(app, /\{ name: "Krea2",[^}]*ready: false \}/);
   assert.doesNotMatch(app, /\{ name: "Krea2", detail: "即将支持"/);
   assert.match(app, /\{ name: "Krea2", detail: "[^"]+", ready: true \}/);
-  assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2"\]/);
-  assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"\]/);
+  assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]/);
+  assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"\]/);
   assert.match(app, /const KREA2_SAMPLERS = samplerNames/);
   assert.match(app, /const KREA2_SCHEDULERS = schedulerNames/);
 
@@ -107,7 +107,7 @@ test("a Krea2 request keeps per-unit ADetailer negative prompts", () => {
 });
 
 test("Krea2 refinement steps are counted like the other native engines", () => {
-  assert.deepEqual(NATIVE_STEP_ENGINES, ["Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(NATIVE_STEP_ENGINES, ["Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   const unit = { useSteps: true, steps: 20, denoise: 0.2, detector: "face_yolov8n.pt" };
   assert.equal(adetailerUnitSteps(unit, 30, "Krea2"), 20);
   assert.equal(adetailerUnitSteps(unit, 30, "SD"), 20);
@@ -115,7 +115,7 @@ test("Krea2 refinement steps are counted like the other native engines", () => {
 });
 
 test("Krea2 has its own LoRA scope without invalidating libraries saved before it existed", () => {
-  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   assert.deepEqual(emptyMountedLoraMap().byEngine.Krea2, []);
 
   // A v2 library written when Flux2 was the newest engine has no `Krea2` key. Treating that as a
@@ -130,7 +130,7 @@ test("Krea2 has its own LoRA scope without invalidating libraries saved before i
 });
 
 test("a shared LoRA root saved before Krea2 existed expands rather than excluding it", () => {
-  assert.deepEqual(SHARED_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(SHARED_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   assert.deepEqual(normalizeSharedEngines(["SD", "iL", "Anima", "Flux", "Flux2"]), [...SHARED_LORA_ENGINES]);
   // A deliberately narrowed list is still respected.
   assert.deepEqual(normalizeSharedEngines(["SD", "Krea2"]), ["SD", "Krea2"]);
@@ -147,8 +147,8 @@ test("the control plane lists Krea2 components and its own LoRA root", async () 
   assert.doesNotMatch(branch, /text_encoder_2/);
   // Qwen3-VL reads through the Qwen2.5 table, which is the resource Anima already bundles.
   assert.match(branch, /qwen_tokenizer:/);
-  assert.match(vite, /const nativeEngines = new Set\(\["Anima", "Flux", "Flux2", "Krea2"\]\)/);
-  assert.match(vite, /const loraEnginePathKeys = \{ SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2" \}/);
+  assert.match(vite, /const nativeEngines = new Set\(\["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]\)/);
+  assert.match(vite, /const loraEnginePathKeys = \{ SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2", MOSS: "moss" \}/);
 
   const modelPaths = await readSource("scripts/model-paths.mjs");
   assert.match(modelPaths, /krea2: "models\/loras\/krea2"/);
@@ -156,7 +156,7 @@ test("the control plane lists Krea2 components and its own LoRA root", async () 
 
 test("the image-to-image page opens its split picker for Krea2 and leaves the negative prompt live", async () => {
   const page = await readSource("src/ImageToImagePage.jsx");
-  assert.match(page, /\["Anima", "Flux", "Flux2", "Krea2"\]\.includes\(engine\.name\)/);
+  assert.match(page, /\["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]\.includes\(engine\.name\)/);
   // The negative-prompt lock is driven by the distilled list, which Krea 2 is not on.
   assert.match(page, /const pageAllowsNegativePrompt = !DISTILLED_GUIDANCE_ENGINES\.includes\(engine\.name\)/);
 });

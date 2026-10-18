@@ -18,7 +18,7 @@ SHARED_REF_PREFIX = "shared:"
 SHARED_ROOT_ID_LENGTH = 12
 MAX_SHARED_ROOTS = 24
 SHARED_ROOT_KINDS = ("auto", "loras", "checkpoints")
-SHARED_LORA_ENGINES = ("SD", "iL", "Anima", "Flux", "Flux2", "Krea2")
+SHARED_LORA_ENGINES = ("SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS")
 # Full engine sets this field has previously shipped with. A root saved while one of these was
 # the whole roster predates the engines added since, so it reads as "not configured" rather
 # than as a deliberate exclusion. Mirrors `shared-model-refs.js`.
@@ -26,6 +26,7 @@ LEGACY_SHARED_LORA_ENGINE_SETS = (
     ("SD", "iL", "Anima"),
     ("SD", "iL", "Anima", "Flux"),
     ("SD", "iL", "Anima", "Flux", "Flux2"),
+    ("SD", "iL", "Anima", "Flux", "Flux2", "Krea2"),
 )
 _ROOT_ID_PATTERN = re.compile(rf"^[0-9a-f]{{{SHARED_ROOT_ID_LENGTH}}}$")
 

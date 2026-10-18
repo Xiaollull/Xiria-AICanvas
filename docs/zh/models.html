@@ -37,6 +37,7 @@
       <li><a href="#paths">model-paths.json</a></li>
       <li><a href="#catalog">推荐模型浏览器</a></li>
       <li><a href="#file-formats">文件格式</a></li>
+      <li><a href="#moss">MOSS-Image</a></li>
       <li><a href="#quantization">关于量化，说实话</a></li>
     </ul>
   </aside>
@@ -79,7 +80,7 @@
           <tr><td><code>checkpoints/illustrious</code></td><td>Illustrious / Illustrious XL 检查点。必须放在这里，才能选中正确的 SDXL 管道。</td></tr>
           <tr><td><code>loras/sd</code>、<code>loras/illustrious</code></td><td>LoRA 根目录。四个默认分类保持可用，同时自定义文件夹与任意嵌套会被自动发现。</td></tr>
           <tr><td><code>vae</code></td><td>分离式模型管道使用的独立与共享 VAE。</td></tr>
-          <tr><td><code>diffusion_models</code></td><td>Anima、FLUX.1、FLUX.2、Krea 2 及其他分离式扩散权重。全部支持 <code>.safetensors</code>，其中三个引擎另支持 <code>.gguf</code>。</td></tr>
+          <tr><td><code>diffusion_models</code></td><td>Anima、FLUX.1、FLUX.2、Krea 2、MOSS 及其他分离式扩散权重。全部支持 <code>.safetensors</code>，其中三个引擎另支持 <code>.gguf</code>。</td></tr>
           <tr><td><code>text_encoders</code></td><td>分离式模型管道所需的独立文本编码器。</td></tr>
           <tr><td><code>embeddings</code></td><td>为将来的文本反转支持预留。</td></tr>
           <tr><td><code>yolo</code></td><td>用于本地 ADetailer 流程的 Ultralytics <code>.pt</code> 检测或分割模型。社区模型可以放在这里，包括放在子目录中。</td></tr>
@@ -110,6 +111,7 @@
       <li><strong>FLUX.2</strong> —— Klein 9B True V3 的 Safetensors 或 GGUF 版本，以及官方 Klein 9B KV
         单文件版本（受限仓库，需接受许可并提供 Hugging Face Token）。两者都搭配 Qwen 3 8B 文本编码器与 FLUX.2 VAE。</li>
       <li><strong>Krea 2</strong> —— 12B 模型的 Raw 与 Turbo 变体，并可单独选择 4B 文本编码器精度。其 VAE 与 Anima 共用。</li>
+      <li><strong>MOSS</strong> —— 固定版本的 Comfy-Org 重新打包的 MOSS-Image SFT 与 Base（ConvRot INT8 或 BF16），搭配 Qwen3.5 9B INT8 文本编码器；VAE 为 FLUX.2 完整解码器。</li>
       <li><strong>放大模型</strong> —— 重采样单元在缩放与重绘之前可用来放大的 Real-ESRGAN 官方模型。</li>
     </ul>
 
@@ -123,7 +125,7 @@
 
     <h2 id="file-formats">文件格式</h2>
     <p>所有组件都支持 <code>.safetensors</code>。FLUX.1、FLUX.2 与 Krea 2 的全部组件——扩散模型、文本编码器与
-      VAE——还支持 <code>.gguf</code>，某些量化版本只以这种形式发布。Anima 的组件仍然只接受 <code>.safetensors</code>。</p>
+      VAE——还支持 <code>.gguf</code>，某些量化版本只以这种形式发布。Anima 与 MOSS 的组件仍然只接受 <code>.safetensors</code>。</p>
 
     <p>GGUF 扩散模型与 VAE 保留检查点自身的张量命名（ComfyUI-GGUF 的写法），包括它对 ggml 无法容纳的 5 维卷积形状的记录。文本编码器多由
       llama.cpp 发布，它会重命名每个张量；下表中的系列会被改回 ComfyUI 的命名，并且必须与文件声明的架构一致。其他情况按名称拒绝，而不是只加载一部分。</p>
@@ -155,6 +157,36 @@
     </div>
     <p>使用其他布局的文件不会出现在选择器中，而不是先列出再在加载时拒绝。</p>
 
+    <h2 id="moss">MOSS-Image</h2>
+    <p>MOSS-Image（OpenMOSS，Apache-2.0）是一个 5B 单流 DiT。<strong>MOSS</strong> 引擎挂载三个文件：</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>组件</th><th>文件</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>扩散模型</td><td>Comfy-Org 重新打包的 <code>moss_image_sft_int8_convrot_attn.safetensors</code> 及其 Base / BF16 同系文件，或 Hugging Face 原始分片</td><td>SFT 与 Base 按权重而非文件名区分，运行时会报告加载的是哪一个。</td></tr>
+          <tr><td>文本编码器</td><td><code>qwen3.5_9b_int8_convrot.safetensors</code></td><td>只加载语言模型；同一文件中的视觉塔与 MTP 头按精确清单丢弃。</td></tr>
+          <tr><td>VAE</td><td><code>flux2-vae.safetensors</code></td><td>FLUX.2 完整解码器，以 FP32 解码。Hugging Face 包中的小解码器会被拒绝。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Tokenizer 随程序附带，引擎加载时会校验。默认值沿用官方工作流：1024&#215;1024、50 步、CFG 3、shift 5、
+      <code>euler</code> / <code>sgm_uniform</code>、空负面提示词，无条件分支跳过第 22 块。</p>
+    <p><strong>量化。</strong>ConvRot INT8 按存储形式运行（包括整数矩阵乘），INT8 词表永不整体展开。文件中的 INT8 注意力标记会被读取并报告；
+      未安装 comfy-kitchen 时注意力使用 PyTorch SDPA，这与 ComfyUI 在内核不可用时的做法相同。FP8 文件（原始或带 scale、与 BF16 混合）
+      可以读取，但目前还没有发布 MOSS FP8 模型。GGUF、NVFP4、MXFP8 与 INT4 对 MOSS 一律拒绝。</p>
+    <p><strong>LoRA。</strong>标准 DiT LoRA（<code>lora_A/B</code> 或 <code>lora_down/up</code> 加 <code>alpha</code>）与
+      LyCORIS LoKr（完整的 <code>lokr_w1</code>，第二因子为完整矩阵或低秩分解），放在 <code>models/loras/moss</code>；q、k、v
+      目标映射到融合后的投影上。量化层上两者都挂在存储权重旁边，此时该层的矩阵乘法改用全精度，与 ComfyUI 相同。文本编码器
+      LoRA、LoHa、DoRA，以及第一因子被分解或带 Tucker 因子的 LoKr 会被拒绝。</p>
+    <p><strong>坐标布局。</strong>MOSS 也可以用画布上带类型的框组成的布局代替文本提示词。布局编辑器及其发送的内容见
+      <a href="usage.html#moss-layout">MOSS 坐标布局</a>。</p>
+    <p><strong>MOSS 暂不支持：</strong>图生图、USDU、PAG、CFG-Zero* 与标准 SLG。
+      MOSS PNG 中写入的 ComfyUI 工作流需要带 MOSS 核心支持的 ComfyUI（拉取请求 #17095）；官方 MOSS 插件读不了 Comfy-Org 的文件。</p>
+    <div class="note">
+      <span class="label">状态</span>
+      <p>已在 24 GB 的 RTX 3090 上用真实权重测试：SFT INT8 配 Qwen3.5 INT8 编码器，覆盖文生图、Hires、ADetailer、LoRA 与 LoKr——1024&#215;1024、50 步在模型已加载时约 66 秒。BF16 文件与 Base 模型走同一套代码，但尚未用真实权重运行。坐标布局为 1.4 新增，尚未在 GPU 上运行。</p>
+    </div>
+
     <h2 id="quantization">关于量化，说实话</h2>
     <p>发布方提供量化版本时也会一并列出，因此同一个模型可以选择 bf16、fp8、mxfp8、nvfp4、int4/int8 或 GGUF
       Q4-Q8。ComfyUI 的每种量化布局都按 ComfyUI 0.33.0 的方式读取——逐层 <code>comfy_quant</code> 标记或
@@ -163,16 +195,16 @@
 
     <div class="scroller">
       <table>
-        <thead><tr><th>布局</th><th>Krea 2</th><th>FLUX.1 / FLUX.2</th><th>原生内核</th></tr></thead>
+        <thead><tr><th>布局</th><th>Krea 2</th><th>FLUX.1 / FLUX.2</th><th>MOSS</th><th>原生内核</th></tr></thead>
         <tbody>
-          <tr><td>FP8（<code>float8_e4m3fn</code>、<code>float8_e5m2</code>）</td><td>保持 fp8，逐层解码</td><td>加载时展开</td><td>——</td></tr>
-          <tr><td>ConvRot INT8（<code>int8_tensorwise</code> + <code>convrot</code>）</td><td>保持 int8；激活先旋转、逐行量化，再做整数矩阵乘——即 ComfyUI 的 W8A8 路径</td><td>还原旋转后加载时展开</td><td>INT8 张量核心，SM 7.5+</td></tr>
-          <tr><td>INT8（<code>int8_tensorwise</code>，逐张量或逐行）</td><td>保持 int8，W8A8 整数矩阵乘</td><td>加载时展开</td><td>SM 7.5+</td></tr>
-          <tr><td>ConvRot W4A4 INT4（<code>convrot_w4a4</code>）</td><td>保持打包形式；SM 8.x 上为 W4A4，其他为 W4A8，与固定版本的 CUDA 后端一致</td><td>还原旋转后加载时展开</td><td>SM 7.5+</td></tr>
-          <tr><td>MXFP8</td><td>保持 fp8，逐层解码</td><td>加载时展开</td><td>SM 10.0+ 且 PyTorch 2.10+；低于此 ComfyUI 同样解码</td></tr>
-          <tr><td>NVFP4</td><td>保持打包形式，逐层解码</td><td>加载时展开</td><td>SM 10.0+；低于此 ComfyUI 同样解码</td></tr>
-          <tr><td>GGUF</td><td colspan="2">加载时展开，三个组件均可</td><td>——</td></tr>
-          <tr><td>ConvRot W4A8（<code>asym_w4a8_int8</code>）、SVDQuant、ComfyUI-INT8-Fast 缺少 format 的标记</td><td colspan="3">按名称拒绝</td></tr>
+          <tr><td>FP8（<code>float8_e4m3fn</code>、<code>float8_e5m2</code>）</td><td>保持 fp8，逐层解码</td><td>加载时展开</td><td>保持 fp8，带缩放或逐次转换</td><td>——</td></tr>
+          <tr><td>ConvRot INT8（<code>int8_tensorwise</code> + <code>convrot</code>）</td><td>保持 int8；激活先旋转、逐行量化，再做整数矩阵乘——即 ComfyUI 的 W8A8 路径</td><td>还原旋转后加载时展开</td><td>保持 int8，同一条 W8A8 路径；文本编码器的 INT8 嵌入表只对提示词用到的行解码</td><td>INT8 张量核心，SM 7.5+</td></tr>
+          <tr><td>INT8（<code>int8_tensorwise</code>，逐张量或逐行）</td><td>保持 int8，W8A8 整数矩阵乘</td><td>加载时展开</td><td>保持 int8，W8A8</td><td>SM 7.5+</td></tr>
+          <tr><td>ConvRot W4A4 INT4（<code>convrot_w4a4</code>）</td><td>保持打包形式；SM 8.x 上为 W4A4，其他为 W4A8，与固定版本的 CUDA 后端一致</td><td>还原旋转后加载时展开</td><td>拒绝</td><td>SM 7.5+</td></tr>
+          <tr><td>MXFP8</td><td>保持 fp8，逐层解码</td><td>加载时展开</td><td>拒绝</td><td>SM 10.0+ 且 PyTorch 2.10+；低于此 ComfyUI 同样解码</td></tr>
+          <tr><td>NVFP4</td><td>保持打包形式，逐层解码</td><td>加载时展开</td><td>拒绝</td><td>SM 10.0+；低于此 ComfyUI 同样解码</td></tr>
+          <tr><td>GGUF</td><td colspan="2">加载时展开，三个组件均可</td><td>拒绝</td><td>——</td></tr>
+          <tr><td>ConvRot W4A8（<code>asym_w4a8_int8</code>）、SVDQuant、ComfyUI-INT8-Fast 缺少 format 的标记</td><td colspan="4">按名称拒绝</td></tr>
         </tbody>
       </table>
     </div>
@@ -193,6 +225,10 @@
             <td>Krea 2</td>
             <td>就是它存储的大小，适用于上表中的每种布局。权重保持检查点自身的类型，缩放在线性算子内部完成，因此一个 fp8
               扩散模型占用约 12 GB，而不是展开后的 24 GB——这正是能否常驻 24 GB 显卡的分界线——NVFP4 则约为 7 GB。</td>
+          </tr>
+          <tr>
+            <td>MOSS</td>
+            <td>INT8 与 FP8 都是它存储的大小，与 Krea 2 相同：权重保持自身类型，缩放在线性算子内部完成，因此 SFT INT8 扩散模型仍约为 5 GB。文本编码器的 INT8 嵌入表同样不会展开。</td>
           </tr>
           <tr>
             <td>Anima、FLUX.1、FLUX.2</td>

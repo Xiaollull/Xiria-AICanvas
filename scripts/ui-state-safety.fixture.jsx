@@ -35,7 +35,7 @@ window.fetch = async (input, options = {}) => {
     return reply(["SD", "iL"].includes(engine) ? { engine, model_type: "checkpoint", models: choices("checkpoint") } : { engine, model_type: "split", assets: Object.fromEntries(["diffusion_model", "text_encoder", "text_encoder_2", "vae"].map((k, i) => [k, { models: choices(["diffusion", "encoder", "encoder2", "vae"][i]) }])) });
   }
   if (path === "/api/loras") return reply({ engine, categories: [], directory: "fixture-only" });
-  if (path === "/api/inference/health") return reply({ status: "ready", protocol: 39, workspace_id: "fixture", cuda: false, device: "Fixture CPU only", engines: Object.fromEntries(SETTINGS_ENGINES.map(e => [e, { available: true, features: { lora: true } }])), pipeline_configs: { sd: true, sdxl: true }, performance: {}, upscalers: { models: [], builtins: [] }, background_removal: { models: [], builtins: [] } });
+  if (path === "/api/inference/health") return reply({ status: "ready", protocol: 40, workspace_id: "fixture", cuda: false, device: "Fixture CPU only", engines: Object.fromEntries(SETTINGS_ENGINES.map(e => [e, { available: true, features: { lora: true } }])), pipeline_configs: { sd: true, sdxl: true }, performance: {}, upscalers: { models: [], builtins: [] }, background_removal: { models: [], builtins: [] } });
   if (path === "/api/inference/jobs/active") return reply({ job: null });
   if (path === "/api/inference/jobs") return reply({ jobs: [], counts: {} });
   if (path === "/api/lora-relink/state") return reply({ revision: 5 });
@@ -44,7 +44,7 @@ window.fetch = async (input, options = {}) => {
   if (path === "/api/plugins") return reply({ plugins: [], diagnostics: [] });
   if (path === "/api/console") return reply({ entries: [], latest: 0 });
   if (path.includes("history")) return reply({ entries: [], images: [], batches: [] });
-  if (path.endsWith("capabilities")) return reply({ executor_ready: true, max_concurrency: 1, protocol: 39 });
+  if (path.endsWith("capabilities")) return reply({ executor_ready: true, max_concurrency: 1, protocol: 40 });
   if (path.includes("xyz-plots")) return reply({ experiments: [], unreadable: [] });
   return reply({ models: [], builtins: [], available: false, runtime_available: false });
 };

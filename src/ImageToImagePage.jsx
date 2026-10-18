@@ -514,6 +514,7 @@ export default function ImageToImagePage({
     engine: engine.name,
     engineReady: engine.ready,
     serviceReady: engine.serviceReady,
+    imageToImageAvailable: engine.features?.img2img !== false,
     postprocess: {
       hiresReady,
       hiresReason: postprocess.upscalerRuntime === false ? "超分运行环境尚未配置" : chainIssue || "重采样参数未就绪",
@@ -712,7 +713,7 @@ export default function ImageToImagePage({
                 onClick={() => modelPicker.onSelectEngine(item.name)}
               ><span className="seg-name">{item.name}</span><span className="seg-detail">{item.ready ? item.detail : "即将支持"}</span></button>)}
             </div>
-            {["Anima", "Flux", "Flux2", "Krea2"].includes(engine.name) ? <div className={`checkpoint-picker split-model-picker ${modelPicker.error || modelPicker.assets.some((item) => item.missing) ? "error" : ""}`}>
+            {["Anima", "Flux", "Flux2", "Krea2", "MOSS"].includes(engine.name) ? <div className={`checkpoint-picker split-model-picker ${modelPicker.error || modelPicker.assets.some((item) => item.missing) ? "error" : ""}`}>
               <span className="checkpoint-label"><b>模型组件</b><span className="asset-list-actions"><small>{modelPicker.loading ? "扫描中" : `${modelPicker.assets.reduce((total, item) => total + item.options.length, 0)} 个资源`}</small><button type="button" className="asset-refresh" title={`刷新 ${engine.name} 模型组件`} aria-label={`刷新 ${engine.name} 模型组件`} disabled={modelPicker.loading || modelPicker.refreshing || modelPicker.switching} onClick={() => modelPicker.onRefresh()}><RefreshCw className={modelPicker.refreshing ? "spin" : ""} size={13} /></button></span></span>
               {modelPicker.assets.map((asset) => <label className="split-model-field" key={asset.kind}>
                 <span>{asset.label}<small>{modelPicker.loading ? "扫描中" : `${asset.options.length} 个`}</small></span>

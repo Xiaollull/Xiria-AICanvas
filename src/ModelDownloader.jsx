@@ -97,7 +97,7 @@ export default function ModelDownloader({ onDownloaded }) {
 
   const kindOptions = [
     { id: "checkpoint", label: "底模", detail: "Stable Diffusion / Illustrious" },
-    { id: "diffusion_model", label: "扩散模型", detail: "Anima / Flux / Krea 2" },
+    { id: "diffusion_model", label: "扩散模型", detail: "Anima / Flux / Krea 2 / MOSS" },
     { id: "text_encoder", label: "文本编码器", detail: "独立 Text Encoder" },
     { id: "lora", label: "LoRA", detail: "按底模与分类保存" },
     { id: "vae", label: "VAE", detail: "独立 VAE 权重" },
@@ -111,7 +111,7 @@ export default function ModelDownloader({ onDownloaded }) {
   const modelLinks = modelUrls.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
   const requiresEngine = kind === "checkpoint" || kind === "lora";
   const progress = download.totalBytes > 0 ? Math.min(100, download.currentBytes / download.totalBytes * 100) : 0;
-  const enginePathKey = engine === "Anima" ? "anima" : engine === "Flux" ? "flux" : engine === "Flux2" ? "flux2" : engine === "Krea2" ? "krea2" : engine === "iL" ? "illustrious" : "sd";
+  const enginePathKey = engine === "Anima" ? "anima" : engine === "Flux" ? "flux" : engine === "Flux2" ? "flux2" : engine === "Krea2" ? "krea2" : engine === "MOSS" ? "moss" : engine === "iL" ? "illustrious" : "sd";
   const defaultTargetPaths = {
     checkpoint: `models/checkpoints/${enginePathKey}`,
     diffusion_model: "models/diffusion_models",
@@ -243,6 +243,7 @@ export default function ModelDownloader({ onDownloaded }) {
     { id: "anima", badge: "AN", label: "Anima", detail: "Anima 官方模型、衍生模型与共享组件", groups: ["Anima"] },
     { id: "flux", badge: "FX", label: "Flux", detail: "FLUX.2 Klein 系列与量化版本", groups: ["Flux"] },
     { id: "krea-2", badge: "K2", label: "Krea 2", detail: "Krea 2 Raw / Turbo 与文本编码器", groups: ["Krea 2"] },
+    { id: "moss", badge: "MO", label: "MOSS", detail: "MOSS-Image SFT / Base 与 Qwen3.5 文本编码器", groups: ["MOSS"] },
     { id: "upscaler", badge: "4X", label: "超分模型", detail: "Hires.fix 像素预放大模型", groups: ["Upscaler"] },
   ].map((category) => ({ ...category, families: recommended.families.filter((family) => category.groups.includes(family.group)) }));
   const selectedRecommendedCategory = recommendedCategories.find((category) => category.id === recommendedCategoryId);
@@ -420,9 +421,9 @@ export default function ModelDownloader({ onDownloaded }) {
       </section>
       <section className="downloader-card type-card">
         <div className="downloader-section-head"><div><strong>保存类型与目录</strong><small>类型决定可用格式和本地保存位置</small></div></div>
-        <div className="download-kind-grid" role="radiogroup" aria-label="模型类型">{kindOptions.map((item) => <button key={item.id} type="button" role="radio" aria-checked={kind === item.id} className={kind === item.id ? "active" : ""} onClick={() => { setKind(item.id); if (item.id !== "lora" && ["Anima", "Flux", "Flux2"].includes(engine)) setEngine("SD"); }}><strong>{item.label}</strong><small>{item.detail}</small></button>)}</div>
+        <div className="download-kind-grid" role="radiogroup" aria-label="模型类型">{kindOptions.map((item) => <button key={item.id} type="button" role="radio" aria-checked={kind === item.id} className={kind === item.id ? "active" : ""} onClick={() => { setKind(item.id); if (item.id !== "lora" && ["Anima", "Flux", "Flux2", "MOSS"].includes(engine)) setEngine("SD"); }}><strong>{item.label}</strong><small>{item.detail}</small></button>)}</div>
         <div className="download-options">
-          {requiresEngine && <label>兼容底模<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="SD">Stable Diffusion</option><option value="iL">Illustrious / SDXL</option>{kind === "lora" && <option value="Anima">Anima</option>}{kind === "lora" && <option value="Flux">Flux</option>}{kind === "lora" && <option value="Flux2">Flux 2</option>}{kind === "lora" && <option value="Krea2">Krea 2</option>}</select></label>}
+          {requiresEngine && <label>兼容底模<select value={engine} onChange={(event) => setEngine(event.target.value)}><option value="SD">Stable Diffusion</option><option value="iL">Illustrious / SDXL</option>{kind === "lora" && <option value="Anima">Anima</option>}{kind === "lora" && <option value="Flux">Flux</option>}{kind === "lora" && <option value="Flux2">Flux 2</option>}{kind === "lora" && <option value="Krea2">Krea 2</option>}{kind === "lora" && <option value="MOSS">MOSS</option>}</select></label>}
           {kind === "lora" && <label>LoRA 分类<select value={category} onChange={(event) => setCategory(event.target.value)}><option value="character">角色 Character</option><option value="style">风格 Style</option><option value="concept">概念 Concept</option><option value="other">其他 Other</option></select></label>}
           <div className="download-connection-setting">
             <span>下载线程</span>

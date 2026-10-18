@@ -36,7 +36,8 @@ export function xyzAxisValueIssue(field, value, engine) {
     else if (field === 'lora_multiplier') bounded(value, -5, 5);
     else if (STRING_FIELDS.has(field) && typeof value !== 'string') throw new Error('需要文本值；原始值保留');
     else if (field === 'guidance' && !capabilities.engines[engine]?.guidance.includes(value)) throw new Error('当前引擎不支持此引导类型');
-    else if (field === 'sampler' && !capabilities.samplers.includes(value) || field === 'scheduler' && !capabilities.schedulers.includes(value)) throw new Error('未知采样器或调度器');
+    // An engine may narrow the shared vocabulary (MOSS offers only its exact k-diffusion samplers).
+    else if (field === 'sampler' && !(capabilities.engines[engine]?.samplers || capabilities.samplers).includes(value) || field === 'scheduler' && !(capabilities.engines[engine]?.schedulers || capabilities.schedulers).includes(value)) throw new Error('未知采样器或调度器');
     else if (['components','prompt_replace','negative_replace','lora_model','lora_profile'].includes(field) && (typeof value !== 'object' || Array.isArray(value))) throw new Error('未解析 JSON；原文保留，请修复');
     else if (typeof value === 'string' && !value.trim()) throw new Error('待定义');
     return '';

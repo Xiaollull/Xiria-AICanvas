@@ -78,7 +78,7 @@ test("LoRA asset page persists only explicit scoped local edits without overwrit
   // The page lists every engine the mounted library can hold. A hard-coded three once hid every
   // FLUX.1, FLUX.2 and Krea 2 LoRA from it, including ones the workspace already had mounted.
   const { READY_LORA_ENGINES } = await import("../src/lora-model-scope.js");
-  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   assert.match(page, /const ENGINES = READY_LORA_ENGINES;/);
   assert.match(page, /useState\(\(\) => Object\.fromEntries\(ENGINES\.map\(\(engine\) => \[engine, null\]\)\)\)/);
   assert.doesNotMatch(page, /SD、iL 与 Anima|SD \+ iL \+ Anima/);

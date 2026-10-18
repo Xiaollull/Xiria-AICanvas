@@ -3,7 +3,7 @@ import { ChevronDown, ChevronUp, Plus, Trash2, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useDialogLifecycle } from "./gallery-core.js";
 import WorkspaceSelect from "./WorkspaceSelect.jsx";
-import { groupXYZProfile, xyzAxisOptions, decimalRangeValues } from "./xyz-draft.js";
+import { XYZ_CAPABILITIES, groupXYZProfile, xyzAxisOptions, decimalRangeValues } from "./xyz-draft.js";
 import { xyzExpectedValues } from './xyz-editor-source.js';
 import XYZAxisLoraPicker from './XYZAxisLoraPicker.jsx';
 import { xyzAxisValueIssue } from './xyz-local-validation.js';
@@ -136,7 +136,9 @@ function AxisValue({ axisKey, field, entry, index, last, draft, componentChoices
   const isObjectValue = value && typeof value === "object" && !Array.isArray(value);
 
   const modelField = ["checkpoint", "diffusion_model", "text_encoder", "text_encoder_2", "vae"].includes(field);
-  const choices = modelField ? componentChoices[field] || [] : field === "sampler" ? SAMPLER_NAMES.map((item) => ({ value: item, label: item }))
+  // MOSS narrows the sampler vocabulary in the shared capabilities; the other engines keep the full list.
+  const engineSamplers = XYZ_CAPABILITIES.engines[draft.engine]?.samplers || SAMPLER_NAMES;
+  const choices = modelField ? componentChoices[field] || [] : field === "sampler" ? engineSamplers.map((item) => ({ value: item, label: item }))
       : field === "scheduler" ? SCHEDULER_NAMES.map((item) => ({ value: item, label: item }))
         : field === "guidance" ? (draft.engine && (draft.engine === "SD" || draft.engine === "iL" ? ["none", "pag"] : draft.engine === "Anima" ? ["none", "pag", "cfg_zero_star"] : draft.engine === "Krea2" ? ["none", "cfg_zero_star"] : ["none"]))
           .map((item) => xyzGuidanceOption(runtimeGuidance, draft.engine, item, GUIDANCE_LABELS[item] || item)) : [];

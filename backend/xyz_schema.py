@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
-Engine = Literal['SD', 'iL', 'Anima', 'Flux', 'Flux2', 'Krea2']
+Engine = Literal['SD', 'iL', 'Anima', 'Flux', 'Flux2', 'Krea2', 'MOSS']
 
 
 class Contract(BaseModel):
@@ -51,6 +51,8 @@ class GenerationParameters(Contract):
     output_template: str | None = None
     background_removal_model: str | None = None
     postprocess_chain: list[dict[str, Any]] = Field(default_factory=list)
+    # MOSS only (GenerateInput.moss); frozen into every cell, never an axis in this release.
+    moss: dict[str, Any] | None = None
 
 
 class Baseline(Contract):

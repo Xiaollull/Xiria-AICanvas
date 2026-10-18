@@ -41,4 +41,4 @@ window.__appFetch = async (url, method, body) => {
   return result;
 };
 const fetchBase = window.fetch;
-window.fetch = async (input, options) => String(input).endsWith('/api/inference/xyz-plots/capabilities') ? response({ executor_ready: true, max_concurrency: 6, protocol: 39 }) : fetchBase(input, options);
+window.fetch = async (input, options) => String(input).endsWith('/api/inference/xyz-plots/capabilities') ? response({ executor_ready: true, max_concurrency: 6, protocol: 40 }) : fetchBase(input, options);

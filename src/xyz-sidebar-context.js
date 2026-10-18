@@ -3,6 +3,7 @@ import { validXYZSeed } from "./xyz-axis-editor.js";
 import { inspectMountedLoras } from "./lora-state.js";
 import { inspectLoraIdentity } from "./lora-identity.js";
 import { captureXYZPromptSource } from "./xyz-prompt-source.js";
+import { mossRequestFields } from "./moss-engine.js";
 
 /** UI adapters only. Never normalize a saved draft, rebind an identity, or write Basic. */
 export function xyzCatalogChoices(payload) {
@@ -22,6 +23,8 @@ export function xyzBaselineFromSettings(engine, settings, { mounts, groups, grou
     seed: String(settings.seed), sampler: settings.sampler, scheduler: settings.scheduler, guidance: settings.guidance,
     pag: { scale: settings.pag?.scale ?? 0.3, applied_layers: settings.pag?.appliedLayers ?? "mid" },
     postprocess_chain: chainPayload, background_removal_model: backgroundRemovalModel, ...clipPayload, ...output,
+    // MOSS freezes its versioned sampling block into the baseline; other engines carry none.
+    ...mossRequestFields(engine, settings.mossSampling),
    }, seed_mode: settings.seedMode === "random" ? "random" : "fixed", seed_source:{schema_version:1,mode:settings.seedMode}, loras: mounts, group_snapshots: groups,
     prompt_without_groups: composePrompt("positive", settings.positive, settings.activePromptPresets, ""), group_prompt: groupPrompt, library_revision: libraryRevision });
   return promptRecords ? captureXYZPromptSource(baseline, { positive: settings.positive, negative: settings.negative, active: settings.activePromptPresets, records: promptRecords }) : baseline;

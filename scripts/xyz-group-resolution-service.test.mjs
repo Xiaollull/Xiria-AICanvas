@@ -188,7 +188,7 @@ test("G02 every ready engine resolves its own legacy local group and refuses the
   const base = `http://127.0.0.1:${server.address().port}`, realFetch = globalThis.fetch;
   globalThis.fetch = (url, init) => realFetch(typeof url === "string" && url.startsWith("/") ? base + url : url, init);
   try {
-    assert.equal(READY_LORA_ENGINES.length, 6);
+    assert.equal(READY_LORA_ENGINES.length, 7);
     for (const engine of READY_LORA_ENGINES) {
       const source = group(`g-${engine}`, ["one", "two"].map((name, index) => legacy(`style/${engine}-${name}.safetensors`, `${engine} ${name}`, { weight: index ? -0.25 : 0.8137, precision: index ? 2 : 4, enabled: index === 0 })));
       const own = projectResolvedGroup(source, await resolveGroupMembers(engine, source, { resolve: resolveLoraReferences }));

@@ -51,6 +51,7 @@ import { ANIMA_RUNTIME_ARTIFACTS, animaRuntimeArtifactStatuses, bundledAnimaToke
 import { discoverFluxModels } from "./scripts/flux-models.mjs";
 import { discoverFlux2Models } from "./scripts/flux2-models.mjs";
 import { discoverKrea2Models } from "./scripts/krea2-models.mjs";
+import { MOSS_RUNTIME_ARTIFACTS, bundledMossTokenizerDirectory, discoverMossModels, mossRuntimeArtifactStatuses } from "./scripts/moss-models.mjs";
 import { createConfiguratorHandoff } from "./scripts/configurator-handoff.mjs";
 import { guardedInferenceResponse, inferenceIdentityGate } from "./scripts/inference-identity-gate.mjs";
 import { wd14Admission } from "./scripts/wd14-access.mjs";
@@ -136,8 +137,8 @@ const diffusionModelExtensions = new Set([...checkpointExtensions, ".gguf"]);
 const checkpointEnginePathKeys = { SD: "sd", iL: "illustrious" };
 // The two native engines accept only .safetensors LoRAs: their fusion reads tensors directly
 // rather than through a pickle loader.
-const nativeEngines = new Set(["Anima", "Flux", "Flux2", "Krea2"]);
-const loraEnginePathKeys = { SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2" };
+const nativeEngines = new Set(["Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
+const loraEnginePathKeys = { SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2", MOSS: "moss" };
 const loraCategories = defaultLoraCategories;
 const downloadableModelKinds = new Set(["checkpoint", "diffusion_model", "text_encoder", "lora", "vae", "yolo", "upscaler", "embedding", "config"]);
 const downloadableModelExtensions = {
@@ -236,7 +237,7 @@ const loraPreviewRequests = new Map();
 const workspaceId = createHash("sha256")
   .update(process.platform === "win32" ? path.normalize(projectRoot).toLowerCase() : path.normalize(projectRoot))
   .digest("hex");
-const inferenceProtocol = 39;
+const inferenceProtocol = 40;
 // Per-process proof that the WD14 request passed this Node server's Origin and
 // loopback gates. Not a user credential; never accept a client-supplied proof.
 const wd14ProxyProof = randomBytes(32).toString("hex");
@@ -2136,7 +2137,7 @@ const loraRelinkService = new LoraRelinkService({ stateDirectory, projectRoot, g
     catch { throw Object.assign(new Error("Inference owner unavailable; repair cannot safely admit a commit"), { statusCode: 503 }); }
     if (!result.ok) throw Object.assign(new Error(result.status === 409 ? "活动、排队或恢复中的任务阻止确认；草稿可保留。" : "Inference owner must support the current LoRA admission gate before repair"), { statusCode: result.status === 409 ? 409 : 503 });
     const payload = await result.json();
-    if (payload.idle !== true || payload.protocol !== 39) throw Object.assign(new Error("Inference admission/protocol mismatch"), { statusCode: 503 });
+    if (payload.idle !== true || payload.protocol !== inferenceProtocol) throw Object.assign(new Error("Inference admission/protocol mismatch"), { statusCode: 503 });
   },
 });
 const loraPublishedStore = new LoraPublishedStore({ stateDirectory, ensureRecovered: () => loraRelinkService.ensureRecovered() });
@@ -4835,7 +4836,7 @@ async function buildModelCatalogs() {
   try {
     const directory = await getAuxiliaryModelDirectory("diffusion_models");
     const relative = path.relative(projectRoot, directory).split(path.sep).join("/");
-    const discoveries = [["Anima", discoverAnimaModels], ["Flux", discoverFluxModels], ["Flux2", discoverFlux2Models], ["Krea2", discoverKrea2Models]];
+    const discoveries = [["Anima", discoverAnimaModels], ["Flux", discoverFluxModels], ["Flux2", discoverFlux2Models], ["Krea2", discoverKrea2Models], ["MOSS", discoverMossModels]];
     // Scanned together, claimed in a fixed order, so a file two engines would both accept always
     // lands on the same one rather than on whichever scan finished first.
     const scanned = await Promise.all(discoveries.map(([, discover]) => discover({ diffusion_model: directory })
@@ -5348,6 +5349,40 @@ async function modelApi(request, response, next) {
           qwen_tokenizer: {
             ...runtimeStatuses.qwen_tokenizer,
             path: path.posix.join(relativeDirectory(tokenizerDirectory), ANIMA_RUNTIME_ARTIFACTS.qwen_tokenizer.filename),
+          },
+        },
+      }));
+      return;
+    }
+    if (!isLoraRequest && engine === "MOSS") {
+      // MOSS-Image mounts three files: the 42-block DiT, Qwen3.5-9B and the FLUX.2 full-decoder VAE.
+      // Its tokenizer is the one new bundled resource: the Comfy-Org repackage ships none.
+      const [diffusionDirectory, textEncoderDirectory, vaeDirectory] = await Promise.all([
+        getAuxiliaryModelDirectory("diffusion_models"),
+        getAuxiliaryModelDirectory("text_encoders"),
+        getAuxiliaryModelDirectory("vae"),
+      ]);
+      const discovered = await discoverMossModels({
+        diffusion_model: diffusionDirectory,
+        text_encoder: textEncoderDirectory,
+        vae: vaeDirectory,
+      });
+      const relativeDirectory = (directory) => path.relative(projectRoot, directory).split(path.sep).join("/");
+      const tokenizerDirectory = bundledMossTokenizerDirectory(projectRoot);
+      const runtimeStatuses = await mossRuntimeArtifactStatuses(tokenizerDirectory, cachedRecommendedFileHash);
+      response.statusCode = 200;
+      response.end(JSON.stringify({
+        engine: "MOSS",
+        model_type: "split",
+        assets: {
+          diffusion_model: { directory: relativeDirectory(diffusionDirectory), models: discovered.diffusion_model },
+          text_encoder: { directory: relativeDirectory(textEncoderDirectory), models: discovered.text_encoder },
+          vae: { directory: relativeDirectory(vaeDirectory), models: discovered.vae },
+        },
+        runtime: {
+          qwen35_tokenizer: {
+            ...runtimeStatuses.qwen35_tokenizer,
+            path: path.posix.join(relativeDirectory(tokenizerDirectory), MOSS_RUNTIME_ARTIFACTS.qwen35_tokenizer.filename),
           },
         },
       }));

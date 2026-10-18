@@ -8,6 +8,9 @@ LICENSE text eol=lf
 # The bundled XYZ-export font travels with its OFL text; both stay byte-identical to the recorded hashes.
 *.otf binary
 backend/resources/fonts/*.txt text eol=lf
+# The MOSS tokenizer is verified by the SHA-256 of its gzip and of the decompressed upstream file.
+*.gz binary
+backend/resources/moss-tokenizers/*.txt text eol=lf
 
 *.css text eol=lf
 *.html text eol=lf

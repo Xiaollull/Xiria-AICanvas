@@ -17,7 +17,7 @@ const REQUIRED_MODEL_MANIFESTS = [
   "models/yolo-models.json",
   "models/background-removal-models.json",
 ];
-const INFERENCE_PROTOCOL = 39;
+const INFERENCE_PROTOCOL = 40;
 
 // The updater that applies an update is the *previous* release's code, loaded when its server
 // started. Validating the new tree in that process judged it by the old release's constants: every

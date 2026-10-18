@@ -21,7 +21,7 @@
   <a href="LICENSE"><img alt="许可证：AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-6a55e6"></a>
 </p>
 
-XiriaCanvas AI 是一款本地运行的图像生成界面，支持 Stable Diffusion、Illustrious，以及原生 Anima、FLUX.1、FLUX.2 与 Krea 2 引擎。同一套源代码同时支持 Windows 与 Linux。项目在运行时不依赖 ComfyUI 或 Stable Diffusion WebUI。
+XiriaCanvas AI 是一款本地运行的图像生成界面，支持 Stable Diffusion、Illustrious，以及原生 Anima、FLUX.1、FLUX.2、Krea 2 与 MOSS 引擎。同一套源代码同时支持 Windows 与 Linux。项目在运行时不依赖 ComfyUI 或 Stable Diffusion WebUI。
 
 ## 引擎
 
@@ -33,6 +33,7 @@ XiriaCanvas AI 是一款本地运行的图像生成界面，支持 Stable Diffus
 | **Flux** | FLUX.1，蒸馏引导 | 扩散模型 + CLIP-L + T5-XXL + VAE |
 | **Flux2** | FLUX.2，大模型引导 | 扩散模型 + 文本编码器 + VAE |
 | **Krea2** | Krea 2 单流 DiT | 扩散模型 + 文本编码器 + VAE |
+| **MOSS** | MOSS-Image 单流 DiT，Qwen3.5 编码器；ConvRot INT8，坐标框布局 | 扩散模型 + 文本编码器 + VAE |
 
 ## 快速开始
 
@@ -51,7 +52,7 @@ Windows 用户可双击 `Setup-XirAI.bat`，随后双击 `Start-XirAI.bat`；Lin
 
 - [安装](https://xiaollull.github.io/Xiria-AICanvas/zh/setup.html) —— 环境要求、安装向导、GPU 与 PyTorch 选择、网络策略、命令行参考。
 - [模型](https://xiaollull.github.io/Xiria-AICanvas/zh/models.html) —— 文件放在哪里、推荐模型浏览器、文件格式与量化。
-- [生成图像](https://xiaollull.github.io/Xiria-AICanvas/zh/usage.html) —— 提示词权重、引导、采样器、批次、图像工作区。
+- [生成图像](https://xiaollull.github.io/Xiria-AICanvas/zh/usage.html) —— 提示词权重、MOSS 坐标布局、引导、采样器、批次、图像工作区。
 - [运行与更新](https://xiaollull.github.io/Xiria-AICanvas/zh/runtime.html) —— 配置、显存模式、下载、程序更新。
 
 故障排查、量化支持矩阵、发布流程以及开发与 CI 说明放在 [Wiki](https://github.com/Xiaollull/Xiria-AICanvas/wiki)。

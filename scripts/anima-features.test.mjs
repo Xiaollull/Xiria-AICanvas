@@ -42,7 +42,9 @@ test("Anima workspace restore and generation preserve supported feature settings
 
   assert.match(generate, /const submittedSettings = JSON\.parse\(JSON\.stringify\(\{[\s\S]*?guidance: distilledGeneration \? "none" : guidance,\s+postprocessChain,/);
   assert.match(generate, /postprocess_chain: resampleChainPayload\(postprocessChain, \{ engine: model \}\)/);
-  assert.match(generate, /scheduler: nativeGeneration && !ANIMA_SCHEDULERS\.includes\(scheduler\) \? "simple" : scheduler,\s+guidance: distilledGeneration \? "none" : guidance,\s+pag:/);
+  // MOSS narrows the vocabulary to its own samplers, sends no guidance mode and adds its sampling block
+  // (protocol 40); every other native engine keeps the shared normalisation.
+  assert.match(generate, /scheduler: mossGeneration \? mossSchedulerFor\(scheduler\) : nativeGeneration && !ANIMA_SCHEDULERS\.includes\(scheduler\) \? "simple" : scheduler,\s+guidance: distilledGeneration \|\| mossGeneration \? "none" : guidance,\s+\/\/ Protocol 40:[^\n]*\n\s+\.\.\.mossRequestFields\(model, mossSampling\),\s+\/\/[^\n]*\n\s+\.\.\.\(generationLayout \? \{ moss_layout: mossLayoutPayload\(generationLayout, generationLayoutPrefix\) \} : \{\}\),\s+pag:/);
   assert.match(app, /import \{ SAMPLER_NAMES as samplerNames, SCHEDULER_NAMES as schedulerNames \} from "\.\/sampling-options"/);
   assert.match(app, /const ANIMA_SAMPLERS = samplerNames/);
   assert.match(app, /const ANIMA_SCHEDULERS = schedulerNames/);
@@ -246,7 +248,7 @@ test("Anima LoRA discovery, gallery apply, and downloader avoid engine-specific 
   assert.doesNotMatch(applyGallery, /normalized\.model === "Anima" \? \[\]/);
   assert.doesNotMatch(applyGallery, /set(?:Hires|ADetailer|Rtx)\([\s\S]*?enabled: false/);
 
-  assert.match(downloader, /engine === "Anima" \? "anima" : engine === "Flux" \? "flux" : engine === "Flux2" \? "flux2" : engine === "Krea2" \? "krea2" : engine === "iL" \? "illustrious" : "sd"/);
+  assert.match(downloader, /engine === "Anima" \? "anima" : engine === "Flux" \? "flux" : engine === "Flux2" \? "flux2" : engine === "Krea2" \? "krea2" : engine === "MOSS" \? "moss" : engine === "iL" \? "illustrious" : "sd"/);
   assert.match(downloader, /kind === "lora" && <option value="Anima">Anima<\/option>/);
   assert.match(downloader, /modelPaths\?\.loras\?\.\[enginePathKey\]/);
 });

@@ -48,7 +48,7 @@ OUTPUT_TEMPLATE_PLACEHOLDERS = {
     "hour": "时 HH（24 小时）",
     "minute": "分 mm",
     "second": "秒 ss",
-    "engine": "引擎（SD、iL、Anima、Flux、Flux2、Krea2）",
+    "engine": "引擎（SD、iL、Anima、Flux、Flux2、Krea2、MOSS）",
 }
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 _FORBIDDEN_CHARACTERS = frozenset('<>:"/\\|?*')

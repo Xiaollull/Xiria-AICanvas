@@ -6,7 +6,7 @@ import { loraFileLabel } from "./lora-folders.js";
 // folder cards first, then the files directly inside). Rendering them once keeps the two surfaces
 // from drifting — the reason `LoraMountPanel` is shared as well.
 
-export const LORA_ENGINE_LABELS = Object.freeze({ SD: "SD", iL: "iL", Anima: "Anima", Flux: "FLUX.1", Flux2: "FLUX.2", Krea2: "Krea 2" });
+export const LORA_ENGINE_LABELS = Object.freeze({ SD: "SD", iL: "iL", Anima: "Anima", Flux: "FLUX.1", Flux2: "FLUX.2", Krea2: "Krea 2", MOSS: "MOSS" });
 
 export function LoraEngineBar({ engines, engine, blockedReason = "", onSelectEngine, pathValue, onPathChange, onLocate, busy = false, independent = false, placeholder = "粘贴或输入 LoRA 文件夹路径，例如 models/loras/illustrious/style" }) {
   return <div className="lora-engine-bar">

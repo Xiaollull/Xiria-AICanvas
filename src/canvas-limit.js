@@ -15,7 +15,7 @@ export const HARD_CANVAS_MAX_EDGE = 8192;
 export const CANVAS_BOUND_STEP = 64;
 export const CANVAS_BOUND_PRESETS = Object.freeze([1024, 2048, 3072, 4096, 6144, 8192]);
 // Each native runtime refuses a canvas past its own edge; SD/iL go to the ceiling.
-const ENGINE_CANVAS_CEILING = Object.freeze({ SD: 8192, iL: 8192, Anima: 4096, Flux: 4096, Flux2: 4096, Krea2: 4096 });
+const ENGINE_CANVAS_CEILING = Object.freeze({ SD: 8192, iL: 8192, Anima: 4096, Flux: 4096, Flux2: 4096, Krea2: 4096, MOSS: 4096 });
 
 /**
  * A stored or typed bound, and whether it had to be repaired.

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>XiriaCanvas AI — 文档</title>
-<meta name="description" content="XiriaCanvas AI 使用文档：本地运行的图像生成界面，支持 Stable Diffusion、Illustrious 以及原生 Anima、FLUX.1、FLUX.2 与 Krea 2 引擎。">
+<meta name="description" content="XiriaCanvas AI 使用文档：本地运行的图像生成界面，支持 Stable Diffusion、Illustrious 以及原生 Anima、FLUX.1、FLUX.2、Krea 2 与 MOSS-Image 引擎。">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="../assets/docs.css">
 </head>
@@ -120,12 +120,12 @@
         </article>
         <article class="native-engine">
           <span class="engine-type">分体模型</span>
-          <h3>Anima <i>/</i> FLUX.1 <i>/</i> FLUX.2 <i>/</i> Krea 2</h3>
+          <h3>Anima <i>/</i> FLUX.1 <i>/</i> FLUX.2 <i>/</i> Krea 2 <i>/</i> MOSS</h3>
           <p>独立挂载扩散权重、文本编码器与 VAE；FLUX.1 使用两个编码器。</p>
           <a href="models.html#file-formats">查看格式与量化 <span aria-hidden="true">→</span></a>
         </article>
       </div>
-      <p class="engine-note">PAG：SD、iL、Anima · CFG-Zero*：Anima、Krea 2 · 负面提示词：除 FLUX.1 与 FLUX.2 外全部引擎</p>
+      <p class="engine-note">PAG：SD、iL、Anima · CFG-Zero*：Anima、Krea 2 · 负面提示词：除 FLUX.1 与 FLUX.2 外全部引擎 · 负向分支跳层与坐标框布局：MOSS</p>
     </section>
 
     <section class="home-section manual" id="next" aria-labelledby="manual-title">
@@ -146,7 +146,7 @@
         </a>
         <a class="manual-card" href="usage.html">
           <span>03</span><h3>生成</h3>
-          <p>提示词、引导、采样器、批次与图像工作区。</p>
+          <p>提示词、MOSS 布局、引导、采样器、批次与图像工作区。</p>
         </a>
         <a class="manual-card" href="runtime.html">
           <span>04</span><h3>运行</h3>

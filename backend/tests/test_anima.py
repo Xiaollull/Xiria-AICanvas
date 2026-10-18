@@ -325,7 +325,7 @@ class AnimaPathAndHealthTests(unittest.TestCase):
         with patch.object(inference_server, "anima_health_fields", return_value=anima):
             health = inference_server.health()
         self.assertEqual(health["protocol"], inference_server.INFERENCE_PROTOCOL)
-        self.assertEqual(health["protocol"], 39)
+        self.assertEqual(health["protocol"], 40)
         self.assertEqual(health["engines"]["Anima"], anima)
         self.assertEqual(health["guidance"]["pag"]["engines"], ["SD", "iL", "Anima"])
         self.assertEqual(

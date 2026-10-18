@@ -97,8 +97,8 @@ class SharedRootConfigTests(unittest.TestCase):
         self.assertEqual([root["id"] for root in roots], ["95746e6dad38", "5dff1a102833"])
         self.assertFalse(roots[0]["enabled"])
         self.assertEqual(roots[0]["engines"], ["SD"])
-        # An unset list is every engine, which now includes both Flux generations and Krea 2.
-        self.assertEqual(roots[1]["engines"], ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"])
+        # An unset list is every engine, which now includes both Flux generations, Krea 2 and MOSS.
+        self.assertEqual(roots[1]["engines"], ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"])
 
     def test_invalid_config_shapes_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

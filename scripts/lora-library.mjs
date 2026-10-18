@@ -7,7 +7,7 @@ import { rankRepairRows, scanCovers } from "./lora-repair-ranking.mjs";
 
 export const LIBRARY_SCHEMA = 1;
 const engines = new Set(READY_LORA_ENGINES);
-const native = new Set(["Anima", "Flux", "Flux2", "Krea2"]);
+const native = new Set(["Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
 const legacyExtensions = new Set([".safetensors", ".ckpt", ".pt", ".pth"]);
 export const libraryError = (message, statusCode = 409) => Object.assign(new Error(message), { statusCode });
 export function emptyLoraRegistry() { return { schemaVersion: LIBRARY_SCHEMA, revision: 0, instances: {}, substitutions: [] }; }

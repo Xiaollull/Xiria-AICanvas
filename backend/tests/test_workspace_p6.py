@@ -243,8 +243,9 @@ class GenerateInputP6Tests(unittest.TestCase):
             vae="v.safetensors", sampler="euler", scheduler="simple", **overrides,
         )
 
-    def test_protocol_is_39(self):
-        self.assertEqual(self.server.INFERENCE_PROTOCOL, 39)
+    def test_protocol_is_40(self):
+        # 40: the seventh engine (MOSS) and its versioned `moss` sampling block (QPlan2/MOSS/P1).
+        self.assertEqual(self.server.INFERENCE_PROTOCOL, 40)
 
     def test_clip_skip_defaults_and_ranges(self):
         self.assertEqual(self.server.effective_clip_skip(self.request()), 1)

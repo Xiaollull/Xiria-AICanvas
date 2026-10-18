@@ -76,8 +76,8 @@ __all__ = [
     "COMFY_QUANT_SUFFIX", "FP4_E2M1_VALUES", "MXFP8_GROUP_SIZE", "NVFP4_GROUP_SIZE",
     "QuantizedLinear", "UnsupportedQuantization", "apply_quantized_linears", "checkpoint_runtime_bytes",
     "combine_lora_adapters", "dequantize_mxfp8", "dequantize_nvfp4", "dequantize_scalar_scale",
-    "expand_quantized_layers", "logical_shape_view", "quantized_state_dict", "quantized_weight_bytes",
-    "scan_quantized_layers",
+    "expand_quantized_layers", "kron_adapter_output", "logical_shape_view", "quantized_state_dict",
+    "quantized_weight_bytes", "scan_quantized_layers",
 ]
 
 # The two spellings of a per-tensor scale. ComfyUI's own repackages write the first; the Krea 2
@@ -482,9 +482,20 @@ class QuantizedLinear(nn.Linear):
         self.register_buffer("lora_down", down)
         self.register_buffer("lora_up", up)
 
+    def set_kron_adapters(self, terms) -> None:
+        """Carry LoKr products beside the quantised weight: ``[(w1, w2, row_offset), ...]``.
+
+        A full-matrix LoKr delta ``w1 ⊗ w2`` is as large as the weight, so it is neither a rank-sized
+        pair nor something to round into the stored weight. :func:`kron_adapter_output` applies each
+        product against the sequence instead; the scale and multiplier are already in ``w1``. A
+        product may cover a row slice (one of a fused qkv's q/k/v), which ``row_offset`` places.
+        Like a LoRA adapter, it moves an integer layer's base matmul to full precision.
+        """
+        self.kron_terms = _register_kron_terms(self, terms)
+
     @property
     def has_lora_adapter(self) -> bool:
-        return getattr(self, "lora_down", None) is not None
+        return getattr(self, "lora_down", None) is not None or bool(getattr(self, "kron_terms", ()))
 
     @property
     def uses_integer_matmul(self) -> bool:
@@ -515,9 +526,9 @@ class QuantizedLinear(nn.Linear):
                 )
         else:
             out = F.linear(input, self.dequantized_weight(input.dtype), self.bias)
-        if self.has_lora_adapter:
+        if getattr(self, "lora_down", None) is not None:
             out = out + F.linear(F.linear(input, self.lora_down.to(input.dtype)), self.lora_up.to(input.dtype))
-        return out
+        return add_kron_terms(self, out, input)
 
     def extra_repr(self) -> str:
         return (
@@ -693,6 +704,50 @@ def combine_lora_adapters(adapters, dtype: torch.dtype):
         downs.append(down.to(dtype=torch.float32) * float(multiplier))
         ups.append(up.to(dtype=torch.float32))
     return torch.cat(downs, dim=0).to(dtype), torch.cat(ups, dim=1).to(dtype)
+
+
+def kron_adapter_output(input: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """``x (w1 ⊗ w2)^T`` without forming the Kronecker product.
+
+    Read each row of ``x`` (``in = b·d``) as a ``b × d`` matrix ``X``; then ``(w1 ⊗ w2) vec(X)`` is
+    ``vec(w1 X w2^T)``, in the row-major order :func:`torch.kron` uses. Two small matmuls against
+    the sequence replace one against an ``(a·c) × (b·d)`` matrix the size of the layer's weight.
+    """
+    a, b = w1.shape
+    c, d = w2.shape
+    rows = input.reshape(-1, b, d)
+    return torch.matmul(w1, torch.matmul(rows, w2.t())).reshape(*input.shape[:-1], a * c)
+
+
+def _register_kron_terms(module: nn.Module, terms) -> tuple[tuple[int, int], ...]:
+    """Validate ``(w1, w2, row_offset)`` products against ``module`` and keep them as buffers."""
+    placed = []
+    for index, (w1, w2, offset) in enumerate(terms):
+        if w1.ndim != 2 or w2.ndim != 2:
+            raise ValueError("LoKr factors must be 2-D")
+        rows, cols = w1.shape[0] * w2.shape[0], w1.shape[1] * w2.shape[1]
+        offset = int(offset)
+        if cols != module.in_features or offset < 0 or offset + rows > module.out_features:
+            raise ValueError(
+                f"LoKr product {rows}x{cols} at row {offset} does not fit a "
+                f"{module.out_features}x{module.in_features} linear"
+            )
+        module.register_buffer(f"kron_w1_{index}", w1)
+        module.register_buffer(f"kron_w2_{index}", w2)
+        placed.append((rows, offset))
+    return tuple(placed)
+
+
+def add_kron_terms(module: nn.Module, out: torch.Tensor, input: torch.Tensor) -> torch.Tensor:
+    """``out`` plus every LoKr product ``module`` carries, each on its own rows."""
+    for index, (rows, offset) in enumerate(getattr(module, "kron_terms", ())):
+        delta = kron_adapter_output(
+            input, getattr(module, f"kron_w1_{index}").to(input.dtype), getattr(module, f"kron_w2_{index}").to(input.dtype)
+        )
+        if rows != module.out_features:
+            delta = F.pad(delta, (offset, module.out_features - offset - rows))
+        out = out + delta
+    return out
 
 
 def quantized_weight_bytes(spec: QuantizedLayer, state_dict: Mapping[str, torch.Tensor]) -> int:

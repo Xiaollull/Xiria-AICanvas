@@ -34,7 +34,7 @@ test("opener reports spawn failure and refuses shell/protocol injection without 
   for (const url of ["file:///x", "http://localhost/&bad", 'http://localhost/"bad']) assert.throws(() => browserUrlCommand(url));
 });
 test("ready owner predicate denies unready, foreign workspace/protocol and malformed health", () => {
-  const good = { status: "ready", protocol: 39, workspace_id: "fixture" };
+  const good = { status: "ready", protocol: 40, workspace_id: "fixture" };
   assert.equal(isApplicationReady(good, "fixture"), true);
   assert.equal(startupDisposition(good, "fixture"), "reuse");
   for (const health of [{ ...good, status: "loading" }, { ...good, protocol: 38 }, { ...good, workspace_id: "foreign" }, {}]) {
@@ -68,11 +68,11 @@ test("actual launcher control flow reuses healthy service once and refuses forei
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const script = source.replace(/^import .*;\r?\n/gm, '').replaceAll('import.meta.url', JSON.stringify(new URL('./start.mjs', import.meta.url).href));
   for (const [health, flags, busy, expectedCode, expectedOpen] of [
-    [{status:'ready',protocol:39,workspace_id:'owned'},[],false,0,1],
-    [{status:'ready',protocol:39,workspace_id:'owned'},['--no-open','--exit-after-ready'],false,0,0],
-    [{status:'loading',protocol:39,workspace_id:'owned'},[],false,1,0],
+    [{status:'ready',protocol:40,workspace_id:'owned'},[],false,0,1],
+    [{status:'ready',protocol:40,workspace_id:'owned'},['--no-open','--exit-after-ready'],false,0,0],
+    [{status:'loading',protocol:40,workspace_id:'owned'},[],false,1,0],
     [{status:'ready',protocol:38,workspace_id:'owned'},[],false,1,0],
-    [{status:'ready',protocol:39,workspace_id:'foreign'},[],false,1,0],
+    [{status:'ready',protocol:40,workspace_id:'foreign'},[],false,1,0],
     [null,[],true,1,0],
   ]) {
     const events = [], exit = Object.assign(Error('controlled exit'), { controlled: true });
@@ -81,7 +81,7 @@ test("actual launcher control flow reuses healthy service once and refuses forei
       createHash: () => ({ update: () => ({ digest: () => 'owned' }) }), path, fileURLToPath,
       process: { argv: flags, env: { WEB_PORT: '18999', INFERENCE_PORT: '18998', XIRAI_STATE_DIR: 'scratch' }, platform: 'win32', versions: { node: '24.18.0' }, exit: code => { events.push({exit:code}); throw exit; } },
       loadLocalEnv: () => ({}), createHttpFetch: () => async () => ({ ok: !!health, json: async () => health }),
-      startupDisposition, APPLICATION_PROTOCOL: 39, openBrowser: url => events.push({url}),
+      startupDisposition, APPLICATION_PROTOCOL: 40, openBrowser: url => events.push({url}),
       assertStartupPortsFree: async ports => { events.push({ports}); if(busy) throw Error('owned fixture port busy; no kill'); },
       writeDiagnosticLog: (_root, entry) => events.push({diagnostic:entry.message}),
       console: { log() {}, error() {} }, AbortController, setTimeout, clearTimeout,
@@ -96,7 +96,7 @@ test("actual launcher control flow reuses healthy service once and refuses forei
 test("actual Setup return wait requires ready/protocol/workspace and redirects this tab only", async () => {
   const part = html.slice(html.indexOf('async function waitForApplication()'), html.indexOf('async function closeConfigurator()'));
   const create = new Function('state','fetch','isApplicationReady','window','setTimeout','AbortSignal', part+';return waitForApplication;');
-  const good={status:'ready',protocol:39,workspace_id:'owned'};
+  const good={status:'ready',protocol:40,workspace_id:'owned'};
   for(const health of [{...good,status:'loading'},{...good,protocol:38},{...good,workspace_id:'foreign'},null,good]) {
     const redirects=[], reads=[];
     const wait=create({workspaceId:'owned'},async url=>{reads.push(url);return {ok:health!==null,json:async()=>health};},isApplicationReady,{location:{replace:url=>redirects.push(url)}},resolve=>resolve(),{timeout:()=>undefined});

@@ -25,6 +25,7 @@ export const DEFAULT_PERFORMANCE = {
   staged_vae_decode: false,
   compile_transformer: false,
   vram_limit_gb: 0,
+  moss_text_encoder_placement: "auto",
 };
 
 /**

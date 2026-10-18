@@ -471,7 +471,8 @@ test("stage capability is resolved once, by the page that owns the asymmetry", a
   // Anima must *declare* each stage while SD/iL only have to not deny it. Reading `features` raw on
   // the image page would be a second copy of that rule, free to drift from `engineAllowsHires`.
   const app = await readSource("src/App.jsx");
-  assert.match(app, /features: \{ hires: engineAllowsHires, adetailer: engineAllowsADetailer, rtx: engineAllowsRtx \}/);
+  // Whether the engine can run image-to-image at all (MOSS cannot) is resolved by the same owner.
+  assert.match(app, /features: \{ hires: engineAllowsHires, adetailer: engineAllowsADetailer, rtx: engineAllowsRtx, img2img: engineAllowsImageToImage \}/);
   assert.match(app, /ultraLow: ultraLowMode/);
   const page = await readSource("src/ImageToImagePage.jsx");
   assert.match(page, /const stageLocked = \(stage\) => running \|\| postprocess\.ultraLow === true \|\| engine\.features\?\.\[stage\] === false;/);

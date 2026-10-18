@@ -1,7 +1,7 @@
 import { inspectMountedLoras, normalizeMountedLoras, sameMountedLoras } from "./lora-state.js";
 
 export const MOUNTED_LORAS_SCHEMA_VERSION = 2;
-export const READY_LORA_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"];
+export const READY_LORA_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"];
 // The engines every v2 library on disk was written with. A library saved before an engine shipped
 // cannot carry its list, so a missing one is an empty scope rather than a corrupt file — treating
 // it as corruption would stop autosave and strand the user's existing mounts.

@@ -31,7 +31,7 @@ except ImportError:
 
 
 WORKFLOW_FORMAT_VERSION = 0.4
-WORKFLOW_ENGINES = ("SD", "iL", "Anima", "Flux", "Flux2", "Krea2")
+WORKFLOW_ENGINES = ("SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS")
 # One forward per step, steered by a guidance scalar in the conditioning: the KSampler runs at CFG
 # 1 and the request's CFG becomes FluxGuidance.
 DISTILLED_ENGINES = frozenset({"Flux", "Flux2"})
@@ -47,13 +47,25 @@ GGUF_NODE_PACK = {"cnr_id": "comfyui-gguf"}
 # Fixed so the same run always yields the same identifiers, and a workflow is recognisably XirAI's.
 WORKFLOW_NAMESPACE = uuid.UUID("5f0c8a3e-7b21-4c6d-9e44-2a9d1b7c3e58")
 
-ENGINE_LABELS = {"SD": "SD", "iL": "iL", "Anima": "Anima", "Flux": "FLUX.1", "Flux2": "FLUX.2", "Krea2": "Krea 2"}
-TEXT_ENCODER_TYPES = {"Anima": "stable_diffusion", "Krea2": "krea2", "Flux2": "flux2"}
+ENGINE_LABELS = {"SD": "SD", "iL": "iL", "Anima": "Anima", "Flux": "FLUX.1", "Flux2": "FLUX.2", "Krea2": "Krea 2", "MOSS": "MOSS-Image"}
+TEXT_ENCODER_TYPES = {"Anima": "stable_diffusion", "Krea2": "krea2", "Flux2": "flux2", "MOSS": "moss_image"}
 TEXT_ENCODER_TITLES = {
     "Anima": "Anima Text Encoder · Qwen3",
     "Krea2": "Krea 2 Text Encoder · Qwen3-VL",
     "Flux2": "FLUX.2 Text Encoder",
+    "MOSS": "MOSS-Image Text Encoder · Qwen3.5-9B",
 }
+# Engines whose latents are FLUX.2's 128-channel, stride-16 packing.
+FLUX2_LATENT_ENGINES = frozenset({"Flux2", "MOSS"})
+# The Comfy-Org MOSS files fuse each block's q/k/v; ComfyUI reads them only with core MOSS support
+# (`UNETLoader` + `CLIPLoader(type=moss_image)`), which on 2026-10-16 exists as the unmerged
+# Comfy-Org/ComfyUI PR #17095. The OpenMOSS plugin @9d799c1 loads HF directories and cannot read
+# the fused files. The graph says so rather than claiming a core 0.33 node can run it.
+MOSS_REQUIREMENT = (
+    "ComfyUI with core MOSS-Image support (Comfy-Org/ComfyUI PR #17095, not in a release on 2026-10-16): "
+    "UNETLoader and CLIPLoader type moss_image read the Comfy-Org single files. The OpenMOSS plugin's "
+    "loaders read HF directories and cannot load these fused files."
+)
 # ComfyUI's ModelSamplingFlux anchors; FLUX.1's resolution shift is exactly this node's line.
 FLUX_MAX_SHIFT = 1.15
 FLUX_BASE_SHIFT = 0.5
@@ -671,7 +683,7 @@ class _WorkflowBuilder:
         width, height = int(request.width), int(request.height)
         x = left + 40
         entries = [{
-            "type": "EmptyFlux2LatentImage" if engine == "Flux2" else "EmptyLatentImage",
+            "type": "EmptyFlux2LatentImage" if engine in FLUX2_LATENT_ENGINES else "EmptyLatentImage",
             "title": f"Base Canvas · {width} × {height}",
             "size": (330, 110),
             "outputs": (("LATENT", "LATENT"),),
@@ -697,6 +709,40 @@ class _WorkflowBuilder:
             }
         if patch:
             entries.append(patch)
+        moss_nodes = []
+        if engine == "MOSS":
+            # The official workflow's order: ModelSamplingSD3 before SkipLayerGuidanceDiTSimple, so the
+            # schedule and the skip window share one shift.
+            moss = request.moss
+            self.requirements.append(MOSS_REQUIREMENT)
+            self.notes.append("XirAI decodes the MOSS VAE in float32; start ComfyUI with --fp32-vae for the matching decode.")
+            if getattr(request, "moss_layout", None) is not None and any(
+                getattr(unit, "enabled", False) for unit in getattr(request, "resample_units", ())
+            ):
+                # One positive node feeds every sampler here, but a layout's boxes are pixels of one canvas.
+                self.notes.append(
+                    "The positive prompt is a MOSS layout for the base canvas. XirAI re-encoded it for each Hires "
+                    "canvas (boxes scaled); the resample samplers in this graph reuse the base-canvas layout."
+                )
+            moss_nodes.append({
+                "type": "ModelSamplingSD3", "title": f"MOSS Shift · {_number(moss.shift)}", "size": (330, 80),
+                "inputs": (("model", "MODEL"),), "outputs": (("MODEL", "MODEL"),),
+                "widgets": (("shift", float(moss.shift)),),
+            })
+            if moss.uncond_skip_layers:
+                moss_nodes.append({
+                    "type": "SkipLayerGuidanceDiTSimple",
+                    "title": "Negative-branch skip · " + ", ".join(str(layer) for layer in moss.uncond_skip_layers),
+                    "size": (330, 170),
+                    "inputs": (("model", "MODEL"),), "outputs": (("MODEL", "MODEL"),),
+                    "widgets": (
+                        ("double_layers", ""),
+                        ("single_layers", ", ".join(str(layer) for layer in moss.uncond_skip_layers)),
+                        ("start_percent", float(moss.uncond_skip_start)),
+                        ("end_percent", float(moss.uncond_skip_end)),
+                    ),
+                })
+            entries.extend(moss_nodes)
         sampling = None
         if self.distilled:
             sampling = {
@@ -725,6 +771,10 @@ class _WorkflowBuilder:
             self.root.connect(model[0], model[1], nodes[position], "model")
             model = (nodes[position], 0)
             position += 1
+        for _node in moss_nodes:
+            self.root.connect(model[0], model[1], nodes[position], "model")
+            model = (nodes[position], 0)
+            position += 1
         shared_model = model
         base_positive = positive
         if sampling:
@@ -741,7 +791,7 @@ class _WorkflowBuilder:
 
     def build_cards(self, left, section, cards, latent, latent_size, model, positive, negative, vae):
         sampler_number = 1
-        grid = 16 if self.engine == "Flux2" else 8
+        grid = 16 if self.engine in FLUX2_LATENT_ENGINES else 8
         final_size = latent_size
         last_resize = "lanczos"
         for index, stage in enumerate(cards):
@@ -1011,7 +1061,7 @@ class _WorkflowBuilder:
 
 
 def workflow_supported(request) -> bool:
-    """Text-to-image runs of the six engines. Image-to-image and post-processing runs start from a
+    """Text-to-image runs of the seven engines. Image-to-image and post-processing runs start from a
     picture this graph would have to fake, so they carry no workflow."""
     source = getattr(request, "source_image", None)
     return (

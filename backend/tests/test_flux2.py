@@ -102,7 +102,7 @@ class Flux2RequestContractTests(unittest.TestCase):
 
 class Flux2EngineWiringTests(unittest.TestCase):
     def test_flux2_is_a_native_family_alongside_anima_and_flux(self):
-        self.assertEqual(inference_server.NATIVE_ENGINES, ("Anima", "Flux", "Flux2", "Krea2"))
+        self.assertEqual(inference_server.NATIVE_ENGINES, ("Anima", "Flux", "Flux2", "Krea2", "MOSS"))
         self.assertTrue(inference_server.is_native_family("flux2"))
         self.assertEqual(inference_server.NATIVE_FAMILY_BY_ENGINE["Flux2"], "flux2")
         # Krea 2 is native but not distilled, so it stays out of this tuple.

@@ -179,6 +179,7 @@ import { createLoraMixDraft, emptyLoraMixDrafts, inspectLoraMixDrafts, withLoraM
 import { pathOnlyFamilyLoras, resolveFamilyLoraIdentities, withFamilyLoraIdentities } from "./xyz-lora-identity.js";
 import XYZPromptDeck from "./XYZPromptDeck.jsx";
 import { SamplerPair, SeedControls, GuidanceControls } from "./SamplingControls.jsx";
+import MossSamplingControls from "./MossSamplingControls.jsx";
 import { captureXYZPostprocessSource } from "./xyz-postprocess-source.js";
 import { ADetailerUnitControls, RTXControls } from "./PostprocessAuxControls.jsx";
 import LoraManagerModal from "./LoraManagerModal.jsx";
@@ -258,6 +259,30 @@ import {
 } from "./engine-settings";
 import { clipSkipPayload, clipSkipRange } from "./clip-skip.js";
 import {
+  MOSS_SAMPLERS,
+  MOSS_SCHEDULERS,
+  MOSS_SHIFT_RANGE,
+  describeMossSampling,
+  formatSkipLayers,
+  isMossEngine,
+  mossRequestFields,
+  mossSamplerFor,
+  mossSchedulerFor,
+  normalizeMossSampling,
+  parseSkipLayers,
+} from "./moss-engine.js";
+import {
+  compileMossLayout,
+  emptyMossLayout,
+  mossLayoutFromTemplate,
+  mossLayoutPayload,
+  normalizeMossLayout,
+  rescaleMossLayout,
+} from "./moss-layout.js";
+import { mossLayoutPeakTokens, useMossLayoutTokens } from "./moss-layout-tokens.js";
+import MossLayoutCard from "./MossLayoutCard.jsx";
+import { copyText } from "./clipboard.js";
+import {
   CANVAS_BOUND_PRESETS,
   CANVAS_BOUND_STEP,
   DEFAULT_CANVAS_MAX_EDGE,
@@ -304,6 +329,7 @@ const SharedModelDirectories = lazy(() => import("./SharedModelDirectories"));
 // The assistant is opened on demand and carries its own provider table and chat surface, so it stays
 // out of the workspace chunk until the user actually asks for it.
 const AiAssistantOverlay = lazy(() => import("./AiAssistantOverlay"));
+const MossLayoutStudio = lazy(() => import("./MossLayoutStudio.jsx"));
 
 const models = [
   { name: "SD", detail: "Stable Diffusion", ready: true },
@@ -312,6 +338,7 @@ const models = [
   { name: "Flux", detail: "FLUX.1 蒸馏引导", ready: true },
   { name: "Flux2", detail: "FLUX.2 大模型引导", ready: true },
   { name: "Krea2", detail: "Krea 2 单流 DiT", ready: true },
+  { name: "MOSS", detail: "MOSS-Image 单流 DiT · Qwen3.5", ready: true },
 ];
 
 const ANIMA_SAMPLERS = samplerNames;
@@ -329,8 +356,8 @@ const FLUX2_SCHEDULERS = schedulerNames;
 const KREA2_SAMPLERS = samplerNames;
 const KREA2_SCHEDULERS = schedulerNames;
 // Engines that mount separate component files instead of one checkpoint.
-const SPLIT_MODEL_ENGINES = ["Anima", "Flux", "Flux2", "Krea2"];
-const READY_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"];
+const SPLIT_MODEL_ENGINES = ["Anima", "Flux", "Flux2", "Krea2", "MOSS"];
+const READY_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"];
 
 const guidanceOptions = [
   { id: "none", label: "无（None）", detail: "标准 CFG 采样" },
@@ -1057,8 +1084,8 @@ function loadWorkspaceState(saved) {
       batchCount: Math.round(numberInRange(saved.batchCount, 1, 1, 20)),
       seed: normalizeSeed(saved.seed ?? "847291"),
       seedMode: seedModes.some((item) => item.id === saved.seedMode) ? saved.seedMode : "random",
-      sampler: isSplitModel ? ANIMA_SAMPLERS.includes(saved.sampler) ? saved.sampler : "euler" : samplerNames.includes(saved.sampler) ? saved.sampler : "dpmpp_2m",
-      scheduler: isSplitModel ? ANIMA_SCHEDULERS.includes(saved.scheduler) ? saved.scheduler : "simple" : schedulerNames.includes(saved.scheduler) ? saved.scheduler : "karras",
+      sampler: isMossEngine(savedModel) ? mossSamplerFor(saved.sampler) : isSplitModel ? ANIMA_SAMPLERS.includes(saved.sampler) ? saved.sampler : "euler" : samplerNames.includes(saved.sampler) ? saved.sampler : "dpmpp_2m",
+      scheduler: isMossEngine(savedModel) ? mossSchedulerFor(saved.scheduler) : isSplitModel ? ANIMA_SCHEDULERS.includes(saved.scheduler) ? saved.scheduler : "simple" : schedulerNames.includes(saved.scheduler) ? saved.scheduler : "karras",
       guidance: guidanceOptions.some((item) => item.id === saved.guidance) ? saved.guidance : "none",
       pag: {
         scale: Math.round(numberInRange(savedPag.scale, PAG_DEFAULTS.scale, 0, 5) * 100) / 100,
@@ -1069,6 +1096,8 @@ function loadWorkspaceState(saved) {
         height: Math.round(numberInRange(saved.size?.height, 1024, 0, MAX_CANVAS_EDGE) / 64) * 64,
       },
       clipSkip: Number.isInteger(saved.clipSkip) ? saved.clipSkip : null,
+      // MOSS's versioned sampling block (shift, negative-branch skipping); inert for other engines.
+      mossSampling: normalizeMossSampling(saved.mossSampling),
       backgroundRemovalModel: typeof saved.backgroundRemovalModel === "string" ? saved.backgroundRemovalModel : "",
       samplingExpanded: saved.samplingExpanded !== false,
       runInfoVisible: saved.runInfoVisible !== false,
@@ -1129,6 +1158,8 @@ function gallerySettingsWithoutPromptPresets(settings) {
   // words that ran, in `composedPrompt`, not the switches that produced them.
   // The canvas bound and the output template are preferences of this workspace, not of a run.
   const { generationMode: _generationMode, xyzByEngine: _xyzByEngine, loraMixByEngine: _loraMixByEngine, canvasMaxEdge: _canvasMaxEdge, outputTemplate: _outputTemplate, promptPresets: _promptPresets, activePromptPresets: _activePromptPresets, mountedLorasByEngine: _mountedLorasByEngine, loraGroupsByEngine: _loraGroupsByEngine, engineSettingsByEngine: _engineSettingsByEngine, ...gallerySettings } = settings;
+  // A MOSS layout that is switched off is a draft of this workspace, not part of a run.
+  if (gallerySettings.mossLayout?.enabled !== true) delete gallerySettings.mossLayout;
   return gallerySettings;
 }
 
@@ -1475,6 +1506,14 @@ function App() {
   const [scheduler, setScheduler] = useState("karras");
   const [guidance, setGuidance] = useState("none");
   const [pag, setPag] = useState(PAG_DEFAULTS);
+  const [mossSampling, setMossSampling] = useState(() => normalizeMossSampling(null));
+  // The skip-layer field is typed text; it is parsed into the block only when it is valid.
+  const [mossSkipText, setMossSkipText] = useState("22");
+  // QPlan2/MOSS/P2: MOSS's coordinate layout. While `enabled`, it is the positive prompt and the text box
+  // is left as it was, so switching back to text finds it intact.
+  const [mossLayout, setMossLayout] = useState(() => emptyMossLayout(1024, 1024));
+  const [mossLayoutStudioOpen, setMossLayoutStudioOpen] = useState(false);
+  const [mossLayoutNotice, setMossLayoutNotice] = useState(null);
   const [size, setSize] = useState({ width: 1024, height: 1024 });
   const [status, setStatus] = useState("idle");
   const [activeJobRecoveryPending, setActiveJobRecoveryPending] = useState(true);
@@ -1869,7 +1908,7 @@ function App() {
     positive, negative, activePromptPresets, clipSkip,
     checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
     steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
-    sampler, scheduler, guidance, pag, size,
+    sampler, scheduler, guidance, pag, size, mossSampling, mossLayout,
     postprocessChain, backgroundRemovalModel,
     // The image page's parameters belong to the engine as much as the generate page's do, so they
     // are put down and picked up by the same swap rather than surviving the switch unchanged.
@@ -1910,6 +1949,14 @@ function App() {
     setScheduler(settings.scheduler);
     setGuidance(settings.guidance);
     setPag(settings.pag);
+    const nextMoss = normalizeMossSampling(settings.mossSampling);
+    setMossSampling(nextMoss);
+    setMossSkipText(formatSkipLayers(nextMoss.uncondSkipLayers));
+    // An engine without the block opens on an empty, switched-off layout; MOSS's own record is kept
+    // in the map, so coming back to MOSS finds its layout where it was left.
+    setMossLayout(normalizeMossLayout(settings.mossLayout ?? null, settings.size?.width >= 64 && settings.size?.height >= 64 ? settings.size : null));
+    setMossLayoutStudioOpen(false);
+    setMossLayoutNotice(null);
     setSize(settings.size);
     setPostprocessChain(settings.postprocessChain);
     setBackgroundRemovalModel(settings.backgroundRemovalModel);
@@ -1936,6 +1983,7 @@ function App() {
     promptPresets: persistedPromptPresets,
     activePromptPresets,
     sampler, scheduler, guidance, pag, size, samplingExpanded, runInfoVisible, postprocessChain, loraCategory, loraSearch,
+    ...(isMossEngine(model) ? { mossSampling, mossLayout } : {}),
     canvasMaxEdge,
     outputTemplate,
     // The selected engine's record is the live hooks, which have not been written back to the map
@@ -1945,7 +1993,7 @@ function App() {
       positive, negative, activePromptPresets, clipSkip,
       checkpoint, diffusionModel, textEncoder, textEncoder2, vae,
       steps, cfg, denoise, imagesPerBatch, batchCount, seed: normalizeSeed(seed), seedMode,
-      sampler, scheduler, guidance, pag, size,
+      sampler, scheduler, guidance, pag, size, mossSampling, mossLayout,
       postprocessChain, backgroundRemovalModel,
       imageToImage,
     }),
@@ -3282,9 +3330,10 @@ function App() {
         prompt: composeGenerationPrompt({ groupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: positive }),
         negative_prompt: distilled ? "" : composeGenerationPrompt({ records: promptPresets.records, activeIds: activePromptPresets.negative, type: "negative", prompt: negative }),
         width: size.width, height: size.height, steps, cfg, denoise, seed: normalizeSeed(seed),
-        sampler: native && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
-        scheduler: native && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
-        guidance: distilled ? "none" : guidance, pag: { scale: pag.scale, applied_layers: pag.appliedLayers },
+        sampler: isMossEngine(model) ? mossSamplerFor(sampler) : native && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
+        scheduler: isMossEngine(model) ? mossSchedulerFor(scheduler) : native && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
+        guidance: distilled || isMossEngine(model) ? "none" : guidance, pag: { scale: pag.scale, applied_layers: pag.appliedLayers },
+        ...mossRequestFields(model, mossSampling),
         background_removal_model: transparentPromptEnabled ? backgroundRemovalModel : null,
         postprocess_chain: resampleChainPayload(postprocessChain, { engine: model }),
         ...clipSkipPayload(model, clipSkip),
@@ -3345,8 +3394,10 @@ function App() {
     const fluxGeneration = model === "Flux";
     const flux2Generation = model === "Flux2";
     const krea2Generation = model === "Krea2";
-    // Every native engine shares the ComfyUI sampler vocabulary, so one normalisation covers them.
-    const nativeGeneration = animaGeneration || fluxGeneration || flux2Generation || krea2Generation;
+    const mossGeneration = isMossEngine(model);
+    // Every native engine shares the ComfyUI sampler vocabulary, so one normalisation covers them;
+    // MOSS narrows it to its exact k-diffusion samplers.
+    const nativeGeneration = animaGeneration || fluxGeneration || flux2Generation || krea2Generation || mossGeneration;
     // Both Flux generations are guidance distilled: no negative branch, no enhancement.
     const distilledGeneration = DISTILLED_GUIDANCE_ENGINES.includes(model);
     submissionInFlight.current = true;
@@ -3368,14 +3419,22 @@ function App() {
     const generationGroupPrompt = composeGroupPrompt(generationGroups, "");
     // The prompt as the job receives it: the LoRA groups' words lead, then the presets switched on,
     // then what was typed. Each is its own paragraph, and the box itself is never rewritten.
-    const generationPrompt = composeGenerationPrompt({ groupPrompt: generationGroupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: positive });
+    // QPlan2/MOSS/P2: in layout mode the same groups and presets become the prefix line, and the prompt
+    // is the layout compiled at this canvas — byte for byte what the server recompiles from `moss_layout`.
+    const generationLayout = mossGeneration && mossLayout.enabled ? rescaleMossLayout(mossLayout, size.width, size.height) : null;
+    const generationLayoutPrefix = generationLayout
+      ? composeGenerationPrompt({ groupPrompt: generationGroupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: "" })
+      : "";
+    const generationPrompt = generationLayout
+      ? compileMossLayout(generationLayout, generationLayoutPrefix).prompt
+      : composeGenerationPrompt({ groupPrompt: generationGroupPrompt, records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: positive });
     const generationNegative = composeGenerationPrompt({ records: promptPresets.records, activeIds: activePromptPresets.negative, type: "negative", prompt: negative });
     setSeed(generationSeed);
     const submittedSettings = JSON.parse(JSON.stringify({
       ...gallerySettingsWithoutPromptPresets(workspaceSnapshot.current),
       seed: generationSeed,
-      sampler: nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
-      scheduler: nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
+      sampler: mossGeneration ? mossSamplerFor(sampler) : nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
+      scheduler: mossGeneration ? mossSchedulerFor(scheduler) : nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
       guidance: distilledGeneration ? "none" : guidance,
       postprocessChain,
       loras: generationLoras,
@@ -3415,11 +3474,16 @@ function App() {
           seed: generationSeed,
           images_per_batch: imagesPerBatch,
           batch_count: batchCount,
-          sampler: nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
-          scheduler: nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
-          guidance: distilledGeneration ? "none" : guidance,
+          sampler: mossGeneration ? mossSamplerFor(sampler) : nativeGeneration && !ANIMA_SAMPLERS.includes(sampler) ? "euler" : sampler,
+          scheduler: mossGeneration ? mossSchedulerFor(scheduler) : nativeGeneration && !ANIMA_SCHEDULERS.includes(scheduler) ? "simple" : scheduler,
+          guidance: distilledGeneration || mossGeneration ? "none" : guidance,
+          // Protocol 40: MOSS sends its versioned sampling block; every other engine sends nothing.
+          ...mossRequestFields(model, mossSampling),
+          // …and, in layout mode, the layout the prompt was compiled from (the server refuses a mismatch).
+          ...(generationLayout ? { moss_layout: mossLayoutPayload(generationLayout, generationLayoutPrefix) } : {}),
           pag: { scale: pag.scale, applied_layers: pag.appliedLayers },
-          background_removal_model: transparentPromptEnabled ? backgroundRemovalModel : null,
+          // A layout carries no transparent-background tag (the server refuses the pair in this release).
+          background_removal_model: transparentPromptEnabled && !generationLayout ? backgroundRemovalModel : null,
           // The chain in execution order, stage by stage. Protocol 38 carries strict per-unit
           // execution and lossless per-unit seed contracts.
           postprocess_chain: resampleChainPayload(postprocessChain, { engine: model }),
@@ -3888,6 +3952,13 @@ function App() {
     if (selectedGroups.has("prompts")) {
       setPositive(normalized.positive);
       setNegative(normalized.negative);
+      // A card or picture that ran a layout brings it back in layout mode; one that ran text switches
+      // the layout off without discarding the one being drafted.
+      if (isMossEngine(normalized.model)) {
+        const ranLayout = source.mossLayout && typeof source.mossLayout === "object" && source.mossLayout.enabled === true;
+        setMossLayout((currentLayout) => ranLayout ? normalizeMossLayout(source.mossLayout, normalized.size) : { ...currentLayout, enabled: false });
+        setMossLayoutNotice(null);
+      }
       setADetailer((currentValue) => ({
         ...currentValue,
         units: currentValue.units.map((unit, index) => {
@@ -3908,6 +3979,10 @@ function App() {
       setScheduler(normalized.scheduler);
       setGuidance(normalized.guidance);
       setPag(normalized.pag);
+      if (isMossEngine(normalized.model)) {
+        setMossSampling(normalized.mossSampling);
+        setMossSkipText(formatSkipLayers(normalized.mossSampling.uncondSkipLayers));
+      }
       // A record without a CLIP skip ran the family default, so that is what it applies.
       setClipSkip(normalizeClipSkip(normalized.model, Number.isInteger(source.clipSkip) ? source.clipSkip : null));
     }
@@ -4051,6 +4126,8 @@ function App() {
     const workspaceGroups = [...plan.groups];
     if (!workspaceGroups.length) return;
     const snapshot = gallerySettingsWithoutPromptPresets(workspaceSnapshot.current);
+    // Whether layout mode stays on is the picture's to say: its own layout, or none (a text prompt).
+    delete snapshot.mossLayout;
     const overlay = { ...plan.overlay };
     const targetEngine = overlay.model || snapshot.model;
     if (targetEngine !== snapshot.model) {
@@ -4084,6 +4161,8 @@ function App() {
         size: record.size,
         postprocessChain: record.postprocessChain,
       });
+      if (isMossEngine(targetEngine)) snapshot.mossSampling = record.mossSampling;
+      else delete snapshot.mossSampling;
     }
     Object.assign(overlay, overlayChain);
     if (Array.isArray(overlay.loras)) {
@@ -6905,6 +6984,63 @@ function App() {
   const isFlux = model === "Flux";
   const isFlux2 = model === "Flux2";
   const isKrea2 = model === "Krea2";
+  const isMoss = isMossEngine(model);
+  // QPlan2/MOSS/P2: the layout prompt as it would be submitted now, and what it costs per canvas.
+  const mossLayoutActive = isMoss && mossLayout.enabled;
+  const mossLayoutPrefix = mossLayoutActive
+    ? composeGenerationPrompt({ groupPrompt: composeGroupPrompt(enabledLoraGroups(activeLoraGroups), ""), records: promptPresets.records, activeIds: activePromptPresets.positive, type: "positive", prompt: "" })
+    : "";
+  const mossLayoutCompiled = mossLayoutActive ? compileMossLayout(mossLayout, mossLayoutPrefix) : { draft: null, issues: [], prompt: null };
+  const mossLayoutStages = mossLayoutActive
+    ? resampleChainPlan(size, postprocessChain, model).trace
+      .filter((entry) => entry.type === "resample" && entry.redraws)
+      .map((entry) => ({ width: entry.redraw.width, height: entry.redraw.height }))
+    : [];
+  const mossLayoutTokens = useMossLayoutTokens({
+    active: mossLayoutActive,
+    payload: mossLayoutActive ? mossLayoutPayload(mossLayout, mossLayoutPrefix) : null,
+    prompt: mossLayoutCompiled.prompt,
+    stages: mossLayoutStages,
+  });
+  const mossLayoutPeak = mossLayoutPeakTokens(mossLayoutTokens);
+  const mossLayoutFirstIssue = mossLayoutCompiled.issues[0] || null;
+  const mossLayoutIssueText = mossLayoutFirstIssue
+    ? `${mossLayoutFirstIssue.itemId ? `#${mossLayout.items.findIndex((item) => item.id === mossLayoutFirstIssue.itemId) + 1} ` : ""}${mossLayoutFirstIssue.path.replace(/^items\[\d+\]\.?/, "") || "布局"} ${mossLayoutFirstIssue.message}`
+    : "";
+  // D15: the layout always sits on the Basic canvas. A size change rescales it, and says so once.
+  useEffect(() => {
+    if (size.width < 64 || size.height < 64) return;
+    if (mossLayout.width === size.width && mossLayout.height === size.height) return;
+    if (mossLayout.enabled && mossLayout.items.length) {
+      setMossLayoutNotice({
+        message: `画布 ${mossLayout.width} × ${mossLayout.height} → ${size.width} × ${size.height}：所有框已按比例缩放`,
+        undo: { layout: mossLayout, size: { width: mossLayout.width, height: mossLayout.height } },
+      });
+    }
+    setMossLayout(rescaleMossLayout(mossLayout, size.width, size.height));
+  }, [size.width, size.height, mossLayout]);
+  const enableMossLayout = (enabled) => setMossLayout((current) => ({ ...current, enabled }));
+  const applyMossLayoutTemplate = (id) => {
+    const next = mossLayoutFromTemplate(id, mossLayout.width, mossLayout.height);
+    if (!next) return;
+    setMossLayout(next);
+    setMossLayoutStudioOpen(true);
+  };
+  const mossLayoutToText = () => {
+    // The layout JSON alone: in text mode the groups and presets are composed in front of it again.
+    const body = compileMossLayout(mossLayout, "").prompt;
+    if (!body) return;
+    setPositive(body);
+    enableMossLayout(false);
+  };
+  const undoMossLayoutRescale = () => {
+    const undo = mossLayoutNotice?.undo;
+    if (undo) {
+      setSize(undo.size);
+      setMossLayout(undo.layout);
+    }
+    setMossLayoutNotice(null);
+  };
   // Both Flux generations are guidance distilled, and the label is what the notes below name.
   const isDistilledGuidance = DISTILLED_GUIDANCE_ENGINES.includes(model);
   const distilledEngineLabel = isFlux2 ? "FLUX.2" : "FLUX.1";
@@ -6928,14 +7064,19 @@ function App() {
   const selectedEngineHealth = inferenceHealth?.engines?.[model] || {};
   const xyzRuntimeGuidance = xyzRuntimeGuidanceForEngine(inferenceHealth, activeXYZEngine);
   const selectedEngineFeatures = selectedEngineHealth.features || {};
-  const nativeSamplerNames = isFlux ? FLUX_SAMPLERS : isFlux2 ? FLUX2_SAMPLERS : isKrea2 ? KREA2_SAMPLERS : ANIMA_SAMPLERS;
-  const nativeSchedulerNames = isFlux ? FLUX_SCHEDULERS : isFlux2 ? FLUX2_SCHEDULERS : isKrea2 ? KREA2_SCHEDULERS : ANIMA_SCHEDULERS;
+  const nativeSamplerNames = isFlux ? FLUX_SAMPLERS : isFlux2 ? FLUX2_SAMPLERS : isKrea2 ? KREA2_SAMPLERS : isMoss ? MOSS_SAMPLERS : ANIMA_SAMPLERS;
+  const nativeSchedulerNames = isFlux ? FLUX_SCHEDULERS : isFlux2 ? FLUX2_SCHEDULERS : isKrea2 ? KREA2_SCHEDULERS : isMoss ? MOSS_SCHEDULERS : ANIMA_SCHEDULERS;
   const activeSamplerNames = isSplitModel ? (selectedEngineHealth.samplers || nativeSamplerNames).filter((name) => nativeSamplerNames.includes(name)) : samplerNames;
   const activeSchedulerNames = isSplitModel ? (selectedEngineHealth.schedulers || nativeSchedulerNames).filter((name) => nativeSchedulerNames.includes(name)) : schedulerNames;
   const engineAllowsLora = isSplitModel ? selectedEngineFeatures.lora === true : selectedEngineFeatures.lora !== false;
   const engineAllowsHires = isSplitModel ? selectedEngineFeatures.hires === true : selectedEngineFeatures.hires !== false;
   const engineAllowsADetailer = isSplitModel ? selectedEngineFeatures.adetailer === true : selectedEngineFeatures.adetailer !== false;
   const engineAllowsRtx = isSplitModel ? selectedEngineFeatures.rtx === true : selectedEngineFeatures.rtx !== false;
+  // A split engine whose service does not declare redraws still keeps pixel-only resample units (denoise 0).
+  const engineAllowsResizeOnly = isSplitModel && selectedEngineFeatures.resize_only_resample === true;
+  // Only MOSS denies image-to-image (and post-processing-only runs); it is refused by name too, so the
+  // page says so before the health block has arrived instead of submitting into a 422.
+  const engineAllowsImageToImage = !isMoss && selectedEngineFeatures.img2img !== false;
   // Both Flux generations steer with a distilled guidance embedding instead of classifier-free
   // guidance, so the CFG control means something different and the negative prompt has nothing to
   // encode into.
@@ -6994,6 +7135,9 @@ function App() {
     // ComfyUI points every Qwen3 encoder at the Qwen2.5 table. [dev]'s Mistral tokenizer is not an
     // installed resource at all, so there is nothing here that can be missing for it.
     !(animaRuntimeHealth.qwen_tokenizer?.installed ?? animaRuntime?.qwen_tokenizer?.installed) && "Qwen Tokenizer",
+  ].filter(Boolean) : isMoss ? [
+    // MOSS reads Qwen3.5's own 248k table, the one new tokenizer resource it bundles.
+    !(animaRuntimeHealth.qwen35_tokenizer?.installed ?? animaRuntime?.qwen35_tokenizer?.installed) && "Qwen3.5 Tokenizer",
   ].filter(Boolean) : [];
   const animaSettingsUnsupported = isSplitModel && (
     !activeSamplerNames.includes(sampler)
@@ -7030,16 +7174,18 @@ function App() {
                         : isSplitModel && animaSettingsUnsupported ? `当前 ${engineLabel} 参数包含不受支持的采样或引导设置`
                          : !loraReady ? `当前推理服务未声明 ${engineLabel} LoRA 能力`
                            : !loraResourcesReady ? "已启用的 LoRA 文件未安装、已移动或目录尚未就绪"
-                             : activeResampleUnits.length && !engineAllowsHires ? `当前推理服务未声明 ${engineLabel} 重采样能力`
+                             : activeResampleUnits.some((unit) => !engineAllowsHires && !(engineAllowsResizeOnly && !(Number(unit.denoise) > 0))) ? (engineAllowsResizeOnly ? `${engineLabel} 本版本不支持重绘类重采样（Hires / USDU）；仅可使用重绘幅度为 0 的纯缩放` : `当前推理服务未声明 ${engineLabel} 重采样能力`)
                              : adetailer.enabled && !engineAllowsADetailer ? `当前推理服务未声明 ${engineLabel} ADetailer 能力`
                                : rtx.enabled && !engineAllowsRtx ? `当前推理服务未声明 ${engineLabel} RTX VSR 能力`
                          : !isSplitModel && !checkpoint ? "请先选择可用底模"
                           : !isSplitModel && checkpointMissing ? "当前底模文件已不存在"
-      : !positive.trim() ? "请输入正向提示词"
-          : transparentPromptEnabled && !transparentPromptSubject ? "透明背景标签之外还需要填写主体提示词"
-          : transparentPromptEnabled && !selectedBackgroundRemovalModel ? "请选择透明背景模型"
-          : transparentPromptEnabled && !selectedBackgroundRemovalModel?.installed ? "所选透明背景模型尚未下载"
-          : transparentPromptEnabled && !inferenceHealth?.background_removal?.runtime_available ? "ONNX Runtime 尚未就绪，请重新运行环境配置器"
+      : mossLayoutActive && mossLayoutCompiled.issues.length ? `MOSS 布局有 ${mossLayoutCompiled.issues.length} 处需要修正：${mossLayoutIssueText}`
+      : mossLayoutActive && mossLayoutPeak !== null && mossLayoutPeak > mossLayoutTokens.maxTokens ? `MOSS 布局提示词 ${mossLayoutPeak} tokens，超过 ${mossLayoutTokens.maxTokens} 的上限；请缩短描述或删去元素`
+      : !mossLayoutActive && !positive.trim() ? "请输入正向提示词"
+          : !mossLayoutActive && transparentPromptEnabled && !transparentPromptSubject ? "透明背景标签之外还需要填写主体提示词"
+          : !mossLayoutActive && transparentPromptEnabled && !selectedBackgroundRemovalModel ? "请选择透明背景模型"
+          : !mossLayoutActive && transparentPromptEnabled && !selectedBackgroundRemovalModel?.installed ? "所选透明背景模型尚未下载"
+          : !mossLayoutActive && transparentPromptEnabled && !inferenceHealth?.background_removal?.runtime_available ? "ONNX Runtime 尚未就绪，请重新运行环境配置器"
           : !canvasSizeValid ? canvasIssue
             : ultraLowMode && enabledChainStages(postprocessChain).length ? "极限省存模式正在关闭附加后处理阶段"
               : ultraLowMode && guidance !== "none" ? "极限省存模式不支持引导增强"
@@ -7219,7 +7365,7 @@ function App() {
               refreshTitle={`刷新 ${engineLabel} 模型组件`} refreshAriaLabel={`刷新 ${engineLabel} 模型组件`} onRefresh={refreshCheckpoints}
               fields={[
                 { kind: "diffusionModel", label: "扩散模型", value: diffusionModel, items: diffusionModels, directory: diffusionModelDirectory, missing: diffusionModelMissing, missingLabel: `${diffusionModel}（文件已删除）`, missingMessage: "扩散模型文件已删除，请选择其他资源", error: modelError, onChange: (nextValue) => selectSplitModelAsset("diffusionModel", nextValue) },
-                { kind: "textEncoder", label: isFlux ? "文本编码器 · CLIP-L" : isFlux2 || isKrea2 ? "文本编码器 · 大语言模型" : "文本编码器", value: textEncoder, items: textEncoders, directory: textEncoderDirectory, missing: textEncoderMissing, missingLabel: `${textEncoder}（文件已删除）`, missingMessage: "文本编码器文件已删除，请选择其他资源", error: modelError, onChange: (nextValue) => selectSplitModelAsset("textEncoder", nextValue) },
+                { kind: "textEncoder", label: isFlux ? "文本编码器 · CLIP-L" : isMoss ? "文本编码器 · Qwen3.5-9B" : isFlux2 || isKrea2 ? "文本编码器 · 大语言模型" : "文本编码器", value: textEncoder, items: textEncoders, directory: textEncoderDirectory, missing: textEncoderMissing, missingLabel: `${textEncoder}（文件已删除）`, missingMessage: "文本编码器文件已删除，请选择其他资源", error: modelError, onChange: (nextValue) => selectSplitModelAsset("textEncoder", nextValue) },
                 ...(isFlux ? [{ kind: "textEncoder2", label: "文本编码器 · T5-XXL", value: textEncoder2, items: textEncoders2, directory: textEncoderDirectory, missing: textEncoder2Missing, missingLabel: `${textEncoder2}（文件已删除）`, missingMessage: "文本编码器 · T5-XXL 文件已删除，请选择其他资源", error: modelError, onChange: (nextValue) => selectSplitModelAsset("textEncoder2", nextValue) }] : []),
                 { kind: "vae", label: "VAE", value: vae, items: vaes, directory: vaeDirectory, missing: vaeMissing, missingLabel: `${vae}（文件已删除）`, missingMessage: "VAE 文件已删除，请选择其他资源", error: modelError, onChange: (nextValue) => selectSplitModelAsset("vae", nextValue) },
               ]} /> : <ModelAssetPicker loading={modelLoading} refreshing={modelsRefreshing} switching={modelSwitching} error={Boolean(modelError || checkpointMissing)}
@@ -7231,7 +7377,8 @@ function App() {
               onOpenManager={() => setLoraManagerOpen(true)} />
             {isSplitModel && !engineAllowsLora && <p className="guidance-unavailable" role="status">当前推理服务未声明 {engineLabel} LoRA 能力；可管理现有组合，但启用后不能生成。</p>}
 
-            <GuidanceControls value={guidance} detail={isDistilledGuidance ? `${distilledEngineLabel} 蒸馏引导，无无条件分支` : guidanceOptions.find((item) => item.id === guidance)?.detail} disabled={modelSwitching || isDistilledGuidance} invalid={!guidanceReady} describedBy={!guidanceReady ? "guidance-compatibility-note" : undefined} onChange={setGuidance} options={(isDistilledGuidance ? guidanceOptions.filter((item) => item.id === "none") : guidanceOptions).map((item) => ({ value: item.id, label: item.label }))} pag={pag} onPag={setPag} pagDisabled={modelSwitching} Slider={Slider} />
+            <GuidanceControls value={guidance} detail={isDistilledGuidance ? `${distilledEngineLabel} 蒸馏引导，无无条件分支` : isMoss ? "标准 CFG · 负向分支跳层见采样参数" : guidanceOptions.find((item) => item.id === guidance)?.detail} disabled={modelSwitching || isDistilledGuidance || isMoss} invalid={!guidanceReady} describedBy={!guidanceReady ? "guidance-compatibility-note" : undefined} onChange={setGuidance} options={(isDistilledGuidance || isMoss ? guidanceOptions.filter((item) => item.id === "none") : guidanceOptions).map((item) => ({ value: item.id, label: item.label }))} pag={pag} onPag={setPag} pagDisabled={modelSwitching} Slider={Slider} />
+            {isMoss && <p className="guidance-unavailable" role="status">MOSS 本版本使用标准 CFG 与负向分支跳层；PAG、CFG-Zero* 与标准 SLG 暂不可用。</p>}
             {isDistilledGuidance && <p className="guidance-unavailable" role="status">{distilledEngineLabel} 经过引导蒸馏，每一步只跑一次前向，没有可供 PAG 或 CFG-Zero* 作用的无条件分支。</p>}
             {guidance === "pag" && !guidancePagCompatible && <p id="guidance-compatibility-note" className="guidance-unavailable" role="status" aria-live="polite">当前 {model} 推理运行时未声明 PAG 可用，请切换为“无”后生成。</p>}
             {guidance === "cfg_zero_star" && !guidanceFlowCompatible && <p id="guidance-compatibility-note" className="guidance-unavailable" role="status" aria-live="polite">当前 {model} 推理运行时未声明 CFG-Zero* 可用，请切换为“无”后生成。</p>}
@@ -7246,6 +7393,7 @@ function App() {
                 {clipSkipLimits && <Slider label="CLIP skip" value={clipSkip ?? clipSkipLimits.default} min={clipSkipLimits.minimum} max={clipSkipLimits.maximum} integer onChange={(value) => setClipSkip(normalizeClipSkip(model, value))} />}
               </div>
               {clipSkipLimits && <p className="clip-skip-note">生效值 <b>{normalizeClipSkip(model, clipSkip)}</b>{model === "iL" ? " · SDXL/iL 的 CLIP-L/G 两塔最小有效值为 2（与 Forge 一致），默认 2 即当前编码" : " · 默认 1 即最终层（当前编码）"}</p>}
+              {isMoss && <MossSamplingControls value={mossSampling} skipText={mossSkipText} onSkipText={setMossSkipText} onChange={setMossSampling} cfg={cfg} disabled={modelSwitching} Slider={Slider} />}
               <div className="generation-count-grid">
                 <CountField label="单批图片数" detail="一次批量推理同时生成" value={imagesPerBatch} max={10} disabled={modelSwitching} onChange={setImagesPerBatch} />
                 <CountField label="生成批次数" detail="批次之间按顺序排队" value={batchCount} max={20} disabled={modelSwitching} onChange={setBatchCount} />
@@ -7260,8 +7408,8 @@ function App() {
                 chain={postprocessChain}
                 onChange={setPostprocessChain}
                 engine={model}
-                samplers={model === "Anima" ? ANIMA_SAMPLERS : samplerNames}
-                schedulers={model === "Anima" ? ANIMA_SCHEDULERS : schedulerNames}
+                samplers={model === "Anima" ? ANIMA_SAMPLERS : isMoss ? MOSS_SAMPLERS : samplerNames}
+                schedulers={model === "Anima" ? ANIMA_SCHEDULERS : isMoss ? MOSS_SCHEDULERS : schedulerNames}
                 baseSize={size}
                 baseSteps={steps}
                 baseCfg={cfg}
@@ -7451,15 +7599,45 @@ function App() {
         <section className="center-panel panel">
           <div className="prompt-header">
             <div><span className="eyebrow">PROMPT COMPOSER</span><p className="prompt-syntax-help">权重语法：<code>(text)</code> = 1.1；<code>(text:1.25)</code> = 显式权重；<code>\(text\)</code> = 字面括号。</p></div>
-            <button className="optimize" onClick={() => setAssistantOpen(true)} aria-expanded={assistantOpen}><WandSparkles size={16} />AI 助手<kbd>Ctrl/⌘ K</kbd></button>
+            <div className="prompt-header-actions">
+              {isMoss && <div className="prompt-mode-switch" role="group" aria-label="正向提示词模式">
+                <button type="button" aria-pressed={!mossLayout.enabled} disabled={modelSwitching} onClick={() => enableMossLayout(false)} title="普通文本提示词">文本</button>
+                <button type="button" aria-pressed={mossLayout.enabled} disabled={modelSwitching} onClick={() => enableMossLayout(true)} title="MOSS 坐标布局：在画布上画框并逐框描述">布局</button>
+              </div>}
+              <button className="optimize" onClick={() => setAssistantOpen(true)} aria-expanded={assistantOpen}><WandSparkles size={16} />AI 助手<kbd>Ctrl/⌘ K</kbd></button>
+            </div>
           </div>
 
-          <label className={`prompt-field positive-field ${transparentPromptEnabled ? "transparent-enabled" : ""}`}>
+          {mossLayoutActive ? <MossLayoutCard
+            layout={mossLayout}
+            compiled={mossLayoutCompiled}
+            tokens={mossLayoutTokens}
+            prefix={mossLayoutPrefix}
+            positiveText={positive}
+            disabled={modelSwitching}
+            notice={mossLayoutNotice}
+            onOpen={() => setMossLayoutStudioOpen(true)}
+            onCopy={() => copyText(mossLayoutCompiled.prompt)}
+            onToText={mossLayoutToText}
+            onTemplate={applyMossLayoutTemplate}
+            onDismissNotice={() => setMossLayoutNotice(null)}
+            onUndoNotice={undoMossLayoutRescale}
+          /> : <label className={`prompt-field positive-field ${transparentPromptEnabled ? "transparent-enabled" : ""}`}>
             <div><span>正向提示词{transparentPromptEnabled && <b className="special-tag-mark">TRANSPARENT PNG</b>}</span><small>{positive.length} 字符</small></div>
             <textarea ref={positivePromptRef} value={positive} onChange={(event) => changePromptText("positive", event)} onSelect={(event) => recordPromptSelection("positive", event)} onClick={(event) => recordPromptSelection("positive", event)} onKeyUp={(event) => recordPromptSelection("positive", event)} onFocus={(event) => recordPromptSelection("positive", event)} placeholder="描述画面主体、环境、光线与风格..." spellCheck={false} />
             <Sparkles className="field-watermark" size={46} />
-          </label>
-          <TransparentBackgroundControl
+          </label>}
+          {mossLayoutStudioOpen && mossLayoutActive && <Suspense fallback={null}><MossLayoutStudio
+            layout={mossLayout}
+            onChange={setMossLayout}
+            prefix={mossLayoutPrefix}
+            compiled={mossLayoutCompiled}
+            tokens={mossLayoutTokens}
+            stageSizes={mossLayoutStages}
+            adetailerActive={Boolean(adetailer.enabled)}
+            onClose={() => setMossLayoutStudioOpen(false)}
+          /></Suspense>}
+          {mossLayoutActive ? transparentPromptEnabled && <p className="moss-layout-text-note">布局模式不使用透明背景；文本提示词中的透明背景标签只在文本模式生效。</p> : <TransparentBackgroundControl
             enabled={transparentPromptEnabled}
             disabled={modelSwitching}
             modelId={backgroundRemovalModel}
@@ -7470,7 +7648,7 @@ function App() {
             onModelChange={setBackgroundRemovalModel}
             onDownload={downloadBackgroundRemovalModel}
             onToggle={toggleTextToImageTransparentBackground}
-          />
+          />}
           <PromptPresetStrip type="positive" container={promptPresets} activeIds={activePromptPresets.positive} open={presetWindowOpen && presetWindowModule === "positive"} disabled={modelSwitching} libraryError={promptPresetLibraryError} onOpen={togglePromptPresetWindow} onToggle={applyPreset} />
 
           <label className="prompt-field negative-field">
@@ -7558,7 +7736,7 @@ function App() {
             <div title={inferenceHealth?.memory_reason || "首次生成加载模型时自动评估"}><span>显存档位</span><strong>{inferenceHealth?.memory_label || "AUTO 待评估"}</strong></div>
             <div><span>底模缓存</span><strong>{inferenceHealth?.model_resident ? "GPU 常驻" : inferenceHealth?.model_cached ? "内存缓存" : "未加载"}</strong></div>
           </div>
-          {promptConditioning && <p className="conditioning-info">{displayedRunEngine === "Anima" ? "Qwen3 + T5 Tokenizer 条件" : displayedRunEngine === "Flux" ? "T5-XXL + CLIP-L 条件" : displayedRunEngine === "Flux2" ? "大语言模型三层取样条件" : displayedRunEngine === "Krea2" ? "Qwen3-VL 十二层取样条件" : "CLIP 条件"}：正向 {promptConditioning.tokens} tokens / {promptConditioning.blocks} blocks{promptConditioning.weightedTokens ? ` / ${promptConditioning.weightedTokens} 加权` : ""}；负向 {promptConditioning.negativeTokens} tokens / {promptConditioning.negativeBlocks} blocks{promptConditioning.negativeWeightedTokens ? ` / ${promptConditioning.negativeWeightedTokens} 加权` : ""}</p>}
+          {promptConditioning && <p className="conditioning-info">{displayedRunEngine === "Anima" ? "Qwen3 + T5 Tokenizer 条件" : displayedRunEngine === "Flux" ? "T5-XXL + CLIP-L 条件" : displayedRunEngine === "Flux2" ? "大语言模型三层取样条件" : displayedRunEngine === "Krea2" ? "Qwen3-VL 十二层取样条件" : displayedRunEngine === "MOSS" ? "Qwen3.5-9B 末层条件" : "CLIP 条件"}：正向 {promptConditioning.tokens} tokens / {promptConditioning.blocks} blocks{promptConditioning.weightedTokens ? ` / ${promptConditioning.weightedTokens} 加权` : ""}；负向 {promptConditioning.negativeTokens} tokens / {promptConditioning.negativeBlocks} blocks{promptConditioning.negativeWeightedTokens ? ` / ${promptConditioning.negativeWeightedTokens} 加权` : ""}</p>}
           {generationWarning && <p className="generation-warning">{generationWarning}</p>}
           </div>
           <button className={`generate-button ${queueBusy ? "queueing" : ""}`} title={generationDisabledReason || (queueBusy ? "按当前参数排队一个新任务" : "开始生成")} onClick={generate} disabled={Boolean(generationDisabledReason)}>
@@ -7581,7 +7759,7 @@ function App() {
            // SD/iL only have to not deny it, and `engineAllowsHires` and its siblings are where that
            // asymmetry is decided — re-reading `features` on the page would be a second copy of the
            // rule, free to drift from the one the generate page enforces.
-           features: { hires: engineAllowsHires, adetailer: engineAllowsADetailer, rtx: engineAllowsRtx },
+           features: { hires: engineAllowsHires, adetailer: engineAllowsADetailer, rtx: engineAllowsRtx, img2img: engineAllowsImageToImage },
            ready: imageEngineReady,
           serviceReady: inferenceHealth?.status === "ready" && Boolean(inferenceHealth.cuda),
           serviceLabel: inferenceHealth?.status === "ready" ? inferenceHealth.cuda ? inferenceHealth.device : "CUDA 不可用" : inferenceHealth?.status === "error" ? `启动失败：${inferenceHealth.error}` : inferenceHealth?.status === "offline" ? "离线" : "正在启动",
@@ -7598,7 +7776,7 @@ function App() {
           checkpointMissing,
           assets: [
             { kind: "diffusionModel", label: "扩散模型", value: diffusionModel, options: diffusionModels, directory: diffusionModelDirectory, missing: diffusionModelMissing },
-            { kind: "textEncoder", label: isFlux ? "文本编码器 · CLIP-L" : isFlux2 || isKrea2 ? "文本编码器 · 大语言模型" : "文本编码器", value: textEncoder, options: textEncoders, directory: textEncoderDirectory, missing: textEncoderMissing },
+            { kind: "textEncoder", label: isFlux ? "文本编码器 · CLIP-L" : isMoss ? "文本编码器 · Qwen3.5-9B" : isFlux2 || isKrea2 ? "文本编码器 · 大语言模型" : "文本编码器", value: textEncoder, options: textEncoders, directory: textEncoderDirectory, missing: textEncoderMissing },
             ...(isFlux ? [{ kind: "textEncoder2", label: "文本编码器 · T5-XXL", value: textEncoder2, options: textEncoders2, directory: textEncoderDirectory, missing: textEncoder2Missing }] : []),
             { kind: "vae", label: "VAE", value: vae, options: vaes, directory: vaeDirectory, missing: vaeMissing },
           ],
@@ -7653,7 +7831,7 @@ function App() {
           memoryReason: inferenceHealth?.memory_reason || "首次生成加载模型时自动评估",
           cacheLabel: inferenceHealth?.model_resident ? "GPU 常驻" : inferenceHealth?.model_cached ? "内存缓存" : "未加载",
           conditioning: promptConditioning,
-          conditioningLabel: isAnima ? "Qwen3 + T5 Tokenizer 条件" : isFlux ? "T5-XXL + CLIP-L 条件" : isFlux2 ? "大语言模型三层取样条件" : isKrea2 ? "Qwen3-VL 十二层取样条件" : "CLIP 条件",
+          conditioningLabel: isAnima ? "Qwen3 + T5 Tokenizer 条件" : isFlux ? "T5-XXL + CLIP-L 条件" : isFlux2 ? "大语言模型三层取样条件" : isKrea2 ? "Qwen3-VL 十二层取样条件" : isMoss ? "Qwen3.5-9B 末层条件" : "CLIP 条件",
         }}
         transparentBackground={{
           modelId: backgroundRemovalModel,
@@ -7910,6 +8088,10 @@ function App() {
                 <div className="performance-toggle-row">
                   <div><strong>Transformer 编译加速</strong><p>{performanceCapabilities.triton === false ? "需要在配置器中安装 Triton；未安装时保持关闭。" : "把 Anima 的 28 个 Transformer 块交给 Inductor 编译，融合逐元素算子。每种画布尺寸首次生成需要一次编译（约 10 秒），之后每步更快；同种子出图会改变。仅对 Anima 生效。"}</p></div>
                   <button type="button" role="switch" aria-checked={performanceConfig.compile_transformer} disabled={performanceCapabilities.triton === false} className={`settings-switch ${performanceConfig.compile_transformer ? "active" : ""}`} onClick={() => setPerformanceConfig((current) => ({ ...current, compile_transformer: !current.compile_transformer }))}><i /></button>
+                </div>
+                <div className="performance-toggle-row">
+                  <div><strong>MOSS 文本编码器位置</strong><p>MOSS 的 Qwen3.5-9B 编码器（INT8 语言部分约 8 GB）。自动：放得下就常驻 GPU，放不下就逐层流式送入 GPU；CPU 编码只在手动选择时使用，会明显变慢。仅对 MOSS 生效。</p></div>
+                  <div className="performance-segment four" role="group" aria-label="MOSS 文本编码器位置">{[["auto", "自动"], ["gpu_resident", "GPU 常驻"], ["gpu_streamed", "GPU 流式"], ["cpu", "CPU"]].map(([value, label]) => <button type="button" key={value} aria-pressed={performanceConfig.moss_text_encoder_placement === value} className={performanceConfig.moss_text_encoder_placement === value ? "active" : ""} disabled={performanceLoading} onClick={() => setPerformanceConfig((current) => ({ ...current, moss_text_encoder_placement: value }))}>{label}</button>)}</div>
                 </div>
                 <div className={`nvfp4-status ${performanceCapabilities.nvfp4?.runtime_ready ? "detected" : ""}`}>
                   <div><span>BLACKWELL PATH</span><strong>NVFP4 实验能力</strong><p>{performanceCapabilities.nvfp4?.hardware_supported ? performanceCapabilities.nvfp4?.runtime_ready ? "已检测到 50 系硬件和量化运行库；为保护单文件 SDXL、LoRA 与 CPU offload 兼容性，本版本仅检测不启用。" : "显卡支持 NVFP4，但项目缺少经过验证的 TorchAO / ModelOpt 量化运行链。" : "当前显卡不提供 NVFP4 Tensor Core 路径；不影响 FP16 / BF16 与 SDPA 优化。"}</p></div>

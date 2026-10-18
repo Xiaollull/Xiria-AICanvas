@@ -41,6 +41,7 @@ import { composeGroupPrompt } from "./lora-groups";
 import { formatWeight } from "./lora-weight";
 import { copyText } from "./clipboard";
 import { engineGuidance, isSplitEngine } from "./engine-settings.js";
+import { MOSS_SAMPLERS, MOSS_SCHEDULERS, isMossEngine, mossSamplerFor, mossSchedulerFor, normalizeMossSampling } from "./moss-engine.js";
 import { NATIVE_STEP_ENGINES, adetailerSummary, normalizeADetailerUnits } from "./adetailer-units.js";
 import ResampleChainPanel from "./ResampleChainPanel.jsx";
 import GalleryOutputDrawer from "./GalleryOutputDrawer.jsx";
@@ -845,21 +846,27 @@ function GalleryCardEditor({
   // Guidance the selected engine refuses: distilled Flux takes none, CFG-Zero* needs a
   // flow-matching engine, Krea 2 has no PAG. One rule set, shared with the workspace.
   const guidanceBlocked = engineGuidance(settings.model, settings.guidance) !== settings.guidance;
-  const visibleSamplers = SAMPLERS;
-  const visibleSchedulers = SCHEDULERS;
-  const changeEngine = (nextModel) => setSettings((current) => ({
-    ...current,
-    model: nextModel,
-    checkpoint: "",
-    diffusionModel: "",
-    textEncoder: "",
-    textEncoder2: "",
-    vae: "",
-    loras: [],
-    sampler: SAMPLERS.includes(current.sampler) ? current.sampler : isSplitEngine(nextModel) ? "euler" : "dpmpp_2m",
-    scheduler: SCHEDULERS.includes(current.scheduler) ? current.scheduler : isSplitEngine(nextModel) ? "simple" : "karras",
-    guidance: engineGuidance(nextModel, current.guidance),
-  }));
+  // MOSS offers ComfyUI's exact updates only; every other engine keeps the shared vocabulary.
+  const visibleSamplers = isMossEngine(settings.model) ? MOSS_SAMPLERS : SAMPLERS;
+  const visibleSchedulers = isMossEngine(settings.model) ? MOSS_SCHEDULERS : SCHEDULERS;
+  const changeEngine = (nextModel) => setSettings((current) => {
+    const next = {
+      ...current,
+      model: nextModel,
+      checkpoint: "",
+      diffusionModel: "",
+      textEncoder: "",
+      textEncoder2: "",
+      vae: "",
+      loras: [],
+      sampler: isMossEngine(nextModel) ? mossSamplerFor(current.sampler) : SAMPLERS.includes(current.sampler) ? current.sampler : isSplitEngine(nextModel) ? "euler" : "dpmpp_2m",
+      scheduler: isMossEngine(nextModel) ? mossSchedulerFor(current.scheduler) : SCHEDULERS.includes(current.scheduler) ? current.scheduler : isSplitEngine(nextModel) ? "simple" : "karras",
+      guidance: engineGuidance(nextModel, current.guidance),
+    };
+    if (isMossEngine(nextModel)) next.mossSampling = normalizeMossSampling(current.mossSampling);
+    else delete next.mossSampling;
+    return next;
+  });
   useEffect(() => {
     const controller = new AbortController();
     fetch(`/api/models?engine=${encodeURIComponent(settings.model)}`, { signal: controller.signal, cache: "no-store" })
@@ -1158,7 +1165,7 @@ function GalleryCardEditor({
         <section>
           <div className="gallery-editor-section-head"><div><span>02</span><strong>模型组件与 LoRA</strong></div><button type="button" onClick={() => setLoraOpen(true)}><Layers3 size={13} />LoRA 管理器</button></div>
           <div className={`gallery-editor-grid ${isSplit ? "four" : "three"}`}>
-            <label className="gallery-field"><span>模型引擎</span><select value={settings.model} onChange={(event) => changeEngine(event.target.value)}><option value="SD">SD</option><option value="iL">iL / SDXL</option><option value="Anima">Anima</option><option value="Flux">FLUX.1</option><option value="Flux2">FLUX.2</option><option value="Krea2">Krea 2</option></select></label>
+            <label className="gallery-field"><span>模型引擎</span><select value={settings.model} onChange={(event) => changeEngine(event.target.value)}><option value="SD">SD</option><option value="iL">iL / SDXL</option><option value="Anima">Anima</option><option value="Flux">FLUX.1</option><option value="Flux2">FLUX.2</option><option value="Krea2">Krea 2</option><option value="MOSS">MOSS</option></select></label>
             {isSplit ? [["diffusionModel", "扩散模型", splitAssets.diffusion_model], ["textEncoder", isFlux ? "CLIP-L 文本编码器" : "文本编码器", splitAssets.text_encoder], ...(isFlux ? [["textEncoder2", "T5-XXL 文本编码器", splitAssets.text_encoder_2]] : []), ["vae", "VAE", splitAssets.vae]].map(([key, label, catalog]) => <label className="gallery-field" key={key}><span>{label}</span><select value={settings[key]} onChange={(event) => setField(key, event.target.value)}><option value="">未指定</option>{settings[key] && !catalog.some((item) => item.value === settings[key]) && <option value={settings[key]}>{settings[key]}（未在当前目录发现）</option>}{catalog.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>) : <label className="gallery-field wide"><span>底模选择</span><select value={settings.checkpoint} onChange={(event) => setField("checkpoint", event.target.value)}><option value="">未指定</option>{settings.checkpoint && !checkpoints.some((item) => item.value === settings.checkpoint) && <option value={settings.checkpoint}>{settings.checkpoint}（未在当前目录发现）</option>}{checkpoints.map((item) => <option value={item.value} key={item.value}>{item.name}</option>)}</select></label>}
           </div>
           {modelCatalogError && <p className="gallery-form-error">模型目录扫描失败：{modelCatalogError}</p>}

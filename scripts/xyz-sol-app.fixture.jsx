@@ -32,7 +32,7 @@ window.__appFetch = async (url, method, body) => {
       : { engine, model_type: "split", assets: Object.fromEntries(fields.map((field) => [field, { models: choices(names[field]), directory: "fixture/read-only" }])), runtime: {} });
   }
   if (url.startsWith("/api/loras?")) return response({ engine, directory: "fixture/read-only", categories: [{ id: "character", label: "人物", models: [reference(engine, 0), reference(engine, 1)] }] });
-  if (url.startsWith("/api/inference/health")) return response({ status: "ready", cuda: false, device: "Fixture · no GPU", protocol: 39,
+  if (url.startsWith("/api/inference/health")) return response({ status: "ready", cuda: false, device: "Fixture · no GPU", protocol: 40,
     engines: Object.fromEntries(SETTINGS_ENGINES.map((e) => [e, { available: true, features: { lora: true, hires: true } }])),
     pipeline_configs: { sd: true, sdxl: true }, guidance: { pag: { available: true, engines: ["SD", "iL", "Anima"] }, cfg_zero_star: { available: true, engines: ["Anima", "Krea2"] }, },
     performance: {}, upscalers: { models: [], builtins: [] }, background_removal: { models: [], builtins: [] } });

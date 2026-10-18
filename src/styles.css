@@ -555,6 +555,7 @@ button { color: inherit; }
 .wd14-page .wd14-engine-grid .model-seg:nth-child(2n) { border-right: 0; }
 .wd14-page .wd14-engine-grid .model-seg:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
 .wd14-page .wd14-engine-grid .model-seg:nth-last-child(-n + 2) { border-bottom: 0; }
+.wd14-page .wd14-engine-grid .model-seg:last-child { grid-column: auto; }
 .wd14-page .wd14-info-button { width: 32px; height: 32px; min-height: 32px; padding: 0; border-radius: 50%; color: var(--lime); }
 .wd14-status a { color: var(--lime); font-size: 12px; text-underline-offset: 3px; }
 .wd14-info-popover { position: fixed; z-index: 12000; width: min(360px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto; box-sizing: border-box; padding: 16px; color: var(--n-28); background: var(--n-02); border: 1px solid var(--n-08); border-radius: 8px; box-shadow: 0 12px 36px rgb(0 0 0 / .24); font: 13px/1.65 "Manrope", sans-serif; }
@@ -700,8 +701,20 @@ button { color: inherit; }
 
 .model-segment { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--n-02); }
 .model-seg { position: relative; min-width: 0; padding: 12px 4px 11px; text-align: center; border: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: transparent; color: var(--n-19); cursor: pointer; transition: background .18s, color .18s; }
-.model-seg:nth-child(3n) { border-right: 0; }
-.model-seg:nth-last-child(-n + 3) { border-bottom: 0; }
+.model-seg:nth-child(3n), .model-seg:last-child { border-right: 0; }
+/* The last row starts at the 3n + 1 cell among the last three; a short last row is filled so no cell sits alone. */
+.model-seg:nth-child(3n + 1):nth-last-child(-n + 3), .model-seg:nth-child(3n + 1):nth-last-child(-n + 3) ~ .model-seg { border-bottom: 0; }
+.model-seg:nth-child(3n + 1):last-child { grid-column: 1 / -1; }
+.model-seg:nth-child(3n + 2):last-child { grid-column: span 2; }
+/* Seven engines sit 2 · 3 · 2 on six tracks instead, so the last one is not a full-width bar. Each cell is
+   matched by its position from both ends, which only a list of seven satisfies. */
+.model-segment:has(> .model-seg:nth-child(7):last-child) { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.model-seg:nth-child(1):nth-last-child(7), .model-seg:nth-child(2):nth-last-child(6),
+.model-seg:nth-child(6):nth-last-child(2), .model-seg:nth-child(7):nth-last-child(1) { grid-column: span 3; }
+.model-seg:nth-child(3):nth-last-child(5), .model-seg:nth-child(4):nth-last-child(4), .model-seg:nth-child(5):nth-last-child(3) { grid-column: span 2; }
+.model-seg:nth-child(3):nth-last-child(5), .model-seg:nth-child(6):nth-last-child(2) { border-right: 1px solid var(--line); }
+.model-seg:nth-child(2):nth-last-child(6), .model-seg:nth-child(5):nth-last-child(3) { border-right: 0; }
+.model-seg:nth-child(6):nth-last-child(2) { border-bottom: 0; }
 .model-seg:hover:not(:disabled) { background: var(--n-03); color: var(--n-26); }
 .model-seg.active { color: var(--n-02); background: var(--lime); }
 .model-seg.active:hover:not(:disabled) { background: var(--lime); color: var(--n-02); }
@@ -1622,7 +1635,7 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
 .auto-vram-notice { margin-top: 10px; padding: 13px 15px; border: 1px solid #5a482e; border-left: 3px solid #d6a952; background: linear-gradient(100deg, rgba(214,169,82,.08), transparent 65%), #17140f; }.auto-vram-notice strong { color: #d7bd8b; font-size: 9px; }.auto-vram-notice p { margin: 6px 0 0; color: #8f8066; font: 7px/1.7 "DM Mono"; }
 .performance-group { margin-top: 14px; border: 1px solid var(--n-06); background: var(--n-02); }.performance-group-head { min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 13px; border-bottom: 1px solid var(--n-05); }.performance-group-head span, .performance-group-head strong, .performance-group-head small { min-width: 0; display: block; }.performance-group-head strong { color: var(--n-26); font-size: 9px; }.performance-group-head small { margin-top: 4px; color: var(--n-12); font: 7px "DM Mono"; line-height: 1.5; }.performance-group-head > b { flex: 0 0 auto; color: var(--lime); font: 7px "DM Mono"; font-weight: 500; }
 .performance-choice-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1px; background: var(--n-05); }.performance-choice-grid.compact { grid-template-columns: repeat(2, minmax(0, 1fr)); }.performance-choice-grid button { min-width: 0; min-height: 68px; display: grid; grid-template-columns: 8px minmax(0, 1fr); align-items: start; gap: 8px; padding: 11px 10px; border: 0; color: var(--n-18); background: var(--n-02); cursor: pointer; text-align: left; }.performance-choice-grid button:hover:not(:disabled) { background: var(--n-03); }.performance-choice-grid button > i { width: 6px; height: 6px; margin-top: 3px; border: 1px solid var(--n-11); border-radius: 50%; }.performance-choice-grid button span, .performance-choice-grid button strong, .performance-choice-grid button small { min-width: 0; display: block; }.performance-choice-grid button strong { color: var(--n-23); font-size: 8px; }.performance-choice-grid button small { margin-top: 5px; color: var(--n-11); font: 6px/1.5 "DM Mono"; }.performance-choice-grid button.active { background: linear-gradient(130deg, rgb(var(--accent-rgb) / .1), transparent 75%), var(--n-03); }.performance-choice-grid button.active > i { border-color: var(--lime); background: var(--lime); box-shadow: 0 0 7px rgb(var(--accent-rgb) / .55); }.performance-choice-grid button.active strong { color: var(--lime); }.performance-choice-grid button:disabled { opacity: .38; cursor: not-allowed; }
-.performance-toggle-row { min-height: 74px; display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 10px; padding: 13px 15px; border: 1px solid var(--n-06); background: var(--n-02); }.performance-toggle-row > div:first-child { min-width: 0; }.performance-toggle-row strong { color: var(--n-26); font-size: 9px; }.performance-toggle-row p { margin: 5px 0 0; color: var(--n-13); font: 7px/1.55 "DM Mono"; }.performance-segment { display: grid; grid-template-columns: repeat(2, auto); flex: 0 0 auto; border: 1px solid var(--n-07); }.performance-segment button { height: 30px; padding: 0 10px; border: 0; color: var(--n-15); background: var(--n-02); cursor: pointer; font-size: 7px; }.performance-segment button + button { border-left: 1px solid var(--n-07); }.performance-segment button.active { color: var(--accent-contrast); background: var(--lime); }
+.performance-toggle-row { min-height: 74px; display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 10px; padding: 13px 15px; border: 1px solid var(--n-06); background: var(--n-02); }.performance-toggle-row > div:first-child { min-width: 0; }.performance-toggle-row strong { color: var(--n-26); font-size: 9px; }.performance-toggle-row p { margin: 5px 0 0; color: var(--n-13); font: 7px/1.55 "DM Mono"; }.performance-segment { display: grid; grid-template-columns: repeat(2, auto); flex: 0 0 auto; border: 1px solid var(--n-07); }.performance-segment button { height: 30px; padding: 0 10px; border: 0; color: var(--n-15); background: var(--n-02); cursor: pointer; font-size: 7px; }.performance-segment button + button { border-left: 1px solid var(--n-07); }.performance-segment button.active { color: var(--accent-contrast); background: var(--lime); }.performance-segment.four { grid-template-columns: repeat(4, auto); }.performance-segment.four button:nth-child(3) { border-left: 1px solid var(--n-07); }
 .nvfp4-status { min-height: 92px; display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 10px; padding: 15px; overflow: hidden; border: 1px solid var(--n-07); background: linear-gradient(120deg, rgba(116,129,104,.08), transparent 48%), var(--n-02); }.nvfp4-status.detected { border-color: color-mix(in srgb, var(--lime) 31%, var(--n-07)); background: linear-gradient(120deg, rgb(var(--accent-rgb) / .1), transparent 52%), var(--n-02); }.nvfp4-status > div { min-width: 0; }.nvfp4-status span, .nvfp4-status strong { display: block; }.nvfp4-status span { color: #74796b; font: 6px "DM Mono"; letter-spacing: .18em; }.nvfp4-status strong { margin-top: 5px; color: var(--n-26); font-size: 10px; }.nvfp4-status p { max-width: 500px; margin: 6px 0 0; color: var(--n-13); font: 7px/1.65 "DM Mono"; }.nvfp4-status > b { flex: 0 0 auto; padding: 6px 8px; color: #8a8f81; border: 1px solid var(--n-08); font: 6px "DM Mono"; font-weight: 500; letter-spacing: .08em; }.nvfp4-status.detected > b { color: var(--lime); border-color: color-mix(in srgb, var(--lime) 33%, var(--n-08)); }.quant-status ul { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 4px 14px; margin: 9px 0 0; padding: 0; list-style: none; }.quant-status li { min-width: 0; display: flex; flex-direction: column; gap: 2px; }.quant-status li b { color: var(--n-22); font: 7px "DM Mono"; letter-spacing: .06em; }.quant-status li small { color: var(--n-13); font: 7px/1.5 "DM Mono"; overflow-wrap: anywhere; }
 .performance-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 15px; }.performance-actions button { height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 12px; border: 1px solid var(--n-07); color: var(--n-20); background: var(--n-03); cursor: pointer; font: 8px "DM Mono"; }.performance-actions button:hover:not(:disabled) { color: var(--n-28); border-color: var(--n-12); }.performance-actions .performance-apply { min-width: 150px; color: var(--accent-contrast); border-color: var(--lime); background: var(--lime); font-weight: 700; }.performance-actions button:disabled { opacity: .45; cursor: wait; }
 .theme-section { min-height: 100%; background: radial-gradient(circle at 88% 10%, rgb(var(--accent-rgb) / .075), transparent 27%); }
@@ -1759,7 +1772,7 @@ kbd { padding: 3px 5px; color: var(--n-16); border: 1px solid var(--n-07); backg
   .theme-toolbar { align-items: stretch; flex-direction: column; }
   .theme-toolbar-actions { width: 100%; }.theme-toolbar-actions button { flex: 1; }
   .theme-palette-grid { grid-template-columns: 1fr; }
-  .performance-live-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }.performance-preset-grid { grid-template-columns: 1fr; }.performance-preset-grid > button:last-child:nth-child(odd) { grid-column: auto; min-height: 108px; }.performance-choice-grid, .choice-grid-memory_mode, .choice-grid-attention_backend, .choice-grid-vae_mode, .choice-grid-compute_dtype { grid-template-columns: repeat(2, minmax(0, 1fr)); }.performance-toggle-row, .nvfp4-status { align-items: stretch; flex-direction: column; }.performance-segment { grid-template-columns: repeat(2, 1fr); }.performance-actions { flex-direction: column; }.performance-actions button { width: 100%; }
+  .performance-live-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }.performance-preset-grid { grid-template-columns: 1fr; }.performance-preset-grid > button:last-child:nth-child(odd) { grid-column: auto; min-height: 108px; }.performance-choice-grid, .choice-grid-memory_mode, .choice-grid-attention_backend, .choice-grid-vae_mode, .choice-grid-compute_dtype { grid-template-columns: repeat(2, minmax(0, 1fr)); }.performance-toggle-row, .nvfp4-status { align-items: stretch; flex-direction: column; }.performance-segment, .performance-segment.four { grid-template-columns: repeat(2, 1fr); }.performance-segment.four button:nth-child(3) { border-left: 0; }.performance-segment.four button:nth-child(n + 3) { border-top: 1px solid var(--n-07); }.performance-actions { flex-direction: column; }.performance-actions button { width: 100%; }
   .theme-group-label small { display: none; }
   .environment-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .reconfigure-card { align-items: stretch; flex-direction: column; }
@@ -3882,6 +3895,9 @@ button.metadata-json-value:hover { color: var(--lime); }
 /* P6 · CLIP skip readout and the expanded-canvas note. */
 .clip-skip-note, .canvas-size-note { margin: 6px 0 0; color: var(--n-13); font: 8px/1.6 "DM Mono"; }
 .clip-skip-note b { color: var(--lime); font-weight: 500; }
+/* MOSS sampling block: the seed field's input without its trailing button. */
+.moss-sampling .moss-skip-field input { border-radius: 5px; }
+.moss-sampling .guidance-unavailable { margin-top: 6px; }
 .canvas-size-note { text-align: center; }
 
 /* P6 · Settings → General: canvas bound and output path. */
@@ -4752,8 +4768,9 @@ button.metadata-json-value:hover { color: var(--lime); }
   .workspace.xyz-mode .xyz-sidebar { overflow: visible; }
   .workspace.xyz-mode .xyz-sidebar .panel-scroll { overflow: visible; padding: 8px 12px; }
   .workspace.xyz-mode .xyz-sidebar .panel-scroll > .section-heading:first-child { display: none; }
-  .workspace.xyz-mode .xyz-sidebar .model-segment { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px; }
-  .workspace.xyz-mode .xyz-sidebar .model-seg { min-height: 44px; padding: 4px 2px; }
+  .workspace.xyz-mode .xyz-sidebar .model-segment { grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+  .workspace.xyz-mode .xyz-sidebar .model-seg { min-height: 44px; padding: 4px 2px; grid-column: auto; border-bottom: 0; }
+  .workspace.xyz-mode .xyz-sidebar .model-seg:not(:last-child) { border-right: 1px solid var(--line); }
   .workspace.xyz-mode .xyz-sidebar .seg-detail { display: none; }
   .workspace.xyz-mode .xyz-sidebar .seg-name { font-size: 11px; }
   .workspace.xyz-mode .xyz-sidebar .generation-mode-field { margin-top: 6px; }
@@ -5121,4 +5138,365 @@ button.metadata-json-value:hover { color: var(--lime); }
   .gallery-transfer-tabs { padding: 8px 12px 0; }
   .gallery-transfer-list em { display: none; }
   .gallery-transfer-list label { grid-template-columns: 18px minmax(0, 1fr); }
+}
+
+/* ---------------------------------------------------------------------------
+   MOSS coordinate layouts (QPlan2/MOSS/P2): the Basic page card and the Studio.
+
+   Label colours carry meaning in both places and nowhere else, so they are scoped
+   to the two surfaces rather than added to the shared ramp: text is amber, object
+   blue, character rose, panel the neutral grey drawn dashed (a frame, not a thing).
+   Every control states its own size; nothing here inherits a browser default.
+   --------------------------------------------------------------------------- */
+.moss-layout-card, .moss-studio, .prompt-mode-switch { --moss-text: #e3ad48; --moss-object: #62a0f2; --moss-character: #ee7898; --moss-panel: var(--n-21); }
+:is(.moss-layout-card, .moss-studio) .label-text { --label: var(--moss-text); }
+:is(.moss-layout-card, .moss-studio) .label-object { --label: var(--moss-object); }
+:is(.moss-layout-card, .moss-studio) .label-character { --label: var(--moss-character); }
+:is(.moss-layout-card, .moss-studio) .label-panel { --label: var(--moss-panel); }
+
+.prompt-header-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.prompt-mode-switch { height: 36px; display: inline-flex; padding: 2px; border: 1px solid var(--n-07); border-radius: 4px; background: var(--n-02); }
+.prompt-mode-switch button { min-width: 52px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 10px; border: 0; border-radius: 3px; color: var(--n-18); background: transparent; cursor: pointer; font-size: 11px; }
+.prompt-mode-switch button:hover:not(:disabled) { color: var(--n-28); }
+.prompt-mode-switch button[aria-pressed="true"] { color: var(--accent-contrast); background: var(--lime); font-weight: 700; }
+.prompt-mode-switch button:disabled { opacity: .45; cursor: not-allowed; }
+
+.moss-layout-card { position: relative; margin-bottom: 12px; font-size: 11px; padding: 13px 14px; border: 1px solid var(--n-06); border-radius: 5px; background: var(--n-02); }
+.moss-layout-card.invalid { border-color: color-mix(in srgb, var(--moss-text) 45%, var(--n-06)); }
+.moss-layout-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.moss-layout-card > header > span { display: inline-flex; align-items: center; color: var(--n-29); font-size: 12px; font-weight: 600; }
+.moss-layout-card > header small { color: var(--n-14); font: 10px "DM Mono"; }
+.moss-layout-card-body, .moss-layout-card-empty { display: grid; grid-template-columns: minmax(130px, 220px) minmax(0, 1fr); gap: 16px; margin-top: 12px; }
+.moss-layout-preview { position: relative; height: 196px; display: block; padding: 0; border: 1px solid var(--n-07); border-radius: 4px; background: var(--n-01); cursor: pointer; }
+.moss-layout-preview:hover:not(:disabled) { border-color: rgb(var(--accent-rgb) / .6); }
+.moss-layout-mini { width: 100%; height: 100%; display: block; overflow: visible; }
+/* The frame has a definite size and the drawing is letterboxed inside it; a grid cell would let a tall or square canvas grow past the frame. */
+.moss-layout-preview > .moss-layout-mini { position: absolute; inset: 8px; width: calc(100% - 16px); height: calc(100% - 16px); }
+.moss-layout-mini rect.paper { fill: var(--n-04); stroke: var(--n-09); stroke-width: 1px; vector-effect: non-scaling-stroke; }
+.moss-layout-mini g rect { fill: color-mix(in srgb, var(--label) 16%, transparent); stroke: var(--label); stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
+.moss-layout-mini g.label-panel rect { fill: color-mix(in srgb, var(--label) 6%, transparent); stroke-dasharray: 5 3; }
+.moss-layout-mini text { fill: var(--label); font-family: "DM Mono"; font-weight: 700; }
+.moss-layout-card-info { min-width: 0; display: grid; align-content: start; gap: 9px; }
+.moss-layout-caption { display: -webkit-box; margin: 0; overflow: hidden; color: var(--n-26); font-size: 13px; line-height: 1.6; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
+.moss-layout-caption.missing { color: var(--moss-text); font-size: 12px; }
+.moss-layout-counts, .moss-label-counts { display: flex; flex-wrap: wrap; gap: 5px; }
+.moss-layout-counts span, .moss-label-counts span { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid color-mix(in srgb, var(--label) 35%, var(--n-06)); border-radius: 3px; color: var(--n-24); background: color-mix(in srgb, var(--label) 7%, transparent); font: 10px "DM Mono"; }
+.moss-layout-counts span.zero, .moss-label-counts span.zero { opacity: .45; }
+.moss-layout-counts i, .moss-label-counts i { width: 7px; height: 7px; border-radius: 1px; background: var(--label); }
+.moss-token-meter { display: grid; grid-template-columns: auto minmax(60px, 1fr) auto; align-items: center; gap: 8px; color: var(--n-16); font: 10px "DM Mono"; }
+.moss-token-meter > span { letter-spacing: .08em; }
+.moss-token-meter > i { height: 5px; overflow: hidden; border-radius: 3px; background: var(--n-05); }
+.moss-token-meter > i b { height: 100%; display: block; background: var(--lime); transition: width .2s; }
+.moss-token-meter.warn > i b { background: var(--moss-text); }
+.moss-token-meter.over > i b { background: var(--state-error-strong); }
+.moss-token-meter output { color: var(--n-26); font: 11px "DM Mono"; white-space: nowrap; }
+.moss-token-meter.warn output { color: var(--moss-text); }
+.moss-token-meter.over output { color: var(--state-error-strong); }
+.moss-token-meter.compact { min-width: 220px; }
+.moss-layout-validity { display: flex; align-items: flex-start; gap: 6px; margin: 0; font-size: 11px; line-height: 1.5; }
+.moss-layout-validity svg { flex: 0 0 auto; margin-top: 2px; }
+.moss-layout-validity.good { color: color-mix(in srgb, var(--lime) 80%, var(--n-28)); }
+.moss-layout-validity.bad { color: var(--moss-text); }
+.moss-layout-prefix { min-width: 0; display: flex; gap: 7px; margin: 0; overflow: hidden; color: var(--n-18); font: 10px "DM Mono"; white-space: nowrap; text-overflow: ellipsis; }
+.moss-layout-prefix b { flex: 0 0 auto; color: var(--n-24); font-weight: 600; }
+.moss-layout-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.moss-layout-actions button, .moss-layout-notice button { min-height: 32px; display: inline-flex; align-items: center; gap: 6px; padding: 0 11px; border: 1px solid var(--n-08); border-radius: 3px; color: var(--n-24); background: var(--n-03); cursor: pointer; font-size: 11px; }
+.moss-layout-actions button:hover:not(:disabled) { color: var(--lime); border-color: rgb(var(--accent-rgb) / .55); }
+.moss-layout-actions button.primary { color: var(--accent-contrast); border-color: var(--lime); background: var(--lime); font-weight: 700; }
+.moss-layout-actions button.primary:hover:not(:disabled) { color: var(--accent-contrast); filter: brightness(1.08); }
+.moss-layout-actions button.confirm { color: var(--moss-text); border-color: color-mix(in srgb, var(--moss-text) 60%, var(--n-08)); }
+.moss-layout-actions button:disabled { opacity: .45; cursor: not-allowed; }
+.moss-layout-empty-canvas { height: 150px; display: grid; place-content: center; justify-items: center; gap: 8px; border: 1px dashed var(--n-10); border-radius: 4px; color: var(--n-18); background: var(--n-01); cursor: pointer; font: 10px "DM Mono"; }
+.moss-layout-empty-canvas:hover:not(:disabled) { color: var(--lime); border-color: var(--lime); }
+.moss-layout-card-empty strong { color: var(--n-28); font-size: 13px; }
+.moss-layout-card-empty p { margin: 6px 0 12px; color: var(--n-18); font-size: 11px; line-height: 1.65; }
+.moss-layout-notice { display: flex; align-items: center; gap: 8px; margin-top: 11px; padding: 7px 8px 7px 11px; border-left: 2px solid var(--lime); color: var(--n-24); background: rgb(var(--accent-rgb) / .06); font-size: 11px; }
+.moss-layout-notice > span { flex: 1; min-width: 0; }
+.moss-layout-notice button { min-height: 26px; padding: 0 8px; font-size: 10px; }
+.moss-layout-notice button.icon { width: 26px; justify-content: center; padding: 0; }
+.moss-layout-text-note { margin: -4px 0 12px; color: var(--n-18); font-size: 10px; }
+
+/* The Studio: the image viewer's frame and line work, at the Basic page's type scale. */
+.moss-studio-backdrop { position: fixed; z-index: var(--z-modal); inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(3,3,4,.94); backdrop-filter: blur(12px); }
+.moss-studio { position: relative; width: min(1720px, 100%); height: min(1040px, calc(100vh - 36px)); height: min(1040px, calc(100dvh - 36px)); display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 58px auto auto minmax(0, 1fr) auto; overflow: hidden; border: 1px solid var(--n-07); border-radius: 7px; outline: 0; color: var(--n-27); background: var(--n-01); box-shadow: 0 30px 100px rgba(0,0,0,.72); font-size: 11px; user-select: none; -webkit-user-select: none; }
+/* Rows by name, not by order: the narrow-screen pane tabs are display:none on wide screens and would otherwise shift the body into the toolbar's row. */
+.moss-studio > * { min-width: 0; }
+.moss-studio-head { grid-row: 1; }
+.moss-studio-toolbar { grid-row: 2; }
+.moss-studio-panes { grid-row: 3; }
+.moss-studio-body { grid-row: 4; }
+.moss-studio-status { grid-row: 5; }
+.moss-studio :is(input, textarea, pre, code) { user-select: text; -webkit-user-select: text; }
+.moss-studio button { font-family: inherit; }
+.moss-studio svg { flex: 0 0 auto; }
+.moss-studio-head { position: relative; z-index: 60; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 11px 0 18px; border-bottom: 1px solid var(--line); background: var(--n-02); }
+.moss-studio-title { min-width: 0; }
+.moss-studio-title strong, .moss-studio-title span { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.moss-studio-title strong { color: var(--n-29); font-size: 14px; }
+.moss-studio-title span { margin-top: 4px; color: var(--n-14); font: 10px "DM Mono"; }
+.moss-studio-head-actions { display: flex; flex: 0 0 auto; gap: 5px; }
+.moss-studio-head-actions button { height: 34px; display: inline-flex; align-items: center; gap: 6px; padding: 0 11px; border: 1px solid var(--n-07); border-radius: 3px; color: var(--n-22); background: var(--n-03); cursor: pointer; font-size: 11px; }
+.moss-studio-head-actions button:hover:not(:disabled), .moss-studio-head-actions button.active { color: var(--lime); border-color: #4e5438; }
+.moss-studio-head-actions button.primary { color: var(--accent-contrast); border-color: var(--lime); background: var(--lime); font-weight: 700; }
+.moss-studio-head-actions button.primary:hover { color: var(--accent-contrast); filter: brightness(1.08); }
+.moss-studio-head-actions button:disabled { opacity: .45; cursor: not-allowed; }
+.moss-studio-head-actions .moss-studio-close { width: 36px; justify-content: center; padding: 0; }
+
+.moss-popover { position: absolute; z-index: 70; top: calc(100% + 4px); right: 10px; width: min(420px, calc(100vw - 24px)); max-height: min(560px, calc(100dvh - 120px)); display: grid; gap: 8px; overflow-y: auto; padding: 10px; border: 1px solid var(--n-08); border-radius: 5px; background: rgba(13,14,13,.98); box-shadow: 0 18px 55px rgba(0,0,0,.62); backdrop-filter: blur(14px); scrollbar-width: thin; }
+.moss-popover > header { padding: 2px 2px 8px; border-bottom: 1px solid var(--n-06); }
+.moss-popover > header strong { display: block; color: var(--n-28); font-size: 12px; }
+.moss-popover > header span { display: block; margin-top: 4px; color: var(--n-15); font-size: 10px; line-height: 1.5; }
+.moss-popover > button { min-height: 52px; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; padding: 7px 9px; border: 1px solid var(--n-06); border-radius: 4px; color: var(--n-24); background: var(--n-03); cursor: pointer; text-align: left; }
+.moss-popover > button:hover:not(:disabled) { border-color: rgb(var(--accent-rgb) / .55); }
+.moss-popover > button:disabled { opacity: .45; cursor: not-allowed; }
+.moss-popover > button strong, .moss-popover > button small { display: block; }
+.moss-popover > button strong { color: var(--n-28); font-size: 12px; }
+.moss-popover > button small { margin-top: 3px; color: var(--n-15); font-size: 10px; }
+.moss-templates > button { grid-template-columns: 76px minmax(0, 1fr); }
+.moss-layout-mini.template { width: 76px; height: 60px; }
+.moss-import textarea { width: 100%; min-height: 150px; padding: 9px; resize: vertical; border: 1px solid var(--n-07); border-radius: 4px; outline: 0; color: var(--n-27); background: var(--n-01); font: 11px/1.55 "DM Mono"; }
+.moss-import textarea:focus { border-color: var(--lime); }
+.moss-popover em { color: var(--state-error-ink); font-size: 11px; font-style: normal; line-height: 1.5; }
+.moss-tool-reference { position: relative; }
+.moss-reference-panel { top: calc(100% + 6px); right: auto; left: 0; width: 300px; }
+
+.moss-studio-toolbar { position: relative; z-index: 50; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--n-05); background: var(--n-02); }
+.moss-tool-group { height: 32px; display: inline-flex; align-items: stretch; overflow: hidden; border: 1px solid var(--n-07); border-radius: 3px; background: var(--n-02); }
+.moss-tool-group > button { min-width: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 9px; border: 0; border-right: 1px solid var(--n-06); color: var(--n-21); background: var(--n-03); cursor: pointer; font-size: 11px; white-space: nowrap; }
+.moss-tool-group > button:last-child { border-right: 0; }
+.moss-tool-group > button:hover:not(:disabled) { color: var(--lime); }
+.moss-tool-group > button[aria-pressed="true"] { color: var(--lime); background: rgb(var(--accent-rgb) / .12); box-shadow: inset 0 -2px var(--lime); }
+.moss-tool-group > button:disabled { opacity: .38; cursor: not-allowed; }
+.moss-align-tools > button { padding: 0 7px; }
+.moss-zoom .moss-zoom-value { min-width: 56px; color: var(--n-27); font: 11px "DM Mono"; }
+.moss-tool-reference > button { height: 32px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; border: 1px solid var(--n-07); border-radius: 3px; color: var(--n-21); background: var(--n-03); cursor: pointer; font-size: 11px; white-space: nowrap; }
+.moss-tool-reference > button:hover, .moss-tool-reference > button.active { color: var(--lime); border-color: #4e5438; }
+.moss-label-picker { height: 32px; display: inline-flex; gap: 3px; padding: 2px; border: 1px solid var(--n-07); border-radius: 3px; background: var(--n-02); }
+.moss-label-picker button { display: inline-flex; align-items: center; gap: 5px; padding: 0 8px; border: 1px solid transparent; border-radius: 2px; color: var(--n-19); background: transparent; cursor: pointer; font-size: 11px; }
+.moss-label-picker button i { width: 9px; height: 9px; border-radius: 2px; background: var(--label); }
+.moss-label-picker button:hover { color: var(--n-28); }
+.moss-label-picker button[aria-checked="true"] { color: var(--n-30); border-color: color-mix(in srgb, var(--label) 70%, transparent); background: color-mix(in srgb, var(--label) 14%, transparent); }
+.moss-toggle-group { height: 32px; display: inline-flex; align-items: center; gap: 12px; padding: 0 10px; border: 1px solid var(--n-07); border-radius: 3px; color: var(--n-21); background: var(--n-02); font-size: 11px; }
+.moss-toggle-group label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+.moss-toggle-group input { margin: 0; accent-color: var(--lime); }
+.moss-studio-panes { display: none; }
+
+.moss-studio-body { min-height: 0; display: grid; grid-template-columns: 272px minmax(0, 1fr) 352px; }
+.moss-studio-list, .moss-studio-inspector { min-width: 0; min-height: 0; display: grid; background: var(--n-02); }
+.moss-studio-list { grid-template-rows: auto auto minmax(0, 1fr) auto; border-right: 1px solid var(--n-05); }
+.moss-studio-list > header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 12px 12px 8px; }
+.moss-studio-list > header strong { flex: 0 0 auto; color: var(--n-28); font-size: 12px; white-space: nowrap; }
+.moss-studio-list > header strong b { margin-left: 4px; color: var(--lime); font: 11px "DM Mono"; }
+.moss-studio-list > header span { min-width: 0; overflow: hidden; color: var(--n-13); font-size: 10px; white-space: nowrap; text-overflow: ellipsis; }
+.moss-studio-list .moss-label-counts { padding: 0 12px 10px; border-bottom: 1px solid var(--n-05); }
+.moss-studio-list ol { min-height: 0; margin: 0; padding: 6px; overflow-y: auto; list-style: none; scrollbar-width: thin; scrollbar-color: var(--n-08) transparent; }
+.moss-studio-list li { --row-bg: var(--n-03); position: relative; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 4px; margin-bottom: 3px; padding: 3px 4px 3px 2px; border: 1px solid transparent; border-radius: 4px; background: var(--row-bg); }
+.moss-studio-list li:hover { border-color: var(--n-07); }
+.moss-studio-list li.selected { --row-bg: color-mix(in srgb, rgb(var(--accent-rgb)) 8%, var(--n-03)); border-color: rgb(var(--accent-rgb) / .6); }
+.moss-studio-list li.hidden { opacity: .55; }
+.moss-studio-list li.drop-before { box-shadow: 0 -2px 0 var(--lime); }
+.moss-studio-list li.drop-after { box-shadow: 0 2px 0 var(--lime); }
+.moss-grip { color: var(--n-11); font-size: 11px; letter-spacing: -2px; text-align: center; cursor: grab; }
+.moss-list-main { min-width: 0; display: grid; grid-template-columns: 20px 10px minmax(0, 1fr); align-items: center; gap: 6px; padding: 5px 2px; border: 0; color: inherit; background: transparent; cursor: pointer; text-align: left; }
+.moss-list-main > b { color: var(--n-16); font: 11px "DM Mono"; text-align: right; }
+.moss-swatch { width: 10px; height: 10px; border-radius: 2px; background: var(--label); }
+.moss-swatch.label-panel { background: transparent; border: 1.5px dashed var(--label); }
+.moss-list-main > span { min-width: 0; }
+.moss-list-main strong, .moss-list-main small { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.moss-list-main strong { display: flex; align-items: center; gap: 5px; color: var(--n-27); font-size: 12px; }
+.moss-list-main strong svg { color: var(--moss-text); }
+.moss-list-main small { margin-top: 2px; color: var(--n-16); font-size: 11px; }
+.moss-list-main small.missing { color: var(--moss-text); }
+.moss-row-actions { position: relative; display: flex; align-items: center; }
+.moss-row-actions button { width: 26px; height: 26px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 3px; color: var(--n-16); background: transparent; cursor: pointer; }
+.moss-row-actions button:hover:not(:disabled) { color: var(--lime); background: var(--n-05); }
+.moss-row-actions button.danger:hover:not(:disabled) { color: var(--state-error-strong); }
+.moss-row-actions button:disabled { opacity: .3; cursor: not-allowed; }
+.moss-row-more { position: absolute; right: 100%; top: 50%; display: none; padding-left: 18px; translate: 0 -50%; background: linear-gradient(90deg, transparent, var(--row-bg) 16px); }
+.moss-studio-list li:is(:hover, :focus-within) .moss-row-more { display: flex; }
+.moss-list-empty { margin: 0; padding: 18px 14px; color: var(--n-15); font-size: 11px; line-height: 1.6; }
+.moss-add-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; padding: 9px; border-top: 1px solid var(--n-05); }
+.moss-add-row button { min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 4px; border: 1px solid color-mix(in srgb, var(--label) 35%, var(--n-07)); border-radius: 3px; color: var(--n-25); background: var(--n-03); cursor: pointer; font-size: 11px; white-space: nowrap; }
+.moss-add-row button i { width: 7px; height: 7px; border-radius: 1px; background: var(--label); }
+.moss-add-row button:hover:not(:disabled) { color: var(--n-31); background: color-mix(in srgb, var(--label) 12%, var(--n-03)); }
+.moss-add-row button:disabled { opacity: .4; cursor: not-allowed; }
+
+.moss-studio-canvas { position: relative; min-width: 0; min-height: 0; overflow: hidden; touch-action: none; background-color: var(--n-01); background-image: radial-gradient(var(--n-04) 1px, transparent 1px); background-size: 18px 18px; }
+.moss-studio-canvas.cursor-draw { cursor: crosshair; }
+.moss-studio-canvas.cursor-pan, .moss-studio-canvas.cursor-pan .moss-box { cursor: grab; }
+.moss-studio-canvas.cursor-pan:active { cursor: grabbing; }
+.moss-studio-canvas.cursor-draw .moss-box { cursor: crosshair; }
+/* Its own stacking context: box z-indexes (one per item, up to 257) stay inside the paper, so the canvas hint and notice drawn after it always sit on top. */
+.moss-paper { position: absolute; isolation: isolate; background: var(--n-04); box-shadow: 0 0 0 1px var(--n-09), 0 18px 60px rgba(0,0,0,.55); }
+.moss-reference { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; }
+.moss-grid { position: absolute; inset: 0; pointer-events: none; background-image: linear-gradient(rgba(255,255,255,.055) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.055) 1px, transparent 1px); }
+.moss-thirds i { position: absolute; display: block; pointer-events: none; background: rgb(var(--accent-rgb) / .35); }
+.moss-thirds i:nth-child(1), .moss-thirds i:nth-child(2) { top: 0; bottom: 0; width: 1px; }
+.moss-thirds i:nth-child(1) { left: 33.333%; }
+.moss-thirds i:nth-child(2) { left: 66.667%; }
+.moss-thirds i:nth-child(3), .moss-thirds i:nth-child(4) { left: 0; right: 0; height: 1px; }
+.moss-thirds i:nth-child(3) { top: 33.333%; }
+.moss-thirds i:nth-child(4) { top: 66.667%; }
+.moss-centre-mark { position: absolute; left: 50%; top: 50%; width: 15px; height: 15px; translate: -50% -50%; pointer-events: none; background: linear-gradient(var(--n-12), var(--n-12)) center / 1px 100% no-repeat, linear-gradient(var(--n-12), var(--n-12)) center / 100% 1px no-repeat; }
+.moss-ruler { position: absolute; pointer-events: none; color: var(--n-13); font: 10px "DM Mono"; }
+.moss-ruler.top { left: 0; right: 0; top: -18px; height: 15px; }
+.moss-ruler.top span { position: absolute; bottom: 0; height: 13px; padding-left: 3px; border-left: 1px solid var(--n-09); line-height: 13px; }
+.moss-ruler.left { top: 0; bottom: 0; left: -40px; width: 36px; }
+.moss-ruler.left span { position: absolute; right: 0; padding-right: 3px; border-top: 1px solid var(--n-09); line-height: 13px; text-align: right; }
+.moss-box { position: absolute; box-sizing: border-box; border: 1.5px solid var(--label); background: color-mix(in srgb, var(--label) 13%, transparent); cursor: move; touch-action: none; }
+.moss-box.label-panel { border-style: dashed; background: color-mix(in srgb, var(--label) 5%, transparent); }
+.moss-box:hover { background: color-mix(in srgb, var(--label) 19%, transparent); }
+.moss-box.selected { border-width: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,.65), 0 0 18px color-mix(in srgb, var(--label) 35%, transparent); }
+.moss-box.locked { pointer-events: none; border-style: dotted; }
+/* A panel is a frame: its inside lets drags through to draw the boxes it holds, and it is grabbed by its tag. */
+.moss-studio-canvas.cursor-select .moss-box.label-panel:not(.locked) { pointer-events: none; }
+.moss-studio-canvas.cursor-select .moss-box.label-panel:not(.locked) :is(.moss-box-tag, .moss-handle) { pointer-events: auto; }
+.moss-studio-canvas.cursor-select .moss-box.label-panel:not(.locked) .moss-box-tag { cursor: move; }
+.moss-box.invalid .moss-box-tag svg { color: #7b2a17; }
+.moss-box.drafting { pointer-events: none; border-style: dashed; background: color-mix(in srgb, var(--label) 10%, transparent); }
+.moss-box-tag { position: absolute; left: -1.5px; top: -1.5px; max-width: calc(100% + 3px); display: inline-flex; align-items: center; gap: 4px; overflow: hidden; padding: 2px 6px 2px 2px; color: var(--n-01); background: var(--label); font: 700 10px/14px "DM Mono"; white-space: nowrap; pointer-events: none; }
+.moss-box-tag > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.moss-box-tag b { flex: 0 0 auto; min-width: 16px; padding: 0 3px; color: var(--label); background: rgba(11,12,11,.86); text-align: center; }
+.moss-box-caption { position: absolute; inset: 21px 6px auto; display: -webkit-box; overflow: hidden; color: var(--n-30); font-size: 11px; line-height: 1.4; text-shadow: 0 1px 2px rgba(0,0,0,.85); pointer-events: none; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow-wrap: anywhere; }
+.moss-box-caption b { display: block; color: var(--moss-text); font-weight: 700; }
+.moss-box-caption em { color: var(--moss-text); font-style: normal; }
+.moss-box-size { position: absolute; right: 3px; bottom: 3px; padding: 1px 4px; color: var(--n-29); background: rgba(11,12,11,.78); font: 10px "DM Mono"; pointer-events: none; }
+.moss-handle { position: absolute; z-index: 2; width: 10px; height: 10px; border: 1.5px solid var(--label); background: var(--n-32); }
+.moss-handle.h-tl { left: -6px; top: -6px; cursor: nwse-resize; }
+.moss-handle.h-top { left: calc(50% - 5px); top: -6px; cursor: ns-resize; }
+.moss-handle.h-tr { right: -6px; top: -6px; cursor: nesw-resize; }
+.moss-handle.h-right { right: -6px; top: calc(50% - 5px); cursor: ew-resize; }
+.moss-handle.h-br { right: -6px; bottom: -6px; cursor: nwse-resize; }
+.moss-handle.h-bottom { left: calc(50% - 5px); bottom: -6px; cursor: ns-resize; }
+.moss-handle.h-bl { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.moss-handle.h-left { left: -6px; top: calc(50% - 5px); cursor: ew-resize; }
+.moss-guide { position: absolute; z-index: 9999; display: block; pointer-events: none; background: var(--lime); box-shadow: 0 0 8px var(--lime); }
+.moss-guide.x { top: 0; bottom: 0; width: 1px; }
+.moss-guide.y { left: 0; right: 0; height: 1px; }
+.moss-canvas-hint { position: absolute; left: 50%; bottom: 22px; display: inline-flex; align-items: center; gap: 8px; translate: -50% 0; padding: 7px 12px; border: 1px solid var(--n-08); border-radius: 4px; color: var(--n-22); background: rgba(16,17,16,.9); font-size: 11px; pointer-events: none; }
+.moss-studio-notice { position: absolute; left: 50%; bottom: 16px; max-width: calc(100% - 30px); translate: -50% 0; padding: 8px 12px; border: 1px solid #4d5439; border-radius: 4px; color: #c9cfae; background: rgba(18,20,15,.95); box-shadow: 0 8px 30px rgba(0,0,0,.45); cursor: pointer; font-size: 11px; }
+
+.moss-studio-inspector { grid-template-rows: auto minmax(0, 1fr); border-left: 1px solid var(--n-05); }
+.moss-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--n-05); }
+.moss-tabs button { min-height: 40px; border: 0; border-bottom: 2px solid transparent; color: var(--n-18); background: transparent; cursor: pointer; font-size: 12px; }
+.moss-tabs button:hover { color: var(--n-28); }
+.moss-tabs button[aria-selected="true"] { color: var(--lime); border-bottom-color: var(--lime); font-weight: 700; }
+.moss-tabs button.attention::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 5px; border-radius: 50%; background: var(--moss-text); vertical-align: middle; }
+.moss-inspector-body { min-height: 0; display: grid; align-content: start; gap: 15px; overflow-y: auto; padding: 14px 14px 22px; scrollbar-width: thin; scrollbar-color: var(--n-08) transparent; }
+.moss-inspector-empty { display: grid; justify-items: center; align-content: start; gap: 8px; padding: 34px 18px; color: var(--n-16); text-align: center; }
+.moss-inspector-empty strong { color: var(--n-26); font-size: 13px; }
+.moss-inspector-empty p { margin: 0 0 8px; font-size: 11px; line-height: 1.65; }
+.moss-inspector-empty .moss-add-row { width: 100%; padding: 0; border: 0; }
+.moss-item-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.moss-item-title b { color: var(--lime); font: 12px "DM Mono"; }
+.moss-item-title strong { color: var(--n-30); font-size: 14px; }
+.moss-flag { padding: 2px 6px; border: 1px solid var(--n-08); border-radius: 3px; color: var(--n-19); font-size: 10px; }
+.moss-field { min-width: 0; display: grid; gap: 7px; }
+.moss-field-label { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--n-25); font-size: 11px; font-weight: 600; }
+.moss-field-label small { color: var(--n-14); font: 400 10px "DM Mono"; }
+.moss-field textarea, .moss-coord input, .moss-chips input { min-width: 0; width: 100%; border: 1px solid var(--n-07); border-radius: 4px; outline: 0; color: var(--n-29); background: var(--n-01); font-size: 12px; }
+.moss-field textarea { padding: 9px 10px; resize: vertical; line-height: 1.6; }
+.moss-field textarea:focus, .moss-coord input:focus { border-color: var(--lime); box-shadow: 0 0 0 1px rgb(var(--accent-rgb) / .15); }
+.moss-field.invalid textarea, .moss-field.invalid .moss-chips { border-color: color-mix(in srgb, var(--moss-text) 70%, var(--n-07)); }
+.moss-field > em { color: var(--moss-text); font-size: 11px; font-style: normal; }
+.moss-json { font: 11px/1.55 "DM Mono" !important; white-space: pre; }
+.moss-segmented { display: grid; gap: 4px; }
+.moss-segmented.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.moss-segmented button { min-height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 4px; border: 1px solid var(--n-07); border-radius: 3px; color: var(--n-20); background: var(--n-02); cursor: pointer; font-size: 11px; white-space: nowrap; }
+.moss-segmented button i { width: 8px; height: 8px; border-radius: 2px; background: var(--label, var(--n-14)); }
+.moss-segmented button:hover { color: var(--n-29); }
+.moss-segmented button.active { color: var(--n-31); border-color: var(--label, var(--lime)); background: color-mix(in srgb, var(--label, var(--lime)) 16%, var(--n-02)); font-weight: 700; }
+.moss-coords { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.moss-coord { display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 6px; }
+.moss-coord span { color: var(--n-16); font: 11px "DM Mono"; text-align: right; }
+.moss-coord input { height: 32px; padding: 0 8px; font: 12px "DM Mono"; }
+.moss-coord-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.moss-coord-actions button, .moss-inspector-actions button, .moss-file-button, .moss-suggestions button, .moss-colour-add button { min-height: 30px; display: inline-flex; align-items: center; gap: 5px; padding: 0 9px; border: 1px solid var(--n-08); border-radius: 3px; color: var(--n-23); background: var(--n-03); cursor: pointer; font-size: 11px; }
+.moss-coord-actions button:hover, .moss-inspector-actions button:hover:not(:disabled), .moss-file-button:hover, .moss-suggestions button:hover, .moss-colour-add button:hover { color: var(--lime); border-color: rgb(var(--accent-rgb) / .55); }
+.moss-inspector-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.moss-inspector-actions button.primary { color: var(--accent-contrast); border-color: var(--lime); background: var(--lime); font-weight: 700; }
+.moss-inspector-actions button.danger { color: #e39a84; border-color: #5d3d34; }
+.moss-inspector-actions button:disabled { opacity: .4; cursor: not-allowed; }
+.moss-file-button { position: relative; overflow: hidden; }
+.moss-file-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.moss-centred { display: block; padding: 7px 9px; border: 1px dashed var(--n-08); border-radius: 3px; color: var(--n-20); background: var(--n-01); font: 11px "DM Mono"; overflow-wrap: anywhere; }
+.moss-chips { min-height: 36px; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding: 4px; border: 1px solid var(--n-07); border-radius: 4px; background: var(--n-01); }
+.moss-chips input { flex: 1 1 110px; width: auto; min-height: 26px; padding: 0 5px; border: 0; background: transparent; }
+.moss-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 3px 3px 3px 7px; border: 1px solid var(--n-08); border-radius: 3px; color: var(--n-27); background: var(--n-04); font-size: 11px; overflow-wrap: anywhere; }
+.moss-chip i { width: 11px; height: 11px; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.3); border-radius: 2px; }
+.moss-chip button { width: 18px; height: 18px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 2px; color: var(--n-16); background: transparent; cursor: pointer; }
+.moss-chip button:hover { color: var(--state-error-strong); background: var(--n-06); }
+.moss-colour-add { display: flex; align-items: center; gap: 6px; }
+.moss-colour-add input[type="color"] { width: 34px; height: 30px; padding: 2px; border: 1px solid var(--n-08); border-radius: 3px; background: var(--n-02); cursor: pointer; }
+.moss-colour-add button { font-family: "DM Mono"; }
+.moss-suggestions { display: flex; flex-wrap: wrap; gap: 5px; }
+.moss-suggestions button { min-height: 26px; padding: 0 7px; color: var(--n-18); font: 10px "DM Mono"; }
+.moss-inspector-note { margin: 0; color: var(--n-17); font-size: 11px; line-height: 1.6; }
+.moss-inspector-note.good { display: flex; align-items: center; gap: 5px; color: color-mix(in srgb, var(--lime) 80%, var(--n-28)); }
+.moss-align-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.moss-align-grid button { min-height: 32px; display: inline-flex; align-items: center; gap: 7px; padding: 0 9px; border: 1px solid var(--n-07); border-radius: 3px; color: var(--n-22); background: var(--n-03); cursor: pointer; font-size: 11px; text-align: left; }
+.moss-align-grid button:hover:not(:disabled) { color: var(--lime); border-color: rgb(var(--accent-rgb) / .55); }
+.moss-align-grid button:disabled { opacity: .4; cursor: not-allowed; }
+.moss-issues { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.moss-issues button { width: 100%; display: grid; gap: 3px; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--moss-text) 30%, var(--n-07)); border-radius: 3px; color: var(--n-25); background: color-mix(in srgb, var(--moss-text) 5%, var(--n-02)); cursor: pointer; font-size: 11px; text-align: left; }
+.moss-issues code { color: var(--moss-text); font: 10px "DM Mono"; }
+.moss-compiled { max-height: 220px; margin: 0; padding: 9px 10px; overflow: auto; border: 1px solid var(--n-07); border-radius: 4px; color: var(--n-22); background: var(--n-01); font: 11px/1.55 "DM Mono"; white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-width: thin; }
+.moss-range { display: grid; grid-template-columns: auto minmax(0, 1fr) 40px; align-items: center; gap: 8px; color: var(--n-20); font-size: 11px; }
+.moss-range input { accent-color: var(--lime); }
+.moss-range output { color: var(--n-26); font: 11px "DM Mono"; text-align: right; }
+
+.moss-studio-status { min-height: 40px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 6px 12px; border-top: 1px solid var(--n-05); color: var(--n-17); background: var(--n-02); font-size: 11px; }
+.moss-studio-status > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.moss-status-validity { min-height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid var(--n-07); border-radius: 3px; background: var(--n-03); cursor: pointer; font-size: 11px; font-weight: 600; }
+.moss-status-validity.good { color: color-mix(in srgb, var(--lime) 80%, var(--n-28)); cursor: default; }
+.moss-status-validity.bad { color: var(--moss-text); border-color: color-mix(in srgb, var(--moss-text) 45%, var(--n-07)); }
+.moss-status-prefix { max-width: 340px; color: var(--n-20); font-family: "DM Mono"; }
+.moss-status-cursor { margin-left: auto; color: var(--n-20); font: 11px "DM Mono"; }
+
+@media (max-width: 1360px) {
+  .moss-studio-body { grid-template-columns: 236px minmax(0, 1fr) 312px; }
+  .moss-label-picker button { padding: 0 6px; }
+}
+@media (max-width: 1100px) {
+  .moss-studio-backdrop { padding: 0; }
+  .moss-studio { width: 100vw; height: 100vh; height: 100dvh; border: 0; border-radius: 0; }
+  .moss-studio-body { grid-template-columns: 220px minmax(0, 1fr) 292px; }
+  .moss-tool-group > button > span, .moss-studio-head-actions button:not(.primary) > span { display: none; }
+  .moss-align-tools { display: none; }
+}
+@media (max-width: 899px) {
+  .moss-studio { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
+  .moss-studio-head { min-height: 54px; padding: 0 8px 0 12px; }
+  .moss-studio-title span { display: none; }
+  .moss-studio-head-actions button.primary > span { display: none; }
+  .moss-studio-head-actions button { padding: 0 9px; }
+  .moss-studio-toolbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .moss-studio-toolbar::-webkit-scrollbar { display: none; }
+  .moss-tool-group, .moss-label-picker, .moss-toggle-group, .moss-tool-reference { flex: 0 0 auto; }
+  .moss-reference-panel { position: fixed; top: 112px; left: 8px; right: 8px; width: auto; }
+  .moss-studio-panes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--n-05); background: var(--n-02); }
+  .moss-studio-panes button { min-height: 38px; border: 0; border-bottom: 2px solid transparent; color: var(--n-18); background: transparent; cursor: pointer; font-size: 12px; }
+  .moss-studio-panes button[aria-pressed="true"] { color: var(--lime); border-bottom-color: var(--lime); font-weight: 700; }
+  .moss-studio-body { grid-template-columns: minmax(0, 1fr); }
+  .moss-studio-body > * { grid-row: 1; grid-column: 1; border: 0; }
+  .moss-studio-body[data-pane="canvas"] > :not(.moss-studio-canvas),
+  .moss-studio-body[data-pane="list"] > :not(.moss-studio-list),
+  .moss-studio-body[data-pane="inspector"] > :not(.moss-studio-inspector) { visibility: hidden; pointer-events: none; }
+  .moss-studio-status { gap: 4px 10px; padding: 6px 10px; }
+  .moss-status-prefix, .moss-studio-status > span:not(.moss-status-cursor) { display: none; }
+  .moss-token-meter.compact { min-width: 0; flex: 1 1 160px; }
+  .moss-row-more { position: static; display: flex; padding: 0; translate: none; background: none; }
+}
+@media (max-width: 600px) {
+  /* The prompt copy stays one tap away in 导出; the head keeps 完成 and ✕ in reach. */
+  .moss-studio-head { gap: 8px; }
+  .moss-studio-head-actions { gap: 4px; }
+  .moss-studio-head-actions button { width: 34px; justify-content: center; padding: 0; }
+  .moss-studio-head-actions .moss-head-copy { display: none; }
+  .moss-studio-list > header span { display: none; }
+}
+@media (max-width: 720px) {
+  .moss-layout-card-body, .moss-layout-card-empty { grid-template-columns: minmax(0, 1fr); }
+  .moss-layout-preview { height: 180px; }
+  .prompt-header { flex-wrap: wrap; gap: 10px; }
 }

@@ -11,6 +11,7 @@ DEFAULT_MODEL_PATHS = {
         "flux": "models/loras/flux",
         "flux2": "models/loras/flux2",
         "krea2": "models/loras/krea2",
+        "moss": "models/loras/moss",
     },
     "vae": "models/vae",
     "diffusion_models": "models/diffusion_models",

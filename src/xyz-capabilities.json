@@ -11,6 +11,7 @@
     "Anima": { "model_fields": ["diffusion_model", "text_encoder", "vae"], "negative_prompt": true, "clip_skip": null, "guidance": ["none", "pag", "cfg_zero_star"], "max_edge": 4096 },
     "Flux": { "model_fields": ["diffusion_model", "text_encoder", "text_encoder_2", "vae"], "negative_prompt": false, "clip_skip": null, "guidance": ["none"], "max_edge": 4096 },
     "Flux2": { "model_fields": ["diffusion_model", "text_encoder", "vae"], "negative_prompt": false, "clip_skip": null, "guidance": ["none"], "max_edge": 4096, "prompt_weights": false },
-    "Krea2": { "model_fields": ["diffusion_model", "text_encoder", "vae"], "negative_prompt": true, "clip_skip": null, "guidance": ["none", "cfg_zero_star"], "max_edge": 4096 }
+    "Krea2": { "model_fields": ["diffusion_model", "text_encoder", "vae"], "negative_prompt": true, "clip_skip": null, "guidance": ["none", "cfg_zero_star"], "max_edge": 4096 },
+    "MOSS": { "model_fields": ["diffusion_model", "text_encoder", "vae"], "negative_prompt": true, "clip_skip": null, "guidance": ["none"], "max_edge": 4096, "prompt_weights": false, "samplers": ["euler", "euler_ancestral", "heun"], "schedulers": ["simple", "sgm_uniform", "karras", "exponential", "ddim_uniform", "beta", "normal", "linear_quadratic", "kl_optimal"], "moss_sampling": true }
   }
 }

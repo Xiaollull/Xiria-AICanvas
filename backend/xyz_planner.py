@@ -263,8 +263,11 @@ def validate_parameters(request, cap, catalog):
         request['clip_skip'] = int(bounded(request['clip_skip'], *cap['clip_skip'], integer=True))
     if request['guidance'] not in cap['guidance']:
         reject('guidance', 'Guidance type is not implemented by this engine')
-    if request['sampler'] not in CAPABILITIES['samplers'] or request['scheduler'] not in CAPABILITIES['schedulers']:
+    # An engine may narrow the shared vocabulary (MOSS offers only its exact k-diffusion samplers).
+    if request['sampler'] not in cap.get('samplers', CAPABILITIES['samplers']) or request['scheduler'] not in cap.get('schedulers', CAPABILITIES['schedulers']):
         reject('sampling', 'Unsupported sampler or scheduler')
+    if request.get('moss') is not None and not cap.get('moss_sampling'):
+        reject('moss', 'The MOSS sampling block applies to the MOSS engine only')
     if not isinstance(request['pag'], dict) or set(request['pag']) != {'scale', 'applied_layers'} or request['pag']['applied_layers'] not in {'mid', 'all'}:
         reject('pag', 'Invalid PAG parameters')
     request['pag']['scale'] = float(bounded(request['pag']['scale'], 0, 5))

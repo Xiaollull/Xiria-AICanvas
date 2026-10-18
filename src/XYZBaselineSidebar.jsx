@@ -13,7 +13,7 @@ import { validXYZSeed } from "./xyz-axis-editor.js";
 const modelLabels = { checkpoint: "底模选择", diffusion_model: "扩散模型", text_encoder: "文本编码器", text_encoder_2: "文本编码器 · T5-XXL", vae: "VAE" };
 function xyzModelLabel(engine, field) {
   if (field === "text_encoder" && engine === "Flux") return "文本编码器 · CLIP-L";
-  if (field === "text_encoder" && ["Flux2", "Krea2"].includes(engine)) return "文本编码器 · 大语言模型";
+  if (field === "text_encoder" && ["Flux2", "Krea2", "MOSS"].includes(engine)) return "文本编码器 · 大语言模型";
   return modelLabels[field] || field;
 }
 function SavedSelect({ label, value, options, onChange, disabled = false }) {
@@ -57,7 +57,7 @@ export default function XYZBaselineSidebar({ draft, onChange, onOpenManager, pre
     {!runtimeGuidance.includes(p.guidance) && <p className="guidance-unavailable" role="alert">保存的 {p.guidance} 当前不可用；原值保留，预检会拒绝。</p>}
     <section className="xyz-baseline-sampling xyz-mother-controls"><div className="section-heading"><span>03</span><h2>采样参数</h2></div>
       <div className="sampling-parameters">
-      <SamplerPair prefix="XYZ " preserveUnavailable sampler={p.sampler} scheduler={p.scheduler} samplers={["SD", "iL"].includes(draft.engine) ? SAMPLER_NAMES : XYZ_CAPABILITIES.samplers} schedulers={["SD", "iL"].includes(draft.engine) ? SCHEDULER_NAMES : XYZ_CAPABILITIES.schedulers} onSampler={(sampler) => update({ sampler })} onScheduler={(scheduler) => update({ scheduler })} />
+      <SamplerPair prefix="XYZ " preserveUnavailable sampler={p.sampler} scheduler={p.scheduler} samplers={["SD", "iL"].includes(draft.engine) ? SAMPLER_NAMES : cap.samplers || XYZ_CAPABILITIES.samplers} schedulers={["SD", "iL"].includes(draft.engine) ? SCHEDULER_NAMES : cap.schedulers || XYZ_CAPABILITIES.schedulers} onSampler={(sampler) => update({ sampler })} onScheduler={(scheduler) => update({ scheduler })} />
       <div className="sliders">
         <Slider label="采样步数" value={p.steps} min={1} max={60} integer NumberInput={XYZNumberInput} onChange={(steps) => update({ steps })} />
         <Slider label={cap.negative_prompt ? "CFG 引导" : "蒸馏引导（Guidance）"} value={p.cfg} min={1} max={15} step={0.5} inputStep={0.1} NumberInput={XYZNumberInput} onChange={(cfg) => update({ cfg })} />

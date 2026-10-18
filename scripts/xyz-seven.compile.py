@@ -3,9 +3,11 @@ No inference import, formal listener, model files or GPU. Writes only into the s
 """
 import ast, builtins, copy, hashlib, json, re, sys, types, time, math
 from pathlib import Path
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
+# GenerateInput's MOSS layout block validates through the pure layout compiler (json/math only, no inference).
+from backend import moss_layout
 from backend.xyz_planner import CAPABILITIES, compile_xyz, plan_record
 from backend.xyz_schema import LoraReference, XYZExperimentInput
 from backend.output_paths import normalize_output_template
@@ -35,7 +37,7 @@ def constant(name,expr):
             if isinstance(n,ast.Name):constant(n.id,expr)
         v=eval(compile(ast.Expression(expr[name]),'current-constant','eval'),{'__builtins__':{}},constants)
     constants[name]=v;return v
-for file in ['anima_pipeline.py','anima_sampling.py','flux_pipeline.py','flux_sampling.py','flux2_pipeline.py','flux2_sampling.py','krea2_pipeline.py','krea2_sampling.py','guidance.py','rtx_vsr.py']:
+for file in ['anima_pipeline.py','anima_sampling.py','flux_pipeline.py','flux_sampling.py','flux2_pipeline.py','flux2_sampling.py','krea2_pipeline.py','krea2_sampling.py','moss_model.py','moss_sampling.py','guidance.py','rtx_vsr.py']:
     expr={t.id:n.value for n in ast.parse((ROOT/'backend'/file).read_text(encoding='utf-8')).body if isinstance(n,ast.Assign) for t in n.targets if isinstance(t,ast.Name)}
     for name in expr.keys()&(unresolved|{'MAX_OUTPUT_EDGE','MAX_OUTPUT_PIXELS'}):constant(name,expr)
 env.update(constants);env['rtx_vsr']=types.SimpleNamespace(MAX_OUTPUT_EDGE=constants['MAX_OUTPUT_EDGE'],MAX_OUTPUT_PIXELS=constants['MAX_OUTPUT_PIXELS'])

@@ -51,7 +51,7 @@ try {
     try {
       const health = await (await fetch(`${origin}/api/inference/health`)).json();
       lastHealth = { status: health.status, phase: health.phase, error: health.error, protocol: health.protocol };
-      if (health.status === "ready" && health.protocol === 39) { ready = true; break; }
+      if (health.status === "ready" && health.protocol === 40) { ready = true; break; }
     } catch { /* still importing */ }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }

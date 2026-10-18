@@ -78,9 +78,17 @@ test("the panel is built from the measured card, not from the constant", async (
 test("the frontend baseline and the server's table stay in step", async () => {
   const python = await read("backend/performance_settings.py");
   const table = python.slice(python.indexOf("DEFAULT_PERFORMANCE_SETTINGS = {"), python.indexOf("SETTING_CHOICES"));
+  // The MOSS encoder placement is sparse on the server: it stays out of the table so a settings file
+  // written before MOSS reads back item for item, and its default is declared on its own.
+  const sparse = { moss_text_encoder_placement: "MOSS_TEXT_ENCODER_PLACEMENT_DEFAULT" };
   for (const [key, value] of Object.entries(DEFAULT_PERFORMANCE)) {
     if (key === "vram_limit_gb") continue;
     const literal = typeof value === "boolean" ? (value ? "True" : "False") : `"${value}"`;
+    if (sparse[key]) {
+      assert.ok(!table.includes(`"${key}":`), `${key} stays out of the server table`);
+      assert.ok(python.includes(`${sparse[key]} = ${literal}\n`), `${key} is ${literal} on both sides`);
+      continue;
+    }
     assert.ok(table.includes(`"${key}": ${literal},`), `${key} is ${literal} on both sides`);
   }
   // The rule itself is written twice -- the server decides what an untouched install runs with, the

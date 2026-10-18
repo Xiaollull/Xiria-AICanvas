@@ -136,7 +136,7 @@ export function sharedKindSupported(kind) {
   return SHARED_RUNTIME_KINDS.includes(kind);
 }
 
-export const SHARED_LORA_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"];
+export const SHARED_LORA_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"];
 
 // Full engine sets this field has previously shipped with. A root saved while one of these was the
 // whole roster was never scoped to those engines — it simply predates the ones added since, so it
@@ -146,6 +146,7 @@ const LEGACY_SHARED_LORA_ENGINE_SETS = [
   ["SD", "iL", "Anima"],
   ["SD", "iL", "Anima", "Flux"],
   ["SD", "iL", "Anima", "Flux", "Flux2"],
+  ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"],
 ];
 
 function sameEngineSet(first, second) {

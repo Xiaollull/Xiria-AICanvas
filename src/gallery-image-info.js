@@ -17,6 +17,7 @@ import { normalizeResampleChain } from "./resample-chain.js";
 import { effectiveCanvasMaxEdge } from "./canvas-limit.js";
 import { engineGuidance, isSplitEngine } from "./engine-settings.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
+import { isMossEngine, mossSamplerFor, mossSchedulerFor, normalizeMossSampling } from "./moss-engine.js";
 
 /** At most this many pictures of one addition are read; the rest keep the settings they get. */
 export const GALLERY_IMAGE_INFO_READ_LIMIT = 12;
@@ -107,10 +108,12 @@ export function galleryCardFromImageInfo(current, info, {
       textEncoder2: "",
       vae: "",
       loras: [],
-      sampler: SAMPLER_NAMES.includes(current.sampler) ? current.sampler : isSplitEngine(engine) ? "euler" : "dpmpp_2m",
-      scheduler: SCHEDULER_NAMES.includes(current.scheduler) ? current.scheduler : isSplitEngine(engine) ? "simple" : "karras",
+      sampler: isMossEngine(engine) ? mossSamplerFor(current.sampler) : SAMPLER_NAMES.includes(current.sampler) ? current.sampler : isSplitEngine(engine) ? "euler" : "dpmpp_2m",
+      scheduler: isMossEngine(engine) ? mossSchedulerFor(current.scheduler) : SCHEDULER_NAMES.includes(current.scheduler) ? current.scheduler : isSplitEngine(engine) ? "simple" : "karras",
       guidance: engineGuidance(engine, current.guidance),
     });
+    if (isMossEngine(engine)) next.mossSampling = normalizeMossSampling(current.mossSampling);
+    else delete next.mossSampling;
   }
   const filled = [];
   if (plan.groups.includes("prompts")) {
@@ -119,7 +122,7 @@ export function galleryCardFromImageInfo(current, info, {
     filled.push(GROUP_LABELS.prompts);
   }
   if (plan.groups.includes("sampling")) {
-    for (const key of ["steps", "cfg", "sampler", "scheduler", "seed", "seedMode"]) if (key in overlay) next[key] = overlay[key];
+    for (const key of ["steps", "cfg", "sampler", "scheduler", "seed", "seedMode", "mossSampling"]) if (key in overlay) next[key] = overlay[key];
     // A picture that records no CLIP skip ran the family default, so the card says nothing either.
     next.clipSkip = "clipSkip" in overlay ? overlay.clipSkip : null;
     filled.push(GROUP_LABELS.sampling);

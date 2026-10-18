@@ -100,6 +100,13 @@ def estimate_inference_bytes(family, width, height, guidance_scale=7.5, images_p
         # 2048x2944 Hires pass — 15.7 GiB of a 23.5 GiB card, measured — down the block-streaming
         # path, where it took 690 seconds instead of running resident.
         estimate_gb = 0.35 + 0.90 * megapixels * batch_factor
+    elif family == "moss":
+        # MOSS-Image is 3072 wide like FLUX.1, but its single stream carries the whole conditioning
+        # (up to 4096 Qwen3.5 tokens) beside the 4096 image tokens of a 1 MP canvas, and an INT8
+        # linear's int32 accumulators are four bytes per output. The figure is a provisional upper
+        # bound until the xiria-39 measurement replaces it; the branches run one after the other,
+        # which reaches this function through `batch_factor` as for Krea 2.
+        estimate_gb = 0.80 + 1.00 * megapixels * batch_factor
     elif family == "anima":
         # Anima was the last native engine still sized by the generic fallback below, which was
         # written for SD-era UNets. Its DiT is 2048 wide over 28 blocks and patchifies to (W/16 x
@@ -162,6 +169,8 @@ def estimate_largest_component_bytes(runtime_weight_bytes, family):
         else 0.70 if family == "flux"
         else 0.60 if family == "flux2"
         else 0.75 if family == "krea2"
+        # MOSS's largest component is the Qwen3.5-9B encoder, not the 5B DiT.
+        else 0.60 if family == "moss"
         else 0.82
     )
     return min(runtime_weight_bytes, max(GIB, int(runtime_weight_bytes * ratio)))

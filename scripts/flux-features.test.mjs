@@ -37,12 +37,12 @@ test("the Flux entry point is open on the main page and mounts four components",
   assert.match(app, /\{ name: "Flux", detail: "FLUX\.1 蒸馏引导", ready: true \}/);
   // "即将支持" is the disabled-engine caption; Flux must no longer carry it in the engine table.
   assert.doesNotMatch(app, /\{ name: "Flux",[^}]*ready: false \}/);
-  assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2"\]/);
-  assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"\]/);
+  assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]/);
+  assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"\]/);
 
   const picker = sourceBetween(app, "            {isSplitModel ? <ModelAssetPicker", "            {isSplitModel && !engineAllowsLora");
   // The split engines share one `ModelAssetPicker`; each component is a `{ kind, label, ... }` field.
-  assert.match(picker, /\{ kind: "textEncoder", label: isFlux \? "文本编码器 · CLIP-L" : isFlux2 \|\| isKrea2 \? "文本编码器 · 大语言模型" : "文本编码器"/);
+  assert.match(picker, /\{ kind: "textEncoder", label: isFlux \? "文本编码器 · CLIP-L" : isMoss \? "文本编码器 · Qwen3.5-9B" : isFlux2 \|\| isKrea2 \? "文本编码器 · 大语言模型" : "文本编码器"/);
   assert.match(picker, /\.\.\.\(isFlux \? \[\{ kind: "textEncoder2", label: "文本编码器 · T5-XXL"/);
   // The second encoder is a Flux slot, not a fourth Anima component.
   assert.doesNotMatch(picker, /\n\s*\{ kind: "textEncoder2"/);
@@ -151,7 +151,7 @@ test("Flux refinement steps are counted like Anima's, not like Diffusers'", () =
 });
 
 test("Flux has its own LoRA scope without invalidating libraries saved before it existed", () => {
-  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   assert.equal(engineScopeKey("Flux"), "Flux");
   assert.deepEqual(emptyMountedLoraMap().byEngine.Flux, []);
 
@@ -177,7 +177,7 @@ test("the control plane lists Flux components and its own LoRA root", async () =
   assert.match(vite, /import \{ discoverFluxModels \} from "\.\/scripts\/flux-models\.mjs"/);
   assert.match(vite, /if \(!isLoraRequest && engine === "Flux"\)/);
   assert.match(vite, /text_encoder_2: \{ directory: relativeDirectory\(textEncoderDirectory\), models: discovered\.text_encoder_2 \}/);
-  assert.match(vite, /const nativeEngines = new Set\(\["Anima", "Flux", "Flux2", "Krea2"\]\)/);
+  assert.match(vite, /const nativeEngines = new Set\(\["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]\)/);
 
   const modelPaths = await readSource("scripts/model-paths.mjs");
   assert.match(modelPaths, /flux: "models\/loras\/flux"/);

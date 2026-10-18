@@ -6,6 +6,8 @@ import { normalizeUint64Seed } from "./hires-settings.js";
 import { migrateResampleChain } from "./resample-chain.js";
 import { normalizeADetailerStage } from "./adetailer-units.js";
 import { SETTINGS_ENGINES, engineGuidance, isSplitEngine } from "./engine-settings.js";
+import { MOSS_DEFAULTS, isMossEngine, mossSamplerFor, mossSchedulerFor, normalizeMossSampling } from "./moss-engine.js";
+import { normalizeMossLayout } from "./moss-layout.js";
 
 export const DEFAULT_SETTINGS = {
   model: "SD",
@@ -91,8 +93,14 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS) {
     // Only FLUX.1 mounts a second encoder; any other engine's card carries none.
     textEncoder2: model !== "Flux" ? "" : typeof source.textEncoder2 === "string" ? source.textEncoder2 : typeof base.textEncoder2 === "string" ? base.textEncoder2 : "",
     vae: typeof source.vae === "string" ? source.vae : typeof base.vae === "string" ? base.vae : "",
-    sampler: SAMPLERS.includes(source.sampler) ? source.sampler : SAMPLERS.includes(base.sampler) ? base.sampler : isSplitEngine(model) ? "euler" : "dpmpp_2m",
-    scheduler: SCHEDULERS.includes(source.scheduler) ? source.scheduler : SCHEDULERS.includes(base.scheduler) ? base.scheduler : isSplitEngine(model) ? "simple" : "karras",
+    // MOSS runs ComfyUI's exact updates only, so a name outside its vocabulary becomes its default
+    // rather than a sampler its server refuses.
+    sampler: isMossEngine(model)
+      ? mossSamplerFor(source.sampler ?? base.sampler)
+      : SAMPLERS.includes(source.sampler) ? source.sampler : SAMPLERS.includes(base.sampler) ? base.sampler : isSplitEngine(model) ? "euler" : "dpmpp_2m",
+    scheduler: isMossEngine(model)
+      ? mossSchedulerFor(source.scheduler ?? base.scheduler ?? MOSS_DEFAULTS.scheduler)
+      : SCHEDULERS.includes(source.scheduler) ? source.scheduler : SCHEDULERS.includes(base.scheduler) ? base.scheduler : isSplitEngine(model) ? "simple" : "karras",
     // Coerced by the engine's own rules: distilled Flux engines take none, CFG-Zero* needs a
     // flow-matching engine, Krea 2 has no PAG. A card must not carry what its engine refuses.
     guidance: engineGuidance(model, GUIDANCE.some(([id]) => id === source.guidance)
@@ -124,6 +132,15 @@ export function normalizedSettings(value, fallback = DEFAULT_SETTINGS) {
     imageHiresSeedModes: Array.isArray(source.imageHiresSeedModes) ? [...source.imageHiresSeedModes] : Array.isArray(base.imageHiresSeedModes) ? [...base.imageHiresSeedModes] : [],
     imageHiresSeeds: Array.isArray(source.imageHiresSeeds) ? [...source.imageHiresSeeds] : Array.isArray(base.imageHiresSeeds) ? [...base.imageHiresSeeds] : [],
   };
+  // MOSS's own sampling block (shift and negative-branch skipping) rides only on a MOSS card.
+  if (isMossEngine(model)) normalized.mossSampling = normalizeMossSampling(source.mossSampling ?? base.mossSampling);
+  else delete normalized.mossSampling;
+  // The coordinate layout (QPlan2/MOSS/P2) is part of a MOSS card's prompt, and only when it ran. A card
+  // without one ran a text prompt and keeps saying nothing, so applying it never puts a workspace into
+  // layout mode, nor overwrites the layout being drafted there.
+  const cardLayout = source.mossLayout && typeof source.mossLayout === "object" && source.mossLayout.enabled === true ? source.mossLayout : null;
+  if (isMossEngine(model) && cardLayout) normalized.mossLayout = normalizeMossLayout(cardLayout);
+  else delete normalized.mossLayout;
   delete normalized.promptPresets;
   // A Gallery card is a single reproducible model/list record, never a
   // workspace persistence transport. Retire any malformed/old injected map.

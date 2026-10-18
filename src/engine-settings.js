@@ -32,6 +32,8 @@ import { IMAGE_TO_IMAGE_DEFAULTS, normalizeImageToImageSettings } from "./image-
 import { normalizeUint64Seed } from "./hires-settings.js";
 import { migrateResampleChain } from "./resample-chain.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
+import { MOSS_DEFAULTS, isMossEngine, mossSamplerFor, mossSchedulerFor, normalizeMossSampling } from "./moss-engine.js";
+import { emptyMossLayout, normalizeMossLayout } from "./moss-layout.js";
 
 export { clipSkipRange, normalizeClipSkip };
 export const ENGINE_SETTINGS_SCHEMA_VERSION = 3;
@@ -43,9 +45,9 @@ function normalizeActivePresetIds(value) {
   const ids = (list) => (Array.isArray(list) ? [...new Set(list.filter((id) => typeof id === "string" && id))] : []);
   return { positive: ids(source.positive), negative: ids(source.negative) };
 }
-export const SETTINGS_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"];
+export const SETTINGS_ENGINES = ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"];
 // Engines that mount separate component files instead of one checkpoint.
-const SPLIT_ENGINES = new Set(["Anima", "Flux", "Flux2", "Krea2"]);
+const SPLIT_ENGINES = new Set(["Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
 // Guidance distillation removes the unconditional branch, so there is nothing for either guidance
 // enhancement to work against and the negative prompt has nothing to encode into.
 const DISTILLED_ENGINES = new Set(["Flux", "Flux2"]);
@@ -79,7 +81,8 @@ function inRange(value, fallback, minimum, maximum) {
 // iL keep the dpmpp_2m/karras pair the ComfyUI samplers default to. Both pages start an engine on
 // the same pair, so this is the one place that decides it.
 function engineDefaultSampler(engine) { return isSplitEngine(engine) ? "euler" : "dpmpp_2m"; }
-function engineDefaultScheduler(engine) { return isSplitEngine(engine) ? "simple" : "karras"; }
+// MOSS starts on the official workflow's sgm_uniform rather than the other split engines' simple.
+function engineDefaultScheduler(engine) { return isMossEngine(engine) ? MOSS_DEFAULTS.scheduler : isSplitEngine(engine) ? "simple" : "karras"; }
 
 /**
  * An engine's own image-to-image parameters. Every engine offers the same sampler and scheduler
@@ -102,9 +105,11 @@ export function imageToImageDefaultsFor(engine, overrides = null) {
 
 export function engineSettingsDefaults(engine) {
   const split = isSplitEngine(engine);
+  const moss = isMossEngine(engine);
   return {
     positive: DEFAULT_POSITIVE_PROMPT,
-    negative: DEFAULT_NEGATIVE_PROMPT,
+    // MOSS's official workflow starts with an empty negative prompt; the others keep theirs.
+    negative: moss ? MOSS_DEFAULTS.negative : DEFAULT_NEGATIVE_PROMPT,
     activePromptPresets: { positive: [], negative: [] },
     clipSkip: normalizeClipSkip(engine, null),
     checkpoint: "",
@@ -112,8 +117,8 @@ export function engineSettingsDefaults(engine) {
     textEncoder: "",
     textEncoder2: "",
     vae: "",
-    steps: 28,
-    cfg: 6.5,
+    steps: moss ? MOSS_DEFAULTS.steps : 28,
+    cfg: moss ? MOSS_DEFAULTS.cfg : 6.5,
     denoise: 1,
     imagesPerBatch: 1,
     batchCount: 1,
@@ -127,6 +132,9 @@ export function engineSettingsDefaults(engine) {
     postprocessChain: migrateResampleChain({}, { engine }),
     backgroundRemovalModel: "",
     imageToImage: imageToImageDefaultsFor(engine),
+    // Only MOSS carries its versioned sampling block and its coordinate layout, so the other six
+    // engines' records are exactly what they were before the seventh engine existed.
+    ...(moss ? { mossSampling: normalizeMossSampling(null), mossLayout: emptyMossLayout(1024, 1024) } : {}),
   };
 }
 
@@ -144,6 +152,8 @@ function resolveGuidance(engine, value) {
   // Krea 2 keeps its unconditional branch, so CFG-Zero* survives, but this runtime installs no
   // attention override for its single-stream blocks and cannot do PAG.
   if (requested === "pag" && engine === "Krea2") return "none";
+  // MOSS runs plain CFG (with its negative-branch skipping) and offers neither enhancement yet.
+  if (isMossEngine(engine)) return "none";
   return requested;
 }
 
@@ -194,8 +204,12 @@ export function normalizeEngineSettings(engine, value, fallback = null) {
     batchCount: Math.round(inRange(source.batchCount, defaults.batchCount, 1, 20)),
     seed: normalizeSeedText(source.seed, defaults.seed),
     seedMode: SEED_MODES.has(source.seedMode) ? source.seedMode : defaults.seedMode,
-    sampler: SAMPLER_NAMES.includes(source.sampler) ? source.sampler : defaults.sampler,
-    scheduler: SCHEDULER_NAMES.includes(source.scheduler) ? source.scheduler : defaults.scheduler,
+    sampler: isMossEngine(engine)
+      ? mossSamplerFor(source.sampler ?? defaults.sampler)
+      : SAMPLER_NAMES.includes(source.sampler) ? source.sampler : defaults.sampler,
+    scheduler: isMossEngine(engine)
+      ? mossSchedulerFor(source.scheduler ?? defaults.scheduler)
+      : SCHEDULER_NAMES.includes(source.scheduler) ? source.scheduler : defaults.scheduler,
     guidance: resolveGuidance(engine, source.guidance ?? defaults.guidance),
     pag: {
       scale: Math.round(inRange(source.pag?.scale, defaults.pag.scale, 0, 5) * 100) / 100,
@@ -215,7 +229,17 @@ export function normalizeEngineSettings(engine, value, fallback = null) {
     // A record saved under schema 1 has no image-to-image block; it starts from this engine's
     // defaults rather than from whatever the other engines happen to hold.
     imageToImage: imageToImageDefaultsFor(engine, isPlainObject(source.imageToImage) ? source.imageToImage : defaults.imageToImage),
+    ...(isMossEngine(engine) ? {
+      mossSampling: normalizeMossSampling(isPlainObject(source.mossSampling) ? source.mossSampling : defaults.mossSampling),
+      // The layout's canvas is the record's canvas (QPlan2/MOSS/P2 D15).
+      mossLayout: normalizeMossLayout(isPlainObject(source.mossLayout) ? source.mossLayout : defaults.mossLayout, layoutCanvas(normalizeSize(source.size, defaults.size))),
+    } : {}),
   };
+}
+
+// A layout cannot sit on a canvas below 64 px (or 0 x 0, the grid-positioning value); it keeps its own.
+function layoutCanvas(size) {
+  return size.width >= 64 && size.height >= 64 ? size : null;
 }
 
 export function emptyEngineSettingsMap() {

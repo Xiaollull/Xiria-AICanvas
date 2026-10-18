@@ -34,8 +34,8 @@ test("the Flux2 entry point is open on the main page and mounts three components
   assert.match(app, /\{ name: "Flux2", detail: "FLUX\.2 大模型引导", ready: true \}/);
   // "即将支持" is the disabled-engine caption; Flux2 must no longer carry it.
   assert.doesNotMatch(app, /\{ name: "Flux2",[^}]*ready: false \}/);
-  assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2"\]/);
-  assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"\]/);
+  assert.match(app, /const SPLIT_MODEL_ENGINES = \["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]/);
+  assert.match(app, /const READY_ENGINES = \["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"\]/);
 
   const picker = sourceBetween(app, "            {isSplitModel ? <ModelAssetPicker", "            {isSplitModel && !engineAllowsLora");
   // The second encoder row stays a FLUX.1 slot: FLUX.2's whole conditioning is one language model.
@@ -109,7 +109,7 @@ test("a Flux2 request drops per-unit ADetailer negative prompts without erasing 
 });
 
 test("Flux2 refinement steps are counted like the other native engines", () => {
-  assert.deepEqual(NATIVE_STEP_ENGINES, ["Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(NATIVE_STEP_ENGINES, ["Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   const unit = { useSteps: true, steps: 20, denoise: 0.2, detector: "face_yolov8n.pt" };
   assert.equal(adetailerUnitSteps(unit, 30, "Flux2"), 20);
   assert.equal(adetailerUnitSteps(unit, 30, "SD"), 20);
@@ -117,7 +117,7 @@ test("Flux2 refinement steps are counted like the other native engines", () => {
 });
 
 test("Flux2 has its own LoRA scope without invalidating libraries saved before it existed", () => {
-  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(READY_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   assert.deepEqual(emptyMountedLoraMap().byEngine.Flux2, []);
 
   // A v2 library written when Flux was the newest engine has no `Flux2` key. Treating that as a
@@ -132,7 +132,7 @@ test("Flux2 has its own LoRA scope without invalidating libraries saved before i
 });
 
 test("a shared LoRA root saved before Flux2 existed expands rather than excluding it", () => {
-  assert.deepEqual(SHARED_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]);
+  assert.deepEqual(SHARED_LORA_ENGINES, ["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]);
   // The stored list is exactly "every engine there was", so it means "not configured" and has to
   // grow with the vocabulary instead of silently hiding the folder from the new engine. Every
   // roster this field has ever shipped with reads that way, including the one Krea 2 replaced.
@@ -151,7 +151,7 @@ test("the control plane lists Flux2 components and its own LoRA root", async () 
   // refuses.
   const branch = sourceBetween(vite, 'if (!isLoraRequest && engine === "Flux2") {', "    const directory = await getConfiguredDirectory(");
   assert.doesNotMatch(branch, /text_encoder_2/);
-  assert.match(vite, /const loraEnginePathKeys = \{ SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2" \}/);
+  assert.match(vite, /const loraEnginePathKeys = \{ SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2", MOSS: "moss" \}/);
 
   const modelPaths = await readSource("scripts/model-paths.mjs");
   assert.match(modelPaths, /flux2: "models\/loras\/flux2"/);
@@ -159,7 +159,7 @@ test("the control plane lists Flux2 components and its own LoRA root", async () 
 
 test("the image-to-image page opens its split picker and negative-prompt lock for Flux2", async () => {
   const page = await readSource("src/ImageToImagePage.jsx");
-  assert.match(page, /\["Anima", "Flux", "Flux2", "Krea2"\]\.includes\(engine\.name\)/);
+  assert.match(page, /\["Anima", "Flux", "Flux2", "Krea2", "MOSS"\]\.includes\(engine\.name\)/);
   assert.match(page, /const distilledPageLabel = engine\.name === "Flux2" \? "FLUX\.2" : "FLUX\.1"/);
   // The prompt pair is the shared `PromptField`: the page hands it the edit lock and the engine
   // gate separately, and the field disables its textarea on either.

@@ -22,7 +22,7 @@
 </p>
 
 XiriaCanvas AI is a local image-generation UI for Stable Diffusion, Illustrious,
-and the native Anima, FLUX.1, FLUX.2, and Krea 2 engines. The same source tree
+and the native Anima, FLUX.1, FLUX.2, Krea 2, and MOSS engines. The same source tree
 supports Windows and Linux. The project does not depend on ComfyUI or Stable
 Diffusion WebUI at runtime.
 
@@ -36,6 +36,7 @@ Diffusion WebUI at runtime.
 | **Flux** | FLUX.1, distilled guidance | diffusion model + CLIP-L + T5-XXL + VAE |
 | **Flux2** | FLUX.2, large-model guidance | diffusion model + text encoder + VAE |
 | **Krea2** | Krea 2 single-stream DiT | diffusion model + text encoder + VAE |
+| **MOSS** | MOSS-Image single-stream DiT, Qwen3.5 encoder; ConvRot INT8, coordinate-box layouts | diffusion model + text encoder + VAE |
 
 ## Quick start
 
@@ -59,7 +60,7 @@ The full manual lives at **[xiaollull.github.io/Xiria-AICanvas](https://xiaollul
 
 - [Installation](https://xiaollull.github.io/Xiria-AICanvas/setup.html) — requirements, the setup wizard, GPU and PyTorch selection, network policy, CLI reference.
 - [Models](https://xiaollull.github.io/Xiria-AICanvas/models.html) — where files go, the recommended-model browser, file formats and quantization.
-- [Generating images](https://xiaollull.github.io/Xiria-AICanvas/usage.html) — prompt weights, guidance, samplers, batches, the image workspace.
+- [Generating images](https://xiaollull.github.io/Xiria-AICanvas/usage.html) — prompt weights, MOSS coordinate layouts, guidance, samplers, batches, the image workspace.
 - [Runtime & updates](https://xiaollull.github.io/Xiria-AICanvas/runtime.html) — configuration, VRAM memory modes, downloads, program updates.
 
 Troubleshooting, the quantization support matrix, the release process, and the

@@ -30,7 +30,7 @@ from math import ceil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Annotated, Callable, Literal, Union
+from typing import Annotated, Any, Callable, Literal, Union
 try:
     from .benchmark_lease import HIRES_ARTIFACT_PURPOSE, validate_lease
     from .hires_artifacts import NULL_CAPTURE, StageArtifactCapture, canonical_parameter_digest, capture_gate, prompt_facts
@@ -42,6 +42,7 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ANIMA_TOKENIZER_DIRECTORY = PROJECT_ROOT / "backend" / "resources" / "anima-tokenizers"
+MOSS_TOKENIZER_DIRECTORY = PROJECT_ROOT / "backend" / "resources" / "moss-tokenizers"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -231,6 +232,34 @@ try:
         krea2_sampling_diagnostics,
         KREA2_SHIFT,
     )
+    from .moss_pipeline import (
+        MOSS_ENGINE,
+        MOSS_FAMILY,
+        load_moss_runtime,
+        moss_component_bytes,
+    )
+    from .moss_model import MOSS_MAX_EDGE, MOSS_PIXEL_ALIGNMENT, QKV_FUSION_VERSION as MOSS_QKV_FUSION_VERSION
+    from .moss_sampling import (
+        MOSS_DEFAULT_CFG,
+        MOSS_DEFAULT_SHIFT,
+        MOSS_DEFAULT_SKIP_END,
+        MOSS_DEFAULT_SKIP_START,
+        MOSS_DEFAULT_UNCOND_SKIP_LAYERS,
+        MOSS_MAX_SHIFT,
+        MOSS_MIN_SHIFT,
+        MOSS_SAMPLERS,
+        MOSS_SCHEDULERS,
+        build_guidance_plan as build_moss_guidance_plan,
+        moss_sampling_diagnostics,
+    )
+    from .moss_text_encoder import (
+        DISCARD_ALLOWLIST_VERSION as MOSS_DISCARD_ALLOWLIST_VERSION,
+        MOSS_MAX_TOKENS,
+        MossTokenizer,
+        TOKENIZER_GZ_NAME as MOSS_TOKENIZER_GZ_NAME,
+        load_tokenizer_json as load_moss_tokenizer_json,
+    )
+    from . import moss_layout
     from .hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware, read_gpu_memory, read_system_memory
     from .memory_policy import (
         GIB,
@@ -295,6 +324,7 @@ try:
     from . import rtx_vsr
     from .comfy_quant import quantization_capabilities
     from .performance_settings import (
+        MOSS_TEXT_ENCODER_PLACEMENT_DEFAULT,
         file_sha256,
         disable_sequential_batch_forward,
         enable_sequential_batch_forward,
@@ -388,6 +418,34 @@ except ImportError:
         krea2_sampling_diagnostics,
         KREA2_SHIFT,
     )
+    from moss_pipeline import (
+        MOSS_ENGINE,
+        MOSS_FAMILY,
+        load_moss_runtime,
+        moss_component_bytes,
+    )
+    from moss_model import MOSS_MAX_EDGE, MOSS_PIXEL_ALIGNMENT, QKV_FUSION_VERSION as MOSS_QKV_FUSION_VERSION
+    from moss_sampling import (
+        MOSS_DEFAULT_CFG,
+        MOSS_DEFAULT_SHIFT,
+        MOSS_DEFAULT_SKIP_END,
+        MOSS_DEFAULT_SKIP_START,
+        MOSS_DEFAULT_UNCOND_SKIP_LAYERS,
+        MOSS_MAX_SHIFT,
+        MOSS_MIN_SHIFT,
+        MOSS_SAMPLERS,
+        MOSS_SCHEDULERS,
+        build_guidance_plan as build_moss_guidance_plan,
+        moss_sampling_diagnostics,
+    )
+    from moss_text_encoder import (
+        DISCARD_ALLOWLIST_VERSION as MOSS_DISCARD_ALLOWLIST_VERSION,
+        MOSS_MAX_TOKENS,
+        MossTokenizer,
+        TOKENIZER_GZ_NAME as MOSS_TOKENIZER_GZ_NAME,
+        load_tokenizer_json as load_moss_tokenizer_json,
+    )
+    import moss_layout
     from hardware_probe import CpuSampler, NvidiaSmiSampler, probe as probe_hardware, read_gpu_memory, read_system_memory
     from memory_policy import (
         GIB,
@@ -452,6 +510,7 @@ except ImportError:
     import rtx_vsr
     from comfy_quant import quantization_capabilities
     from performance_settings import (
+        MOSS_TEXT_ENCODER_PLACEMENT_DEFAULT,
         file_sha256,
         disable_sequential_batch_forward,
         enable_sequential_batch_forward,
@@ -645,9 +704,12 @@ HISTORY_STARTED_AT = time.time()
 # Diffusers pipeline built from one checkpoint. They share the staged load, the group-offload
 # escape hatch and the refinement contract, which is why so much of the run loop asks "is this a
 # native family" rather than naming one.
-NATIVE_ENGINES = ("Anima", "Flux", "Flux2", "Krea2")
-NATIVE_FAMILIES = ("anima", "flux", "flux2", "krea2")
-NATIVE_FAMILY_BY_ENGINE = {"Anima": "anima", "Flux": "flux", "Flux2": "flux2", "Krea2": "krea2"}
+NATIVE_ENGINES = ("Anima", "Flux", "Flux2", "Krea2", "MOSS")
+NATIVE_FAMILIES = ("anima", "flux", "flux2", "krea2", "moss")
+NATIVE_FAMILY_BY_ENGINE = {"Anima": "anima", "Flux": "flux", "Flux2": "flux2", "Krea2": "krea2", "MOSS": "moss"}
+# Every engine the request contract names. An engine outside it never reaches a model root: the
+# lookups below raise instead of falling through to another engine's directories.
+ALL_ENGINES = ("SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS")
 # Both Flux generations are guidance distilled: one forward per step steered by a scalar in the
 # timestep embedding, with no unconditional branch to hold a negative prompt, PAG or CFG-Zero*.
 # Krea 2 is deliberately absent: it carries no guidance conditioning and runs ordinary CFG.
@@ -683,6 +745,7 @@ ENGINE_PIXEL_ALIGNMENT = {
     "flux": FLUX_PIXEL_ALIGNMENT,
     "flux2": FLUX2_PIXEL_ALIGNMENT,
     "krea2": KREA2_PIXEL_ALIGNMENT,
+    "moss": MOSS_PIXEL_ALIGNMENT,
 }
 # The edge each engine refuses a refinement past, by family rather than by engine name so the walk
 # that validates a chain and the stage that executes it consult one table.
@@ -692,6 +755,7 @@ ENGINE_MAX_REFINEMENT_EDGE = {
     "flux": FLUX_MAX_EDGE,
     "flux2": FLUX2_MAX_EDGE,
     "krea2": KREA2_MAX_EDGE,
+    "moss": MOSS_MAX_EDGE,
 }
 
 
@@ -871,7 +935,7 @@ def run_tagger_gpu(operation):
 
 wd14.tagger_resources.GPU_RUN = run_tagger_gpu
 wd14.tagger_resources.GPU_BUSY = tagger_generation_busy
-INFERENCE_PROTOCOL = 39
+INFERENCE_PROTOCOL = 40
 WORKSPACE_ID = os.environ.get("INFERENCE_WORKSPACE_ID")
 
 
@@ -1205,6 +1269,7 @@ def resample_sampling_catalog(family: str):
         else (FLUX_SAMPLERS, FLUX_SCHEDULERS) if family == "flux"
         else (FLUX2_SAMPLERS, FLUX2_SCHEDULERS) if family == "flux2"
         else (KREA2_SAMPLERS, KREA2_SCHEDULERS) if family == "krea2"
+        else (MOSS_SAMPLERS, MOSS_SCHEDULERS) if family == "moss"
         else (DIFFUSERS_RESAMPLE_SAMPLERS, DIFFUSERS_RESAMPLE_SCHEDULERS)
     )
 
@@ -1399,10 +1464,93 @@ def has_gallery_access(job: dict, token: str | None) -> bool:
     return isinstance(token, str) and isinstance(digest, str) and hmac.compare_digest(digest, gallery_access_digest(token))
 
 
+# The released MOSS-Image DiT has 42 blocks; a request's skip indices are checked against that here
+# and against the mounted model's own depth again at load.
+MOSS_DIT_DEPTH = 42
+
+
+class MossSamplingInput(BaseModel):
+    """MOSS-only sampling (version 1): ComfyUI's `ModelSamplingSD3(shift)` and
+    `SkipLayerGuidanceDiTSimple` on the unconditional branch.
+
+    The shift is applied exactly once, by the discrete-flow model sampling. Standard positive-branch
+    SLG (a third forward) is a different technique that this release does not implement, so the only
+    value its switch accepts is off: a request asking for it is refused rather than run without it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    shift: float = Field(default=MOSS_DEFAULT_SHIFT, ge=MOSS_MIN_SHIFT, le=MOSS_MAX_SHIFT)
+    uncond_skip_layers: list[StrictInt] = Field(
+        default_factory=lambda: list(MOSS_DEFAULT_UNCOND_SKIP_LAYERS), max_length=MOSS_DIT_DEPTH
+    )
+    uncond_skip_start: float = Field(default=MOSS_DEFAULT_SKIP_START, ge=0, le=1)
+    uncond_skip_end: float = Field(default=MOSS_DEFAULT_SKIP_END, ge=0, le=1)
+    standard_slg: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_plan(self):
+        if not math.isfinite(self.shift):
+            raise ValueError("MOSS shift must be finite")
+        try:
+            build_moss_guidance_plan(
+                MOSS_DEFAULT_CFG, self.uncond_skip_layers, self.uncond_skip_start, self.uncond_skip_end,
+                self.shift, depth=MOSS_DIT_DEPTH,
+            )
+        except ValueError as error:
+            raise ValueError(f"MOSS sampling: {error}") from error
+        return self
+
+    def runtime_options(self) -> dict:
+        return {
+            "shift": float(self.shift),
+            "uncond_skip_layers": list(self.uncond_skip_layers),
+            "uncond_skip_start": float(self.uncond_skip_start),
+            "uncond_skip_end": float(self.uncond_skip_end),
+            "standard_slg": False,
+        }
+
+
+class MossLayoutInput(BaseModel):
+    """A MOSS coordinate layout (version 1, QPlan2/MOSS/P2): the official readable draft plus a prefix.
+
+    ``draft`` is exactly the draft OpenMOSS's `compile_prompt.py` reads — top-left ``[x1, y1, x2, y2]``
+    pixels on ``width × height`` — kept as a plain dict so its keys keep the order they arrive in, which is
+    the order the compiled JSON carries. ``prefix`` is the text the workspace puts in front of the JSON
+    (LoRA-group prompt, active presets). The request's ``prompt`` must be this layout compiled at the
+    request canvas; Hires and ADetailer recompile it for the canvas they encode at.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    prefix: str = Field(default="", max_length=moss_layout.MAX_PREFIX_CHARACTERS)
+    draft: dict[str, Any]
+
+    @model_validator(mode="after")
+    def validate_draft(self):
+        try:
+            moss_layout.require_valid_draft(self.draft)
+        except moss_layout.LayoutError as error:
+            raise ValueError(f"MOSS layout {error}") from error
+        return self
+
+    def prompt_at(self, width: int, height: int) -> str:
+        """The layout prompt on a ``width × height`` canvas."""
+        return moss_layout.compile_draft(moss_layout.scale_draft(self.draft, int(width), int(height)), self.prefix)
+
+    def region_prompt(self, image_size, crop_box, process_size) -> str:
+        return moss_layout.region_prompt(self.draft, self.prefix, image_size, crop_box, process_size)
+
+    def record(self, stages=()) -> dict:
+        return {"version": 1, "prefix": self.prefix, "draft": self.draft, "stages": list(stages)}
+
+
 class GenerateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"]
+    engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"]
     checkpoint: str | None = Field(default=None, min_length=1, max_length=500)
     diffusion_model: str | None = Field(default=None, min_length=1, max_length=500)
     text_encoder: str | None = Field(default=None, min_length=1, max_length=500)
@@ -1438,6 +1586,12 @@ class GenerateInput(BaseModel):
     scheduler: str
     guidance: Literal["none", "pag", "cfg_zero_star"] = "none"
     pag: PagInput = Field(default_factory=PagInput)
+    # MOSS only. Absent on a MOSS request means the official workflow's defaults, which validation
+    # fills in so the job and its PNG record the values that actually ran.
+    moss: MossSamplingInput | None = None
+    # MOSS only: the coordinate layout `prompt` was compiled from. Present, it makes later stages that
+    # encode at another canvas (Hires, ADetailer crops) recompile the layout for that canvas.
+    moss_layout: MossLayoutInput | None = None
     background_removal_model: str | None = Field(default=None, max_length=300)
     source_image: SourceImageInput = Field(default_factory=SourceImageInput)
     # Forge-compatible opt-in semantics for the SD/iL base image-to-image pass. Off preserves the
@@ -1625,7 +1779,7 @@ class GenerateInput(BaseModel):
                 raise ValueError("Flux2 has no unconditional branch; the negative prompt must be empty")
             if any(unit.negative_prompt for unit in self.adetailer.active_units):
                 raise ValueError("Flux2 has no unconditional branch; ADetailer negative prompts must be empty")
-        else:
+        elif self.engine == "Krea2":
             if self.checkpoint is not None:
                 raise ValueError("Krea2 forbids checkpoint; use diffusion_model, text_encoder, and vae")
             if any(value is None for value in split_fields):
@@ -1642,6 +1796,48 @@ class GenerateInput(BaseModel):
             # override of the transformer's own blocks, which this runtime does not install.
             if self.guidance == "pag":
                 raise ValueError("Krea2 does not support PAG; select None or CFG-Zero*")
+        elif self.engine == "MOSS":
+            if self.checkpoint is not None:
+                raise ValueError("MOSS forbids checkpoint; use diffusion_model, text_encoder, and vae")
+            if any(value is None for value in split_fields):
+                raise ValueError("MOSS requires diffusion_model, text_encoder, and vae")
+            if self.text_encoder_2 is not None:
+                raise ValueError("MOSS mounts one text encoder (Qwen3.5-9B); text_encoder_2 belongs to Flux")
+            if self.sampler not in MOSS_SAMPLERS:
+                raise ValueError(f"Unsupported MOSS sampler: {self.sampler}; MOSS offers {', '.join(MOSS_SAMPLERS)}")
+            if self.scheduler not in MOSS_SCHEDULERS:
+                raise ValueError(f"Unsupported MOSS scheduler: {self.scheduler}")
+            if self.scheduler == "kl_optimal" and self.steps < 2:
+                raise ValueError("The kl_optimal scheduler needs at least 2 steps")
+            if self.guidance != "none":
+                raise ValueError("MOSS supports plain CFG only in this release; PAG and CFG-Zero* are not available")
+            # Hires full-frame redraws and ADetailer run through `refine_batch`; USDU tiling is refused
+            # with the other engines that lack it, below. Image-to-image as a base pass stays off.
+            if self.source_image.enabled or self.postprocess_only:
+                raise ValueError("MOSS image-to-image and post-processing-only runs are not available in this release")
+            if self.moss is None:
+                self.moss = MossSamplingInput()
+        else:
+            raise ValueError(f"Unknown engine {self.engine!r}")
+        if self.moss is not None and self.engine != "MOSS":
+            raise ValueError("The moss sampling block applies to the MOSS engine only")
+        if self.moss_layout is not None:
+            if self.engine != "MOSS":
+                raise ValueError("The moss_layout block applies to the MOSS engine only")
+            draft = self.moss_layout.draft
+            if (draft["width"], draft["height"]) != (self.width, self.height):
+                raise ValueError(
+                    f"MOSS layout canvas {draft['width']}x{draft['height']} must equal the requested "
+                    f"{self.width}x{self.height}"
+                )
+            # The prompt is what the PNG, the workflow and every reader show, so it has to be the text
+            # the base pass actually encodes rather than a second copy that could drift from the layout.
+            if self.prompt != self.moss_layout.prompt_at(self.width, self.height):
+                raise ValueError("MOSS layout: the prompt is not this layout compiled at the requested canvas")
+            # The transparent-background directive rewrites the prompt text (tag out, suffix after the
+            # JSON), which the stages that recompile the layout would not repeat.
+            if parse_prompt_directives(self.prompt)[1]["transparent_background"]:
+                raise ValueError("MOSS layout: transparent background is not available with a layout in this release")
         family = request_family(self.engine)
         distilled = self.engine in DISTILLED_GUIDANCE_ENGINES
         for number, unit in enumerate(self.resample_units, start=1):
@@ -1707,6 +1903,9 @@ class PerformanceInput(BaseModel):
     # tiles, so it is the default rather than an opt-in.
     unload_before_decode: bool = True
     vram_limit_gb: float = Field(default=0.0, ge=0.0, le=1024.0)
+    # MOSS-Image only: where the ~7 GiB Qwen3.5-9B encoder runs. `auto` keeps it on the GPU when it
+    # fits and streams one layer at a time otherwise; `cpu` is honoured only as an explicit choice.
+    moss_text_encoder_placement: Literal["auto", "gpu_resident", "gpu_streamed", "cpu"] = "auto"
 
 
 COLLAGE_MAX_DECODED_BYTES = 128 * 1024 * 1024
@@ -2862,6 +3061,21 @@ def krea2_model_roots():
     }
 
 
+def moss_model_roots():
+    """MOSS-Image's components, with its own LoRA root.
+
+    The DiT, Qwen3.5 encoder and FLUX.2 VAE share the component directories every native engine
+    uses; a MOSS LoRA patches a 42-block single-stream DiT named nothing like the other engines',
+    so it only ever applies here.
+    """
+    return {
+        "diffusion_model": resolve_model_directory(PROJECT_ROOT, "diffusion_models"),
+        "text_encoder": resolve_model_directory(PROJECT_ROOT, "text_encoders"),
+        "vae": resolve_model_directory(PROJECT_ROOT, "vae"),
+        "lora": resolve_model_directory(PROJECT_ROOT, "loras", "moss"),
+    }
+
+
 def native_model_roots(engine: str):
     if engine == "Flux":
         return flux_model_roots()
@@ -2869,7 +3083,12 @@ def native_model_roots(engine: str):
         return flux2_model_roots()
     if engine == "Krea2":
         return krea2_model_roots()
-    return anima_model_roots()
+    if engine == "MOSS":
+        return moss_model_roots()
+    if engine == "Anima":
+        return anima_model_roots()
+    # An engine this server does not know must not borrow another engine's directories.
+    raise ValueError(f"Unknown native engine {engine!r}")
 
 
 CHECKPOINT_EXTENSIONS = frozenset({".safetensors", ".ckpt"})
@@ -3621,6 +3840,234 @@ def krea2_health_fields():
             "prompt_weights": False,
             "hires": True,
             "adetailer": True,
+            "rtx": True,
+            "staged_vae_decode": False,
+            "lora": True,
+            "transparent_background": True,
+        },
+    }
+
+
+# The bundled MOSS tokenizer is a deterministic gzip of the pinned upstream tokenizer.json. Both the
+# archive and the decompressed bytes are pinned, so neither a truncated download nor a re-encoded
+# copy can pass.
+MOSS_TOKENIZER_GZ_SIZE = 3_760_595
+MOSS_TOKENIZER_GZ_SHA256 = "70765620bd5db1fd13e40a868c10419c7c8de7dbb2b5abd3a43d69aaa6c6f5b0"
+
+
+@lru_cache(maxsize=4)
+def _moss_tokenizer_verdict(path_value: str, size: int, modified_ns: int, changed_ns: int):
+    del modified_ns, changed_ns
+    path = Path(path_value)
+    if size != MOSS_TOKENIZER_GZ_SIZE:
+        return f"expected {MOSS_TOKENIZER_GZ_SIZE} bytes, found {size}"
+    if file_sha256(path) != MOSS_TOKENIZER_GZ_SHA256:
+        return "SHA-256 of the bundled archive does not match the pinned resource"
+    try:
+        load_moss_tokenizer_json(path)
+    except (OSError, ValueError) as error:
+        return str(error)
+    return None
+
+
+def moss_tokenizer_status(directory=None):
+    directory = Path(directory or MOSS_TOKENIZER_DIRECTORY)
+    path = directory / MOSS_TOKENIZER_GZ_NAME
+    try:
+        stat = path.stat()
+        reason = _moss_tokenizer_verdict(str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    except FileNotFoundError:
+        reason = "bundled program resource is missing"
+    except OSError:
+        reason = "bundled program resource could not be read"
+    return {"path": path, "installed": reason is None, "reason": reason}
+
+
+def moss_tokenizer_sources():
+    status = moss_tokenizer_status()
+    if not status["installed"]:
+        raise ValueError(f"Bundled MOSS Qwen3.5 tokenizer resource is missing or corrupt ({status['reason']})")
+    return {"qwen35": status["path"]}
+
+
+_moss_layout_tokenizer_lock = threading.Lock()
+_moss_layout_tokenizer: dict = {}
+
+
+def moss_layout_tokenizer() -> MossTokenizer:
+    """The bundled Qwen3.5 tokenizer, for counting layout prompts without the text encoder."""
+    path = moss_tokenizer_sources()["qwen35"]
+    with _moss_layout_tokenizer_lock:
+        tokenizer = _moss_layout_tokenizer.get(str(path))
+        if tokenizer is None:
+            tokenizer = MossTokenizer.from_resource(path)
+            _moss_layout_tokenizer.clear()
+            _moss_layout_tokenizer[str(path)] = tokenizer
+    return tokenizer
+
+
+def moss_prompt_tokens(prompt: str) -> int:
+    """Tokens MOSS encodes for `prompt`, chat template included and before the 4096 cut."""
+    _ids, info = moss_layout_tokenizer().encode(prompt)
+    return int(info["untruncated_token_count"])
+
+
+def moss_layout_stages(request: "GenerateInput") -> list[dict]:
+    """Every canvas the layout is encoded at before ADetailer: the base pass and each Hires redraw."""
+    stages = [{"stage": "base", "width": request.width, "height": request.height}]
+    for entry in resample_chain_plan(request):
+        if entry["type"] == "resample" and entry["redraws"]:
+            width, height = entry["redraw_size"]
+            stages.append({"stage": f"hires_{entry['unit_number']}", "width": int(width), "height": int(height)})
+    return stages
+
+
+def checked_moss_layout_tokens(prompt: str, label: str) -> int:
+    """`prompt`'s token count, refused when the window would cut it: a cut layout is broken JSON."""
+    tokens = moss_prompt_tokens(prompt)
+    if tokens > MOSS_MAX_TOKENS:
+        raise ValueError(
+            f"MOSS layout: the {label} prompt is {tokens} tokens; MOSS reads at most {MOSS_MAX_TOKENS} "
+            "(chat template included). Shorten captions or remove items"
+        )
+    return tokens
+
+
+def preflight_moss_layout_request(request: "GenerateInput"):
+    """Count every pre-ADetailer layout prompt before a job exists; the audit becomes `prompt_encoding`."""
+    if request.moss_layout is None:
+        return None
+    stages = []
+    for stage in moss_layout_stages(request):
+        prompt = request.moss_layout.prompt_at(stage["width"], stage["height"])
+        label = "base" if stage["stage"] == "base" else f"Hires {stage['stage'][len('hires_'):]} ({stage['width']}x{stage['height']})"
+        stages.append({**stage, "tokens": checked_moss_layout_tokens(prompt, label)})
+    return {
+        "compiler": "moss_layout_v1",
+        "items": moss_layout.item_count(request.moss_layout.draft),
+        "max_tokens": MOSS_MAX_TOKENS,
+        "stages": stages,
+    }
+
+
+def moss_stage_prompt(request: "GenerateInput", size) -> str:
+    """The positive prompt a MOSS stage encodes on a `size` canvas: its layout recompiled, or the prompt."""
+    if request.moss_layout is None:
+        return request.prompt
+    width, height = (int(value) for value in size)
+    prompt = request.moss_layout.prompt_at(width, height)
+    checked_moss_layout_tokens(prompt, f"{width}x{height}")
+    return prompt
+
+
+def moss_region_prompt(request: "GenerateInput", unit_prompt: str, image_size, crop_box, process_size) -> str:
+    """An ADetailer region's prompt under a layout.
+
+    An empty unit prompt is the crop-local layout; `[PROMPT]` is replaced by it; any other unit prompt is
+    the user's own text and is used as written, as without a layout.
+    """
+    if request.moss_layout is None:
+        return expand_prompt(unit_prompt, request.prompt)
+    if unit_prompt.strip() and "[PROMPT]" not in unit_prompt:
+        return unit_prompt.strip()
+    local = request.moss_layout.region_prompt(image_size, crop_box, process_size)
+    prompt = local if not unit_prompt.strip() else unit_prompt.replace("[PROMPT]", local).strip()
+    checked_moss_layout_tokens(prompt, "ADetailer region")
+    return prompt
+
+
+def moss_health_fields():
+    try:
+        roots = moss_model_roots()
+        status = moss_tokenizer_status()
+        required_assets = {
+            "diffusion_models": project_storage_reference(roots["diffusion_model"]),
+            "text_encoders": project_storage_reference(roots["text_encoder"]),
+            "vae": project_storage_reference(roots["vae"]),
+            "loras": project_storage_reference(roots["lora"]),
+            "qwen35_tokenizer": project_storage_reference(status["path"]),
+        }
+        tokenizers_ready = status["installed"]
+        tokenizer_reason = None if tokenizers_ready else f"Bundled MOSS tokenizer resource failed validation: {status['reason']}"
+        tokenizer_runtime = {
+            "qwen35_tokenizer": {
+                "path": project_storage_reference(status["path"]),
+                "installed": status["installed"],
+                "reason": status["reason"],
+            },
+        }
+    except ValueError as error:
+        required_assets = {}
+        tokenizers_ready = False
+        tokenizer_reason = str(error)
+        tokenizer_runtime = {}
+    try:
+        import diffusers
+        from accelerate import init_empty_weights as _init_empty_weights
+        from diffusers import AutoencoderKLFlux2 as _AutoencoderKLFlux2
+        from safetensors import safe_open as _safe_open
+        from tokenizers import Tokenizer as _Tokenizer
+        del _init_empty_weights, _AutoencoderKLFlux2, _safe_open, _Tokenizer
+        runtime_ready = str(diffusers.__version__).startswith("0.38.")
+        runtime_reason = None if runtime_ready else "Native MOSS requires diffusers 0.38.x"
+    except (ImportError, AttributeError) as error:
+        runtime_ready = False
+        runtime_reason = f"Native MOSS runtime dependencies are unavailable: {error}"
+    cuda_ready = bool(
+        torch.cuda.is_available()
+        and hasattr(torch.cuda, "is_bf16_supported")
+        and torch.cuda.is_bf16_supported()
+    )
+    available = runtime_ready and tokenizers_ready and cuda_ready
+    reason = None
+    if not runtime_ready:
+        reason = runtime_reason
+    elif not tokenizers_ready:
+        reason = tokenizer_reason
+    elif not cuda_ready:
+        reason = "Native MOSS requires a CUDA GPU with BF16 support"
+    return {
+        "available": available,
+        "reason": reason,
+        "runtime_ready": runtime_ready,
+        "tokenizers_ready": tokenizers_ready,
+        "runtime": tokenizer_runtime,
+        "bf16_ready": cuda_ready,
+        "required_assets": required_assets,
+        "samplers": list(MOSS_SAMPLERS),
+        "schedulers": list(MOSS_SCHEDULERS),
+        "defaults": {
+            "width": 1024, "height": 1024, "steps": 50, "cfg": MOSS_DEFAULT_CFG,
+            "sampler": "euler", "scheduler": "sgm_uniform",
+        },
+        "moss_sampling": {
+            "version": 1,
+            "shift": {"default": MOSS_DEFAULT_SHIFT, "minimum": MOSS_MIN_SHIFT, "maximum": MOSS_MAX_SHIFT},
+            "uncond_skip_layers": {"default": list(MOSS_DEFAULT_UNCOND_SKIP_LAYERS), "depth": MOSS_DIT_DEPTH},
+            "uncond_skip_window": {"default": [MOSS_DEFAULT_SKIP_START, MOSS_DEFAULT_SKIP_END]},
+            "standard_slg": False,
+        },
+        "validation": {
+            "int8_convrot": "real-model verified: SFT INT8 + Qwen3.5 INT8 (txt2img, Hires, ADetailer, LoRA, LoKr); Base INT8 shares the path, not run",
+            "bf16": "code/fixtures covered; full BF16 model not tested",
+            "fp8": "compatibility-ready, awaiting a published MOSS FP8 model",
+        },
+        "features": {
+            # A real unconditional branch with negative-branch block skipping; PAG and CFG-Zero* are
+            # not implemented for MOSS in this release.
+            "pag": False,
+            "cfg_zero_star": False,
+            "negative_prompt": True,
+            "distilled_guidance": False,
+            # Weighting is disabled in ComfyUI's MOSS tokenizer: `(word:1.2)` is literal text.
+            "prompt_weights": False,
+            "img2img": False,
+            # Full-frame Hires redraws and ADetailer regions run through `refine_batch`; USDU tiling
+            # needs shared conditioning/sigmas, which MOSS does not prepare.
+            "hires": True,
+            "resize_only_resample": True,
+            "adetailer": True,
+            "usdu": False,
             "rtx": True,
             "staged_vae_decode": False,
             "lora": True,
@@ -6004,7 +6451,7 @@ def anima_memory_strategy(
 
 
 @lru_cache(maxsize=16)
-def flux_component_weight_bytes(component_path: str, file_size: int, modified_ns: int, family: str = "flux"):
+def flux_component_weight_bytes(component_path: str, file_size: int, modified_ns: int, family: str = "flux", role: str | None = None):
     """Loaded size of one component, which is not its size on disk.
 
     The Flux engines expand every quantisation to BF16, so an fp8 file costs twice what it
@@ -6016,6 +6463,9 @@ def flux_component_weight_bytes(component_path: str, file_size: int, modified_ns
     """
     del modified_ns
     try:
+        if family == "moss":
+            # Stored bytes, minus the text encoder's discarded subgraphs, with the VAE at float32.
+            return moss_component_bytes(component_path, role or "diffusion_model")
         if family == "krea2":
             return krea2_component_bytes([component_path])
         return flux_component_bytes([component_path])
@@ -6025,9 +6475,12 @@ def flux_component_weight_bytes(component_path: str, file_size: int, modified_ns
 
 def flux_weight_estimates(assets, family="flux"):
     estimates = []
-    for path in assets.values():
+    for role, path in assets.items():
         stat = path.stat()
-        estimates.append(flux_component_weight_bytes(str(path), stat.st_size, stat.st_mtime_ns, family))
+        if family == "moss":
+            estimates.append(flux_component_weight_bytes(str(path), stat.st_size, stat.st_mtime_ns, family, role))
+        else:
+            estimates.append(flux_component_weight_bytes(str(path), stat.st_size, stat.st_mtime_ns, family))
     return sum(estimates), max(estimates)
 
 
@@ -6062,7 +6515,7 @@ def choose_flux_memory_strategy(
     at all. Each of those reaches the policy as a number rather than as a second copy of the
     decision: measured bytes for the first two, ``guidance_copies`` for the third.
     """
-    engine_label = {"flux2": "Flux2", "krea2": "Krea2"}.get(family, "Flux")
+    engine_label = {"flux2": "Flux2", "krea2": "Krea2", "moss": "MOSS"}.get(family, "Flux")
     guidance_copies = max(1, int(guidance_copies))
 
     def choose(batch_size):
@@ -6161,7 +6614,9 @@ def choose_flux_memory_strategy(
             f"显存预算模式为 {strategy['mode'].upper()}，聚合权重约 {strategy['weight_gb']:.1f} GB"
             + ("；批量按单图串行采样" if microbatch else "")
             + ("；任务间保留 DiT GPU 驻留" if keep_transformer_resident else "")
-            + ("；正负分支串行执行，单次前向峰值" if guidance_copies > 1 else "；蒸馏引导，单次前向无负向分支")
+            + ("；正负分支串行执行，单次前向峰值" if guidance_copies > 1
+               else "；CFG 为 1，仅执行正向分支" if family == "moss"
+               else "；蒸馏引导，单次前向无负向分支")
         ),
     )
     strategy["memory_path"] = NATIVE_BLOCK if group_offload else NATIVE_RESIDENT
@@ -6209,6 +6664,15 @@ def configure_decode_residency(runtime):
     if configure is None:
         return None
     return configure(performance_settings["unload_before_decode"])
+
+
+def configure_text_encoder_placement(runtime):
+    """MOSS only: where its Qwen3.5-9B encoder runs. ``auto`` picks resident, then layer-streamed,
+    from measured free memory at each encode; CPU encoding happens only when chosen explicitly."""
+    configure = getattr(runtime, "configure_text_encoder_placement", None)
+    if configure is None:
+        return None
+    return configure(performance_settings.get("moss_text_encoder_placement", MOSS_TEXT_ENCODER_PLACEMENT_DEFAULT))
 
 
 def configure_flux_vae(runtime, strategy):
@@ -6568,6 +7032,10 @@ def load_flux_pipeline(
         **{name: str(path) for name, path in assets.items()},
         "loras": [(str(path), multiplier) for path, multiplier in lora_descriptors],
     }
+    if family == "moss":
+        # Code-level contracts a cached runtime was built under: the q/k/v fusion and the text
+        # encoder's discard list. A change to either must rebuild rather than reuse.
+        identity["moss_contract"] = (MOSS_QKV_FUSION_VERSION, MOSS_DISCARD_ALLOWLIST_VERSION, "bfloat16")
     revisions = {}
     for name, path in assets.items():
         file_stat = path.stat()
@@ -6633,6 +7101,7 @@ def load_flux_pipeline(
             configure_anima_attention_backend(loaded_pipeline)
             loaded_pipeline.configure_transformer_residency(strategy.get("keep_transformer_resident", False))
             configure_decode_residency(loaded_pipeline)
+            configure_text_encoder_placement(loaded_pipeline)
             active_compute_dtype = "bf16"
             active_vae_mode = configure_flux_vae(loaded_pipeline, strategy)
             pipeline_cpu_parked = False
@@ -6684,6 +7153,15 @@ def load_flux_pipeline(
                     dtype=torch.bfloat16,
                     loras=lora_descriptors,
                 )
+            elif engine == "MOSS":
+                runtime = load_moss_runtime(
+                    diffusion_model,
+                    text_encoder,
+                    vae,
+                    tokenizer_sources["qwen35"],
+                    dtype=torch.bfloat16,
+                    loras=lora_descriptors,
+                )
             else:
                 runtime = load_flux_runtime(
                     diffusion_model,
@@ -6730,6 +7208,7 @@ def load_flux_pipeline(
             configure_anima_attention_backend(runtime)
             runtime.configure_transformer_residency(strategy.get("keep_transformer_resident", False))
             configure_decode_residency(runtime)
+            configure_text_encoder_placement(runtime)
             loaded_pipeline = runtime
             loaded_checkpoint = str(diffusion_model)
             loaded_family = family
@@ -9020,7 +9499,9 @@ def _apply_resample_unit_stages(
         previous_metrics = dict(getattr(pipeline, "last_generation_metrics", {}) or {})
         refined = pipeline.refine_batch(
             images=[upscaled.convert("RGB")],
-            prompt=request.prompt,
+            # A MOSS layout's boxes are pixels of the canvas they were written for, so the redraw
+            # encodes the layout recompiled for its own, larger canvas.
+            prompt=moss_stage_prompt(request, upscaled.size),
             negative_prompt=request.negative_prompt,
             steps=unit_steps,
             denoise=settings.denoise,
@@ -9034,6 +9515,7 @@ def _apply_resample_unit_stages(
             masks=None,
             on_step=on_anima_hires_step,
             on_step_checkpoint=on_anima_hires_checkpoint,
+            **({"moss": request.moss.runtime_options()} if family == "moss" else {}),
         )
         if len(refined) != 1:
             raise RuntimeError(f"Native resample refinement returned {len(refined)} images instead of 1")
@@ -9394,7 +9876,11 @@ def apply_adetailer_unit(
             previous_metrics = dict(getattr(pipeline, "last_generation_metrics", {}) or {})
             refined = pipeline.refine_batch(
                 images=[crop.convert("RGB")],
-                prompt=detail_prompt,
+                # Under a MOSS layout the crop is its own canvas: an empty or `[PROMPT]` unit prompt
+                # becomes the items inside it, in its processing pixels.
+                prompt=detail_prompt if request.moss_layout is None else moss_region_prompt(
+                    request, settings.prompt, current_image.size, crop_box, process_size,
+                ),
                 negative_prompt=detail_negative_prompt,
                 steps=detail_steps,
                 denoise=settings.denoise,
@@ -9408,6 +9894,7 @@ def apply_adetailer_unit(
                 masks=[hard_crop],
                 on_step=on_anima_detail_step,
                 on_step_checkpoint=on_anima_detail_checkpoint,
+                **({"moss": request.moss.runtime_options()} if family == "moss" else {}),
             )
             if len(refined) != 1:
                 raise RuntimeError(f"Anima ADetailer returned {len(refined)} images instead of 1")
@@ -10029,6 +10516,38 @@ def save_image(
                 request.sampler, request.scheduler, request.width, request.height
             ),
         })
+    elif request.engine == "MOSS":
+        # The MOSS block is the effective one (validation fills the official defaults), and the
+        # identification comes from the loaded runtime rather than from the request.
+        moss_options = request.moss.runtime_options()
+        plan = build_moss_guidance_plan(
+            request.cfg, moss_options["uncond_skip_layers"], moss_options["uncond_skip_start"],
+            moss_options["uncond_skip_end"], moss_options["shift"],
+        )
+        reports = (getattr(loaded_pipeline, "reports", None) or {}) if loaded_engine == "MOSS" else {}
+        transformer_report = reports.get("transformer", {})
+        parameters.update({
+            "diffusion_model": public_model_reference(request.diffusion_model),
+            "text_encoder": public_model_reference(request.text_encoder),
+            "vae": public_model_reference(request.vae),
+            "flow_shift": round(float(moss_options["shift"]), 6),
+            "moss": {
+                "version": 1,
+                **moss_options,
+                "variant": transformer_report.get("variant"),
+                "variant_fingerprint": transformer_report.get("variant_fingerprint"),
+                "qkv_layout": (transformer_report.get("layout") or {}).get("source_qkv"),
+                "attention": "sdpa" if not (transformer_report.get("attention_markers") or {}).get("methods")
+                else "sdpa (comfy_kitchen_int8 marker; kernel unavailable)",
+            },
+            "sampling": moss_sampling_diagnostics(request.sampler, request.scheduler, request.width, request.height, plan),
+        })
+        if request.moss_layout is not None:
+            # The draft is what reopens the layout for editing; the prompt above is its base compile.
+            parameters["moss_layout"] = request.moss_layout.record([
+                {**stage, "tokens": moss_prompt_tokens(request.moss_layout.prompt_at(stage["width"], stage["height"]))}
+                for stage in moss_layout_stages(request)
+            ])
     if loaded_checkpoint_hash:
         parameters["checkpoint_sha256"] = loaded_checkpoint_hash
         if request.engine in NATIVE_ENGINES:
@@ -10542,6 +11061,31 @@ def run_generation(
             family = "krea2"
             if ultra_low_memory:
                 raise ValueError("Native Krea2 does not support ultra-low-memory mode")
+        elif request.engine == "MOSS":
+            roots = moss_model_roots()
+            diffusion_model = validate_native_diffusion_model(
+                request.diffusion_model, roots["diffusion_model"], "MOSS diffusion model"
+            )
+            text_encoder = validate_native_component(
+                request.text_encoder, roots["text_encoder"], "MOSS text encoder"
+            )
+            text_encoder_2 = None
+            vae = validate_native_component(request.vae, roots["vae"], "MOSS VAE")
+            tokenizer_sources = moss_tokenizer_sources()
+            checkpoint = diffusion_model
+            anima_loras = []
+            native_loras = [
+                (path, multiplier)
+                for path, multiplier in (
+                    (validate_native_lora(lora.path, roots["lora"], "MOSS LoRA"), lora.weight)
+                    for lora in request.loras
+                )
+                if multiplier != 0.0
+            ]
+            lora_bytes = sum(path.stat().st_size for path, _multiplier in native_loras)
+            family = "moss"
+            if ultra_low_memory:
+                raise ValueError("Native MOSS does not support ultra-low-memory mode")
         else:
             anima_loras = []
             native_loras = []
@@ -10599,7 +11143,7 @@ def run_generation(
                 loras=anima_loras,
                 lora_bytes=lora_bytes,
             )
-        elif family in ("flux", "flux2", "krea2"):
+        elif family in ("flux", "flux2", "krea2", "moss"):
             pipeline = load_flux_pipeline(
                 diffusion_model,
                 text_encoder,
@@ -10617,7 +11161,7 @@ def run_generation(
                 # Reported, not budgeted: Krea 2 runs a second branch per step but runs it
                 # sequentially, so this changes what the job says it is doing, not what it admits.
                 guidance_copies=(
-                    guidance_prediction_copies(request.guidance, memory_cfg) if family == "krea2" else 1
+                    guidance_prediction_copies(request.guidance, memory_cfg) if family in ("krea2", "moss") else 1
                 ),
             )
         else:
@@ -10738,6 +11282,49 @@ def run_generation(
                         warning,
                         f"{len(skipped)} LoRA target(s) outside the Krea 2 transformer were skipped (text-encoder LoRA is not applied)",
                     )
+        elif family == "moss":
+            moss_plan = build_moss_guidance_plan(
+                request.cfg, request.moss.uncond_skip_layers, request.moss.uncond_skip_start,
+                request.moss.uncond_skip_end, request.moss.shift, depth=int(pipeline.config["num_layers"]),
+            )
+            sampling_diagnostics = moss_sampling_diagnostics(
+                request.sampler, request.scheduler, request.width, request.height, moss_plan
+            )
+            warning = (
+                f"Native MOSS-Image discrete flow (ComfyUI ModelSamplingSD3) uses shift {request.moss.shift:g} with "
+                f"{request.sampler} and {request.scheduler}"
+            )
+            if moss_plan.skip_active:
+                warning = append_warning(
+                    warning,
+                    "Negative-branch block skipping: blocks "
+                    + ", ".join(str(layer) for layer in moss_plan.uncond_skip_layers)
+                    + f" are skipped in the unconditional forward between {request.moss.uncond_skip_start:g} and "
+                    f"{request.moss.uncond_skip_end:g} of the schedule",
+                )
+            elif not moss_plan.runs_unconditional:
+                warning = append_warning(warning, "CFG 1 runs no unconditional branch, so the negative prompt and block skipping do not apply")
+            variant = (getattr(pipeline, "reports", {}) or {}).get("transformer", {}).get("variant_label")
+            if variant:
+                warning = append_warning(warning, f"Diffusion model identified as {variant} by its tensor fingerprint")
+            if request.moss_layout is not None:
+                # Parentheses inside a layout caption are literal by design, so no weighting note here.
+                stages = moss_layout_stages(request)
+                note = (
+                    f"Layout prompt: {moss_layout.item_count(request.moss_layout.draft)} items on "
+                    f"{request.width}x{request.height}"
+                )
+                rescaled = [f"{stage['width']}x{stage['height']}" for stage in stages[1:]]
+                if rescaled:
+                    note += "; Hires re-encodes it at " + ", ".join(rescaled)
+                if any(moss_layout.aspect_mismatch(request.moss_layout.draft, stage["width"], stage["height"]) for stage in stages):
+                    note += "; a stage changes the aspect ratio, so its boxes are stretched"
+                warning = append_warning(warning, note)
+            elif prompt_carries_weight_syntax(request.prompt):
+                warning = append_warning(
+                    warning,
+                    "MOSS reads the prompt through Qwen3.5 with weighting disabled; (word:1.2) is read as literal text",
+                )
         else:
             warning = configure_scheduler(pipeline, request.sampler, request.scheduler)
             if request.guidance == "pag":
@@ -10787,6 +11374,19 @@ def run_generation(
             negative_prompt_info = pipeline.token_diagnostics(request.negative_prompt)["llm"]
             prompt_weighted_tokens = 0
             negative_prompt_weighted_tokens = 0
+        elif family == "moss":
+            # The 4096-token window includes the chat template; a cut is reported, never hidden.
+            prompt_info = pipeline.token_diagnostics(request.prompt)["llm"]
+            negative_prompt_info = pipeline.token_diagnostics(request.negative_prompt)["llm"]
+            prompt_weighted_tokens = 0
+            negative_prompt_weighted_tokens = 0
+            for label, info in (("Prompt", prompt_info), ("Negative prompt", negative_prompt_info)):
+                if info.get("truncated"):
+                    warning = append_warning(
+                        warning,
+                        f"{label} encodes to {info['untruncated_token_count']} tokens including the chat template; "
+                        f"only the first {info['max_tokens']} are used",
+                    )
         else:
             configure_loras(pipeline, request.loras, lora_root, job_id)
             # Adapters change every figure the controller places the model by, and a block or leaf
@@ -11024,7 +11624,7 @@ def run_generation(
                     vae_mode=active_vae_mode,
                 )
                 merge_runtime_metrics(job_id, getattr(pipeline, "last_generation_metrics", None))
-            elif family in ("flux", "flux2", "krea2"):
+            elif family in ("flux", "flux2", "krea2", "moss"):
                 plan_native_stage(
                     "base_sampling", family, (request.width, request.height), request.cfg,
                     request.images_per_batch, pipeline, job_id,
@@ -11075,6 +11675,7 @@ def run_generation(
                         on_step=on_anima_step,
                         on_step_checkpoint=on_anima_step_checkpoint,
                         sampling_batch_size=flux_batch_size,
+                        **({"moss": request.moss.runtime_options()} if family == "moss" else {}),
                     )
                 record_native_decode("base_decode", family, (request.width, request.height), job_id)
                 runtime_attention_backend = getattr(pipeline, "attention_backend", None)
@@ -11452,6 +12053,7 @@ def health_scan_fields(force=False):
         "flux": flux_health_fields(),
         "flux2": flux2_health_fields(),
         "krea2": krea2_health_fields(),
+        "moss": moss_health_fields(),
         "upscalers": upscaler_status(UPSCALER_MODEL_DIRECTORY),
     }
     with _health_scan_lock:
@@ -11468,6 +12070,7 @@ def health():
     flux_status = scanned["flux"]
     flux2_status = scanned["flux2"]
     krea2_status = scanned["krea2"]
+    moss_status = scanned["moss"]
     return {
         "status": "ready",
         "protocol": INFERENCE_PROTOCOL,
@@ -11508,6 +12111,7 @@ def health():
             "Flux": flux_status,
             "Flux2": flux2_status,
             "Krea2": krea2_status,
+            "MOSS": moss_status,
         },
         "background_removal": background_removal_status(),
         "pipeline_configs": {
@@ -11702,6 +12306,50 @@ def list_upscaler_models():
     return upscaler_status(UPSCALER_MODEL_DIRECTORY)
 
 
+class MossLayoutCompileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Unvalidated on purpose: a draft the compiler refuses is the editor's normal state while the user
+    # types, and comes back as `issues` rather than as a 422.
+    layout: dict[str, Any]
+    stages: list[tuple[StrictInt, StrictInt]] = Field(default_factory=list, max_length=8)
+
+
+@app.post("/api/inference/moss/layout/compile")
+def compile_moss_layout(payload: MossLayoutCompileInput):
+    """The MOSS layout editor's compile: prompt and token count per canvas, or the draft's issues.
+
+    CPU only — the bundled tokenizer, never a model and never the queue.
+    """
+    layout = payload.layout
+    issues = []
+    if layout.get("version") != 1:
+        issues.append({"path": "version", "message": "must be 1"})
+    unknown = sorted(set(layout) - {"version", "prefix", "draft"})
+    if unknown:
+        issues.append({"path": "", "message": f"unknown fields {unknown}"})
+    prefix = layout.get("prefix", "")
+    if not isinstance(prefix, str) or len(prefix) > moss_layout.MAX_PREFIX_CHARACTERS:
+        issues.append({"path": "prefix", "message": f"must be text of at most {moss_layout.MAX_PREFIX_CHARACTERS} characters"})
+    draft = layout.get("draft")
+    issues.extend(moss_layout.draft_issues(draft))
+    response = {"valid": not issues, "issues": issues, "prompt": None, "tokens": None,
+                "max_tokens": MOSS_MAX_TOKENS, "stages": []}
+    if issues:
+        return response
+    try:
+        response["prompt"] = moss_layout.compile_draft(draft, prefix)
+        response["tokens"] = moss_prompt_tokens(response["prompt"])
+        for width, height in payload.stages:
+            if not (16 <= width <= MAX_SAMPLING_EDGE * 4 and 16 <= height <= MAX_SAMPLING_EDGE * 4):
+                raise HTTPException(status_code=422, detail=f"stage canvas {width}x{height} is out of range")
+            prompt = moss_layout.compile_draft(moss_layout.scale_draft(draft, width, height), prefix)
+            response["stages"].append({"width": width, "height": height, "tokens": moss_prompt_tokens(prompt)})
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return response
+
+
 @app.post("/api/inference/shutdown", include_in_schema=False)
 def shutdown(x_shutdown_token: str | None = Header(default=None)):
     global shutdown_requested
@@ -11728,7 +12376,7 @@ def shutdown(x_shutdown_token: str | None = Header(default=None)):
 
 
 @app.delete("/api/inference/model-cache")
-def unload_model_cache(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None, checkpoint: str | None = None):
+def unload_model_cache(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"] | None = None, checkpoint: str | None = None):
     with pipeline_lock:
         with jobs_lock:
             busy = any(job["status"] in JOB_ACTIVE_STATUSES for job in jobs.values())
@@ -12010,6 +12658,8 @@ def _admit_generation_request(request: GenerateInput, *, library_revision=0, htt
         validate_latent_resample_request(request)
         validate_diffusers_postprocess_schedules(request)
         prompt_encoding_audit = preflight_dynamic_prompt_request(request)
+        if request.moss_layout is not None:
+            prompt_encoding_audit = preflight_moss_layout_request(request)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     if request.engine in NATIVE_ENGINES:
@@ -13067,7 +13717,7 @@ def create_xyz_experiment(payload: dict, http_request: Request = None):
 
 
 @app.get("/api/inference/xyz-plots")
-def list_xyz_experiments(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None,
+def list_xyz_experiments(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"] | None = None,
                          origin: Literal["any", "none"] = "any"):
     # origin=none: only the XYZ workspace's own experiments (no `origin` block); the default stays every experiment.
     return xyz_store().list(engine, plain_only=origin == "none")
@@ -13097,7 +13747,7 @@ def module_tasks(module, *, engine=None, payload=None, committing=False, http_re
 
 
 @app.get("/api/inference/xyz-plots/tasks")
-def list_xyz_tasks(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None):
+def list_xyz_tasks(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"] | None = None):
     return module_tasks("xyz", engine=engine)
 
 
@@ -13347,14 +13997,14 @@ def confirm_mix_round(payload: dict, http_request: Request = None):
 
 
 @app.get("/api/inference/lora-mix/sessions")
-def list_mix_sessions(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None):
+def list_mix_sessions(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"] | None = None):
     store = xyz_store()
     store.ensure_loaded()
     return {"sessions": mix_search.session_summaries(store.records, engine)}
 
 
 @app.get("/api/inference/lora-mix/tasks")
-def list_mix_tasks(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2"] | None = None):
+def list_mix_tasks(engine: Literal["SD", "iL", "Anima", "Flux", "Flux2", "Krea2", "MOSS"] | None = None):
     return module_tasks("lora_mix", engine=engine)
 
 
@@ -13725,7 +14375,7 @@ def get_output_template(template: str | None = None, engine: str = "iL"):
     a template the page calls valid is one a job will accept. Only relative locations are returned
     for the preview; the root itself is named relative to the project when it lives inside it.
     """
-    if engine not in {"SD", "iL", "Anima", "Flux", "Flux2", "Krea2"}:
+    if engine not in set(ALL_ENGINES):
         raise HTTPException(status_code=422, detail="Unsupported engine")
     payload = {
         "root": output_root_display(OUTPUT_DIRECTORY, PROJECT_ROOT),

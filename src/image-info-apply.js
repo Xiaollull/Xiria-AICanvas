@@ -15,6 +15,8 @@ import { clipSkipRange, isSplitEngine } from "./engine-settings.js";
 import { extractPromptLoras } from "./image-metadata.js";
 import { imageInfoPostprocessCandidate } from "./image-info-postprocess.js";
 import { SAMPLER_NAMES, SCHEDULER_NAMES } from "./sampling-options.js";
+import { describeMossSampling, isMossEngine, mossSamplingFromPayload } from "./moss-engine.js";
+import { mossLayoutFromRecord } from "./moss-layout.js";
 
 export const IMAGE_INFO_APPLY_TARGETS = [
   { id: "t2i", label: "文生图" },
@@ -315,8 +317,19 @@ export function buildImageInfoApplyPlan(info, fieldIds, target = "t2i", { engine
   for (const field of available) {
     if (field.id === "prompts") {
       const values = { positive: textOf(info.positive), negative: textOf(info.negative) };
-      if (toImageToImage) Object.assign(imageToImage, values);
-      else Object.assign(overlay, values);
+      // A MOSS layout picture's prompt is compiled JSON. Its layout goes back into layout mode and the
+      // text box keeps what it holds; the prefix line came from LoRA groups and presets, which are
+      // not rewritten from a picture.
+      const restored = info.mossLayout ? mossLayoutFromRecord(info.mossLayout) : null;
+      if (restored && !toImageToImage && isMossEngine(targetEngine)) {
+        overlay.negative = values.negative;
+        overlay.mossLayout = restored.layout;
+        if (restored.prefix.trim()) notes.push(`布局前缀「${restored.prefix.trim().slice(0, 80)}」来自当时的 LoRA 组与预设，未写入`);
+      } else {
+        if (restored) skipped.push("MOSS 坐标布局仅适用于 MOSS 文生图；已按编译后的文本提示词写入");
+        if (toImageToImage) Object.assign(imageToImage, values);
+        else Object.assign(overlay, values);
+      }
       groups.push("prompts");
     }
     if (field.id === "sampling") {
@@ -333,6 +346,12 @@ export function buildImageInfoApplyPlan(info, fieldIds, target = "t2i", { engine
       else {
         delete sampling.fixSteps;
         Object.assign(overlay, sampling);
+      }
+      // A MOSS picture's shift and skip layers belong to its sampling; they land only on a MOSS
+      // workspace, since no other engine has the block (and image-to-image does not run MOSS).
+      if (info.mossSampling) {
+        if (!toImageToImage && isMossEngine(targetEngine)) overlay.mossSampling = mossSamplingFromPayload(info.mossSampling);
+        else skipped.push(`MOSS 采样设置（${describeMossSampling(mossSamplingFromPayload(info.mossSampling))}）仅适用于 MOSS 文生图`);
       }
       groups.push("sampling");
     }

@@ -5,7 +5,7 @@ import test from "node:test";
 
 const root = path.resolve(import.meta.dirname, "..");
 
-test("frontend supervisor, startup, update validation, and Python backend use protocol 39", () => {
+test("frontend supervisor, startup, update validation, and Python backend use protocol 40", () => {
   const sources = [
     ["vite.config.js", /const inferenceProtocol = (\d+);/],
     // Start and Setup share one readiness predicate, so the startup protocol is declared there.
@@ -18,6 +18,6 @@ test("frontend supervisor, startup, update validation, and Python backend use pr
     assert.ok(match, `${relative} must declare the inference protocol`);
     return Number(match[1]);
   });
-  assert.deepEqual(protocols, [39, 39, 39, 39]);
+  assert.deepEqual(protocols, [40, 40, 40, 40]);
   assert.match(readFileSync(path.join(root, "scripts/start.mjs"), "utf8"), /const inferenceProtocol = APPLICATION_PROTOCOL;/);
 });

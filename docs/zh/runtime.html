@@ -176,7 +176,7 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
 
     <div class="note">
       <span class="label">量化文件的占用取决于引擎</span>
-      <p>Krea 2 会让逐张量缩放的 fp8 或 int8 权重保持存储形式，并在线性算子内部施加缩放，因此这类文件按其存储大小计入预算并占用显存。其余引擎，以及所有引擎读取的
+      <p>Krea 2 与 MOSS 会让带缩放的 fp8 或 int8 权重保持存储形式，并在线性算子内部施加缩放，因此这类文件按其存储大小计入预算并占用显存。其余引擎，以及所有引擎读取的
         GGUF，都会在加载时展开为计算精度。无论哪种情况，预算都按张量形状及其存储类型计算，而非按文件大小计算。参见<a href="models.html#quantization">关于量化，说实话</a>。</p>
     </div>
 
@@ -190,6 +190,11 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
       CPU，也绝不会进入串行 CFG 的极限省存模式，那仍然只能手动选择。静态提示词在一个任务中只编码一次，由基础采样、重绘与 ADetailer 共享。</p>
     <p>推荐显存为 6 GB 以上。低于该值时 AUTO 仍可使用，设置页会提示<em>低于推荐配置，可能无法完成任务</em>。手动模式的行为与之前完全相同；固定
       Seed 在 AUTO 下画出的图也与该模式出现之前相同。AUTO 生成的图片会在参数中记录每个阶段实际使用的路径（<code>memory_schedule</code>）。</p>
+
+    <p><strong>MOSS 文本编码器。</strong>MOSS 以 Qwen3.5-9B 作为条件编码器，其语言部分在 INT8 下约 8 GB。性能调度 →
+      <strong>MOSS 文本编码器位置</strong>决定它在哪里运行：<em>自动</em>在显存放得下（含编码工作区）时常驻 GPU，否则逐层流式送入 GPU；
+      <em>GPU 常驻</em>与<em>GPU 流式</em>可强制其一；<em>CPU</em> 在处理器上编码，速度明显更慢，绝不会被自动选择。MOSS 之前的设置文件读回时不变，
+      缺少该值即视为<em>自动</em>。</p>
 
     <h2 id="cache">管道缓存</h2>
     <p>所有三种模式都会在成功、已取消或非 OOM

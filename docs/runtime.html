@@ -223,7 +223,7 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
 
     <div class="note">
       <span class="label">What a quantized file costs depends on the engine</span>
-      <p>Krea 2 keeps a scalar-scaled fp8 or int8 weight in its stored form and applies the scale
+      <p>Krea 2 and MOSS keep a scaled fp8 or int8 weight in its stored form and apply the scale
         inside the linear, so such a file is budgeted and held at its stored size. Every other
         engine, and GGUF everywhere, expands to the compute dtype while loading. Either way the
         budget is computed from tensor shapes and stored types rather than file size. See
@@ -250,6 +250,13 @@ Residency · base sampling    leaf stream → parked · 6.88 GB free · park for
       The manual modes behave exactly as before, and a fixed seed draws the same picture under AUTO as it did
       before this mode existed. A picture made under AUTO records which path each stage ran on in its
       parameters (<code>memory_schedule</code>).</p>
+
+    <p><strong>MOSS text encoder.</strong> MOSS conditions on Qwen3.5-9B, whose language part is about
+      8 GB in INT8. 性能调度 → <strong>MOSS 文本编码器位置</strong> chooses where it runs. <em>自动</em>
+      keeps it on the GPU when it fits beside the encode workspace, and otherwise streams it to the GPU
+      one layer at a time. <em>GPU 常驻</em> and <em>GPU 流式</em> force either. <em>CPU</em> encodes on the
+      processor and is much slower; it is never chosen automatically. Settings files from before MOSS
+      read back unchanged; a missing value means <em>自动</em>.</p>
 
     <h2 id="cache">The pipeline cache</h2>
     <p>All three modes keep the loaded pipeline object cached after a successful, cancelled, or

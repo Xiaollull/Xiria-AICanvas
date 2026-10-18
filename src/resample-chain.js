@@ -63,8 +63,8 @@ export function isRelativeUpscalerId(value) {
 
 // What each engine's latent grid accepts as a redraw canvas, mirroring the backend table. A unit
 // that does not redraw is not held to any of them.
-const ENGINE_PIXEL_ALIGNMENT = { SD: 8, iL: 8, Anima: 32, Flux: 16, Flux2: 16, Krea2: 16 };
-const ENGINE_MAX_REFINEMENT_EDGE = { SD: 8192, iL: 8192, Anima: 4096, Flux: 4096, Flux2: 4096, Krea2: 4096 };
+const ENGINE_PIXEL_ALIGNMENT = { SD: 8, iL: 8, Anima: 32, Flux: 16, Flux2: 16, Krea2: 16, MOSS: 16 };
+const ENGINE_MAX_REFINEMENT_EDGE = { SD: 8192, iL: 8192, Anima: 4096, Flux: 4096, Flux2: 4096, Krea2: 4096, MOSS: 4096 };
 
 export const RESAMPLE_UNIT_DEFAULTS = Object.freeze({
   type: "resample",

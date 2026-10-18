@@ -252,6 +252,7 @@ class Krea2EngineWiringTests(unittest.TestCase):
             "flux": inference_server.flux_health_fields(),
             "flux2": inference_server.flux2_health_fields(),
             "krea2": inference_server.krea2_health_fields(),
+            "moss": inference_server.moss_health_fields(),
             "upscalers": {"models": []},
         }):
             health = inference_server.health()

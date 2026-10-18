@@ -261,10 +261,13 @@ export function imageToImageFixStepsPlan(config, engine, source) {
 
 // Why the run button is off, in the order the user can act on: no picture, then no model, then a
 // service that is not up, then a run already in flight.
-export function imageToImageBlockers({ source, settings, engine, engineReady = true, serviceReady = true, postprocess = {}, backgroundRemoval = {}, canvasMaxEdge = MAXIMUM_EDGE }) {
+export function imageToImageBlockers({ source, settings, engine, engineReady = true, serviceReady = true, imageToImageAvailable = true, postprocess = {}, backgroundRemoval = {}, canvasMaxEdge = MAXIMUM_EDGE }) {
   const config = normalizeImageToImageSettings(settings);
   const postprocessOnly = config.mode === "postprocess";
   const fixStepsPlan = imageToImageFixStepsPlan(config, engine, source);
+  // An engine without an image-to-image path (MOSS in this release) cannot run either mode here; no
+  // picture or prompt would change that, so it is said first.
+  if (!imageToImageAvailable) return `${engine} 本版本暂不支持图生图与纯后处理，请在文生图页面使用，或切换到其他引擎`;
   if (!source?.dataUrl) return "请先选择一张来源图片";
   if (!postprocessOnly) {
     // A custom canvas saved under a higher bound is kept, not cut down; it just cannot run until the
@@ -347,10 +350,11 @@ export function imageToImageRequestBody({
   const flux = engine === "Flux";
   const flux2 = engine === "Flux2";
   const krea2 = engine === "Krea2";
+  const moss = engine === "MOSS";
   // Every native engine mounts components instead of a checkpoint and none streams a decoded
   // latent, so the facts the request depends on are "is this a split model", "does it mount a
   // second text encoder" and "is it guidance distilled".
-  const splitModel = anima || flux || flux2 || krea2;
+  const splitModel = anima || flux || flux2 || krea2 || moss;
   const distilled = DISTILLED_GUIDANCE_ENGINES.includes(engine);
   const postprocessOnly = config.mode === "postprocess";
   const fixStepsPlan = imageToImageFixStepsPlan(config, engine, source);

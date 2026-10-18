@@ -54,7 +54,7 @@ window.fetch = async (input, options = {}) => {
   const body = options.body ? JSON.parse(options.body) : null;
   if (window.__appFetch) { const answer = await window.__appFetch(url, method, body); if (answer) return answer; }
   if (url.startsWith("/api/inference/xyz-plots")) window.__xyzCalls.push({ url, method, body });
-  if (url.endsWith("/capabilities")) return response({ executor_ready: true, max_concurrency: 10, protocol: 39, phase: "E" });
+  if (url.endsWith("/capabilities")) return response({ executor_ready: true, max_concurrency: 10, protocol: 40, phase: "E" });
   if (url.endsWith("/plan")) {
     window.__xyzPlanBodies ||= [];
     window.__xyzPlanBodies.push(body);

@@ -211,7 +211,7 @@ test("Anima tokenizers are bundled program resources and not recommended downloa
 
   const vite = await readFile(path.join(root, "vite.config.js"), "utf8");
   assert.match(vite, /const checkpointEnginePathKeys = \{ SD: "sd", iL: "illustrious" \}/);
-  assert.match(vite, /const loraEnginePathKeys = \{ SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2" \}/);
+  assert.match(vite, /const loraEnginePathKeys = \{ SD: "sd", iL: "illustrious", Anima: "anima", Flux: "flux", Flux2: "flux2", Krea2: "krea2", MOSS: "moss" \}/);
   assert.doesNotMatch(vite, /checkpointEnginePathKeys = \{[^}]*Anima/);
   // A request that names no engine is a caller mistake, and the refusal has to read as one: the
   // bare "Unsupported model engine" was taken as evidence of a corrupt model library.

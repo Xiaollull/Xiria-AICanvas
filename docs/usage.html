@@ -34,6 +34,7 @@
     <ul>
       <li><a href="#prompt">Prompt weights</a></li>
       <li><a href="#prompt-length">Prompt length</a></li>
+      <li><a href="#moss-layout">MOSS coordinate layouts</a></li>
       <li><a href="#guidance">Guidance</a></li>
       <li><a href="#adapters">Adapter fusion</a></li>
       <li><a href="#lora-cards">LoRA cards</a></li>
@@ -47,12 +48,13 @@
 
   <main>
     <h1>Generating images</h1>
-    <p class="lede">All six engines share one prompt grammar, one sampler vocabulary and one
-      gallery. What differs is which guidance method applies and what the schedule behind a sampler
-      name actually is.</p>
+    <p class="lede">All seven engines share one sampler vocabulary and one gallery, and every engine
+      but MOSS shares one prompt grammar. What differs is which guidance method applies and what the
+      schedule behind a sampler name actually is.</p>
 
     <h2 id="prompt">Prompt weights</h2>
-    <p>All six engines share the core ComfyUI parenthesis grammar:</p>
+    <p>Every engine except MOSS shares the core ComfyUI parenthesis grammar. MOSS reads the prompt
+      as written, so the brackets below reach its text encoder as literal text:</p>
     <div class="scroller">
       <table>
         <thead><tr><th>Syntax</th><th>Effect</th></tr></thead>
@@ -71,9 +73,11 @@
       output.</p>
 
     <h2 id="prompt-length">Prompt length</h2>
-    <p>There is no length limit on a prompt, on any engine. A prompt is encoded at whatever length
-      it tokenises to: a long one costs a little more time in the text encoder and nothing else, and
-      it is never truncated, never rejected, and never a reason a generation refuses to start.</p>
+    <p>There is no length limit on a prompt on any engine but MOSS. A prompt is encoded at whatever
+      length it tokenises to: a long one costs a little more time in the text encoder and nothing
+      else, and it is never truncated, never rejected, and never a reason a generation refuses to
+      start. MOSS's encoder stops at 4096 tokens; its row below and the
+      <a href="#moss-layout">layout limits</a> say what happens past that.</p>
     <div class="scroller">
       <table>
         <thead><tr><th>Engine</th><th>What a long prompt does</th></tr></thead>
@@ -82,6 +86,7 @@
           <tr><td>Anima</td><td>Qwen and T5 both run at the prompt's own length. Below 512 tokens the sequence is padded up to it and the padding is masked.</td></tr>
           <tr><td>FLUX.1</td><td>T5-XXL carries the conditioning and runs at the prompt's own length. CLIP-L contributes only a pooled vector and reads the first 77 tokens, because that is how many position embeddings it has — the same vector ComfyUI takes from its first block.</td></tr>
           <tr><td>FLUX.2, Krea 2</td><td>The language model runs at the prompt's own length. FLUX.2 pads up to its trained 512-token context; Krea 2 pads nothing.</td></tr>
+          <tr><td>MOSS</td><td>Qwen3.5-9B reads the prompt inside its chat template at the prompt's own length, up to 4096 tokens including the template; a longer prompt is truncated and the run says so. Weight syntax such as <code>(word:1.2)</code> is passed as literal text.</td></tr>
         </tbody>
       </table>
     </div>
@@ -96,6 +101,58 @@
       stayed resident to roughly seven thousand prompt tokens and finished a 13,849-token prompt on
       the streamed path in about two and a half minutes against forty seconds.</p>
 
+    <h2 id="moss-layout">MOSS coordinate layouts</h2>
+    <p>Besides plain text, MOSS-Image reads a <em>layout</em>: a JSON prompt holding a description of
+      the whole picture and a list of boxes, each with a label, a description and its place on the
+      canvas, as the official README documents. On the MOSS engine the prompt header carries a
+      <strong>文本 | 布局</strong> switch. In layout mode the positive prompt becomes a card with a
+      preview of the boxes, the count per label, the token count and whether the layout is valid, and
+      <strong>编辑布局</strong> opens the layout editor. The text prompt is kept, so switching back
+      restores it, and <strong>转为文本</strong> turns the layout into an ordinary text prompt.</p>
+    <div class="scroller">
+      <table>
+        <thead><tr><th>Label</th><th>Use</th></tr></thead>
+        <tbody>
+          <tr><td>物体 <code>object</code></td><td>A thing in the picture.</td></tr>
+          <tr><td>人物 <code>character</code></td><td>A person or character.</td></tr>
+          <tr><td>文字 <code>text</code></td><td>Lettering. Its exact text, line breaks included, is what the model is asked to render.</td></tr>
+          <tr><td>画面 <code>panel</code></td><td>A frame: a comic panel, a background region or the whole canvas. Drawn dashed; the boxes inside it stay reachable, and it is moved by its tag.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>The editor.</strong> Drag on empty canvas to draw a box, move boxes, resize them with
+      the eight handles (Shift keeps the ratio) and let them snap to the canvas edges, centre and
+      thirds and to other boxes; hold Ctrl to place freely. The list on the left is the reading order
+      and the JSON order: drag to reorder, hide a box (hidden boxes are not sent) or lock it. The
+      inspector edits the picture's description (画面), the selected box (元素: label, description,
+      exact text, coordinates, tags, colours) and the readable JSON. Coordinates are top-left pixels
+      on the generation canvas. A reference image can be shown under the boxes; it stays in the
+      browser and is never uploaded. Templates (the official README example and an empty canvas),
+      import of a readable draft or an official compiled layout, export, undo/redo and keyboard
+      shortcuts (V/B/H, Ctrl+Z, Ctrl+D, Delete, arrows, Space to pan) are in the header and the
+      toolbar. Below 900 pixels wide the canvas, the list and the inspector become three tabs.</p>
+    <p><strong>What is sent.</strong> The layout is compiled exactly as the official
+      <code>compile_prompt.py</code> compiles it — centred <code>abs_centralized</code> /
+      <code>yxyx</code> boxes in compact JSON — and the server refuses a prompt that differs from its
+      own compile. The LoRA group's prompt and the active positive presets go on a line before the
+      JSON. The layout follows the canvas size on the Basic page: changing the size rescales every
+      box, with an undo. Each Hires redraw recompiles the layout at its own size. An ADetailer unit
+      with an empty prompt receives the boxes that overlap its crop, mapped onto the crop (or the
+      picture's description when none does); <code>[PROMPT]</code> in a unit prompt is replaced by
+      that text, and any other unit prompt is used as written.</p>
+    <p><strong>Limits.</strong> A layout prompt is never truncated: the first pass and every Hires
+      redraw must fit MOSS's 4096 tokens, chat template included, or generation is blocked and says
+      by how much. The meter turns amber above 3,600. Transparent background, XYZ comparison and LoRA
+      mix search do not take a layout in this release. The layout is written into the PNG and into
+      Gallery cards, and 应用参数 restores it; programs that do not know it still read the compiled
+      prompt.</p>
+    <div class="note">
+      <span class="label">New in 1.4</span>
+      <p>The compiled prompt is checked byte for byte against the official README example and
+        compiler. Runs with the real weights that settle the prefix line and the ADetailer crop
+        layout are still to come, so those two rules may change.</p>
+    </div>
+
     <h2 id="guidance">Guidance</h2>
     <div class="scroller">
       <table>
@@ -103,7 +160,8 @@
         <tbody>
           <tr><td>PAG</td><td>SD, iL, native Anima</td><td>Scale <code>0..5</code>, scope <code>mid|all</code>.</td></tr>
           <tr><td>CFG-Zero*</td><td>native Anima, Krea 2</td><td>—</td></tr>
-          <tr><td>Negative prompt</td><td>SD, iL, Anima, Krea 2</td><td>Both FLUX generations are distilled and send nothing.</td></tr>
+          <tr><td>Negative prompt</td><td>SD, iL, Anima, Krea 2, MOSS</td><td>Both FLUX generations are distilled and send nothing.</td></tr>
+          <tr><td>Negative-branch block skip</td><td>MOSS</td><td>Blocks <code>0..41</code> (default 22) are skipped in the unconditional pass over a sigma window, only when CFG &#8800; 1 and with no extra forward pass. Standard SLG is not offered.</td></tr>
         </tbody>
       </table>
     </div>
@@ -148,12 +206,16 @@
       preserves them. Images no card points at any more are deleted on the next save.</p>
 
     <h2 id="samplers">Samplers and schedulers</h2>
-    <p>All four native engines offer the same 44 sampler and nine scheduler names in Generate and
-      Gallery. The vocabulary is shared; the schedules behind it are not.</p>
+    <p>Anima, FLUX.1, FLUX.2 and Krea 2 offer the same 44 sampler and nine scheduler names in Generate and
+      Gallery. The vocabulary is shared; the schedules behind it are not. MOSS offers three of the samplers.</p>
     <ul>
       <li>Anima's nine are native Flow-shift-3 trajectories.</li>
       <li>Both FLUX generations and Krea 2 run the same ModelSamplingFlux table, FLUX.2 taking its
         shift from the model and Krea 2 from the static shift its own model config declares.</li>
+      <li>MOSS offers <code>euler</code>, <code>euler_ancestral</code> and <code>heun</code> with the nine
+        schedulers on ComfyUI's discrete-flow table (multiplier 1000) and its own shift, 5 by default and
+        adjustable in the sampling panel. <code>sgm_uniform</code> and <code>normal</code> reproduce
+        ComfyUI's double-shifted last step.</li>
     </ul>
     <p>Named compatibility solver mappings are reported in task warnings and PNG sampling metadata
       rather than silently pretending to be a different implementation.</p>
@@ -247,7 +309,7 @@
     <p><strong>Sizes are exact.</strong> Each unit's target is <code>round(edge × scale)</code> of
       the image it receives, the figure ComfyUI's <code>ImageScaleBy</code> computes, with no rounding
       up to 64. A redraw still has to land on the engine's latent grid — 8 pixels for SD and
-      Illustrious, 16 for FLUX.1, FLUX.2 and Krea 2, 32 for Anima — so the panel shows the size the
+      Illustrious, 16 for FLUX.1, FLUX.2, Krea 2 and MOSS, 32 for Anima — so the panel shows the size the
       redraw will actually run at next to the target, and <strong>精确输出尺寸</strong> scales the
       result back to the exact target at the cost of one more resize. A redraw edge may be up to
       8192 pixels on SD and Illustrious and 4096 on the other engines; a unit that does not redraw is
@@ -259,7 +321,8 @@
       <strong>独立步数</strong> and <strong>独立 CFG</strong> and its own pickers. Its seed follows each
       picture's first-pass seed by default, or can be one fixed seed for every picture, or a fresh
       random seed per picture. Anima and Krea 2 can also redraw in USDU tiles instead of the whole
-      frame at once.</p>
+      frame at once. MOSS redraws the whole frame only (no USDU tiles), and the image-to-image page
+      refuses MOSS in this release.</p>
     <p>Settings saved before this chain existed — workspaces, per-engine settings, gallery cards and
       PNG metadata — open with their Hires.fix pass as the first resample unit and the old stage order
       kept, so an old workspace produces the run it always did.</p>
